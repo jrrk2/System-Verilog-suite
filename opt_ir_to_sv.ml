@@ -115,7 +115,7 @@ let convert_to_structural ir =
           dtype_name = "";
           is_param = false;
         } in
-        if !debug then Printf.eprintf "Output port: %s (width=%d)\n" name width;
+        if !debug then Printf.eprintf "Output port: %s (width=%d) = id=%d\n" name width id;
         port :: acc
     | _ -> acc
   ) ir.ir_outputs [] in
@@ -388,10 +388,25 @@ let convert_to_structural ir =
     stmts := cell :: !stmts
   ) ir.ir_nodes;
   
+  (* Phase 7: Generate output assignments *)
+  let output_assignments = Hashtbl.fold (fun name value acc ->
+    match value with
+    | Output { id; _ } ->
+        let assign = AssignW {
+          lhs = VarRef { name; access = "WR"; dtype_ref = None };
+          rhs = VarRef { name = id_to_wire_name id_to_name id; access = "RD"; dtype_ref = None };
+        } in
+        if !debug then Printf.eprintf "Output assignment: %s = %s\n" name (id_to_wire_name id_to_name id);
+        assign :: acc
+    | _ -> acc
+  ) ir.ir_outputs [] in
+  
+  stmts := output_assignments @ !stmts;
+  
   if !debug then Printf.eprintf "=== Conversion complete ===\n";
   if !debug then Printf.eprintf "Total statements: %d\n" (List.length !stmts);
   
-  (* FIXED: Wrap in Netlist for Sv_gen compatibility *)
+  (* Wrap in Netlist for Sv_gen compatibility *)
   let module_ast = Module { name = ir.ir_name; stmts = List.rev !stmts } in
   Netlist [module_ast]
 

@@ -1,4 +1,4 @@
-(* behavioral_to_opt_ir.ml - FIXED to handle ArraySel *)
+(* behavioral_to_opt_ir.ml - Complete correct version *)
 
 open Sv_ast
 open Sv_opt_ir
@@ -60,10 +60,8 @@ let rec convert_expr ctx expr =
       id
   
   | Const { name; dtype_ref } ->
-      (* Parse constant value *)
       let value = try
         if String.contains name '\'' then
-          (* Parse SystemVerilog constants like "32'h0", "1'h0", etc. *)
           let parts = String.split_on_char '\'' name in
           match parts with
           | width_str :: rest ->
@@ -80,9 +78,7 @@ let rec convert_expr ctx expr =
                     int_of_string (String.sub value_str 1 (String.length value_str - 1))
                 | 'b', _ ->
                     int_of_string ("0b" ^ String.sub value_str 1 (String.length value_str - 1))
-                | _ -> 
-                    (* Just a number after the tick *)
-                    int_of_string value_str
+                | _ -> int_of_string value_str
               else int_of_string value_str
           | _ -> int_of_string name
         else
@@ -177,23 +173,13 @@ let rec convert_expr ctx expr =
       if !debug then Printf.eprintf "  Cond (mux) (w=%d) -> id=%d\n" width id;
       id
   
-  (* FIXED: Handle ArraySel properly *)
   | ArraySel { expr; index } ->
       if !debug then Printf.eprintf "  ArraySel detected\n";
-      
-      (* Get the array base *)
       let base_id = convert_expr ctx expr in
-      
-      (* Get the index (should be a constant) *)
       let index_val = match index with
-        | Const { name; _ } -> 
-            (try int_of_string name with _ -> 0)
-        | _ -> 
-            if !debug then Printf.eprintf "    Warning: Non-constant array index\n";
-            0
+        | Const { name; _ } -> (try int_of_string name with _ -> 0)
+        | _ -> 0
       in
-      
-      (* Create extract operation for single bit *)
       let operation = Extract { width = 1; lsb = index_val; msb = index_val } in
       let id = add_node ctx.ir operation [base_id] in
       if !debug then Printf.eprintf "    Created extract[%d]: id=%d\n" index_val id;
@@ -202,14 +188,10 @@ let rec convert_expr ctx expr =
   | Sel { expr; lsb = Some lsb_expr; width = None; _ } ->
       if !debug then Printf.eprintf "  Sel (bit select)\n";
       let base_id = convert_expr ctx expr in
-      
-      (* Try to get constant index *)
       let index = match lsb_expr with
-        | Const { name; _ } -> 
-            (try int_of_string name with _ -> 0)
+        | Const { name; _ } -> (try int_of_string name with _ -> 0)
         | _ -> 0
       in
-      
       let operation = Extract { width = 1; lsb = index; msb = index } in
       let id = add_node ctx.ir operation [base_id] in
       if !debug then Printf.eprintf "    Created extract[%d]: id=%d\n" index id;
@@ -224,7 +206,6 @@ let rec convert_stmt ctx stmt =
   match stmt with
   | Assign { lhs = VarRef { name; dtype_ref; _ }; rhs; is_blocking = true } ->
       let rhs_id = convert_expr ctx rhs in
-      (* For combinational logic, just map the variable to the computed value *)
       Hashtbl.replace ctx.var_to_id name rhs_id;
       if !debug then Printf.eprintf "  Assign: %s <- id=%d\n" name rhs_id
   
@@ -256,6 +237,9 @@ let convert_to_opt_ir ast =
       if !debug then Printf.eprintf "\n=== Converting behavioral AST to Opt IR ===\n";
       if !debug then Printf.eprintf "Module: %s\n" name;
       
+      (* Track output port names separately *)
+      let output_names = Hashtbl.create 10 in
+      
       (* Phase 1: Create ports *)
       List.iter (function
         | Var { name = port_name; dtype_ref; var_type = "PORT"; direction = "INPUT"; _ } ->
@@ -267,7 +251,8 @@ let convert_to_opt_ir ast =
         | Var { name = port_name; dtype_ref; var_type = "PORT"; direction = "OUTPUT"; _ } ->
             let width = get_width_from_dtype dtype_ref in
             let id = add_output ir port_name width in
-            Hashtbl.add ctx.var_to_id port_name id;
+            (* DON'T add to var_to_id yet - outputs will be assigned later *)
+            Hashtbl.add output_names port_name (id, width);
             if !debug then Printf.eprintf "Output: %s (width=%d, id=%d)\n" port_name width id
         
         | _ -> ()
@@ -275,6 +260,20 @@ let convert_to_opt_ir ast =
       
       (* Phase 2: Convert statements *)
       List.iter (convert_stmt ctx) stmts;
+      
+      (* Phase 3: Connect outputs to their computed values *)
+      Hashtbl.iter (fun output_name (output_id, width) ->
+        match Hashtbl.find_opt ctx.var_to_id output_name with
+        | Some computed_id ->
+            (* Output was assigned - update the IR to point to computed value *)
+            if !debug then Printf.eprintf "Connecting output %s: original_id=%d -> computed_id=%d\n" 
+              output_name output_id computed_id;
+            (* Replace the output in the IR with the computed value *)
+            Hashtbl.replace ir.ir_outputs output_name 
+              (Output { id = computed_id; name = output_name; width })
+        | None ->
+            if !debug then Printf.eprintf "Warning: Output %s not assigned\n" output_name
+      ) output_names;
       
       if !debug then Printf.eprintf "\n=== Conversion complete ===\n";
       if !debug then Printf.eprintf "Total nodes: %d\n" (Hashtbl.length ir.ir_nodes);
