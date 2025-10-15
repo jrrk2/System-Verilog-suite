@@ -414,3 +414,73 @@ type attr = {
   module_table : (string, sv_node) Hashtbl.t;
   var_table : (string, sv_node) Hashtbl.t;
  }
+
+(* ============================================================================
+   OPT TYPE DEFINITIONS
+   ============================================================================ *)
+
+(* Value representation - tracks data flow *)
+type value_id = int
+
+type value =
+  | Input of { id: value_id; name: string; width: int }
+  | Output of { id: value_id; name: string; width: int }
+  | Constant of { id: value_id; value: int; width: int }
+  | Wire of { id: value_id; name: string; width: int }
+
+(* Hardware operations - explicit semantics *)
+type operation =
+  | Add of { width: int; signed: bool }
+  | Sub of { width: int; signed: bool }
+  | Mul of { width: int; signed: bool }
+  | Div of { width: int; signed: bool }
+  | And of { width: int }
+  | Or of { width: int }
+  | Xor of { width: int }
+  | Not of { width: int }
+  | Shift of { width: int; direction: [`Left | `Right]; arithmetic: bool; amount: int option }
+  | Compare of { width: int; cmp_op: [`Eq | `Ne | `Lt | `Le | `Gt | `Ge]; signed: bool }
+  | Mux of { width: int }
+  | Concat of { widths: int list }
+  | Extract of { width: int; lsb: int; msb: int }
+  | ZeroExtend of { from_width: int; to_width: int }
+  | SignExtend of { from_width: int; to_width: int }
+  | Register of { 
+      width: int; 
+      clock: value_id; 
+      reset: value_id option; 
+      enable: value_id option;
+      reset_value: int 
+    }
+
+(* Node in the dataflow graph *)
+type node = {
+  node_id: value_id;
+  mutable node_op: operation;
+  mutable node_inputs: value_id list;
+  node_output: value;
+  mutable node_depth: int;  (* Critical path depth *)
+  mutable node_users: value_id list;  (* Who uses this node's output *)
+}
+
+(* The optimization IR *)
+type opt_ir = {
+  ir_name: string;
+  ir_inputs: (string, value) Hashtbl.t;
+  ir_outputs: (string, value) Hashtbl.t;
+  ir_constants: (int, value_id) Hashtbl.t;  (* value -> id mapping *)
+  ir_nodes: (value_id, node) Hashtbl.t;
+  ir_value_to_node: (value_id, value_id) Hashtbl.t;  (* Output value -> node id *)
+  mutable ir_next_id: int;
+  (* Metadata for optimization *)
+  mutable ir_critical_path_length: int;
+  mutable ir_area_estimate: int;
+}
+
+(* Helper to track sharing opportunities *)
+type sharing_candidate = {
+  cand_op: operation;
+  cand_inputs: value_id list;
+  mutable cand_instances: value_id list;  (* All nodes that do this computation *)
+  cand_savings: int;  (* Estimated area saved by sharing *)
+}

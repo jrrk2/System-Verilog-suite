@@ -5,9 +5,11 @@ open Yojson;;
 open Sv_ast;;
 open Sv_parse;;
 open Sv_transform;;
-open Sv_main_struct;;
+open Sv_opt_ir;;
+open Sv_main_opt;;
 (*
 open Sv_main;;
+open Sv_main_struct;;
 *)
 
 let _ = scan "results/";;
