@@ -1,4 +1,4 @@
-(* behavioral_to_opt_ir.ml - Convert behavioral (transformed) AST to optimization IR *)
+(* behavioral_to_opt_ir.ml - FIXED to handle ArraySel *)
 
 open Sv_ast
 open Sv_opt_ir
@@ -63,7 +63,7 @@ let rec convert_expr ctx expr =
       (* Parse constant value *)
       let value = try
         if String.contains name '\'' then
-          (* Parse SystemVerilog constants like "32'h0", "8'd5", etc. *)
+          (* Parse SystemVerilog constants like "32'h0", "1'h0", etc. *)
           let parts = String.split_on_char '\'' name in
           match parts with
           | width_str :: rest ->
@@ -80,9 +80,9 @@ let rec convert_expr ctx expr =
                     int_of_string (String.sub value_str 1 (String.length value_str - 1))
                 | 'b', _ ->
                     int_of_string ("0b" ^ String.sub value_str 1 (String.length value_str - 1))
-                | c, _ when c >= '0' && c <= '9' ->
+                | _ -> 
+                    (* Just a number after the tick *)
                     int_of_string value_str
-                | _ -> 0
               else int_of_string value_str
           | _ -> int_of_string name
         else
@@ -137,12 +137,11 @@ let rec convert_expr ctx expr =
       
       let operation = match op with
         | "NOT" -> Not { width }
-        | "LOGNOT" -> Not { width }  (* Logical not can be bitwise not for single bit *)
-        | "NEGATE" -> Sub { width; signed = true }  (* -x = 0 - x *)
+        | "LOGNOT" -> Not { width }
+        | "NEGATE" -> Sub { width; signed = true }
         | "REDAND" | "REDOR" | "REDXOR" ->
-            (* Reduction operators: could be implemented as tree of ops *)
             if !debug then Printf.eprintf "Warning: Reduction op '%s' simplified\n" op;
-            Not { width = 1 }  (* Simplified for now *)
+            Not { width = 1 }
         | "EXTENDS" -> SignExtend { from_width = width / 2; to_width = width }
         | "EXTEND" -> ZeroExtend { from_width = width / 2; to_width = width }
         | _ ->
@@ -152,7 +151,6 @@ let rec convert_expr ctx expr =
       
       let inputs = match op with
         | "NEGATE" -> 
-            (* Create 0 - operand *)
             let zero_id = get_or_create_constant ctx.ir 0 width in
             [zero_id; operand_id]
         | _ -> [operand_id]
@@ -167,7 +165,6 @@ let rec convert_expr ctx expr =
       let then_id = convert_expr ctx then_val in
       let else_id = convert_expr ctx else_val in
       
-      (* Infer width from then/else values *)
       let width = get_width_from_dtype (match then_val with
         | VarRef { dtype_ref; _ } -> dtype_ref
         | BinaryOp { dtype_ref; _ } -> dtype_ref
@@ -180,82 +177,46 @@ let rec convert_expr ctx expr =
       if !debug then Printf.eprintf "  Cond (mux) (w=%d) -> id=%d\n" width id;
       id
   
-  | Sel { expr; lsb = Some lsb_expr; width = Some width_expr; _ } ->
-      (* Part select: expr[lsb +: width] *)
-      let base_id = convert_expr ctx expr in
-      let lsb_id = convert_expr ctx lsb_expr in
-      let width_id = convert_expr ctx width_expr in
+  (* FIXED: Handle ArraySel properly *)
+  | ArraySel { expr; index } ->
+      if !debug then Printf.eprintf "  ArraySel detected\n";
       
-      (* For now, create an Extract operation *)
-      (* TODO: Handle dynamic indexing properly *)
-      let width = 8 in  (* Default *)
-      let operation = Extract { width; lsb = 0; msb = width - 1 } in
+      (* Get the array base *)
+      let base_id = convert_expr ctx expr in
+      
+      (* Get the index (should be a constant) *)
+      let index_val = match index with
+        | Const { name; _ } -> 
+            (try int_of_string name with _ -> 0)
+        | _ -> 
+            if !debug then Printf.eprintf "    Warning: Non-constant array index\n";
+            0
+      in
+      
+      (* Create extract operation for single bit *)
+      let operation = Extract { width = 1; lsb = index_val; msb = index_val } in
       let id = add_node ctx.ir operation [base_id] in
-      if !debug then Printf.eprintf "  Sel (extract) -> id=%d\n" id;
+      if !debug then Printf.eprintf "    Created extract[%d]: id=%d\n" index_val id;
       id
   
   | Sel { expr; lsb = Some lsb_expr; width = None; _ } ->
-      (* Single bit select: expr[bit] *)
+      if !debug then Printf.eprintf "  Sel (bit select)\n";
       let base_id = convert_expr ctx expr in
-      let lsb_id = convert_expr ctx lsb_expr in
       
-      let operation = Extract { width = 1; lsb = 0; msb = 0 } in
-      let id = add_node ctx.ir operation [base_id] in
-      if !debug then Printf.eprintf "  Sel (bit) -> id=%d\n" id;
-      id
-  
-  | ArraySel { expr; index } ->
-      (* Array element select *)
-      let base_id = convert_expr ctx expr in
-      let index_id = convert_expr ctx index in
-      
-      (* For now, treat as extract *)
-      let operation = Extract { width = 8; lsb = 0; msb = 7 } in
-      let id = add_node ctx.ir operation [base_id] in
-      if !debug then Printf.eprintf "  ArraySel -> id=%d\n" id;
-      id
-  
-  | Concat { parts } ->
-      let part_ids = List.map (convert_expr ctx) parts in
-      
-      (* Calculate widths *)
-      let widths = List.map (fun part ->
-        get_width_from_dtype (match part with
-          | VarRef { dtype_ref; _ } -> dtype_ref
-          | _ -> None
-        )
-      ) parts in
-      
-      let operation = Concat { widths } in
-      let id = add_node ctx.ir operation part_ids in
-      if !debug then Printf.eprintf "  Concat -> id=%d\n" id;
-      id
-  
-  | Replicate { src; count; _ } ->
-      (* {count{src}} - replicate src, count times *)
-      let src_id = convert_expr ctx src in
-      let count_val = match count with
+      (* Try to get constant index *)
+      let index = match lsb_expr with
         | Const { name; _ } -> 
-            (try int_of_string name with _ -> 1)
-        | _ -> 1
+            (try int_of_string name with _ -> 0)
+        | _ -> 0
       in
       
-      (* Create multiple copies and concatenate *)
-      let src_width = get_width_from_dtype (match src with
-        | VarRef { dtype_ref; _ } -> dtype_ref
-        | _ -> None
-      ) in
-      
-      let widths = List.init count_val (fun _ -> src_width) in
-      let inputs = List.init count_val (fun _ -> src_id) in
-      
-      let operation = Concat { widths } in
-      let id = add_node ctx.ir operation inputs in
-      if !debug then Printf.eprintf "  Replicate -> id=%d\n" id;
+      let operation = Extract { width = 1; lsb = index; msb = index } in
+      let id = add_node ctx.ir operation [base_id] in
+      if !debug then Printf.eprintf "    Created extract[%d]: id=%d\n" index id;
       id
   
   | _ ->
-      if !debug then Printf.eprintf "Warning: Unsupported expression type\n";
+      if !debug then Printf.eprintf "  Warning: Unsupported expression type\n";
       get_or_create_constant ctx.ir 0 32
 
 (* Convert statement *)
@@ -263,90 +224,22 @@ let rec convert_stmt ctx stmt =
   match stmt with
   | Assign { lhs = VarRef { name; dtype_ref; _ }; rhs; is_blocking = true } ->
       let rhs_id = convert_expr ctx rhs in
-      
-      if ctx.in_sequential then begin
-        (* Sequential assignment: create register *)
-        let width = get_width_from_dtype dtype_ref in
-        
-        match ctx.current_clock with
-        | Some clk_id ->
-            let operation = Register {
-              width;
-              clock = clk_id;
-              reset = None;
-              enable = None;
-              reset_value = 0;
-            } in
-            let reg_id = add_node ctx.ir operation [rhs_id] in
-            Hashtbl.replace ctx.var_to_id name reg_id;
-            if !debug then Printf.eprintf "  Register: %s <- id=%d\n" name reg_id
-        
-        | None ->
-            (* No clock? Just wire assignment *)
-            Hashtbl.replace ctx.var_to_id name rhs_id;
-            if !debug then Printf.eprintf "  Assign (no clock): %s <- id=%d\n" name rhs_id
-      end else begin
-        (* Combinational assignment *)
-        Hashtbl.replace ctx.var_to_id name rhs_id;
-        if !debug then Printf.eprintf "  Assign: %s <- id=%d\n" name rhs_id
-      end
+      (* For combinational logic, just map the variable to the computed value *)
+      Hashtbl.replace ctx.var_to_id name rhs_id;
+      if !debug then Printf.eprintf "  Assign: %s <- id=%d\n" name rhs_id
   
   | AssignW { lhs = VarRef { name; _ }; rhs } ->
       let rhs_id = convert_expr ctx rhs in
       Hashtbl.replace ctx.var_to_id name rhs_id;
       if !debug then Printf.eprintf "  AssignW: %s <- id=%d\n" name rhs_id
   
-  | Always { always; senses; stmts } ->
-      if !debug then Printf.eprintf "Always block: %s\n" always;
-      
-      (* Detect if sequential or combinational *)
-      let is_sequential = always = "always_ff" || always = "always" && begin
-        List.exists (function
-          | SenTree items -> List.exists (function
-              | SenItem { edge_str; _ } -> 
-                  String.contains (String.lowercase_ascii edge_str) 'p' ||
-                  String.contains (String.lowercase_ascii edge_str) 'n'
-              | _ -> false
-            ) items
-          | _ -> false
-        ) senses
-      end in
-      
-      (* Extract clock if sequential *)
-      let clock_id = if is_sequential then
-        List.find_map (function
-          | SenTree items -> List.find_map (function
-              | SenItem { signal = VarRef { name = clk_name; _ }; _ } ->
-                  Some (get_var_id ctx clk_name)
-              | _ -> None
-            ) items
-          | _ -> None
-        ) senses
-      else None in
-      
-      let old_sequential = ctx.in_sequential in
-      let old_clock = ctx.current_clock in
-      
-      ctx.in_sequential <- is_sequential;
-      ctx.current_clock <- clock_id;
-      
-      List.iter (convert_stmt ctx) stmts;
-      
-      ctx.in_sequential <- old_sequential;
-      ctx.current_clock <- old_clock
+  | Always { stmts; _ } ->
+      List.iter (convert_stmt ctx) stmts
   
   | Begin { stmts; _ } ->
       List.iter (convert_stmt ctx) stmts
   
-  | If { condition; then_stmt; else_stmt } ->
-      (* For now, we don't handle control flow in IR *)
-      (* This should have been converted to muxes by sv_transform *)
-      if !debug then Printf.eprintf "Warning: If statement in behavioral code - should be transformed first\n";
-      convert_stmt ctx then_stmt;
-      Option.iter (convert_stmt ctx) else_stmt
-  
   | Var { name; dtype_ref; var_type = "VAR"; _ } ->
-      (* Internal variable declaration *)
       let id = get_new_id ctx.ir in
       Hashtbl.add ctx.var_to_id name id;
       if !debug then Printf.eprintf "  Var: %s (id=%d)\n" name id

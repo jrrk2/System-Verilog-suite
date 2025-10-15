@@ -391,7 +391,9 @@ let convert_to_structural ir =
   if !debug then Printf.eprintf "=== Conversion complete ===\n";
   if !debug then Printf.eprintf "Total statements: %d\n" (List.length !stmts);
   
-  Module { name = ir.ir_name; stmts = List.rev !stmts }
+  (* FIXED: Wrap in Netlist for Sv_gen compatibility *)
+  let module_ast = Module { name = ir.ir_name; stmts = List.rev !stmts } in
+  Netlist [module_ast]
 
 let convert ?(verbose=false) ir =
   debug := verbose;
