@@ -198,9 +198,55 @@ let rec expr_to_z3 suffix = function
        | [] -> Z3.BitVector.mk_numeral ctx "0" 1
        | [x] -> x
        | x :: xs -> List.fold_left (Z3.BitVector.mk_concat ctx) x xs)
+  
+  | Sv_ast.Sel { expr; lsb = Some lsb_node; width = Some width_node; _ } ->
+      (* Bit selection: expr[msb:lsb] *)
+      (try
+        let base = expr_to_z3 suffix expr in
+        let lsb = match expr_to_z3 suffix lsb_node with
+          | c when Z3.Expr.is_numeral c -> 
+              int_of_string (Z3.Expr.to_string c)
+          | _ -> 0
+        in
+        let w = match expr_to_z3 suffix width_node with
+          | c when Z3.Expr.is_numeral c ->
+              int_of_string (Z3.Expr.to_string c)
+          | _ -> 1
+        in
+        let msb = lsb + w - 1 in
+        Z3.BitVector.mk_extract ctx msb lsb base
+       with e ->
+         Printf.eprintf "Warning: Failed to extract bits: %s\n%!" (Printexc.to_string e);
+         Z3.BitVector.mk_numeral ctx "0" 1)
+  
+  | Sv_ast.ArraySel { expr; index } ->
+      (* Single bit selection: expr[index] *)
+      (try
+        let base = expr_to_z3 suffix expr in
+        let idx = match expr_to_z3 suffix index with
+          | c when Z3.Expr.is_numeral c ->
+              int_of_string (Z3.Expr.to_string c)
+          | _ -> 0
+        in
+        Z3.BitVector.mk_extract ctx idx idx base
+       with e ->
+         Printf.eprintf "Warning: Failed to select bit: %s\n%!" (Printexc.to_string e);
+         Z3.BitVector.mk_numeral ctx "0" 1)
        
-  | _ -> 
-      Printf.eprintf "Warning: Unsupported expression node, returning zero\n%!";
+  | node -> 
+      let node_type = match node with
+        | Sv_ast.Module _ -> "Module"
+        | Sv_ast.Netlist _ -> "Netlist"
+        | Sv_ast.Var _ -> "Var"
+        | Sv_ast.Always _ -> "Always"
+        | Sv_ast.Assign _ -> "Assign"
+        | Sv_ast.AssignW _ -> "AssignW"
+        | Sv_ast.Begin _ -> "Begin"
+        | Sv_ast.Case _ -> "Case"
+        | Sv_ast.If _ -> "If"
+        | _ -> "Unknown"
+      in
+      Printf.eprintf "Warning: Unsupported expression node type: %s, returning zero\n%!" node_type;
       Z3.BitVector.mk_numeral ctx "0" 1
 
 (* ========================================================================= *)
@@ -228,13 +274,31 @@ let rec add_constraints solver suffix stmts =
         (try
           let l = expr_to_z3 suffix lhs in
           let r = expr_to_z3 suffix rhs in
-          let wl = Z3.BitVector.get_size (Z3.Expr.get_sort l) in
-          let wr = Z3.BitVector.get_size (Z3.Expr.get_sort r) in
-          let r' = if wl = wr then r
-                   else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) r
-                   else Z3.BitVector.mk_extract ctx (wl - 1) 0 r in
-          let eq = Z3.Boolean.mk_eq ctx l r' in
-          Z3.Solver.add solver [eq]
+          let l_sort = Z3.Expr.get_sort l in
+          let r_sort = Z3.Expr.get_sort r in
+          
+          (* Check if both are bitvectors *)
+          if Z3.Sort.get_sort_kind l_sort <> Z3enums.BV_SORT then begin
+            Printf.eprintf "Warning: LHS is not a bitvector sort\n%!";
+            ()
+          end else if Z3.Sort.get_sort_kind r_sort <> Z3enums.BV_SORT then begin
+            Printf.eprintf "Warning: RHS is not a bitvector sort\n%!";
+            ()
+          end else begin
+            let wl = Z3.BitVector.get_size l_sort in
+            let wr = Z3.BitVector.get_size r_sort in
+            
+            if wl <= 0 || wr <= 0 then begin
+              Printf.eprintf "Warning: Invalid widths: lhs=%d rhs=%d\n%!" wl wr;
+              ()
+            end else begin
+              let r' = if wl = wr then r
+                       else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) r
+                       else Z3.BitVector.mk_extract ctx (wl - 1) 0 r in
+              let eq = Z3.Boolean.mk_eq ctx l r' in
+              Z3.Solver.add solver [eq]
+            end
+          end
          with e ->
            Printf.eprintf "Warning: Failed to add continuous assignment: %s\n%!"
              (Printexc.to_string e))
