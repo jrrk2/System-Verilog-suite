@@ -171,7 +171,10 @@ let rec expr_to_remap decls = function
       let cond_sig = sig' (expr_to_remap decls condition) in
       let then_sig = sig' (expr_to_remap decls then_val) in
       let else_sig = sig' (expr_to_remap decls else_val) in
-      Sig (mux2 cond_sig then_sig else_sig)
+      (* Ensure condition is single bit *)
+      let cond_bit = if width cond_sig = 1 then cond_sig 
+                     else reduce ~f:(|:) [cond_sig] in
+      Sig (mux2 cond_bit then_sig else_sig)
       
   | Sv_ast.Replicate { count; src; _ } | Sv_ast.Replicate' { count; src; _ } ->
       (match expr_to_remap decls count with
@@ -207,18 +210,27 @@ let rec process_stmt decls = function
       (match expr_to_remap decls lhs with
        | Var v ->
            let rhs_sig = sig' (expr_to_remap decls rhs) in
-           Some (v <-- rhs_sig)
+           let wlhs = width v.value in
+           let wrhs = width rhs_sig in
+           let rhs_resized = if wlhs = wrhs then rhs_sig
+                             else if wlhs > wrhs then uresize rhs_sig wlhs
+                             else select rhs_sig 0 wlhs in
+           Some (v <-- rhs_resized)
        | _ -> None)
        
   | Sv_ast.If { condition; then_stmt; else_stmt = Some else_stmt } ->
-      let cond = sig' (expr_to_remap decls condition) in
+      let cond_raw = sig' (expr_to_remap decls condition) in
+      let cond = if width cond_raw = 1 then cond_raw 
+                 else reduce ~f:(|:) [cond_raw] in
       (match (process_stmt decls then_stmt, process_stmt decls else_stmt) with
        | (Some t, Some e) -> Some (if_ cond [t] [e])
        | (Some t, None) -> Some (when_ cond [t])
        | _ -> None)
        
   | Sv_ast.If { condition; then_stmt; else_stmt = None } ->
-      let cond = sig' (expr_to_remap decls condition) in
+      let cond_raw = sig' (expr_to_remap decls condition) in
+      let cond = if width cond_raw = 1 then cond_raw 
+                 else reduce ~f:(|:) [cond_raw] in
       (match process_stmt decls then_stmt with
        | Some t -> Some (when_ cond [t])
        | None -> None)
@@ -237,9 +249,16 @@ let rec process_stmt decls = function
         | [cond] ->
             (match expr_to_remap decls cond with
              | Con c ->
+                 let cond_sig = Signal.of_constant c in
                  let stmts = List.filter_map (process_stmt decls) item.statements in
                  if List.length stmts > 0 then
-                   Some (c, stmts)
+                   Some (cond_sig, stmts)
+                 else
+                   None
+             | Sig s ->
+                 let stmts = List.filter_map (process_stmt decls) item.statements in
+                 if List.length stmts > 0 then
+                   Some (s, stmts)
                  else
                    None
              | _ -> None)

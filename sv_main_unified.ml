@@ -1,5 +1,4 @@
 (* sv_main_unified.ml - Unified main with command-line backend selection *)
-open Sv_ast
 
 let jsontree = ref (`String "")
 
@@ -36,13 +35,13 @@ let generate_output backend ast =
   | Yosys ->
       Sv_gen_yosys.generate_sv_with_warnings ast 0
   | HardCaml ->
-      Sv_gen_hardcaml.generate_hardcaml ast 0
+      let sv, warn = Sv_gen_hardcaml.generate_hardcaml_with_warnings ast 0 in sv, List.flatten warn
 
 (* Get file extension for backend *)
 let get_extension backend =
   match backend with
-  | Standard | Structural | Yosys -> ".sv"
-  | HardCaml -> ".ml"
+  | Standard | Structural | Yosys | HardCaml -> ".sv"
+  (* All backends output SystemVerilog/Verilog *)
 
 (* Scan directory and process all files *)
 let scan output_dir backend =
