@@ -1,5 +1,10 @@
 open Sv_ast
-open Yojson.Basic.Util
+open Yojson.Safe.Util
+
+let assoc_add lst kw data = lst := (kw,data) :: !lst
+let assoc_find_opt lst kw = List.assoc_opt kw !lst
+let assoc_find lst kw = List.assoc kw !lst
+let assoc_create _ = ref []
 
 (* Parse type table entries *)
 let rec parse_type attr json =
@@ -130,11 +135,11 @@ let rec parse_type_table attr json =
   List.iter (fun type_json ->
     let addr = type_json |> member "addr" |> to_string_option |> Option.value ~default:"" in
     let parsed_type = parse_type attr type_json in
-    if addr <> "" then Hashtbl.add attr.type_table addr parsed_type;
+    if addr <> "" then assoc_add attr.type_table addr parsed_type;
     let modportp = type_json |> member "modportp" |> to_string_option |> Option.value ~default:"" in
-    if modportp <> "" then Hashtbl.add attr.type_table modportp parsed_type;
+    if modportp <> "" then assoc_add attr.type_table modportp parsed_type;
     let varp = type_json |> member "varp" |> to_string_option |> Option.value ~default:"" in
-    if varp <> "" then Hashtbl.add attr.type_table varp parsed_type
+    if varp <> "" then assoc_add attr.type_table varp parsed_type
   ) types_json
 
 let netlist = ref []
@@ -154,7 +159,7 @@ let rec parse_json attr json =
       ) misc_list;
       
       let modules = json |> member "modulesp" |> to_list |> List.map (parse' attr name) in
-      (* let type_list = Hashtbl.fold (fun k v acc -> (k, v) :: acc) attr.type_table [] in *)
+      (* let type_list = assoc_fold (fun k v acc -> (k, v) :: acc) attr.type_table [] in *)
       netlist := modules;
       Netlist modules
       
@@ -162,7 +167,7 @@ let rec parse_json attr json =
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       let m = Module { name; stmts } in
-      if addr <> "" then Hashtbl.add attr.module_table addr m;
+      if addr <> "" then assoc_add attr.module_table addr m;
       m
       
   | "PACKAGE" ->
@@ -174,10 +179,10 @@ let rec parse_json attr json =
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       let interface_node = Interface { name; params = []; stmts } in
       if addr <> "" then (
-			  Hashtbl.add attr.interface_table addr interface_node;
-			  Hashtbl.add attr.module_table addr interface_node
+			  assoc_add attr.interface_table addr interface_node;
+			  assoc_add attr.module_table addr interface_node
 			 );
-      Hashtbl.add attr.interface_table name interface_node; (* Also store by name *)
+      assoc_add attr.interface_table name interface_node; (* Also store by name *)
       interface_node
 
   | "CELL" ->
@@ -193,14 +198,14 @@ let rec parse_json attr json =
       let vars = json |> member "varsp" |> to_list |> List.map (parse' attr name) in
       let m = Modport { name; vars } in
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
-      if addr <> "" then Hashtbl.add attr.interface_table addr m;
+      if addr <> "" then assoc_add attr.interface_table addr m;
       m
       
   | "MODPORTVARREF" ->
       let direction = json |> member "direction" |> to_string_option |> Option.value ~default:"" in
       let var_ref = json |> member "varp" |> to_string_option |> Option.value ~default:"" in
       let m = ModportVarRef { name; direction; var_ref=attr.parent } in
-      Hashtbl.add attr.var_table var_ref m;
+      assoc_add attr.var_table var_ref m;
       m
 
   | "VAR" ->
@@ -225,7 +230,7 @@ let rec parse_json attr json =
 	with _ -> None
       in
       let v = Var' { name; dtype; var_type; direction; value; dtype_name; is_param } in
-      if var_type = "IFACEREF" then List.iter (fun nam -> Hashtbl.add attr.var_table nam v) [name;dtype;addr];
+      if var_type = "IFACEREF" then List.iter (fun nam -> assoc_add attr.var_table nam v) [name;dtype;addr];
       v            
 									    
   | "INITITEM" ->
@@ -548,10 +553,10 @@ let rec rw attr = function
 | Netlist lst -> Netlist (rwlst attr lst)
 | Module {name; stmts} -> Module {name; stmts=rwlst attr stmts}
 | Var' {name; dtype; var_type; direction; value; dtype_name; is_param} ->
-  let dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) in
+  let dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype) in
   Var {name; dtype_ref; var_type; direction; value; dtype_name; is_param}
 | Cell' {name; modp_addr; pins } ->
-  Cell {name; modp_addr=rwopt attr (Hashtbl.find_opt attr.module_table modp_addr); pins=rwlst attr pins}
+  Cell {name; modp_addr=rwopt attr (assoc_find_opt attr.module_table modp_addr); pins=rwlst attr pins}
 | Pin {name; expr} -> Pin {name; expr=rwopt attr expr}
 | InsideRange {lhs; rhs} -> InsideRange {lhs=rw attr lhs; rhs=rw attr rhs}
 | Assign {lhs; rhs; is_blocking} -> Assign {lhs=rw attr lhs; rhs=rw attr rhs; is_blocking}
@@ -564,13 +569,13 @@ let rec rw attr = function
     BinaryOp {op;
     lhs=rw attr lhs;
     rhs=rw attr rhs;
-    dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
+    dtype_ref=rwtyp' attr (assoc_find_opt attr.type_table dtype) }
 | Interface {name; params; stmts} ->
   Interface {name; params=rwlst attr params; stmts=rwlst attr stmts}
 | Modport { name; vars } -> Modport { name; vars=rwlst attr vars }
 | ModportVarRef { name; direction; var_ref } -> ModportVarRef { name; direction; var_ref }
 | Const' { name; dtype } ->
-  Const { name; dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
+  Const { name; dtype_ref=rwtyp' attr (assoc_find_opt attr.type_table dtype) }
 | Begin { name; stmts; is_generate } -> Begin { name; stmts=rwlst attr stmts; is_generate }
 | Sel { expr; lsb; width; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; range }
 | Case {expr; items} -> Case {expr = rw attr expr; items = List.map (rwitm attr) items}
@@ -585,7 +590,7 @@ let rec rw attr = function
 stmts = rwlst attr stmts;
 incs = rwlst attr incs;}
 | UnaryOp' {op; operand; dtype } -> UnaryOp { op; operand = rw attr operand;
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype)}
+    dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype)}
 | Cond {condition; then_val; else_val } -> Cond {condition = rw attr condition;
     then_val = rw attr then_val;
     else_val = rw attr else_val} 
@@ -607,39 +612,39 @@ incs = rwlst attr incs;}
 | StmtExpr { expr } -> StmtExpr { expr = rw attr expr }
 | Package { name; stmts } -> Package { name; stmts = rwlst attr stmts }
 | Typedef' { name; dtype } -> Typedef { name;
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
+    dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype) }
 | Typedef { name; dtype_ref } -> Typedef { name; dtype_ref } 
 | VarRef' { name; access; dtype } -> VarRef {
-    name; access; dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype) }
+    name; access; dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype) }
 | Itord' { dtype; lhs } -> Itord {
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
     lhs = rwlst attr lhs }
 | Itord { dtype_ref; lhs } -> Itord { dtype_ref; lhs } 
 | CvtPackString' { dtype; lhs } -> CvtPackString {
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
     lhs = rwlst attr lhs }
 | CvtPackString { dtype_ref; lhs } -> CvtPackString { dtype_ref; lhs } 
 | Fopen' { dtype; filename; mode } -> Fopen {
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
     filename = rwlst attr filename;
     mode = rwlst attr mode }
 | Fopen { dtype_ref; filename; mode } -> Fopen { dtype_ref; filename; mode } 
 | Fclose { file } -> Fclose {
     file = rwlst attr file }
 | ValuePlusArgs' { dtype; search; out } -> ValuePlusArgs {
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
     search = rwlst attr search;
     out = rwlst attr out;
  }
 | ValuePlusArgs _ as v -> v
 | TestPlusArgs' { dtype; search } -> TestPlusArgs {
-    dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+    dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
     search = rwlst attr search;
  }
 | TestPlusArgs _ as v -> v
 | Func' { name; dtype; stmts; vars } -> Func {
       name;
-      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+      dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
       stmts = rwlst attr stmts ;
       vars = rwlst attr vars }
 | Func {
@@ -654,15 +659,15 @@ incs = rwlst attr incs;}
 | JumpBlock { stmt } -> JumpBlock {
       stmt = rwlst attr stmt }
 | JumpGo' { label } -> JumpGo {
-      label=rwtyp' attr (Hashtbl.find_opt attr.type_table label) }
+      label=rwtyp' attr (assoc_find_opt attr.type_table label) }
 | JumpGo { label } -> JumpGo { label }
 | Replicate' { dtype; src; count } -> Replicate {
-      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+      dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
       src = rw attr src ;
       count = rw attr count }
 | Task' { name; dtype; stmts; vars } -> Task {
       name;
-      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+      dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype);
       stmts = rwlst attr stmts ;
       vars = rwlst attr vars }
 | Task {
@@ -675,11 +680,11 @@ incs = rwlst attr incs;}
       stmts = rwlst attr stmts;
       vars = rwlst attr vars }
 | ConsPack' { dtype; members } -> ConsPack {
-      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype );
+      dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype );
       members = rwlst attr members }
 | ConsPack { dtype_ref; members } -> ConsPack { dtype_ref; members = rwlst attr members }
 | ConsPackMember' { dtype; rhs } -> ConsPackMember {
-      dtype_ref = rwtyp' attr (Hashtbl.find_opt attr.type_table dtype );
+      dtype_ref = rwtyp' attr (assoc_find_opt attr.type_table dtype );
       rhs = rw attr rhs }
 | ConsPackMember { dtype_ref; rhs } -> ConsPackMember { dtype_ref; rhs = rw attr rhs }
 | CaseItem { conditions; stmts } -> CaseItem {
@@ -688,7 +693,7 @@ incs = rwlst attr incs;}
 | InitItem { value } -> InitItem {
       value = rwlst attr value }
 | CMethodHard' { dtype; from; pins } -> CMethodHard {
-      dtype_ref=rwtyp' attr (Hashtbl.find_opt attr.type_table dtype);
+      dtype_ref=rwtyp' attr (assoc_find_opt attr.type_table dtype);
       from=rw attr from;
       pins = rwlst attr pins }
 | Const _
@@ -718,37 +723,37 @@ and rwtyp' attr = function
 
 and rwtyp attr = function
 | ArrayType' { base=base_ref; range } ->
-  let base_type = rwtyp attr (try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType (base_ref, `Null)) in
+  let base_type = rwtyp attr (try assoc_find attr.type_table base_ref with Not_found -> UnknownType (base_ref, `Null)) in
   ArrayType { base = base_type; range }
 | PackArrayType' { base=base_ref; range } ->
-  let base_type = rwtyp attr (try Hashtbl.find attr.type_table base_ref with Not_found -> UnknownType (base_ref, `Null)) in
+  let base_type = rwtyp attr (try assoc_find attr.type_table base_ref with Not_found -> UnknownType (base_ref, `Null)) in
   PackArrayType { base = base_type; range }
 | IntfRefType' { ifacename; modportname; ifacep; modportp } ->
   IntfRefType { ifacename;
   modportname;
-  ifacep=Hashtbl.find_opt attr.interface_table ifacep;
-  modportp=Hashtbl.find_opt attr.interface_table modportp }
+  ifacep=assoc_find_opt attr.interface_table ifacep;
+  modportp=assoc_find_opt attr.interface_table modportp }
 | BasicType _ as t -> t
 | RefType' {name; dtype; refdtype } -> RefType { name;
-    dtype_ref = (try Some (rwtyp attr (Hashtbl.find attr.type_table dtype)) with Not_found -> None);
-    refdtype_ref = (try Some (rwtyp attr (Hashtbl.find attr.type_table refdtype)) with Not_found -> None) }
+    dtype_ref = (try Some (rwtyp attr (assoc_find attr.type_table dtype)) with Not_found -> None);
+    refdtype_ref = (try Some (rwtyp attr (assoc_find attr.type_table refdtype)) with Not_found -> None) }
 | EnumType {name; items} as t -> t
 | StructType { name; packed; members } -> StructType { name; packed; members = List.map (rwtyp attr) members }
 | UnionType { name; packed; members } -> UnionType { name; packed; members = List.map (rwtyp attr) members }
 | MemberType' { name; dtype; child; value } ->
     MemberType { name;
-    dtype_ref = (try Some (rwtyp attr (Hashtbl.find attr.type_table dtype)) with Not_found -> None);
+    dtype_ref = (try Some (rwtyp attr (assoc_find attr.type_table dtype)) with Not_found -> None);
     child = List.map (rwtyp attr) child; value = List.map (rwtyp attr) value }
 | MemberType { name; dtype_ref; child; value } ->
     MemberType { name; dtype_ref; child = List.map (rwtyp attr) child; value = List.map (rwtyp attr) value }
 | ConstType' { name; dtype; child } ->
     ConstType { name;
-    dtype_ref = Hashtbl.find_opt attr.type_table dtype;
+    dtype_ref = assoc_find_opt attr.type_table dtype;
     child = List.map (rwtyp attr) child }
 | ConstType { name; dtype_ref; child } ->
     ConstType { name; dtype_ref; child = List.map (rwtyp attr) child }
 | ParamTypeType' { name; dtype } ->
-    ParamTypeType { name; dtype_ref = Hashtbl.find_opt attr.type_table dtype }
+    ParamTypeType { name; dtype_ref = assoc_find_opt attr.type_table dtype }
 | ParamTypeType { name; dtype_ref } ->
     ParamTypeType { name; dtype_ref }
 | VoidType { name; resolved } -> VoidType { name; resolved }
@@ -771,22 +776,18 @@ let parse json =
   let attr = 
   {
   parent=[];
-  type_table = Hashtbl.create 100;
-  interface_table = Hashtbl.create 20;
-  module_table = Hashtbl.create 20;
-  var_table = Hashtbl.create 20;
+  type_table = assoc_create 100;
+  interface_table = assoc_create 20;
+  module_table = assoc_create 20;
+  var_table = assoc_create 20;
   } in
   depth := json :: [];
   let ast' = parse_json attr json in
   dbgpass1 := ast';
   let ast = rw attr (rw attr ast') in
   dbgpass2 := ast;
-  mods := [];
-  Hashtbl.iter (fun k x -> mods := (k,x) :: !mods) attr.module_table;
-  intf := [];
-  Hashtbl.iter (fun k x -> intf := (k,x) :: !intf) attr.interface_table;
-  typ := [];
-  Hashtbl.iter (fun k x -> typ := (k,x) :: !typ) attr.type_table;
-  vars := [];
-  Hashtbl.iter (fun k x -> vars := (k,x) :: !vars) attr.var_table;
+  mods := !(attr.module_table);
+  intf := !(attr.interface_table);
+  typ  := !(attr.type_table);
+  vars := !(attr.var_table);
   ast

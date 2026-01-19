@@ -1,11 +1,12 @@
 (* sv_main_unified.ml - Unified main with command-line backend selection *)
+open Sv_ast
 
 let jsontree = ref (`String "")
 
 (* Main translation function *)
 let translate_tree_to_ast json_file =
   print_endline ("JSON: "^json_file);
-  let json = match Yojson.Basic.from_file json_file with `Assoc lst -> `Assoc (List.rev lst) | oth -> oth in
+  let json = match Yojson.Safe.from_file json_file with `Assoc lst -> `Assoc (List.rev lst) | oth -> oth in
   jsontree := json;
   Sv_parse.parse json
 
@@ -35,7 +36,9 @@ let generate_output backend ast =
   | Yosys ->
       Sv_gen_yosys.generate_sv_with_warnings ast 0
   | HardCaml ->
-      let sv, warn = Sv_gen_hardcaml.generate_hardcaml_with_warnings ast 0 in sv, List.flatten warn
+      let transformed_ast = Sv_transform.transform ~verbose:false ast in
+      let fd = open_out "dump.json" in output_string fd (Yojson.Safe.pretty_to_string (sv_node_to_yojson transformed_ast)); close_out fd;
+      Sv_gen_hardcaml.generate_hardcaml_with_warnings transformed_ast 0
 
 (* Get file extension for backend *)
 let get_extension backend =

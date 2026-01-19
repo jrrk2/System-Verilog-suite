@@ -357,7 +357,8 @@ let circuit_to_verilog circuit =
 let generate_hardcaml_with_warnings ast indent =
   let warnings = ref [] in
   let circuits = ref [] in
-  
+  print_endline "Processing nodes";
+
   (* Process each module *)
   let rec process_node = function
     | Sv_ast.Netlist nodes ->
@@ -370,12 +371,14 @@ let generate_hardcaml_with_warnings ast indent =
   
   process_node ast;
   
-  if List.length !circuits = 0 then begin
-    warnings := ["No modules found in AST"] :: !warnings;
+  let parts, warn = if List.length !circuits = 0 then begin
+    warnings := "No modules found in AST" :: !warnings;
     ("(* No modules to generate *)\n", !warnings)
   end else begin
     let verilog_parts = List.map circuit_to_verilog !circuits in
     let header = "(* Generated via HardCaml circuit construction *)\n" ^
                  "(* Using Signal/Always API directly *)\n\n" in
     (header ^ String.concat "\n\n" verilog_parts, !warnings)
-  end
+  end in
+  List.iter print_endline warn;
+  parts, warn

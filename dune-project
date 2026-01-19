@@ -1,4 +1,4 @@
 (lang dune 3.0)
 (package
- (name json_verilog)
+ (name sv_main_unified)
  (depends ocaml dune menhir))

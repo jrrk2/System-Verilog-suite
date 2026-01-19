@@ -8,9 +8,8 @@ for j in $*; do
   echo === $j ===;
   done
 rm -f obj_dir/V*.meta.json
-_build/default/sv_main_unified.exe scan std results
+_build/default/sv_main_unified.exe scan hc results
 for i in results/*;
     do echo === $i ===;
-    synlig -p "read_systemverilog $i";
     done
     
