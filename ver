@@ -1,9 +1,10 @@
 rm -rf obj_dir results
 mkdir obj_dir
-for i in $*;
-    do echo === $i ===;
-    verilator --quiet --json-only -Wno-widthexpand -Wno-widthtrunc -Wno-ascrange -Wno-widthconcat --timing +define+INCLUDE_BITWISE +define+INCLUDE_SHIFT +define+INCLUDE_POW $i;
+for j in $*; do
+  for i in `verilator --lint-only $j 2>&1 | grep 'Top module'|cut -d\' -f2`; do echo === $i ===;
+    verilator --quiet --json-only --top-module $i -Wno-widthexpand -Wno-widthtrunc -Wno-ascrange -Wno-widthconcat --timing +define+INCLUDE_BITWISE +define+INCLUDE_SHIFT +define+INCLUDE_POW $j;
     done
+  done
 rm -f obj_dir/V*.meta.json
 ./json_verilog
 for i in results/*;

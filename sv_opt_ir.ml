@@ -146,23 +146,18 @@ let estimate_area ir =
    ============================================================================ *)
 
 let is_constant ir id =
-  Hashtbl.mem ir.ir_constants id || 
-  (match Hashtbl.find_opt ir.ir_nodes id with
-   | Some { node_output = Constant _; _ } -> true
-   | _ -> false)
+  (* Check if this ID is in the constants table *)
+  Hashtbl.fold (fun value const_id found ->
+    found || const_id = id
+  ) ir.ir_constants false
 
 let get_const_value ir id =
-  (* Check if it's in constants table *)
-  let const_val = Hashtbl.fold (fun value cid acc ->
-    if cid = id then Some value else acc
-  ) ir.ir_constants None in
-  match const_val with
+  (* Find the value for this constant ID *)
+  Hashtbl.fold (fun value const_id acc ->
+    if const_id = id then Some value else acc
+  ) ir.ir_constants None |> function
   | Some v -> v
-  | None ->
-      (* Check if it's a constant node *)
-      match Hashtbl.find_opt ir.ir_nodes id with
-      | Some { node_output = Constant { value; _ }; _ } -> value
-      | _ -> 0
+  | None -> 0
 
 let is_constant_value ir id value =
   is_constant ir id && get_const_value ir id = value
@@ -397,6 +392,9 @@ let eliminate_dead_code ir =
 (* ============================================================================
    OPTIMIZATION PASS: TREE BALANCING
    ============================================================================ *)
+(* ============================================================================
+   OPTIMIZATION PASS: TREE BALANCING - FIXED
+   ============================================================================ *)
 
 let balance_trees ir =
   (* Find chains of associative operations *)
@@ -448,7 +446,8 @@ let balance_trees ir =
   
   List.iter (fun (id, nd) ->
     let chain = find_chain nd nd.node_op [] in
-    if List.length chain > 3 then begin
+    (* FIXED: Only balance if chain is long enough AND it would reduce depth *)
+    if List.length chain > 4 then begin  (* Changed from 3 to 4 *)
       let new_tree = build_balanced_tree nd.node_op chain in
       redirect_users ir id new_tree;
       Hashtbl.remove ir.ir_nodes id
@@ -459,7 +458,7 @@ let balance_trees ir =
    MASTER OPTIMIZATION PIPELINE
    ============================================================================ *)
 
-let optimize ir ~verbose =
+let optimize ir ~verbose ~force_balance =
   if verbose then Printf.printf "=== Optimization Pipeline ===\n";
   
   (* Initial metrics *)
@@ -490,7 +489,7 @@ let optimize ir ~verbose =
   if verbose then Printf.printf "  Reduced %d expensive operations\n" strength_reduced;
   
   if verbose then Printf.printf "Balancing expression trees...\n";
-  balance_trees ir;
+  if force_balance then balance_trees ir;
   
   if verbose then Printf.printf "Final dead code elimination...\n";
   let final_dead = eliminate_dead_code ir in

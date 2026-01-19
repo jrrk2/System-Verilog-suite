@@ -1,7 +1,6 @@
 (* opt_ir_to_sv.ml - Convert optimization IR back to structural AST *)
 
 open Sv_ast
-open Sv_opt_ir
 
 let debug = ref false
 

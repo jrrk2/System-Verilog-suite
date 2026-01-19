@@ -53,7 +53,7 @@ let scan rslt =
       
       (* 5. NEW: Optimize! *)
       Printf.printf "  Optimizing...\n";
-      Sv_opt_ir.optimize opt_ir ~verbose:false;
+      Sv_opt_ir.optimize opt_ir ~verbose:false ~force_balance:false;
       
       (* 6. NEW: Print after optimization *)
       Printf.printf "  After optimization: %d nodes, depth=%d, area=%d\n"
