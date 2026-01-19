@@ -150,7 +150,13 @@ let rec expr_to_remap decls = function
         | (Con lsb_const, Con width_const) ->
             let lsb = Constant.to_int lsb_const in
             let w = Constant.to_int width_const in
-            Sig (select (sig' base) lsb w)
+            (* Use sel_bottom to get w bits starting from lsb *)
+            let base_sig = sig' base in
+            if lsb = 0 then
+              Sig (sel_bottom base_sig w)
+            else
+              (* Shift down then select bottom *)
+              Sig (sel_bottom (srl base_sig lsb) w)
         | _ -> Invalid
        with _ -> Invalid)
        
@@ -234,11 +240,33 @@ let process_assign decls lhs rhs =
       let rhs_sig = sig' (expr_to_remap decls rhs) in
       let wlhs = width v.value in
       let wrhs = width rhs_sig in
-      let rhs_resized = if wlhs = wrhs then rhs_sig
-                        else if wlhs > wrhs then uresize rhs_sig wlhs
-                        else select rhs_sig 0 wlhs in
-      Some (v <-- rhs_resized)
-  | _ -> None
+      Printf.eprintf "        Assignment: lhs_width=%d rhs_width=%d\n%!" wlhs wrhs;
+      if wlhs <= 0 then begin
+        Printf.eprintf "        ERROR: LHS width is %d, skipping assignment\n%!" wlhs;
+        None
+      end else if wrhs <= 0 then begin
+        Printf.eprintf "        ERROR: RHS width is %d, skipping assignment\n%!" wrhs;
+        None
+      end else
+        let rhs_resized = if wlhs = wrhs then rhs_sig
+                          else if wlhs > wrhs then begin
+                            Printf.eprintf "        Upsizing RHS from %d to %d\n%!" wrhs wlhs;
+                            uresize rhs_sig wlhs
+                          end else begin
+                            Printf.eprintf "        Downsizing RHS from %d to %d (select bits 0 to %d)\n%!" wrhs wlhs (wlhs-1);
+                            (* select expects: signal lsb width, NOT signal lsb msb *)
+                            (* Actually, looking at error, it seems to use lsb and width correctly *)
+                            (* The issue is we're passing wlhs as the third arg *)
+                            (* Let's use sel_bottom instead which takes width *)
+                            sel_bottom rhs_sig wlhs
+                          end in
+        Some (v <-- rhs_resized)
+  | Invalid ->
+      Printf.eprintf "        ERROR: LHS expression is Invalid\n%!";
+      None
+  | _ -> 
+      Printf.eprintf "        ERROR: LHS is not a Variable\n%!";
+      None
 
 (* Process statement to Always.t *)
 let rec process_stmt decls = function
@@ -254,7 +282,7 @@ let rec process_stmt decls = function
            let wrhs = width rhs_sig in
            let rhs_resized = if wlhs = wrhs then rhs_sig
                              else if wlhs > wrhs then uresize rhs_sig wlhs
-                             else select rhs_sig 0 wlhs in
+                             else sel_bottom rhs_sig wlhs in
            Some (v <-- rhs_resized)
        | _ -> None)
        
@@ -335,23 +363,28 @@ let build_circuit module_name stmts =
     
     let decls = Hashtbl.create 64 in
     
-    (* Create inputs *)
+    (* Create inputs - outputs will be computed later *)
     List.iter (fun (name, width, dir) ->
       match dir with
       | `Input -> 
+          Printf.eprintf "        Creating input: %s[%d]\n%!" name width;
           Hashtbl.add decls name (Sig (input name width))
-      | `Output ->
-          (* Create output as a variable that can be assigned *)
-          if not (Hashtbl.mem decls name) then
-            Hashtbl.add decls name (Var (Variable.wire ~default:(zero width)))
-      | _ -> ()
+      | _ -> ()  (* Outputs computed from always blocks *)
     ) ports;
     
-    (* Create internal signals/registers *)
+    (* Create internal signals/registers AND output variables *)
+    let all_vars = signals @ (List.filter_map (fun (name, width, dir) ->
+      match dir with
+      | `Output -> Some (name, width, false)
+      | _ -> None
+    ) ports) in
+    
     List.iter (fun (name, width, _signed) ->
-      if not (Hashtbl.mem decls name) then
+      if not (Hashtbl.mem decls name) then begin
+        Printf.eprintf "        Creating variable: %s[%d]\n%!" name width;
         Hashtbl.add decls name (Var (Variable.wire ~default:(zero width)))
-    ) signals;
+      end
+    ) all_vars;
     
     (* Process continuous assignments *)
     let cont_assigns = List.filter_map (function
