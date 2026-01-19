@@ -44,13 +44,16 @@ let is_signed = function
 (* Extract ports from module statements *)
 let extract_ports stmts =
   List.filter_map (function
-    | Sv_ast.Var { name; dtype_ref; direction = "input"; _ } ->
+    | Sv_ast.Var { name; dtype_ref; direction; var_type = "PORT"; _ } 
+      when direction = "INPUT" || direction = "input" ->
         let width = extract_width dtype_ref in
         Some (name, width, `Input)
-    | Sv_ast.Var { name; dtype_ref; direction = "output"; _ } ->
+    | Sv_ast.Var { name; dtype_ref; direction; var_type = "PORT"; _ }
+      when direction = "OUTPUT" || direction = "output" ->
         let width = extract_width dtype_ref in
         Some (name, width, `Output)
-    | Sv_ast.Var { name; dtype_ref; direction = "inout"; _ } ->
+    | Sv_ast.Var { name; dtype_ref; direction; var_type = "PORT"; _ }
+      when direction = "INOUT" || direction = "inout" ->
         let width = extract_width dtype_ref in
         Some (name, width, `Inout)
     | _ -> None
@@ -89,11 +92,48 @@ let width_match op lhs rhs =
   else
     op lhs (uresize rhs wlhs)
 
+(* Parse constant from Const node name like "4'h0" or "32'sh8" *)
+let parse_const_value name =
+  try
+    (* Format: <width>'<format><value> *)
+    (* Examples: "4'h0", "32'sh8", "8'd255" *)
+    let parts = String.split_on_char '\'' name in
+    match parts with
+    | [width_str; format_value] ->
+        let width = int_of_string width_str in
+        (* Parse format and value *)
+        let is_signed = String.length format_value > 1 && format_value.[0] = 's' in
+        let fmt_start = if is_signed then 1 else 0 in
+        let format_char = if String.length format_value > fmt_start then format_value.[fmt_start] else 'd' in
+        let value_str = String.sub format_value (fmt_start + 1) (String.length format_value - fmt_start - 1) in
+        
+        let value = match format_char with
+          | 'h' -> int_of_string ("0x" ^ value_str)
+          | 'd' -> int_of_string value_str
+          | 'b' -> int_of_string ("0b" ^ value_str)
+          | 'o' -> int_of_string ("0o" ^ value_str)
+          | _ -> int_of_string value_str
+        in
+        (width, value)
+    | _ ->
+        (* Fallback: try to parse as decimal *)
+        (32, int_of_string name)
+  with e ->
+    Printf.eprintf "Warning: Failed to parse constant '%s': %s\n%!" name (Printexc.to_string e);
+    (32, 0)
+
 (* Convert expression to HardCaml Signal *)
 let rec expr_to_remap decls = function
   | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
       (try Hashtbl.find decls name
        with Not_found -> Invalid)
+       
+  | Sv_ast.Const { name; dtype_ref } ->
+      (* Parse constant like "4'h0" or "8'd255" *)
+      let width = extract_width dtype_ref in
+      let (parsed_width, value) = parse_const_value name in
+      let final_width = if width > 1 then width else parsed_width in
+      Con (Constant.of_int ~width:final_width value)
        
   | Sv_ast.Text { text } ->
       (* Try to parse as number *)
@@ -127,32 +167,32 @@ let rec expr_to_remap decls = function
   | Sv_ast.BinaryOp { op; lhs; rhs; _ } | Sv_ast.BinaryOp' { op; lhs; rhs; _ } ->
       let lhs_sig = sig' (expr_to_remap decls lhs) in
       let rhs_sig = sig' (expr_to_remap decls rhs) in
-      (match op with
-       | "Add" | "VADD" -> Sig (width_match (+:) lhs_sig rhs_sig)
-       | "Sub" | "VSUB" -> Sig (width_match (-:) lhs_sig rhs_sig)
-       | "Mul" | "VMUL" -> Sig (width_match ( *: ) lhs_sig rhs_sig)
-       | "And" | "VAND" -> Sig (width_match (&:) lhs_sig rhs_sig)
-       | "Or" | "VOR" -> Sig (width_match (|:) lhs_sig rhs_sig)
-       | "Xor" | "VXOR" -> Sig (width_match (^:) lhs_sig rhs_sig)
-       | "Eq" | "VEQ" -> Sig (width_match (==:) lhs_sig rhs_sig)
-       | "Neq" | "VNEQ" -> Sig (width_match (<>:) lhs_sig rhs_sig)
-       | "Lt" | "VLT" -> Sig (width_match (<:) lhs_sig rhs_sig)
-       | "Lte" | "VLTE" -> Sig (width_match (<=:) lhs_sig rhs_sig)
-       | "Gt" | "VGT" -> Sig (width_match (>:) lhs_sig rhs_sig)
-       | "Gte" | "VGTE" -> Sig (width_match (>=:) lhs_sig rhs_sig)
-       | "ShiftL" | "VSHIFTL" -> Sig (log_shift sll lhs_sig rhs_sig)
-       | "ShiftR" | "VSHIFTR" -> Sig (log_shift srl lhs_sig rhs_sig)
-       | "ShiftRS" | "VSHIFTRS" -> Sig (log_shift sra lhs_sig rhs_sig)
+      (match String.uppercase_ascii op with
+       | "ADD" | "VADD" -> Sig (width_match (+:) lhs_sig rhs_sig)
+       | "SUB" | "VSUB" -> Sig (width_match (-:) lhs_sig rhs_sig)
+       | "MUL" | "VMUL" -> Sig (width_match ( *: ) lhs_sig rhs_sig)
+       | "AND" | "VAND" -> Sig (width_match (&:) lhs_sig rhs_sig)
+       | "OR" | "VOR" -> Sig (width_match (|:) lhs_sig rhs_sig)
+       | "XOR" | "VXOR" -> Sig (width_match (^:) lhs_sig rhs_sig)
+       | "EQ" | "VEQ" -> Sig (width_match (==:) lhs_sig rhs_sig)
+       | "NEQ" | "VNEQ" -> Sig (width_match (<>:) lhs_sig rhs_sig)
+       | "LT" | "VLT" -> Sig (width_match (<:) lhs_sig rhs_sig)
+       | "LTE" | "VLTE" -> Sig (width_match (<=:) lhs_sig rhs_sig)
+       | "GT" | "VGT" -> Sig (width_match (>:) lhs_sig rhs_sig)
+       | "GTE" | "VGTE" -> Sig (width_match (>=:) lhs_sig rhs_sig)
+       | "SHIFTL" | "VSHIFTL" -> Sig (log_shift sll lhs_sig rhs_sig)
+       | "SHIFTR" | "VSHIFTR" -> Sig (log_shift srl lhs_sig rhs_sig)
+       | "SHIFTRS" | "VSHIFTRS" -> Sig (log_shift sra lhs_sig rhs_sig)
        | _ -> Invalid)
        
   | Sv_ast.UnaryOp { op; operand; _ } | Sv_ast.UnaryOp' { op; operand; _ } ->
       let op_sig = sig' (expr_to_remap decls operand) in
-      (match op with
-       | "Not" | "VNOT" -> Sig (~: op_sig)
-       | "Negate" | "VNEGATE" -> Sig (zero (width op_sig) -: op_sig)
-       | "RedAnd" -> Sig (reduce ~f:(&:) [op_sig])
-       | "RedOr" -> Sig (reduce ~f:(|:) [op_sig])
-       | "RedXor" -> Sig (reduce ~f:(^:) [op_sig])
+      (match String.uppercase_ascii op with
+       | "NOT" | "VNOT" -> Sig (~: op_sig)
+       | "NEGATE" | "VNEGATE" -> Sig (zero (width op_sig) -: op_sig)
+       | "REDAND" -> Sig (reduce ~f:(&:) [op_sig])
+       | "REDOR" -> Sig (reduce ~f:(|:) [op_sig])
+       | "REDXOR" -> Sig (reduce ~f:(^:) [op_sig])
        | _ -> Invalid)
        
   | Sv_ast.Concat { parts } ->
@@ -278,16 +318,32 @@ let process_always decls clock_opt reset_opt stmts =
 (* Build HardCaml circuit for module *)
 let build_circuit module_name stmts =
   try
+    Printf.eprintf "    Building circuit for %s\n%!" module_name;
+    
     (* Extract ports and signals *)
     let ports = extract_ports stmts in
     let signals = extract_signals stmts in
+    
+    Printf.eprintf "      Found %d ports: " (List.length ports);
+    List.iter (fun (name, width, dir) ->
+      let dir_str = match dir with `Input -> "in" | `Output -> "out" | `Inout -> "inout" in
+      Printf.eprintf "%s(%s:%d) " name dir_str width
+    ) ports;
+    Printf.eprintf "\n%!";
+    
+    Printf.eprintf "      Found %d internal signals\n%!" (List.length signals);
     
     let decls = Hashtbl.create 64 in
     
     (* Create inputs *)
     List.iter (fun (name, width, dir) ->
       match dir with
-      | `Input -> Hashtbl.add decls name (Sig (input name width))
+      | `Input -> 
+          Hashtbl.add decls name (Sig (input name width))
+      | `Output ->
+          (* Create output as a variable that can be assigned *)
+          if not (Hashtbl.mem decls name) then
+            Hashtbl.add decls name (Var (Variable.wire ~default:(zero width)))
       | _ -> ()
     ) ports;
     
@@ -357,21 +413,26 @@ let circuit_to_verilog circuit =
 let generate_hardcaml_with_warnings ast indent =
   let warnings = ref [] in
   let circuits = ref [] in
-  print_endline "Processing nodes";
-
+  Printf.eprintf "HardCaml backend: Starting processing\n%!";
+  
   (* Process each module *)
   let rec process_node = function
     | Sv_ast.Netlist nodes ->
+        Printf.eprintf "  Processing Netlist with %d nodes\n%!" (List.length nodes);
         List.iter process_node nodes
     | Sv_ast.Module { name; stmts } ->
+        Printf.eprintf "  Processing Module: %s with %d statements\n%!" name (List.length stmts);
         let circuit = build_circuit name stmts in
         circuits := circuit :: !circuits
-    | _ -> ()
+    | _ -> 
+        Printf.eprintf "  Skipping non-Module node\n%!"
   in
   
   process_node ast;
   
-  let parts, warn = if List.length !circuits = 0 then begin
+  Printf.eprintf "HardCaml backend: Processed %d circuits\n%!" (List.length !circuits);
+  
+  if List.length !circuits = 0 then begin
     warnings := "No modules found in AST" :: !warnings;
     ("(* No modules to generate *)\n", !warnings)
   end else begin
@@ -379,6 +440,4 @@ let generate_hardcaml_with_warnings ast indent =
     let header = "(* Generated via HardCaml circuit construction *)\n" ^
                  "(* Using Signal/Always API directly *)\n\n" in
     (header ^ String.concat "\n\n" verilog_parts, !warnings)
-  end in
-  List.iter print_endline warn;
-  parts, warn
+  end
