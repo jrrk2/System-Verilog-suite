@@ -1,64 +1,92 @@
-# Alternative Makefile for manual building
-OCAMLC = ocamlc
-OCAMLOPT = ocamlopt -g
-OCAMLMKTOP = ocamlmktop -g
-MENHIR = menhir
-OCAMLLEX = ocamllex
+# Makefile for SystemVerilog Decompiler
 
-SOURCES = sv_ast.mli sv_parse.ml sv_gen.ml sv_main.ml sv_args.ml
-SOURCES_YOSYS = sv_ast.mli sv_parse.ml sv_gen_yosys.ml sv_main_yosys.ml
-SOURCES_STRUCT = sv_ast.mli sv_parse.ml sv_transform.ml sv_tran_struct.ml sv_gen.ml sv_main_struct.ml
-SOURCES_OPT = sv_ast.mli sv_parse.ml sv_transform.ml sv_opt_ir.ml behavioural_to_opt_ir.ml opt_ir_to_sv.ml sv_gen.ml sv_main_opt.ml
-SOURCES_SAT = sv_ast.mli sv_parse.ml sv_transform.ml sv_opt_ir.ml behavioural_to_opt_ir.ml opt_ir_to_sv.ml sv_to_z3.ml sv_main_sat.ml
+.PHONY: all build clean test install help unified legacy
 
-TARGET = json_verilog
-TARGET_TOP = json_verilog_top
-TARGET_YOSYS_TOP = json_yosys_top
-TARGET_STRUCT_TOP = json_struct_top
-TARGET_OPT_TOP = json_opt_top
-TARGET_SAT_TOP = json_sat_top
+# Default target
+all: unified
 
-.PHONY: all clean debug
+# Build unified interface (recommended)
+unified:
+	@echo "Building unified decompiler..."
+	dune build sv_main_unified.exe
+	@echo "Built: _build/default/sv_main_unified.exe"
+	@echo "Usage: _build/default/sv_main_unified.exe scan <backend> <output_dir>"
 
-all: $(TARGET) $(TARGET_TOP) $(TARGET_YOSYS_TOP) $(TARGET_STRUCT_TOP) $(TARGET_OPT_TOP) $(TARGET_SAT_TOP)
+# Build legacy interfaces
+legacy:
+	@echo "Building legacy executables..."
+	dune build sv_main.exe
+	@echo "Built: _build/default/sv_main.exe"
 
-json_verilog.ml json_verilog.mli: json_verilog.mly json_types.cmi
-	$(MENHIR) --explain --dump --infer $<
+# Build everything
+build:
+	@echo "Building all executables..."
+	dune build @all
+	@ls -lh _build/default/*.exe 2>/dev/null || echo "No executables built"
 
-json_verilog_lexer.ml: json_verilog_lexer.mll json_verilog.mli
-	$(OCAMLLEX) $<
-
-json_types.cmi: json_types.mli
-	$(OCAMLC) -c $<
-
-$(TARGET_TOP): $(SOURCES)
-	ocamlfind $(OCAMLMKTOP) -package yojson,str,unix -linkpkg -I +unix -o $@ $^
-
-$(TARGET): $(SOURCES)
-	ocamlfind $(OCAMLOPT) -package yojson,str,unix -linkpkg -I +unix -o $@ $^
-
-$(TARGET_YOSYS_TOP): $(SOURCES_YOSYS)
-	ocamlfind $(OCAMLMKTOP) -package yojson,str,unix -linkpkg -I +unix -o $@ $^
-
-$(TARGET_STRUCT_TOP): $(SOURCES_STRUCT)
-	ocamlfind $(OCAMLMKTOP) -package yojson,str,unix -linkpkg -I +unix -o $@ $^
-
-$(TARGET_OPT_TOP): $(SOURCES_OPT)
-	ocamlfind $(OCAMLMKTOP) -package yojson,str,unix -linkpkg -I +unix -o $@ $^
-
-$(TARGET_SAT_TOP): $(SOURCES_SAT)
-	ocamlfind $(OCAMLMKTOP) -package yojson,str,unix,z3 -linkpkg -I +unix -o $@ $^
-
+# Clean build artifacts
 clean:
-	rm -f *.cmi *.cmx *.cmo *.o $(TARGET)
-	rm -f json_verilog.ml json_verilog.mli json_verilog_lexer.ml
-	rm -f json_verilog.automaton json_verilog.conflicts
+	@echo "Cleaning build artifacts..."
+	dune clean
+	rm -rf test_output_*
+	@echo "Clean complete"
 
-install: $(TARGET)
-	cp $(TARGET) /usr/local/bin/
+# Run tests
+test: unified
+	@echo "Running tests..."
+	./test_unified.sh
 
-test: $(TARGET)
-	rm -rf results
-	./$(TARGET) -da test.json test.v
+# Install to system (requires opam)
+install:
+	@echo "Installing to opam environment..."
+	dune install
 
-.INTERMEDIATE: json_verilog.ml json_verilog.mli json_verilog_lexer.ml
+# Display help
+help:
+	@echo "SystemVerilog Decompiler - Makefile"
+	@echo "===================================="
+	@echo ""
+	@echo "Targets:"
+	@echo "  all (default) - Build unified interface (recommended)"
+	@echo "  unified       - Build sv_main_unified.exe"
+	@echo "  legacy        - Build original sv_main.exe"
+	@echo "  build         - Build all executables"
+	@echo "  clean         - Remove build artifacts"
+	@echo "  test          - Run test suite"
+	@echo "  install       - Install to opam"
+	@echo "  help          - Show this help"
+	@echo ""
+	@echo "Backends:"
+	@echo "  standard      - Original SystemVerilog output"
+	@echo "  structural    - Structural with primitives"
+	@echo "  yosys         - Yosys-compatible output"
+	@echo "  hardcaml      - HardCaml OCaml output (NEW!)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make unified"
+	@echo "  ./_build/default/sv_main_unified.exe scan yosys results/"
+	@echo "  ./_build/default/sv_main_unified.exe file hardcaml input.json output.ml"
+	@echo ""
+	@echo "For more information, see README_UNIFIED.md"
+
+# Quick build and run with hardcaml backend
+quicktest-hardcaml: unified
+	@echo "Quick test with HardCaml backend..."
+	@if [ -d "obj_dir" ]; then \
+		mkdir -p test_hardcaml_output; \
+		./_build/default/sv_main_unified.exe scan hardcaml test_hardcaml_output/; \
+		echo "Output in test_hardcaml_output/"; \
+	else \
+		echo "No obj_dir/ found. Place Verilator JSON files there first."; \
+	fi
+
+# Quick build and run with yosys backend
+quicktest-yosys: unified
+	@echo "Quick test with Yosys backend..."
+	@if [ -d "obj_dir" ]; then \
+		mkdir -p test_yosys_output; \
+		./_build/default/sv_main_unified.exe scan yosys test_yosys_output/; \
+		echo "Output in test_yosys_output/"; \
+	else \
+		echo "No obj_dir/ found. Place Verilator JSON files there first."; \
+	fi

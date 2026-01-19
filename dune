@@ -1,5 +1,13 @@
 (executables
- (names sv_main)
- (modules sv_ast sv_common sv_gen sv_main sv_parse)
+ (names sv_main sv_main_unified)
+ (modules sv_ast sv_gen sv_gen_struct sv_gen_yosys sv_gen_hardcaml 
+          sv_main sv_main_unified sv_parse sv_transform sv_tran_struct 
+          behavioural_to_opt_ir opt_ir_to_sv sv_opt_ir)
  (modules_without_implementation sv_ast)
- (libraries str yojson unix))
+ (libraries str yojson unix hardcaml))
+
+(env
+  (dev
+    (flags (:standard -g -w -16 -w -32 -w -52 -w -21 -w -26 -w -27 -w -37 -w -11 -w -9 -w -39))
+  )
+)
