@@ -4,8 +4,6 @@
    the original SystemVerilog by encoding both as Z3 SMT constraints.
 *)
 
-open Z3
-
 (* ========================================================================= *)
 (* Z3 Context and Configuration *)
 (* ========================================================================= *)
@@ -86,7 +84,7 @@ let rec expr_to_z3 suffix = function
   | Sv_ast.VarRef { name; dtype_ref; _ } ->
       let width = extract_width dtype_ref in
       bv_var name width suffix
-
+      
   | Sv_ast.Const { name; dtype_ref } ->
       let width = extract_width dtype_ref in
       let (_, value) = parse_const_value name in
@@ -156,9 +154,10 @@ let rec expr_to_z3 suffix = function
       let t = expr_to_z3 suffix then_val in
       let e = expr_to_z3 suffix else_val in
       (* Convert condition to boolean *)
-      let width = Z3.BitVector.get_size (Z3.Expr.get_sort c) in
-      let c_bool = Z3.Boolean.mk_not ctx 
-        (Z3.Boolean.mk_eq ctx c (Z3.BitVector.mk_numeral ctx "0" width)) in
+      let c_sort = Z3.Expr.get_sort c in
+      let c_size = Z3.BitVector.get_size c_sort in
+      let zero_val = Z3.BitVector.mk_numeral ctx "0" c_size in
+      let c_bool = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx c zero_val) in
       Z3.Boolean.mk_ite ctx c_bool t e
       
   | Sv_ast.Concat { parts } ->
@@ -182,8 +181,8 @@ let rec add_constraints solver suffix stmts =
         (try
           let l = expr_to_z3 suffix lhs in
           let r = expr_to_z3 suffix rhs in
-          let wl = Z3.BitVector.get_size l in
-          let wr = Z3.BitVector.get_size r in
+          let wl = Z3.BitVector.get_size (Z3.Expr.get_sort l) in
+          let wr = Z3.BitVector.get_size (Z3.Expr.get_sort r) in
           (* Handle width mismatch *)
           let r' = if wl = wr then r
                    else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) r
@@ -197,8 +196,8 @@ let rec add_constraints solver suffix stmts =
         (try
           let l = expr_to_z3 suffix lhs in
           let r = expr_to_z3 suffix rhs in
-          let wl = Z3.BitVector.get_size l in
-          let wr = Z3.BitVector.get_size r in
+          let wl = Z3.BitVector.get_size (Z3.Expr.get_sort l) in
+          let wr = Z3.BitVector.get_size (Z3.Expr.get_sort r) in
           let r' = if wl = wr then r
                    else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) r
                    else Z3.BitVector.mk_extract ctx (wl - 1) 0 r in
@@ -381,9 +380,9 @@ let check_equivalence original_ast hardcaml_ast =
 
 let verify_hardcaml_output original_json hardcaml_json =
   Printf.printf "Loading original SystemVerilog AST...\n%!";
-  let original_ast = Sv_parse.parse (Yojson.Basic.from_file original_json) in
+  let original_ast = Sv_parse.parse (Yojson.Safe.from_file original_json) in
   
   Printf.printf "Loading HardCaml-generated AST...\n%!";
-  let hardcaml_ast = Sv_parse.parse (Yojson.Basic.from_file hardcaml_json) in
+  let hardcaml_ast = Sv_parse.parse (Yojson.Safe.from_file hardcaml_json) in
   
   check_equivalence original_ast hardcaml_ast
