@@ -373,12 +373,24 @@ let rec parse_json attr json =
       FuncRef { name; args }
       
   | "TASKREF" ->
-      let args = json |> member "pinsp" |> to_list |> 
-        List.filter_map (fun pin -> 
+      let args = json |> member "pinsp" |> to_list |>
+        List.filter_map (fun pin ->
           try Some (pin |> member "exprp" |> to_list |> List.hd |> parse' attr name)
           with _ -> None
         ) in
       TaskRef { name; args }
+
+  | "METHODCALL" ->
+      (* Method call on object: object.method(args) *)
+      let method_name = json |> member "name" |> to_string in
+      let obj = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
+      let args = json |> member "pinsp" |> to_list |>
+        List.filter_map (fun pin ->
+          try Some (pin |> member "exprp" |> to_list |> List.hd |> parse' attr name)
+          with _ -> None
+        ) in
+      (* For now, represent as FuncRef with object as first arg *)
+      FuncRef { name = method_name; args = obj :: args }
 
   | "RAND" ->
       let name = json |> member "name" |> to_string in
@@ -421,7 +433,7 @@ let rec parse_json attr json =
       
   (* Unary operators *)
   | "NOT" | "REDAND" | "REDOR" | "REDXOR" | "EXTEND" | "LOGNOT" | "ONEHOT" | "ONEHOT0" | "NEGATE"
-  | "EXTENDS" | "ISUNKNOWN" | "CLOG2" ->
+  | "EXTENDS" | "ISUNKNOWN" | "CLOG2" | "SIGNED" | "UNSIGNED" ->
       let operand = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let dtype = json |> member "dtypep" |> to_string in
       UnaryOp' { op = node_type; operand; dtype }
