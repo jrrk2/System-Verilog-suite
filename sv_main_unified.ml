@@ -241,6 +241,34 @@ let parse_backend s =
   | "hardcaml" | "hc" -> HardCaml
   | _ -> failwith ("Unknown backend: " ^ s)
 
+(* Verify two JSON files for equivalence *)
+let verify_files original_json hardcaml_json =
+  if not (Sys.file_exists original_json) then begin
+    Printf.eprintf "Error: File not found: %s\n" original_json;
+    exit 1
+  end;
+
+  if not (Sys.file_exists hardcaml_json) then begin
+    Printf.eprintf "Error: File not found: %s\n" hardcaml_json;
+    exit 1
+  end;
+
+  try
+    Printf.fprintf stderr "Verifying equivalence:\n";
+    Printf.fprintf stderr "  Original: %s\n" original_json;
+    Printf.fprintf stderr "  HardCaml: %s\n\n" hardcaml_json;
+
+    let result = Sv_verify_hardcaml.verify_hardcaml_output original_json hardcaml_json in
+    exit (if result then 0 else 1)
+  with
+  | Failure msg ->
+      Printf.eprintf "Error: %s\n" msg;
+      exit 1
+  | e ->
+      Printf.eprintf "Error: %s\n" (Printexc.to_string e);
+      Printexc.print_backtrace stderr;
+      exit 1
+
 (* Print usage *)
 let print_usage () =
   Printf.eprintf "SystemVerilog Decompiler - Unified Backend Selector\n\n";
@@ -250,6 +278,8 @@ let print_usage () =
   Printf.eprintf "      --verify: Run Z3 verification (all backends)\n\n";
   Printf.eprintf "  %s file <backend> <json_file> <output_file>\n" Sys.argv.(0);
   Printf.eprintf "      Process single file\n\n";
+  Printf.eprintf "  %s verify <original.json> <hardcaml.json>\n" Sys.argv.(0);
+  Printf.eprintf "      Verify equivalence between original and HardCaml output\n\n";
   Printf.eprintf "Backends:\n";
   Printf.eprintf "  standard, std      - Original SystemVerilog output\n";
   Printf.eprintf "  structural, struct - Structural with primitives\n";
@@ -259,6 +289,7 @@ let print_usage () =
   Printf.eprintf "  %s scan yosys results/\n" Sys.argv.(0);
   Printf.eprintf "  %s scan hardcaml results/ --verify\n" Sys.argv.(0);
   Printf.eprintf "  %s file hardcaml input.json output.ml\n" Sys.argv.(0);
+  Printf.eprintf "  %s verify obj_dir/Valu.tree.json obj_dir/Valu_hardcaml.tree.json\n" Sys.argv.(0);
   exit 1
 
 (* Main entry point *)
@@ -282,6 +313,10 @@ let () =
           let json_file = Sys.argv.(3) in
           let output_file = Sys.argv.(4) in
           process_single_file json_file output_file backend
+      | "verify" when Array.length Sys.argv >= 4 ->
+          let original_json = Sys.argv.(2) in
+          let hardcaml_json = Sys.argv.(3) in
+          verify_files original_json hardcaml_json
       | _ -> print_usage ()
     with
     | Failure msg ->

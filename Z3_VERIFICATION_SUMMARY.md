@@ -12,8 +12,8 @@ A complete Z3-based formal verification system to prove HardCaml backend correct
    - Performs equivalence checking
    - Generates counterexamples if inequivalent
 
-2. **verify_main.ml** (40 lines)
-   - Command-line interface
+2. **sv_main_unified.ml** (integrated verify command)
+   - Verification accessible via `verify` command
    - File validation
    - Exit code handling
 
@@ -183,7 +183,7 @@ Checking output: y [8 bits]
 ### Full Verification
 
 ```bash
-./verify_main.exe original.json hardcaml.json
+sv_main_unified verify original.json hardcaml.json
 ```
 
 Returns:

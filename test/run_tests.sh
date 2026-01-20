@@ -17,14 +17,14 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 
 # Test directories
-TEST_DIR="test"
+TEST_DIR="."
 TEST_INPUT="$TEST_DIR/input"
 TEST_EXPECTED="$TEST_DIR/expected"
 TEST_OUTPUT="$TEST_DIR/output"
 TEST_OBJ="$TEST_DIR/obj_dir"
 
-# Executable
-SV_UNIFIED="_build/default/sv_main_unified.exe"
+# Executable (relative to test directory)
+SV_UNIFIED="../_build/default/sv_main_unified.exe"
 
 # Initialize test environment
 init_tests() {
@@ -121,9 +121,9 @@ run_scan_test() {
 
     echo -e "${BLUE}Test $TESTS_RUN: $test_name [scan mode]${NC}"
 
-    # Copy obj_dir for scan test
-    rm -rf obj_dir
-    cp -r "$TEST_OBJ" obj_dir
+    # Copy obj_dir for scan test (to parent directory)
+    rm -rf ../obj_dir
+    cp -r "$TEST_OBJ" ../obj_dir
 
     # Run scan
     local output_dir="$TEST_OUTPUT/scan_${backend}/"
@@ -133,14 +133,14 @@ run_scan_test() {
         if $SV_UNIFIED scan "$backend" "$output_dir" --verify 2>&1 | grep -q "Error\|FAILED"; then
             echo -e "${RED}  ✗ FAILED: Scan with verification failed${NC}"
             TESTS_FAILED=$((TESTS_FAILED + 1))
-            rm -rf obj_dir
+            rm -rf ../obj_dir
             return 1
         fi
     else
         if $SV_UNIFIED scan "$backend" "$output_dir" 2>&1 | grep -q "Error\|FAILED"; then
             echo -e "${RED}  ✗ FAILED: Scan failed${NC}"
             TESTS_FAILED=$((TESTS_FAILED + 1))
-            rm -rf obj_dir
+            rm -rf ../obj_dir
             return 1
         fi
     fi
@@ -149,11 +149,11 @@ run_scan_test() {
     if [ ! -d "$output_dir" ] || [ -z "$(ls -A $output_dir)" ]; then
         echo -e "${RED}  ✗ FAILED: No output generated${NC}"
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        rm -rf obj_dir
+        rm -rf ../obj_dir
         return 1
     fi
 
-    rm -rf obj_dir
+    rm -rf ../obj_dir
     echo -e "${GREEN}  ✓ PASSED${NC}"
     TESTS_PASSED=$((TESTS_PASSED + 1))
     return 0
