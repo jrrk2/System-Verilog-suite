@@ -545,6 +545,11 @@ let build_circuit module_name stmts =
     Printf.eprintf "      Found %d LHS variables (including SSA)\n%!" (List.length lhs_vars);
     Printf.eprintf "      Found %d state elements (registers)\n%!" (Hashtbl.length state_elements);
 
+    (* Detect memories *)
+    Printf.eprintf "      Detecting memories...\n%!";
+    let memories = Sv_memory.detect_memories stmts in
+    Printf.eprintf "      Found %d memories\n%!" (Hashtbl.length memories);
+
     let decls = Hashtbl.create 64 in
 
     (* Create inputs - outputs will be computed later *)
