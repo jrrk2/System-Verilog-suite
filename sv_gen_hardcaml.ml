@@ -41,10 +41,32 @@ let is_signed = function
   | Some (Sv_ast.BasicType { keyword = "int" | "integer" | "shortint" | "longint"; _ }) -> true
   | _ -> false
 
+(* Identify state elements (registers) - variables assigned with non-blocking *)
+let identify_state_elements stmts =
+  let state_vars = Hashtbl.create 16 in
+
+  let rec find_nonblocking = function
+    | Sv_ast.Assign { lhs; is_blocking = false; _ } ->
+        (match lhs with
+         | Sv_ast.VarRef { name; _ } -> Hashtbl.replace state_vars name true
+         | _ -> ())
+    | Sv_ast.Always { stmts; _ } -> List.iter find_nonblocking stmts
+    | Sv_ast.Begin { stmts; _ } -> List.iter find_nonblocking stmts
+    | Sv_ast.If { then_stmt; else_stmt; _ } ->
+        find_nonblocking then_stmt;
+        (match else_stmt with Some e -> find_nonblocking e | None -> ())
+    | Sv_ast.Case { items; _ } ->
+        List.iter (fun item -> List.iter find_nonblocking item.Sv_ast.statements) items
+    | _ -> ()
+  in
+
+  List.iter find_nonblocking stmts;
+  state_vars
+
 (* Extract ports from module statements *)
 let extract_ports stmts =
   List.filter_map (function
-    | Sv_ast.Var { name; dtype_ref; direction; var_type = "PORT"; _ } 
+    | Sv_ast.Var { name; dtype_ref; direction; var_type = "PORT"; _ }
       when direction = "INPUT" || direction = "input" ->
         let width = extract_width dtype_ref in
         Some (name, width, `Input)
@@ -61,11 +83,19 @@ let extract_ports stmts =
 
 (* Extract internal signal declarations *)
 let extract_signals stmts =
+  Printf.eprintf "      extract_signals called with %d statements\n%!" (List.length stmts);
   List.filter_map (function
-    | Sv_ast.Var { name; dtype_ref; var_type = "WIRE" | "VAR" | "REG"; direction = ""; _ } ->
-        let width = extract_width dtype_ref in
-        let signed = is_signed dtype_ref in
-        Some (name, width, signed)
+    | Sv_ast.Var { name; dtype_ref; var_type; direction; _ } ->
+        Printf.eprintf "        Checking var: %s varType=%s direction=%s\n%!" name var_type direction;
+        (match var_type with
+         | "WIRE" | "VAR" | "REG" when direction = "" || direction = "NONE" ->
+             let width = extract_width dtype_ref in
+             let signed = is_signed dtype_ref in
+             Printf.eprintf "          -> Adding as internal signal\n%!";
+             Some (name, width, signed)
+         | _ ->
+             Printf.eprintf "          -> Skipping\n%!";
+             None)
     | _ -> None
   ) stmts
 
@@ -343,6 +373,36 @@ let rec process_stmt decls = function
         
   | _ -> None
 
+(* Extract clock signal from sensitivity list *)
+let extract_clock senses =
+  Printf.eprintf "        extract_clock called with %d senses\n%!" (List.length senses);
+  let rec find_clock = function
+    | [] ->
+        Printf.eprintf "          No more items to check\n%!";
+        None
+    | Sv_ast.SenTree items :: rest ->
+        Printf.eprintf "          Found SenTree with %d items\n%!" (List.length items);
+        (match find_clock items with
+         | Some c -> Some c
+         | None -> find_clock rest)
+    | Sv_ast.SenItem { edge_str; signal; _ } :: rest ->
+        Printf.eprintf "          Found SenItem edge_str=%s\n%!" edge_str;
+        (match signal with
+         | Sv_ast.VarRef { name; _ } ->
+             Printf.eprintf "            Signal is VarRef: %s\n%!" name;
+             let edge_upper = String.uppercase_ascii edge_str in
+             if edge_upper = "POS" || edge_upper = "POSEDGE" then Some name
+             else if edge_upper = "NEG" || edge_upper = "NEGEDGE" then Some name
+             else find_clock rest
+         | _ ->
+             Printf.eprintf "            Signal is not VarRef\n%!";
+             find_clock rest)
+    | _ :: rest ->
+        Printf.eprintf "          Found other node type\n%!";
+        find_clock rest
+  in
+  find_clock senses
+
 (* Process always block *)
 let process_always decls clock_opt reset_opt stmts =
   List.filter_map (process_stmt decls) stmts
@@ -351,30 +411,55 @@ let process_always decls clock_opt reset_opt stmts =
 let build_circuit module_name stmts =
   try
     Printf.eprintf "    Building circuit for %s\n%!" module_name;
-    
+
     (* Extract ports and signals *)
     let ports = extract_ports stmts in
     let signals = extract_signals stmts in
-    
+    let state_elements = identify_state_elements stmts in
+
     Printf.eprintf "      Found %d ports: " (List.length ports);
     List.iter (fun (name, width, dir) ->
       let dir_str = match dir with `Input -> "in" | `Output -> "out" | `Inout -> "inout" in
       Printf.eprintf "%s(%s:%d) " name dir_str width
     ) ports;
     Printf.eprintf "\n%!";
-    
+
     Printf.eprintf "      Found %d internal signals\n%!" (List.length signals);
-    
+    Printf.eprintf "      Found %d state elements (registers)\n%!" (Hashtbl.length state_elements);
+
     let decls = Hashtbl.create 64 in
-    
+
     (* Create inputs - outputs will be computed later *)
     List.iter (fun (name, width, dir) ->
       match dir with
-      | `Input -> 
+      | `Input ->
           Printf.eprintf "        Creating input: %s[%d]\n%!" name width;
           Hashtbl.add decls name (Sig (input name width))
       | _ -> ()  (* Outputs computed from always blocks *)
     ) ports;
+
+    (* Extract clock signal from always blocks for register specs *)
+    let clock_signal =
+      List.find_map (function
+        | Sv_ast.Always { senses; _ } ->
+            Printf.eprintf "      Checking always block for clock...\n%!";
+            (match extract_clock senses with
+             | Some clk_name ->
+                 Printf.eprintf "        Found clock signal: %s\n%!" clk_name;
+                 (match Hashtbl.find_opt decls clk_name with
+                  | Some (Sig s) ->
+                      Printf.eprintf "        Clock signal found in decls\n%!";
+                      Some s
+                  | _ ->
+                      Printf.eprintf "        Clock signal NOT found in decls\n%!";
+                      None)
+             | None ->
+                 Printf.eprintf "        No clock found in sensitivity\n%!";
+                 None)
+        | _ -> None
+      ) stmts
+    in
+    Printf.eprintf "      Clock signal: %s\n%!" (if clock_signal = None then "None" else "Some");
     
     (* Create internal signals/registers AND output variables *)
     let all_vars = signals @ (List.filter_map (fun (name, width, dir) ->
@@ -385,8 +470,18 @@ let build_circuit module_name stmts =
     
     List.iter (fun (name, width, _signed) ->
       if not (Hashtbl.mem decls name) then begin
-        Printf.eprintf "        Creating variable: %s[%d]\n%!" name width;
-        Hashtbl.add decls name (Var (Variable.wire ~default:(zero width)))
+        let is_state = Hashtbl.mem state_elements name in
+        if is_state && clock_signal <> None then begin
+          (* Create as register with clock *)
+          Printf.eprintf "        Creating register: %s[%d] with clock\n%!" name width;
+          let clk = Option.get clock_signal in
+          let spec = Reg_spec.create ~clock:clk () in
+          Hashtbl.add decls name (Var (Variable.reg spec ~width))
+        end else begin
+          (* Create as wire *)
+          Printf.eprintf "        Creating wire: %s[%d]\n%!" name width;
+          Hashtbl.add decls name (Var (Variable.wire ~default:(zero width)))
+        end
       end
     ) all_vars;
     

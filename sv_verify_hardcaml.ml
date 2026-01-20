@@ -571,6 +571,40 @@ let extract_ports ast =
   extract ast
 
 (* ========================================================================= *)
+(* State Element Extraction *)
+(* ========================================================================= *)
+
+let extract_state_elements ast =
+  let state_vars = Hashtbl.create 16 in
+
+  (* Find all variables assigned with non-blocking assignment (ASSIGNDLY) *)
+  let rec find_state_assignments = function
+    | Sv_ast.Netlist nodes -> List.iter find_state_assignments nodes
+    | Sv_ast.Module { stmts; _ } -> List.iter find_state_assignments stmts
+    | Sv_ast.Always { stmts; _ } -> List.iter find_state_assignments stmts
+    | Sv_ast.Begin { stmts; _ } -> List.iter find_state_assignments stmts
+    | Sv_ast.Initial { stmts; _ } -> List.iter find_state_assignments stmts
+    | Sv_ast.If { then_stmt; else_stmt; _ } ->
+        find_state_assignments then_stmt;
+        (match else_stmt with Some e -> find_state_assignments e | None -> ())
+    | Sv_ast.Case { items; _ } ->
+        List.iter (fun item -> List.iter find_state_assignments item.Sv_ast.statements) items
+    | Sv_ast.Assign { lhs; is_blocking; _ } when not is_blocking ->
+        (* Non-blocking assignment (<=) - LHS is a state element *)
+        (match lhs with
+         | Sv_ast.VarRef { name; dtype_ref; _ } ->
+             let width = extract_width dtype_ref in
+             Hashtbl.replace state_vars name width
+         | _ -> ())
+    | _ -> ()
+  in
+
+  find_state_assignments ast;
+
+  (* Convert to list *)
+  Hashtbl.fold (fun name width acc -> (name, width) :: acc) state_vars []
+
+(* ========================================================================= *)
 (* Equivalence Checking *)
 (* ========================================================================= *)
 
@@ -584,12 +618,23 @@ let check_equivalence original_ast hardcaml_ast =
   (* Extract ports *)
   let orig_ports = extract_ports original_ast in
   let hc_ports = extract_ports hardcaml_ast in
-  
+
   let inputs = List.filter (fun (_, _, dir) -> dir = `Input) orig_ports in
   let outputs = List.filter (fun (_, _, dir) -> dir = `Output) orig_ports in
-  
+
+  (* Extract state elements (flip-flops/registers) *)
+  let orig_state = extract_state_elements original_ast in
+  let hc_state = extract_state_elements hardcaml_ast in
+
   Printf.printf "Inputs:  %d\n" (List.length inputs);
   Printf.printf "Outputs: %d\n" (List.length outputs);
+  Printf.printf "State:   %d\n" (List.length orig_state);
+  if List.length orig_state > 0 then begin
+    Printf.printf "  (treating state as pseudo-inputs for combinational equivalence)\n";
+    List.iter (fun (name, width) ->
+      Printf.printf "    - %s[%d]\n" name width
+    ) (List.sort compare orig_state);
+  end;
   Printf.printf "\n";
   
   (* Create solvers for both modules *)
@@ -634,7 +679,15 @@ let check_equivalence original_ast hardcaml_ast =
     let eq = Z3.Boolean.mk_eq ctx input_orig input_hc in
     Z3.Solver.add solver [eq]
   ) inputs;
-  
+
+  (* Constrain state elements to be equal (treat as pseudo-inputs) *)
+  List.iter (fun (name, width) ->
+    let state_orig = bv_var name width "_orig" in
+    let state_hc = bv_var name width "_hc" in
+    let eq = Z3.Boolean.mk_eq ctx state_orig state_hc in
+    Z3.Solver.add solver [eq]
+  ) orig_state;
+
   (* Check each output *)
   let all_equiv = ref true in
   List.iter (fun (name, width, _) ->

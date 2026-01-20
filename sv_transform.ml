@@ -121,11 +121,12 @@ let rec ssa_expr ctx expr =
         then_val = ssa_expr ctx then_val;
         else_val = ssa_expr ctx else_val;
       }
-  | Sel { expr; lsb; width; range } ->
+  | Sel { expr; lsb; width; width_const; range } ->
       Sel {
         expr = ssa_expr ctx expr;
         lsb = Option.map (ssa_expr ctx) lsb;
         width = Option.map (ssa_expr ctx) width;
+        width_const;
         range;
       }
   | ArraySel { expr; index } ->
@@ -253,11 +254,11 @@ let rec substitute_var var_name value expr =
         then_val = substitute_var var_name value then_val;
         else_val = substitute_var var_name value else_val;
       }
-  | Sel { expr; lsb; width; range } ->
+  | Sel { expr; lsb; width; width_const; range } ->
       let substituted_expr = substitute_var var_name value expr in
       let substituted_lsb = Option.map (substitute_var var_name value) lsb in
       let substituted_width = Option.map (substitute_var var_name value) width in
-      Sel { expr = substituted_expr; lsb = substituted_lsb; width = substituted_width; range }
+      Sel { expr = substituted_expr; lsb = substituted_lsb; width = substituted_width; width_const; range }
   | ArraySel { expr; index } ->
       let substituted_index = substitute_var var_name value index in
       (* Simplify Sel nodes with lsb=0 *)
@@ -437,11 +438,12 @@ and transform_expr symtab expr =
         then_val = transform_expr symtab then_val;
         else_val = transform_expr symtab else_val;
       }
-  | Sel { expr; lsb; width; range } ->
+  | Sel { expr; lsb; width; width_const; range } ->
       Sel {
         expr = transform_expr symtab expr;
         lsb = Option.map (transform_expr symtab) lsb;
         width = Option.map (transform_expr symtab) width;
+        width_const;
         range;
       }
   | ArraySel { expr; index } ->
@@ -538,11 +540,12 @@ and substitute_var_expr var_name replacement expr =
         then_val = substitute_var_expr var_name replacement then_val;
         else_val = substitute_var_expr var_name replacement else_val;
       }
-  | Sel { expr; lsb; width; range } ->
+  | Sel { expr; lsb; width; width_const; range } ->
       Sel {
         expr = substitute_var_expr var_name replacement expr;
         lsb = Option.map (substitute_var_expr var_name replacement) lsb;
         width = Option.map (substitute_var_expr var_name replacement) width;
+        width_const;
         range;
       }
   | ArraySel { expr; index } ->
@@ -640,11 +643,12 @@ let rec transform_expr symtab expr =
         else_val = transform_expr symtab else_val;
       }
   
-  | Sel { expr; lsb; width; range } ->
+  | Sel { expr; lsb; width; width_const; range } ->
       Sel {
         expr = transform_expr symtab expr;
         lsb = Option.map (transform_expr symtab) lsb;
         width = Option.map (transform_expr symtab) width;
+        width_const;
         range;
       }
   
