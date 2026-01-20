@@ -447,6 +447,8 @@ let rec generate_sv node indent =
 
   | Const { name; _ } -> name
 
+  | EnumItemRef { name; _ } -> name
+
   | Begin { name; stmts; is_generate; _ } ->
       let stmt_str = String.concat "\n" (List.map (generate_sv_with_interfaces_indent (indent + 1) []) stmts) in
 

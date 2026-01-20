@@ -710,7 +710,16 @@ let rec infer_width ctx = function
           | _ -> 32
         with _ -> 32)
       else 32
-  
+
+  | EnumItemRef { dtype_ref; _ } ->
+      (* Enum items have the width of their enum type *)
+      (match dtype_ref with
+      | Some (EnumType _) -> 8  (* Most enums are 8 bits *)
+      | Some (BasicType { range = Some r; _ }) ->
+          (try Scanf.sscanf r "%d:%d" (fun hi lo -> abs (hi - lo) + 1)
+          with _ -> 8)
+      | _ -> 8)
+
   (* Fallback cases when dtype_ref not available *)
   | BinaryOp { op = "MUL" | "MULS"; lhs; rhs; _ } ->
       (* Multiplication result can be wider *)
@@ -967,9 +976,11 @@ let rec structural_expr ctx expr =
       add_warning (Printf.sprintf "Invalid reference to memory array %s as variable" name);
       "/* mem_ref */"
   | VarRef { name; _ } -> name
-  
+
   | Const { name; _ } -> name
-  
+
+  | EnumItemRef { name; _ } -> name
+
   | UnaryOp { op; operand; dtype_ref } ->
       let operand_wire = structural_expr ctx operand in
       let result_wire = gen_inst_name "wire" in

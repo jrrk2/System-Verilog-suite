@@ -240,7 +240,11 @@ let rec parse_json attr json =
   | "CONST" ->
       let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       Const' { name; dtype }
-      
+
+  | "ENUMITEMREF" ->
+      let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
+      EnumItemRef' { name; dtype }
+
   | "TYPEDEF" ->
       let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
       Typedef' { name; dtype }
@@ -340,7 +344,26 @@ let rec parse_json attr json =
       let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
       let index = json |> member "bitp" |> to_list |> List.hd |> parse' attr name in
       ArraySel { expr; index }
-      
+
+  | "SELBIT" ->
+      (* Single bit selection - treat as Sel with lsb only *)
+      let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
+      let lsb = json |> member "bitp" |> to_list |> List.hd |> parse' attr name in
+      Sel { expr; lsb = Some lsb; width = None; width_const = Some 1; range = "" }
+
+  | "SELEXTRACT" ->
+      (* Bit range extraction [msb:lsb] *)
+      let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
+      let msb = json |> member "leftp" |> to_list |> List.hd |> parse' attr name in
+      let lsb_expr = json |> member "rightp" |> to_list |> List.hd |> parse' attr name in
+      (* Construct width from msb - lsb *)
+      Sel { expr; lsb = Some lsb_expr; width = Some msb; width_const = None; range = "" }
+
+  | "CASTPARSE" ->
+      (* Type casting - just return the expression being casted *)
+      let expr = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
+      expr
+
   | "FUNCREF" ->
       let args = json |> member "pinsp" |> to_list |> 
         List.filter_map (fun pin -> 
@@ -385,9 +408,11 @@ let rec parse_json attr json =
       
   (* Binary operators *)
   | "AND" | "OR" | "XOR"
+  | "LOGAND" | "LOGOR"
   | "EQ" | "NEQ" | "LT" | "LTE" | "LTES" | "GT" | "GTE" | "GTES" | "LTS" | "GTS"
   | "EQWILD" | "NEQWILD" | "NEQCASE"
-  | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "POW" | "POWSS" | "POWSU" | "POWUS" | "SHIFTL" | "SHIFTR" | "SHIFTRS"
+  | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "MOD" | "MODDIV" | "MODDIV" | "MODDIVS"
+  | "POW" | "POWSS" | "POWSU" | "POWUS" | "SHIFTL" | "SHIFTR" | "SHIFTRS"
   | "STREAML" | "STREAMR" ->
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
@@ -578,6 +603,8 @@ let rec rw attr = function
 | ModportVarRef { name; direction; var_ref } -> ModportVarRef { name; direction; var_ref }
 | Const' { name; dtype } ->
   Const { name; dtype_ref=rwtyp' attr (assoc_find_opt attr.type_table dtype) }
+| EnumItemRef' { name; dtype } ->
+  EnumItemRef { name; dtype_ref=rwtyp' attr (assoc_find_opt attr.type_table dtype) }
 | Begin { name; stmts; is_generate } -> Begin { name; stmts=rwlst attr stmts; is_generate }
 | Sel { expr; lsb; width; width_const; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; width_const; range }
 | Case {expr; items} -> Case {expr = rw attr expr; items = List.map (rwitm attr) items}
@@ -699,6 +726,7 @@ incs = rwlst attr incs;}
       from=rw attr from;
       pins = rwlst attr pins }
 | Const _
+| EnumItemRef _
 | Cell _
 | Stop _
 | Replicate _

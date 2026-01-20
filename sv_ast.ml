@@ -94,6 +94,14 @@ and sv_node =
       name: string;
       dtype_ref: sv_type option;
     }
+  | EnumItemRef' of {
+      name: string;
+      dtype: string;
+    }
+  | EnumItemRef of {
+      name: string;
+      dtype_ref: sv_type option;
+    }
   | Typedef' of {
       name: string;
       dtype: string;
