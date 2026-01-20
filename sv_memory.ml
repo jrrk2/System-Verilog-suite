@@ -72,7 +72,12 @@ let is_memory_array var =
   | Var { dtype_ref; _ } ->
       let (depth, width) = get_array_info dtype_ref in
       let size = calculate_memory_size depth width in
-      size > memory_threshold && depth > 1
+      (* Standard case: explicit multi-dimensional array *)
+      let is_multi_dim_array = size > memory_threshold && depth > 1 in
+      (* Special case: Wide packed array that's likely a flattened memory *)
+      (* If width > 512 bits and is a reasonable memory size, treat as memory *)
+      let is_wide_packed = depth = 1 && width > 512 && size <= 65536 in
+      is_multi_dim_array || is_wide_packed
   | _ -> false
 
 (* Print memory info for debugging *)
@@ -80,6 +85,32 @@ let print_memory_info mem =
   Printf.eprintf "  Memory: %s[%d] (depth=%d, width=%d, size=%d bits, reads=%d, writes=%d)\n"
     mem.name mem.depth mem.depth mem.data_width mem.size_bits
     (List.length mem.read_accesses) (List.length mem.write_accesses)
+
+(* Infer array dimensions for wide packed arrays *)
+let infer_array_dimensions stmts total_width =
+  (* Look for DATA_WIDTH or similar parameters *)
+  let elem_width_from_params =
+    List.find_map (function
+      | Var { name; value = Some (Const { name = v; _ }); var_type = "GPARAM"; _ }
+        when name = "DATA_WIDTH" || name = "DATAWIDTH" ->
+          (try Some (int_of_string v) with _ -> None)
+      | _ -> None
+    ) stmts
+  in
+
+  match elem_width_from_params with
+  | Some w when total_width mod w = 0 ->
+      let d = total_width / w in
+      (d, w)
+  | _ ->
+      (* Try common element widths: 64, 32, 16, 8 *)
+      let common_widths = [64; 32; 16; 8] in
+      let found = List.find_opt (fun w ->
+        total_width mod w = 0 && total_width / w >= 4
+      ) common_widths in
+      (match found with
+      | Some w -> (total_width / w, w)
+      | None -> (1, total_width))  (* Fallback: treat as single element *)
 
 (* Detect all memories in a module *)
 let detect_memories stmts =
@@ -99,6 +130,24 @@ let detect_memories stmts =
             addr_width;
             data_width = width;
             depth;
+            size_bits = size;
+            read_accesses = [];
+            write_accesses = [];
+            is_sequential = false;
+          } in
+          Hashtbl.add memories name mem_info;
+          print_memory_info mem_info
+        end else if depth = 1 && width > 512 && size <= 65536 then begin
+          (* Wide packed array - infer dimensions *)
+          Printf.eprintf "        Variable %s is a wide packed array, inferring dimensions...\n%!" name;
+          let (inferred_depth, inferred_width) = infer_array_dimensions stmts width in
+          Printf.eprintf "        Inferred: depth=%d, width=%d\n%!" inferred_depth inferred_width;
+          let addr_width = int_of_float (ceil (log (float_of_int inferred_depth) /. log 2.0)) in
+          let mem_info = {
+            name;
+            addr_width;
+            data_width = inferred_width;
+            depth = inferred_depth;
             size_bits = size;
             read_accesses = [];
             write_accesses = [];
