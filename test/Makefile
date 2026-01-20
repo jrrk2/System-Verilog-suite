@@ -10,13 +10,13 @@ BLUE   := \033[0;34m
 NC     := \033[0m # No Color
 
 # Directories
-TEST_DIR    := test
+TEST_DIR    := .
 OUTPUT_DIR  := $(TEST_DIR)/output
 OBJ_DIR     := $(TEST_DIR)/obj_dir
 INPUT_DIR   := $(TEST_DIR)/input
 
-# Executable
-SV_UNIFIED  := _build/default/sv_main_unified.exe
+# Executable (relative to project root)
+SV_UNIFIED  := ../_build/default/sv_main_unified.exe
 
 all: test
 
@@ -41,7 +41,7 @@ help:
 
 build:
 	@echo "$(BLUE)Building decompiler...$(NC)"
-	@dune build
+	@cd .. && dune build
 	@echo "$(GREEN)✓ Build complete$(NC)"
 
 test: build
