@@ -550,6 +550,12 @@ let build_circuit module_name stmts =
     let memories = Sv_memory.detect_memories stmts in
     Printf.eprintf "      Found %d memories\n%!" (Hashtbl.length memories);
 
+    (* Analyze memory access patterns *)
+    if Hashtbl.length memories > 0 then begin
+      Printf.eprintf "      Analyzing memory access patterns...\n%!";
+      Sv_memory.analyze_memory_accesses stmts memories
+    end;
+
     let decls = Hashtbl.create 64 in
 
     (* Create inputs - outputs will be computed later *)

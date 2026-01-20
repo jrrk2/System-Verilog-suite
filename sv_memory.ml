@@ -112,7 +112,103 @@ let detect_memories stmts =
 
   memories
 
+(* Find all array reads in an expression *)
+let rec find_array_reads expr memories =
+  match expr with
+  | ArraySel { expr = VarRef { name; _ }; index } ->
+      if Hashtbl.mem memories name then begin
+        let mem = Hashtbl.find memories name in
+        let read_acc = MemRead { array_name = name; index } in
+        if not (List.exists (fun acc ->
+          match acc with
+          | MemRead { array_name = n; _ } when n = name ->
+              (* Check if same read already recorded - simplified check *)
+              false
+          | _ -> false
+        ) mem.read_accesses) then
+          mem.read_accesses <- read_acc :: mem.read_accesses
+      end
+
+  | BinaryOp { lhs; rhs; _ } | BinaryOp' { lhs; rhs; _ } ->
+      find_array_reads lhs memories;
+      find_array_reads rhs memories
+
+  | UnaryOp { operand; _ } | UnaryOp' { operand; _ } ->
+      find_array_reads operand memories
+
+  | Cond { condition; then_val; else_val } ->
+      find_array_reads condition memories;
+      find_array_reads then_val memories;
+      find_array_reads else_val memories
+
+  | Concat { parts } ->
+      List.iter (fun e -> find_array_reads e memories) parts
+
+  | Sel { expr; _ } ->
+      find_array_reads expr memories
+
+  | _ -> ()
+
+(* Find all array writes in statements *)
+let rec find_array_writes stmt memories is_clocked =
+  match stmt with
+  | Assign { lhs = ArraySel { expr = VarRef { name; _ }; index }; rhs; _ }
+  | AssignW { lhs = ArraySel { expr = VarRef { name; _ }; index }; rhs; _ } ->
+      if Hashtbl.mem memories name then begin
+        let mem = Hashtbl.find memories name in
+        mem.is_sequential <- is_clocked;
+        let write_acc = MemWrite { array_name = name; index; data = rhs; enable = None } in
+        mem.write_accesses <- write_acc :: mem.write_accesses;
+        (* Also scan RHS for reads *)
+        find_array_reads rhs memories
+      end
+
+  | Assign { rhs; _ } | AssignW { rhs; _ } ->
+      (* Check for array reads in RHS *)
+      find_array_reads rhs memories
+
+  | Always { stmts; _ } ->
+      (* Always blocks are typically clocked *)
+      List.iter (fun s -> find_array_writes s memories true) stmts
+
+  | If { condition; then_stmt; else_stmt; _ } ->
+      find_array_reads condition memories;
+      find_array_writes then_stmt memories is_clocked;
+      Option.iter (fun e -> find_array_writes e memories is_clocked) else_stmt
+
+  | Case { expr; items; _ } ->
+      find_array_reads expr memories;
+      List.iter (fun item ->
+        List.iter (fun s -> find_array_writes s memories is_clocked) item.statements
+      ) items
+
+  | Begin { stmts; _ } ->
+      List.iter (fun s -> find_array_writes s memories is_clocked) stmts
+
+  | For { stmts; _ } | For' { stmts; _ } ->
+      List.iter (fun s -> find_array_writes s memories is_clocked) stmts
+
+  | _ -> ()
+
+(* Analyze access patterns after detection *)
+let analyze_memory_accesses stmts memories =
+  List.iter (fun stmt ->
+    find_array_writes stmt memories false
+  ) stmts;
+
+  (* Print summary *)
+  Hashtbl.iter (fun _ mem ->
+    if List.length mem.read_accesses > 0 || List.length mem.write_accesses > 0 then begin
+      Printf.eprintf "    Access pattern for %s: %d reads, %d writes, %s\n%!"
+        mem.name
+        (List.length mem.read_accesses)
+        (List.length mem.write_accesses)
+        (if mem.is_sequential then "sequential" else "combinational")
+    end
+  ) memories
+
 (* Check if an array should use memory primitive *)
 let should_use_memory_primitive mem_info =
   mem_info.size_bits > memory_threshold &&
-  mem_info.depth > 1
+  mem_info.depth > 1 &&
+  (List.length mem_info.read_accesses > 0 || List.length mem_info.write_accesses > 0)

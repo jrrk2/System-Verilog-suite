@@ -26,6 +26,7 @@ type structural_context = {
   mutable current_clock: string option;
   mutable current_clock_edge: [`Posedge | `Negedge] option;
   mutable current_reset: string option;
+  memories: (string, Sv_memory.memory_info) Hashtbl.t;  (* Detected memories *)
 }
 
 let create_context () = {
@@ -36,6 +37,7 @@ let create_context () = {
   current_clock = None;
   current_clock_edge = None;
   current_reset = None;
+  memories = Hashtbl.create 10;
 }
 
 (* Generate unique instance names *)
@@ -259,6 +261,135 @@ let gen_dff_en ctx clk clk_edge rst en d q width reset_val =
   
   ctx.instances := instance :: !(ctx.instances);
   q
+
+(* Generate memory primitive instance *)
+let gen_memory_primitive ctx mem_info =
+  let open Sv_memory in
+  let inst_name = mem_info.name ^ "_inst" in
+
+  (* Determine memory type based on access pattern *)
+  let num_reads = List.length mem_info.read_accesses in
+  let num_writes = List.length mem_info.write_accesses in
+
+  let module_name =
+    if num_reads = 0 && num_writes > 0 then
+      "memory_sp"  (* Write-only, treat as single-port *)
+    else if num_reads = 1 && num_writes = 1 then
+      "memory_sp"  (* Single-port RAM *)
+    else if num_reads = 2 && num_writes = 1 then
+      "memory_1w2r"  (* Dual-port RAM (1 write, 2 read) *)
+    else if num_reads = 2 && num_writes = 2 then
+      "memory_2w2r"  (* True dual-port RAM *)
+    else
+      "memory_sp"  (* Default to single-port *)
+  in
+
+  Printf.eprintf "        Generating %s instance for %s (%d reads, %d writes)\n%!"
+    module_name mem_info.name num_reads num_writes;
+
+  (* Build parameter list *)
+  let params = [
+    Var {
+      name = "ADDR_WIDTH";
+      dtype_ref = None;
+      var_type = "GPARAM";
+      direction = "NONE";
+      value = Some (Const { name = string_of_int mem_info.addr_width; dtype_ref = None });
+      dtype_name = "";
+      is_param = true;
+    };
+    Var {
+      name = "DATA_WIDTH";
+      dtype_ref = None;
+      var_type = "GPARAM";
+      direction = "NONE";
+      value = Some (Const { name = string_of_int mem_info.data_width; dtype_ref = None });
+      dtype_name = "";
+      is_param = true;
+    }
+  ] in
+
+  (* Build pin list based on memory type *)
+  let pins =
+    if module_name = "memory_sp" then begin
+      (* Single-port: clk, we, addr, wdata, rdata *)
+      let we_signal = match mem_info.write_accesses with
+        | MemWrite { enable = Some en; _ } :: _ ->
+            (match en with VarRef { name; _ } -> name | _ -> "1'b1")
+        | _ -> "1'b1"
+      in
+      let addr_signal = match mem_info.write_accesses, mem_info.read_accesses with
+        | MemWrite { index; _ } :: _, _ ->
+            (match index with VarRef { name; _ } -> name | _ -> "0")
+        | _, MemRead { index; _ } :: _ ->
+            (match index with VarRef { name; _ } -> name | _ -> "0")
+        | _ -> "0"
+      in
+      let wdata_signal = match mem_info.write_accesses with
+        | MemWrite { data; _ } :: _ ->
+            (match data with VarRef { name; _ } -> name | _ -> "0")
+        | _ -> "0"
+      in
+      let rdata_signal = mem_info.name ^ "_rdata" in
+
+      [
+        Pin { name = "clk"; expr = Some (VarRef { name = "clk"; access = "RD"; dtype_ref = None }) };
+        Pin { name = "we"; expr = Some (VarRef { name = we_signal; access = "RD"; dtype_ref = None }) };
+        Pin { name = "addr"; expr = Some (VarRef { name = addr_signal; access = "RD"; dtype_ref = None }) };
+        Pin { name = "wdata"; expr = Some (VarRef { name = wdata_signal; access = "RD"; dtype_ref = None }) };
+        Pin { name = "rdata"; expr = Some (VarRef { name = rdata_signal; access = "WR"; dtype_ref = None }) };
+      ]
+    end else if module_name = "memory_1w2r" then begin
+      (* 1W2R: clk, we, waddr, wdata, raddr1, raddr2, rdata1, rdata2 *)
+      let we_signal = match mem_info.write_accesses with
+        | MemWrite { enable = Some en; _ } :: _ ->
+            (match en with VarRef { name; _ } -> name | _ -> "1'b1")
+        | _ -> "1'b1"
+      in
+      let waddr_signal = match mem_info.write_accesses with
+        | MemWrite { index; _ } :: _ ->
+            (match index with VarRef { name; _ } -> name | _ -> "0")
+        | _ -> "0"
+      in
+      let wdata_signal = match mem_info.write_accesses with
+        | MemWrite { data; _ } :: _ ->
+            (match data with VarRef { name; _ } -> name | _ -> "0")
+        | _ -> "0"
+      in
+
+      (* Extract read addresses *)
+      let read_addrs = List.filter_map (function
+        | MemRead { index; _ } ->
+            Some (match index with VarRef { name; _ } -> name | _ -> "0")
+        | _ -> None
+      ) mem_info.read_accesses in
+
+      let raddr1 = match read_addrs with h :: _ -> h | [] -> "0" in
+      let raddr2 = match read_addrs with _ :: h :: _ -> h | _ -> raddr1 in
+
+      [
+        Pin { name = "clk"; expr = Some (VarRef { name = "clk"; access = "RD"; dtype_ref = None }) };
+        Pin { name = "we"; expr = Some (VarRef { name = we_signal; access = "RD"; dtype_ref = None }) };
+        Pin { name = "waddr"; expr = Some (VarRef { name = waddr_signal; access = "RD"; dtype_ref = None }) };
+        Pin { name = "wdata"; expr = Some (VarRef { name = wdata_signal; access = "RD"; dtype_ref = None }) };
+        Pin { name = "raddr1"; expr = Some (VarRef { name = raddr1; access = "RD"; dtype_ref = None }) };
+        Pin { name = "raddr2"; expr = Some (VarRef { name = raddr2; access = "RD"; dtype_ref = None }) };
+        Pin { name = "rdata1"; expr = Some (VarRef { name = mem_info.name ^ "_rdata1"; access = "WR"; dtype_ref = None }) };
+        Pin { name = "rdata2"; expr = Some (VarRef { name = mem_info.name ^ "_rdata2"; access = "WR"; dtype_ref = None }) };
+      ]
+    end else begin
+      (* Default single-port *)
+      []
+    end
+  in
+
+  let instance = Cell {
+    name = inst_name;
+    modp_addr = Some (Module { name = module_name; stmts = params });
+    pins;
+  } in
+
+  ctx.instances := instance :: !(ctx.instances)
 
 (* ============================================================================
    UTILITY FUNCTIONS
@@ -1295,7 +1426,21 @@ let rec structural_stmt ctx stmt =
 let structural_module name stmts packages =
   add_warning (Printf.sprintf "Converting module '%s' to structural form" name);
   let ctx = create_context () in
-  
+
+  (* Detect memories *)
+  Printf.eprintf "      Detecting memories in module %s...\n%!" name;
+  let memories = Sv_memory.detect_memories stmts in
+  Printf.eprintf "      Found %d memories\n%!" (Hashtbl.length memories);
+
+  (* Analyze memory access patterns *)
+  if Hashtbl.length memories > 0 then begin
+    Printf.eprintf "      Analyzing memory access patterns...\n%!";
+    Sv_memory.analyze_memory_accesses stmts memories
+  end;
+
+  (* Copy memories to context *)
+  Hashtbl.iter (fun k v -> Hashtbl.add ctx.memories k v) memories;
+
   (* Extract type parameters *)
   let type_params = extract_type_params stmts in
   
@@ -1368,16 +1513,31 @@ let rec collect_vars ctx acc stmts =
     | _ -> None
   ) stmts in
   
-  (* Collect all internal vars *)
+  (* Collect all internal vars, filtering out memory arrays *)
   let internal_vars = List.filter_map (function
-    | Var { var_type = "VAR"; _ } as v -> Some v
+    | Var { name; var_type = "VAR"; _ } as v ->
+        (* Skip memory arrays - they'll be replaced by memory primitives *)
+        if Hashtbl.mem ctx.memories name then begin
+          Printf.eprintf "      Filtering out memory array: %s\n%!" name;
+          None
+        end else
+          Some v
     | _ -> None
   ) all_vars in
-  
+
+  (* Generate memory primitive instances *)
+  if Hashtbl.length ctx.memories > 0 then begin
+    Printf.eprintf "      Generating memory primitive instances...\n%!";
+    Hashtbl.iter (fun _ mem_info ->
+      if Sv_memory.should_use_memory_primitive mem_info then
+        gen_memory_primitive ctx mem_info
+    ) ctx.memories
+  end;
+
   (* Build module body: internal vars + wires + instances *)
   let body_stmts =
-    internal_vars @ 
-    (List.rev !(ctx.wires)) @ 
+    internal_vars @
+    (List.rev !(ctx.wires)) @
     (List.rev !(ctx.instances)) in
   
   (* Return Module node *)

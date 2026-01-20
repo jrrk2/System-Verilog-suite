@@ -850,3 +850,124 @@ module multiplier_signed #(
 );
   assign out = a * b;
 endmodule
+
+// =============================================================================
+// Memory Primitives
+// =============================================================================
+
+// Single-port synchronous RAM (1 read/write port)
+module memory_sp #(
+  parameter ADDR_WIDTH = 5,
+  parameter DATA_WIDTH = 8
+) (
+  input  logic clk,
+  input  logic we,
+  input  logic [ADDR_WIDTH-1:0] addr,
+  input  logic [DATA_WIDTH-1:0] wdata,
+  output logic [DATA_WIDTH-1:0] rdata
+);
+  logic [DATA_WIDTH-1:0] mem [(2**ADDR_WIDTH)-1:0];
+
+  always_ff @(posedge clk) begin
+    if (we)
+      mem[addr] <= wdata;
+  end
+
+  assign rdata = mem[addr];
+endmodule
+
+// Dual-port RAM: 1 write port, 2 read ports (typical register file)
+module memory_1w2r #(
+  parameter ADDR_WIDTH = 5,
+  parameter DATA_WIDTH = 64
+) (
+  input  logic clk,
+  input  logic we,
+  input  logic [ADDR_WIDTH-1:0] waddr,
+  input  logic [DATA_WIDTH-1:0] wdata,
+  input  logic [ADDR_WIDTH-1:0] raddr1,
+  input  logic [ADDR_WIDTH-1:0] raddr2,
+  output logic [DATA_WIDTH-1:0] rdata1,
+  output logic [DATA_WIDTH-1:0] rdata2
+);
+  logic [DATA_WIDTH-1:0] mem [(2**ADDR_WIDTH)-1:0];
+
+  always_ff @(posedge clk) begin
+    if (we)
+      mem[waddr] <= wdata;
+  end
+
+  assign rdata1 = mem[raddr1];
+  assign rdata2 = mem[raddr2];
+endmodule
+
+// True dual-port RAM: 2 independent read/write ports
+module memory_2w2r #(
+  parameter ADDR_WIDTH = 5,
+  parameter DATA_WIDTH = 32
+) (
+  input  logic clk,
+  input  logic we1,
+  input  logic [ADDR_WIDTH-1:0] addr1,
+  input  logic [DATA_WIDTH-1:0] wdata1,
+  output logic [DATA_WIDTH-1:0] rdata1,
+  input  logic we2,
+  input  logic [ADDR_WIDTH-1:0] addr2,
+  input  logic [DATA_WIDTH-1:0] wdata2,
+  output logic [DATA_WIDTH-1:0] rdata2
+);
+  logic [DATA_WIDTH-1:0] mem [(2**ADDR_WIDTH)-1:0];
+
+  always_ff @(posedge clk) begin
+    if (we1)
+      mem[addr1] <= wdata1;
+    if (we2)
+      mem[addr2] <= wdata2;
+  end
+
+  assign rdata1 = mem[addr1];
+  assign rdata2 = mem[addr2];
+endmodule
+
+// Read-only memory (ROM)
+module memory_rom #(
+  parameter ADDR_WIDTH = 10,
+  parameter DATA_WIDTH = 32
+) (
+  input  logic [ADDR_WIDTH-1:0] addr,
+  output logic [DATA_WIDTH-1:0] rdata
+);
+  logic [DATA_WIDTH-1:0] mem [(2**ADDR_WIDTH)-1:0];
+  
+  assign rdata = mem[addr];
+endmodule
+
+// Multi-port register file: 2 write ports, 2 read ports
+module memory_2w2r_rf #(
+  parameter ADDR_WIDTH = 5,
+  parameter DATA_WIDTH = 64
+) (
+  input  logic clk,
+  input  logic we1,
+  input  logic [ADDR_WIDTH-1:0] waddr1,
+  input  logic [DATA_WIDTH-1:0] wdata1,
+  input  logic we2,
+  input  logic [ADDR_WIDTH-1:0] waddr2,
+  input  logic [DATA_WIDTH-1:0] wdata2,
+  input  logic [ADDR_WIDTH-1:0] raddr1,
+  input  logic [ADDR_WIDTH-1:0] raddr2,
+  output logic [DATA_WIDTH-1:0] rdata1,
+  output logic [DATA_WIDTH-1:0] rdata2
+);
+  logic [DATA_WIDTH-1:0] mem [(2**ADDR_WIDTH)-1:0];
+
+  always_ff @(posedge clk) begin
+    if (we1)
+      mem[waddr1] <= wdata1;
+    if (we2)
+      mem[waddr2] <= wdata2;
+  end
+
+  assign rdata1 = mem[raddr1];
+  assign rdata2 = mem[raddr2];
+endmodule
