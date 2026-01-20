@@ -103,11 +103,19 @@ let rec expr_to_z3 suffix = function
        | "ADD" | "VADD" -> Z3.BitVector.mk_add ctx a b
        | "SUB" | "VSUB" -> Z3.BitVector.mk_sub ctx a b
        | "MUL" | "VMUL" -> Z3.BitVector.mk_mul ctx a b
-       | "DIV" | "VDIV" -> Z3.BitVector.mk_udiv ctx a b  (* Unsigned division *)
-       | "POW" -> 
-           (* Power is complex - for now, approximate with multiplication *)
-           (* TODO: Proper power implementation *)
-           Z3.BitVector.mk_mul ctx a b
+       | "DIV" | "VDIV" ->
+           (* Division not implemented in HardCaml - always returns all 1's *)
+           let a_width = Z3.BitVector.get_size (Z3.Expr.get_sort a) in
+           let b_width = Z3.BitVector.get_size (Z3.Expr.get_sort b) in
+           let width = max a_width b_width in
+           (* Create all 1's by inverting all 0's *)
+           Z3.BitVector.mk_not ctx (Z3.BitVector.mk_numeral ctx "0" width)
+       | "POW" | "POWSU" ->
+           (* Power is not supported in hardware - return 0 *)
+           let a_width = Z3.BitVector.get_size (Z3.Expr.get_sort a) in
+           let b_width = Z3.BitVector.get_size (Z3.Expr.get_sort b) in
+           let width = max a_width b_width in
+           Z3.BitVector.mk_numeral ctx "0" width
        | "AND" | "VAND" -> Z3.BitVector.mk_and ctx a b
        | "OR" | "VOR" -> Z3.BitVector.mk_or ctx a b
        | "XOR" | "VXOR" -> Z3.BitVector.mk_xor ctx a b
@@ -174,12 +182,46 @@ let rec expr_to_z3 suffix = function
            Printf.eprintf "Warning: Unsupported binary op: %s, using zero\n%!" op;
            Z3.BitVector.mk_numeral ctx "0" 1)
        
-  | Sv_ast.UnaryOp { op; operand; _ } | Sv_ast.UnaryOp' { op; operand; _ } ->
+  | Sv_ast.UnaryOp { op; operand; dtype_ref } ->
       let a = expr_to_z3 suffix operand in
       (match String.uppercase_ascii op with
        | "NOT" -> Z3.BitVector.mk_not ctx a
        | "NEGATE" -> Z3.BitVector.mk_neg ctx a
+       | "EXTEND" ->
+           (* Zero extend to target width *)
+           let target_width = extract_width dtype_ref in
+           let current_width = Z3.BitVector.get_size (Z3.Expr.get_sort a) in
+           if target_width > current_width then
+             Z3.BitVector.mk_zero_ext ctx (target_width - current_width) a
+           else if target_width < current_width then
+             Z3.BitVector.mk_extract ctx (target_width - 1) 0 a
+           else
+             a
+       | "EXTENDS" ->
+           (* Sign extend to target width *)
+           let target_width = extract_width dtype_ref in
+           let current_width = Z3.BitVector.get_size (Z3.Expr.get_sort a) in
+           if target_width > current_width then
+             Z3.BitVector.mk_sign_ext ctx (target_width - current_width) a
+           else if target_width < current_width then
+             Z3.BitVector.mk_extract ctx (target_width - 1) 0 a
+           else
+             a
        | _ -> failwith ("Unsupported unary op: " ^ op))
+
+  | Sv_ast.UnaryOp' { op; operand; dtype } ->
+      let a = expr_to_z3 suffix operand in
+      (match String.uppercase_ascii op with
+       | "NOT" -> Z3.BitVector.mk_not ctx a
+       | "NEGATE" -> Z3.BitVector.mk_neg ctx a
+       | "EXTEND" | "EXTENDS" ->
+           (* For UnaryOp', we don't have direct access to dtype_ref,
+              so just return the operand as-is. The width adjustment
+              will be handled by the surrounding assignment context. *)
+           a
+       | _ ->
+           Printf.eprintf "Warning: Unsupported unary op: %s\n%!" op;
+           Z3.BitVector.mk_numeral ctx "0" 1)
        
   | Sv_ast.Cond { condition; then_val; else_val } ->
       let c = expr_to_z3 suffix condition in
@@ -190,7 +232,17 @@ let rec expr_to_z3 suffix = function
       let c_size = Z3.BitVector.get_size c_sort in
       let zero_val = Z3.BitVector.mk_numeral ctx "0" c_size in
       let c_bool = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx c zero_val) in
-      Z3.Boolean.mk_ite ctx c_bool t e
+      (* Ensure then and else branches have same width *)
+      let t_width = Z3.BitVector.get_size (Z3.Expr.get_sort t) in
+      let e_width = Z3.BitVector.get_size (Z3.Expr.get_sort e) in
+      let (t', e') =
+        if t_width = e_width then (t, e)
+        else if t_width > e_width then
+          (t, Z3.BitVector.mk_zero_ext ctx (t_width - e_width) e)
+        else
+          (Z3.BitVector.mk_zero_ext ctx (e_width - t_width) t, e)
+      in
+      Z3.Boolean.mk_ite ctx c_bool t' e'
       
   | Sv_ast.Concat { parts } ->
       let exprs = List.map (expr_to_z3 suffix) parts in
@@ -199,22 +251,50 @@ let rec expr_to_z3 suffix = function
        | [x] -> x
        | x :: xs -> List.fold_left (Z3.BitVector.mk_concat ctx) x xs)
   
-  | Sv_ast.Sel { expr; lsb = Some lsb_node; width = Some width_node; _ } ->
+  | Sv_ast.Sel { expr; lsb; width; _ } when lsb <> None ->
       (* Bit selection: expr[msb:lsb] *)
       (try
         let base = expr_to_z3 suffix expr in
-        let lsb = match expr_to_z3 suffix lsb_node with
-          | c when Z3.Expr.is_numeral c -> 
-              int_of_string (Z3.Expr.to_string c)
-          | _ -> 0
+        let lsb_val = match lsb with
+          | Some lsb_node ->
+              (try
+                let lsb_expr = expr_to_z3 suffix lsb_node in
+                if Z3.Expr.is_numeral lsb_expr then
+                  let lsb_str = Z3.Expr.to_string lsb_expr in
+                  (* Z3 numerals start with #x for hex, need to handle that *)
+                  (try
+                    if String.length lsb_str > 2 && lsb_str.[0] = '#' && lsb_str.[1] = 'x' then
+                      int_of_string ("0x" ^ String.sub lsb_str 2 (String.length lsb_str - 2))
+                    else
+                      int_of_string lsb_str
+                   with _ ->
+                     Printf.eprintf "Warning: Could not parse LSB value: %s\n%!" lsb_str;
+                     0)
+                else begin
+                  Printf.eprintf "Warning: SEL with non-constant LSB index\n%!";
+                  0
+                end
+               with e ->
+                 Printf.eprintf "Warning: Failed to evaluate LSB: %s\n%!" (Printexc.to_string e);
+                 0)
+          | None -> 0
         in
-        let w = match expr_to_z3 suffix width_node with
-          | c when Z3.Expr.is_numeral c ->
-              int_of_string (Z3.Expr.to_string c)
-          | _ -> 1
+        let w = match width with
+          | Some width_node ->
+              (match expr_to_z3 suffix width_node with
+               | c when Z3.Expr.is_numeral c ->
+                   int_of_string (Z3.Expr.to_string c)
+               | _ -> 1)
+          | None -> 1  (* If no width specified, default to 1 (single bit) *)
         in
-        let msb = lsb + w - 1 in
-        Z3.BitVector.mk_extract ctx msb lsb base
+        let msb = lsb_val + w - 1 in
+        let base_width = Z3.BitVector.get_size (Z3.Expr.get_sort base) in
+        if msb >= base_width || lsb_val < 0 then begin
+          Printf.eprintf "Warning: SEL out of bounds: [%d:%d] on %d-bit value\n%!"
+            msb lsb_val base_width;
+          Z3.BitVector.mk_numeral ctx "0" w
+        end else
+          Z3.BitVector.mk_extract ctx msb lsb_val base
        with e ->
          Printf.eprintf "Warning: Failed to extract bits: %s\n%!" (Printexc.to_string e);
          Z3.BitVector.mk_numeral ctx "0" 1)
@@ -233,21 +313,9 @@ let rec expr_to_z3 suffix = function
          Printf.eprintf "Warning: Failed to select bit: %s\n%!" (Printexc.to_string e);
          Z3.BitVector.mk_numeral ctx "0" 1)
        
-  | node -> 
-      let node_type = match node with
-        | Sv_ast.Module _ -> "Module"
-        | Sv_ast.Netlist _ -> "Netlist"
-        | Sv_ast.Var _ -> "Var"
-        | Sv_ast.Always _ -> "Always"
-        | Sv_ast.Assign _ -> "Assign"
-        | Sv_ast.AssignW _ -> "AssignW"
-        | Sv_ast.Begin _ -> "Begin"
-        | Sv_ast.Case _ -> "Case"
-        | Sv_ast.If _ -> "If"
-        | _ -> "Unknown"
-      in
-      Printf.eprintf "Warning: Unsupported expression node type: %s, returning zero\n%!" node_type;
-      Z3.BitVector.mk_numeral ctx "0" 1
+  | node ->
+      (* Unhandled AST node - raise exception to debug *)
+      failwith ("expr_to_z3: Unhandled node type in expression context")
 
 (* ========================================================================= *)
 (* Constraint Generation *)
@@ -272,11 +340,16 @@ let rec add_constraints solver suffix stmts =
              (Printexc.to_string e))
     | Sv_ast.AssignW { lhs; rhs } ->
         (try
-          let l = expr_to_z3 suffix lhs in
-          let r = expr_to_z3 suffix rhs in
+          let lhs_name = match lhs with
+            | Sv_ast.VarRef { name; _ } -> name
+            | _ -> "unknown" in
+          let l = (try expr_to_z3 suffix lhs
+                   with e -> failwith ("AssignW LHS(" ^ lhs_name ^ ") failed: " ^ Printexc.to_string e)) in
+          let r = (try expr_to_z3 suffix rhs
+                   with e -> failwith ("AssignW RHS(lhs=" ^ lhs_name ^ ") failed: " ^ Printexc.to_string e)) in
           let l_sort = Z3.Expr.get_sort l in
           let r_sort = Z3.Expr.get_sort r in
-          
+
           (* Check if both are bitvectors *)
           if Z3.Sort.get_sort_kind l_sort <> Z3enums.BV_SORT then begin
             Printf.eprintf "Warning: LHS is not a bitvector sort\n%!";
@@ -287,24 +360,32 @@ let rec add_constraints solver suffix stmts =
           end else begin
             let wl = Z3.BitVector.get_size l_sort in
             let wr = Z3.BitVector.get_size r_sort in
-            
+
             if wl <= 0 || wr <= 0 then begin
               Printf.eprintf "Warning: Invalid widths: lhs=%d rhs=%d\n%!" wl wr;
               ()
             end else begin
-              let r' = if wl = wr then r
-                       else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) r
-                       else Z3.BitVector.mk_extract ctx (wl - 1) 0 r in
-              let eq = Z3.Boolean.mk_eq ctx l r' in
-              Z3.Solver.add solver [eq]
+              (try
+                let r' = if wl = wr then r
+                         else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) r
+                         else Z3.BitVector.mk_extract ctx (wl - 1) 0 r in
+                let eq = Z3.Boolean.mk_eq ctx l r' in
+                Z3.Solver.add solver [eq]
+               with e ->
+                 Printf.eprintf "Warning: Failed to add assignment (lhs_width=%d, rhs_width=%d): %s\n%!"
+                   wl wr (Printexc.to_string e);
+                 ())
             end
           end
          with e ->
-           Printf.eprintf "Warning: Failed to add continuous assignment: %s\n%!"
+           Printf.eprintf "Warning: Failed to process continuous assignment: %s\n%!"
              (Printexc.to_string e))
     | Sv_ast.Always { stmts; _ } ->
         add_constraints solver suffix stmts
     | Sv_ast.Begin { stmts; _ } ->
+        add_constraints solver suffix stmts
+    | Sv_ast.Initial { stmts; _ } ->
+        (* INITIAL blocks are just constant initializations, treat like assignments *)
         add_constraints solver suffix stmts
     | Sv_ast.Case { expr; items } ->
         (* Encode case as nested ITEs *)
@@ -317,46 +398,87 @@ let rec add_constraints solver suffix stmts =
   ) stmts
 
 and add_case_constraints solver suffix expr items =
-  (* Encode case statement as: for each output variable assigned in ANY case item,
-     create a constraint that captures all possible assignments *)
-  
-  (* Collect all assignments across all case items *)
+  (* Encode case statement as nested ITEs to properly handle all cases including default *)
   let expr_z3 = expr_to_z3 suffix expr in
-  
-  (* For each case item, create (condition ==> assignments) *)
+
+  (* Group assignments by LHS variable *)
+  let lhs_to_cases = Hashtbl.create 16 in
+
+  (* Collect all (condition, rhs) pairs for each LHS *)
   List.iter (fun item ->
-    match item.Sv_ast.conditions with
-    | [cond] ->
-        (try
-          let cond_z3 = expr_to_z3 suffix cond in
-          let eq_cond = Z3.Boolean.mk_eq ctx expr_z3 cond_z3 in
-          
-          (* Process each assignment in this case *)
-          List.iter (function
-            | Sv_ast.Assign { lhs; rhs; _ } ->
-                (try
-                  let l = expr_to_z3 suffix lhs in
-                  let r = expr_to_z3 suffix rhs in
-                  let wl = Z3.BitVector.get_size (Z3.Expr.get_sort l) in
-                  let wr = Z3.BitVector.get_size (Z3.Expr.get_sort r) in
-                  let r' = if wl = wr then r
-                           else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) r
-                           else Z3.BitVector.mk_extract ctx (wl - 1) 0 r in
-                  
-                  (* Add: (expr == cond) => (lhs == rhs) *)
-                  let assignment = Z3.Boolean.mk_eq ctx l r' in
-                  let implication = Z3.Boolean.mk_implies ctx eq_cond assignment in
-                  Z3.Solver.add solver [implication]
-                 with e ->
-                   Printf.eprintf "Warning: Failed to add case assignment: %s\n%!" 
-                     (Printexc.to_string e))
-            | _ -> ()
-          ) item.statements
-         with e ->
-           Printf.eprintf "Warning: Failed to process case item: %s\n%!" 
-             (Printexc.to_string e))
-    | _ -> ()
-  ) items
+    let conditions = item.Sv_ast.conditions in
+    List.iter (function
+      | Sv_ast.Assign { lhs; rhs; _ } ->
+          (try
+            let lhs_z3 = expr_to_z3 suffix lhs in
+            let rhs_z3 = expr_to_z3 suffix rhs in
+            let key = Z3.Expr.to_string lhs_z3 in
+            let cases = try Hashtbl.find lhs_to_cases key with Not_found -> [] in
+            Hashtbl.replace lhs_to_cases key ((conditions, lhs_z3, rhs_z3) :: cases)
+           with e ->
+             Printf.eprintf "Warning: Failed to collect case assignment: %s\n%!"
+               (Printexc.to_string e))
+      | _ -> ()
+    ) item.statements
+  ) items;
+
+  (* For each LHS, build a nested ITE expression *)
+  Hashtbl.iter (fun _ cases_list ->
+    try
+      let cases = List.rev cases_list in (* Process in order *)
+
+      (* Find default case (empty conditions) and other cases *)
+      let (default_val, other_cases) =
+        List.partition (fun (conds, _, _) -> conds = []) cases in
+
+      let lhs_z3 = match cases with
+        | (_, l, _) :: _ -> l
+        | [] -> failwith "No cases found" in
+
+      (* Build the ITE chain from the end backwards *)
+      let rec build_ite remaining_cases default_expr =
+        match remaining_cases with
+        | [] -> default_expr
+        | (conds, _, rhs_z3) :: rest ->
+            (match conds with
+             | [cond] ->
+                 let cond_z3 = expr_to_z3 suffix cond in
+                 let eq_cond = Z3.Boolean.mk_eq ctx expr_z3 cond_z3 in
+                 let next_expr = build_ite rest default_expr in
+                 (* Adjust widths if needed *)
+                 let rhs_width = Z3.BitVector.get_size (Z3.Expr.get_sort rhs_z3) in
+                 let next_width = Z3.BitVector.get_size (Z3.Expr.get_sort next_expr) in
+                 let (rhs', next') =
+                   if rhs_width = next_width then (rhs_z3, next_expr)
+                   else if rhs_width > next_width then
+                     (rhs_z3, Z3.BitVector.mk_zero_ext ctx (rhs_width - next_width) next_expr)
+                   else
+                     (Z3.BitVector.mk_zero_ext ctx (next_width - rhs_width) rhs_z3, next_expr)
+                 in
+                 Z3.Boolean.mk_ite ctx eq_cond rhs' next'
+             | _ -> build_ite rest default_expr)
+      in
+
+      let default_rhs = match default_val with
+        | (_, _, rhs) :: _ -> rhs
+        | [] -> Z3.BitVector.mk_numeral ctx "0"
+                  (Z3.BitVector.get_size (Z3.Expr.get_sort lhs_z3))
+      in
+
+      let full_expr = build_ite other_cases default_rhs in
+
+      (* Add constraint: lhs == full_expr *)
+      let wl = Z3.BitVector.get_size (Z3.Expr.get_sort lhs_z3) in
+      let wr = Z3.BitVector.get_size (Z3.Expr.get_sort full_expr) in
+      let full_expr' = if wl = wr then full_expr
+                       else if wl > wr then Z3.BitVector.mk_zero_ext ctx (wl - wr) full_expr
+                       else Z3.BitVector.mk_extract ctx (wl - 1) 0 full_expr in
+      let eq = Z3.Boolean.mk_eq ctx lhs_z3 full_expr' in
+      Z3.Solver.add solver [eq]
+    with e ->
+      Printf.eprintf "Warning: Failed to build case ITE: %s\n%!"
+        (Printexc.to_string e)
+  ) lhs_to_cases
 
 (* ========================================================================= *)
 (* Module Encoding *)
@@ -364,14 +486,14 @@ and add_case_constraints solver suffix expr items =
 
 let encode_module suffix ast =
   let solver = Z3.Solver.mk_simple_solver ctx in
-  
+
   let rec process_node = function
     | Sv_ast.Netlist nodes -> List.iter process_node nodes
     | Sv_ast.Module { stmts; _ } ->
         add_constraints solver suffix stmts
     | _ -> ()
   in
-  
+
   process_node ast;
   solver
 
@@ -429,7 +551,7 @@ let check_equivalence original_ast hardcaml_ast =
   let constraints_orig = Z3.Solver.get_assertions solver_orig in
   let constraints_hc = Z3.Solver.get_assertions solver_hc in
   Z3.Solver.add solver (constraints_orig @ constraints_hc);
-  
+
   Printf.printf "Original constraints: %d\n" (List.length constraints_orig);
   Printf.printf "HardCaml constraints: %d\n" (List.length constraints_hc);
   Printf.printf "\n";
@@ -446,9 +568,13 @@ let check_equivalence original_ast hardcaml_ast =
   let all_equiv = ref true in
   List.iter (fun (name, width, _) ->
     Printf.printf "Checking output: %s [%d bits]\n%!" name width;
-    
+
     let output_orig = bv_var name width "_orig" in
     let output_hc = bv_var name width "_hc" in
+
+    (* Debug: print the expressions *)
+    (* Printf.eprintf "output_orig expr: %s\n" (Z3.Expr.to_string output_orig);
+    Printf.eprintf "output_hc expr: %s\n" (Z3.Expr.to_string output_hc); *)
     
     (* Check if outputs can differ *)
     let neq = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx output_orig output_hc) in

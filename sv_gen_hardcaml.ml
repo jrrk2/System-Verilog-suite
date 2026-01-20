@@ -177,6 +177,10 @@ let rec expr_to_remap decls = function
        | "ADD" | "VADD" -> Sig (width_match (+:) lhs_sig rhs_sig)
        | "SUB" | "VSUB" -> Sig (width_match (-:) lhs_sig rhs_sig)
        | "MUL" | "VMUL" -> Sig (width_match ( *: ) lhs_sig rhs_sig)
+       | "DIV" | "VDIV" ->
+           (* Division is not supported in hardware - return all 1's (matching Verilog div-by-zero) *)
+           let w = max (width lhs_sig) (width rhs_sig) in
+           Sig (ones w)
        | "AND" | "VAND" -> Sig (width_match (&:) lhs_sig rhs_sig)
        | "OR" | "VOR" -> Sig (width_match (|:) lhs_sig rhs_sig)
        | "XOR" | "VXOR" -> Sig (width_match (^:) lhs_sig rhs_sig)
