@@ -1,0 +1,56 @@
+
+=== Vlarge_memory.tree.json ===
+  WARNING: Converting module 'large_memory' to structural form
+  WARNING: Variable redefinition: clk
+  WARNING: Variable redefinition: addr
+  WARNING: Variable redefinition: wdata
+  WARNING: Variable redefinition: we
+  WARNING: Variable redefinition: rdata
+  WARNING: Variable redefinition: mem
+
+=== Vfourstate.tree.json ===
+  WARNING: Converting module 'fourstate' to structural form
+  WARNING: Variable redefinition: clk
+  WARNING: Variable redefinition: reset
+  WARNING: Variable redefinition: data
+  WARNING: Variable redefinition: reg1
+
+=== Vcombinational.tree.json ===
+  WARNING: Converting module 'combinational' to structural form
+  WARNING: Variable redefinition: a
+  WARNING: Variable redefinition: b
+  WARNING: Variable redefinition: sel
+  WARNING: Variable redefinition: result
+
+=== Vcounter.tree.json ===
+  WARNING: Converting module 'counter' to structural form
+  WARNING: Variable redefinition: clk
+  WARNING: Variable redefinition: reset
+  WARNING: Variable redefinition: count
+  WARNING: Variable redefinition: count_reg
+
+=== Vmixed.tree.json ===
+  WARNING: Converting module 'mixed' to structural form
+  WARNING: Variable redefinition: clk
+  WARNING: Variable redefinition: a
+  WARNING: Variable redefinition: b
+  WARNING: Variable redefinition: sum
+  WARNING: Variable redefinition: sum_reg
+
+=== Vsmall_memory.tree.json ===
+  WARNING: Converting module 'small_memory' to structural form
+  WARNING: Variable redefinition: clk
+  WARNING: Variable redefinition: addr
+  WARNING: Variable redefinition: wdata
+  WARNING: Variable redefinition: we
+  WARNING: Variable redefinition: rdata
+  WARNING: Variable redefinition: mem
+
+=== Vpipeline.tree.json ===
+  WARNING: Converting module 'pipeline' to structural form
+  WARNING: Variable redefinition: clk
+  WARNING: Variable redefinition: data_in
+  WARNING: Variable redefinition: data_out
+  WARNING: Variable redefinition: stage1
+  WARNING: Variable redefinition: stage2
+  WARNING: Variable redefinition: stage3

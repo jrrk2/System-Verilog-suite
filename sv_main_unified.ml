@@ -14,11 +14,20 @@ let asthash = Hashtbl.create 255
 let tranhash = Hashtbl.create 255
 
 (* Backend type *)
-type backend = 
+type backend =
   | Standard      (* Original sv_gen.ml *)
   | Structural    (* sv_gen_struct.ml - structural with primitives *)
   | Yosys         (* sv_gen_yosys.ml - Yosys compatible *)
   | HardCaml      (* NEW: HardCaml OCaml output *)
+
+(* Parse backend from string *)
+let parse_backend s =
+  match String.lowercase_ascii s with
+  | "standard" | "std" -> Standard
+  | "structural" | "struct" -> Structural
+  | "yosys" -> Yosys
+  | "hardcaml" | "hc" -> HardCaml
+  | _ -> failwith ("Unknown backend: " ^ s)
 
 (* Generate output based on backend choice *)
 let generate_output backend ast =
@@ -39,6 +48,7 @@ let generate_output backend ast =
       let transformed_ast = Sv_transform.transform ~verbose:false ast in
       let fd = open_out "dump.json" in output_string fd (Yojson.Safe.pretty_to_string (sv_node_to_yojson transformed_ast)); close_out fd;
       Sv_gen_hardcaml.generate_hardcaml_with_warnings transformed_ast 0
+
 
 (* Get file extension for backend *)
 let get_extension backend =
@@ -232,15 +242,6 @@ let process_single_file json_file output_file backend =
   end;
   Printf.fprintf stderr "Output written to: %s\n" output_file
 
-(* Parse backend from string *)
-let parse_backend s =
-  match String.lowercase_ascii s with
-  | "standard" | "std" -> Standard
-  | "structural" | "struct" -> Structural
-  | "yosys" -> Yosys
-  | "hardcaml" | "hc" -> HardCaml
-  | _ -> failwith ("Unknown backend: " ^ s)
-
 (* Verify two JSON files for equivalence *)
 let verify_files original_json hardcaml_json =
   if not (Sys.file_exists original_json) then begin
@@ -280,6 +281,9 @@ let print_usage () =
   Printf.eprintf "      Process single file\n\n";
   Printf.eprintf "  %s verify <original.json> <hardcaml.json>\n" Sys.argv.(0);
   Printf.eprintf "      Verify equivalence between original and HardCaml output\n\n";
+  Printf.eprintf "  %s interactive\n" Sys.argv.(0);
+  Printf.eprintf "      Start interactive console mode\n";
+  Printf.eprintf "      Provides REPL with all commands and shell access\n\n";
   Printf.eprintf "Backends:\n";
   Printf.eprintf "  standard, std      - Original SystemVerilog output\n";
   Printf.eprintf "  structural, struct - Structural with primitives\n";
@@ -290,8 +294,272 @@ let print_usage () =
   Printf.eprintf "  %s scan hardcaml results/ --verify\n" Sys.argv.(0);
   Printf.eprintf "  %s file hardcaml input.json output.ml\n" Sys.argv.(0);
   Printf.eprintf "  %s verify obj_dir/Valu.tree.json obj_dir/Valu_hardcaml.tree.json\n" Sys.argv.(0);
+  Printf.eprintf "  %s interactive\n" Sys.argv.(0);
   exit 1
 
+(* Interactive mode state *)
+module Interactive = struct
+  type state = {
+    mutable loaded_asts: (string * sv_node) list;
+    mutable current_backend: backend option;
+    mutable current_dir: string;
+    mutable running: bool;
+    mutable history: string list;
+  }
+
+  let create_state () = {
+    loaded_asts = [];
+    current_backend = None;
+    current_dir = Sys.getcwd ();
+    running = true;
+    history = [];
+  }
+
+  let print_banner () =
+    Printf.printf "\n";
+    Printf.printf "╔════════════════════════════════════════════════════════════╗\n";
+    Printf.printf "║  SystemVerilog Decompiler - Interactive Console           ║\n";
+    Printf.printf "║  Type 'help' for commands, 'quit' to exit                 ║\n";
+    Printf.printf "╚════════════════════════════════════════════════════════════╝\n";
+    Printf.printf "\n"
+
+  let print_help () =
+    Printf.printf "\nAvailable Commands:\n\n";
+    Printf.printf "File Operations:\n";
+    Printf.printf "  load <file.json>              Load Verilator JSON into AST\n";
+    Printf.printf "  list                          List all loaded ASTs\n";
+    Printf.printf "  unload <name>                 Unload an AST from memory\n";
+    Printf.printf "  clear                         Clear all loaded ASTs\n\n";
+    Printf.printf "Backend Operations:\n";
+    Printf.printf "  backend <name>                Set current backend (standard|structural|yosys|hardcaml)\n";
+    Printf.printf "  backends                      List available backends\n";
+    Printf.printf "  generate <ast> <output>       Generate output for loaded AST\n";
+    Printf.printf "  scan <backend> <dir>          Process all files in obj_dir/\n\n";
+    Printf.printf "Verification:\n";
+    Printf.printf "  verify <orig.json> <hc.json>  Verify equivalence between files\n\n";
+    Printf.printf "Shell Operations:\n";
+    Printf.printf "  !<command>                    Execute shell command\n";
+    Printf.printf "  shell <command>               Execute shell command\n";
+    Printf.printf "  cd <dir>                      Change directory\n";
+    Printf.printf "  pwd                           Print working directory\n";
+    Printf.printf "  ls [path]                     List directory contents\n\n";
+    Printf.printf "Interactive:\n";
+    Printf.printf "  help                          Show this help\n";
+    Printf.printf "  history                       Show command history\n";
+    Printf.printf "  quit, exit                    Exit interactive mode\n\n"
+
+  let print_backends () =
+    Printf.printf "\nAvailable Backends:\n";
+    Printf.printf "  standard     - Original SystemVerilog output (clean, readable)\n";
+    Printf.printf "  structural   - Structural with primitives (register inference, memory)\n";
+    Printf.printf "  yosys        - Yosys-compatible output (open-source tools)\n";
+    Printf.printf "  hardcaml     - HardCaml OCaml output (formal verification)\n\n"
+
+  let execute_shell_command cmd =
+    try
+      let exit_code = Sys.command cmd in
+      if exit_code <> 0 then
+        Printf.printf "Shell command exited with code %d\n" exit_code
+    with e ->
+      Printf.printf "Error executing shell command: %s\n" (Printexc.to_string e)
+
+  let load_ast state filename =
+    try
+      Printf.printf "Loading %s...\n" filename;
+      let ast = translate_tree_to_ast filename in
+      let name = Filename.basename filename in
+      state.loaded_asts <- (name, ast) :: state.loaded_asts;
+      Hashtbl.add asthash name ast;
+      Printf.printf "✓ Loaded as '%s'\n" name
+    with e ->
+      Printf.printf "✗ Error loading file: %s\n" (Printexc.to_string e)
+
+  let list_asts state =
+    if List.length state.loaded_asts = 0 then
+      Printf.printf "No ASTs loaded\n"
+    else begin
+      Printf.printf "\nLoaded ASTs:\n";
+      List.iter (fun (name, _) ->
+        Printf.printf "  • %s\n" name
+      ) (List.rev state.loaded_asts)
+    end
+
+  let unload_ast state name =
+    let found = List.exists (fun (n, _) -> n = name) state.loaded_asts in
+    if found then begin
+      state.loaded_asts <- List.filter (fun (n, _) -> n <> name) state.loaded_asts;
+      Hashtbl.remove asthash name;
+      Printf.printf "✓ Unloaded '%s'\n" name
+    end else
+      Printf.printf "✗ AST '%s' not found\n" name
+
+  let clear_asts state =
+    state.loaded_asts <- [];
+    Hashtbl.clear asthash;
+    Printf.printf "✓ Cleared all ASTs\n"
+
+  let set_backend state backend_str =
+    try
+      let backend = parse_backend backend_str in
+      state.current_backend <- Some backend;
+      Printf.printf "✓ Backend set to: %s\n" backend_str
+    with Failure msg ->
+      Printf.printf "✗ %s\n" msg
+
+  let generate_from_loaded state ast_name output_file =
+    match state.current_backend with
+    | None ->
+        Printf.printf "✗ No backend set. Use 'backend <name>' first\n"
+    | Some backend ->
+        try
+          let ast = List.assoc ast_name state.loaded_asts in
+          Printf.printf "Generating output with %s backend...\n"
+            (match backend with Standard -> "standard" | Structural -> "structural"
+                              | Yosys -> "yosys" | HardCaml -> "hardcaml");
+          let (result, warnings) = generate_output backend ast in
+          let fd = open_out output_file in
+          output_string fd result;
+          close_out fd;
+          if List.length warnings > 0 then begin
+            Printf.printf "  %d warnings generated\n" (List.length warnings);
+            List.iter (fun w -> Printf.printf "    WARNING: %s\n" w) warnings
+          end;
+          Printf.printf "✓ Output written to: %s\n" output_file
+        with
+        | Not_found ->
+            Printf.printf "✗ AST '%s' not loaded. Use 'list' to see loaded ASTs\n" ast_name
+        | e ->
+            Printf.printf "✗ Error generating output: %s\n" (Printexc.to_string e)
+
+  let change_directory state dir =
+    try
+      Sys.chdir dir;
+      state.current_dir <- Sys.getcwd ();
+      Printf.printf "✓ Changed to: %s\n" state.current_dir
+    with e ->
+      Printf.printf "✗ Error: %s\n" (Printexc.to_string e)
+
+  let print_working_directory state =
+    Printf.printf "%s\n" (Sys.getcwd ())
+
+  let list_directory path =
+    let dir = if path = "" then "." else path in
+    try
+      let files = Sys.readdir dir in
+      Array.sort String.compare files;
+      Array.iter (fun f ->
+        let full_path = Filename.concat dir f in
+        let is_dir = try Sys.is_directory full_path with _ -> false in
+        if is_dir then
+          Printf.printf "  [DIR]  %s/\n" f
+        else
+          Printf.printf "  [FILE] %s\n" f
+      ) files
+    with e ->
+      Printf.printf "✗ Error: %s\n" (Printexc.to_string e)
+
+  let show_history state =
+    if List.length state.history = 0 then
+      Printf.printf "No command history\n"
+    else begin
+      Printf.printf "\nCommand History:\n";
+      List.iteri (fun i cmd ->
+        Printf.printf "  %3d  %s\n" (i + 1) cmd
+      ) (List.rev state.history)
+    end
+
+  let parse_command line =
+    let line = String.trim line in
+    if line = "" then
+      []
+    else
+      (* Simple tokenizer - split on whitespace, respecting quotes *)
+      let rec tokenize chars current tokens in_quote =
+        match chars with
+        | [] ->
+            if current <> "" then
+              List.rev (current :: tokens)
+            else
+              List.rev tokens
+        | '"' :: rest ->
+            tokenize rest current tokens (not in_quote)
+        | ' ' :: rest when not in_quote ->
+            if current <> "" then
+              tokenize rest "" (current :: tokens) in_quote
+            else
+              tokenize rest "" tokens in_quote
+        | c :: rest ->
+            tokenize rest (current ^ String.make 1 c) tokens in_quote
+      in
+      tokenize (List.of_seq (String.to_seq line)) "" [] false
+
+  let handle_command state tokens =
+    match tokens with
+    | [] -> ()
+    | "help" :: _ -> print_help ()
+    | "quit" :: _ | "exit" :: _ ->
+        state.running <- false;
+        Printf.printf "Goodbye!\n"
+    | "history" :: _ -> show_history state
+    | "load" :: filename :: _ -> load_ast state filename
+    | "list" :: _ -> list_asts state
+    | "unload" :: name :: _ -> unload_ast state name
+    | "clear" :: _ -> clear_asts state
+    | "backend" :: name :: _ -> set_backend state name
+    | "backends" :: _ -> print_backends ()
+    | "generate" :: ast_name :: output :: _ -> generate_from_loaded state ast_name output
+    | "scan" :: backend_str :: dir :: rest ->
+        let verify = List.mem "--verify" rest in
+        (try
+          let backend = parse_backend backend_str in
+          let dir = if dir.[String.length dir - 1] = '/' then dir else dir ^ "/" in
+          scan dir backend verify
+        with Failure msg ->
+          Printf.printf "✗ %s\n" msg)
+    | "verify" :: orig :: hc :: _ ->
+        verify_files orig hc
+    | "cd" :: dir :: _ -> change_directory state dir
+    | "pwd" :: _ -> print_working_directory state
+    | "ls" :: rest ->
+        let path = if rest = [] then "" else List.hd rest in
+        list_directory path
+    | "shell" :: rest ->
+        let cmd = String.concat " " rest in
+        execute_shell_command cmd
+    | cmd :: _ when String.length cmd > 0 && cmd.[0] = '!' ->
+        let shell_cmd = String.sub cmd 1 (String.length cmd - 1) in
+        execute_shell_command shell_cmd
+    | cmd :: _ ->
+        Printf.printf "Unknown command: %s (type 'help' for available commands)\n" cmd
+
+  let read_line_with_prompt prompt =
+    Printf.printf "%s" prompt;
+    flush stdout;
+    try
+      Some (read_line ())
+    with End_of_file ->
+      None
+
+  let run () =
+    let state = create_state () in
+    print_banner ();
+
+    while state.running do
+      match read_line_with_prompt "sv> " with
+      | None ->
+          state.running <- false;
+          Printf.printf "\n"
+      | Some line when String.trim line <> "" ->
+          state.history <- line :: state.history;
+          let tokens = parse_command line in
+          (try
+            handle_command state tokens
+          with e ->
+            Printf.printf "✗ Error: %s\n" (Printexc.to_string e);
+            Printexc.print_backtrace stdout)
+      | Some _ -> ()
+    done
+end
 (* Main entry point *)
 let () =
   if Array.length Sys.argv < 2 then
@@ -317,6 +585,8 @@ let () =
           let original_json = Sys.argv.(2) in
           let hardcaml_json = Sys.argv.(3) in
           verify_files original_json hardcaml_json
+      | "interactive" | "repl" | "i" ->
+          Interactive.run ()
       | _ -> print_usage ()
     with
     | Failure msg ->
