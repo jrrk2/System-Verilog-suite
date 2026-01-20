@@ -470,29 +470,56 @@ let transform_module stmts =
 (* Substitute variable in expression - you already have this *)
 (* Just making sure it handles all cases *)
 
+(* Recursively search for assignments to a variable in a single statement *)
+let rec find_assignment_in_stmt target_name stmt =
+  match stmt with
+  | Assign { lhs = VarRef { name; _ }; rhs; _ } when name = target_name -> Some rhs
+  | Case { items; _ } ->
+      (* Search in each case item's statements *)
+      List.find_map (fun item -> find_assignment_in_stmts target_name item.statements) items
+  | If { then_stmt; else_stmt; _ } ->
+      (* Search in then branch *)
+      (match find_assignment_in_stmt target_name then_stmt with
+      | Some expr -> Some expr
+      | None ->
+          match else_stmt with
+          | Some e_stmt -> find_assignment_in_stmt target_name e_stmt
+          | None -> None)
+  | JumpBlock { stmt; _ } ->
+      (* Search in jump block (used for return statements) *)
+      find_assignment_in_stmts target_name stmt
+  | Begin { stmts = inner_stmts; _ } ->
+      (* Search in begin blocks *)
+      find_assignment_in_stmts target_name inner_stmts
+  | Always { stmts = inner_stmts; _ } ->
+      (* Search in always blocks *)
+      find_assignment_in_stmts target_name inner_stmts
+  | _ -> None
+
+(* Recursively search for assignments to a variable in a list of statements *)
+and find_assignment_in_stmts target_name stmts =
+  List.find_map (find_assignment_in_stmt target_name) stmts
+
 (* Inline a function call by substituting parameters and returning the body *)
 let rec inline_function symtab func_name args =
   match Hashtbl.find_opt symtab.functions func_name with
   | Some (Func { stmts; vars; _ }) ->
       if !debug then
         Printf.eprintf "  Inlining function: %s\n" func_name;
-      
+
       (* Extract input parameters in order *)
       let params = List.filter_map (function
         | Var { name; var_type = "PORT"; direction = "INPUT"; _ } -> Some name
         | _ -> None
       ) stmts in
-      
-      (* Find the return value assignment (assign to function name) *)
-      let return_expr = List.find_map (function
-        | Assign { lhs = VarRef { name; _ }; rhs; _ } when name = func_name -> Some rhs
-        | _ -> None
-      ) stmts in
-      
+
+      (* Find the return value assignment (can be nested in case/if blocks) *)
+      let return_expr = find_assignment_in_stmts func_name stmts in
+
       (match return_expr with
       | Some expr ->
           (* Substitute each parameter with its argument *)
-          let substituted = List.fold_left2 
+          let substituted = List.fold_left2
             (fun acc_expr param arg ->
               (* First evaluate the argument expression *)
               let arg_expr = transform_expr symtab arg in
