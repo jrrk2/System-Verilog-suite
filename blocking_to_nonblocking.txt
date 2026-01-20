@@ -1,0 +1,437 @@
+(* ============================================================================
+   BLOCKING TO NON-BLOCKING ASSIGNMENT CONVERSION
+   Add to sv_transform.ml after function/task inlining
+   ============================================================================ *)
+
+(* Assignment context - tracks what kind of block we're in *)
+type assignment_context =
+  | Sequential of string  (* In sequential block, clock name *)
+  | Combinational         (* In combinational block *)
+  | Unknown               (* Not yet determined *)
+
+(* Variable assignment tracking *)
+type var_assignment = {
+  var_name: string;
+  value: sv_node;
+  version: int;  (* SSA-like versioning *)
+}
+
+(* SSA (Static Single Assignment) state *)
+type ssa_state = {
+  mutable var_versions: (string, int) Hashtbl.t;  (* Current version of each var *)
+  mutable assignments: var_assignment list;        (* All assignments *)
+  mutable temp_counter: int;                       (* Counter for temp variables *)
+}
+
+let create_ssa_state () = {
+  var_versions = Hashtbl.create 50;
+  assignments = [];
+  temp_counter = 0;
+}
+
+(* Get current version of a variable *)
+let get_var_version ssa var_name =
+  try Hashtbl.find ssa.var_versions var_name
+  with Not_found -> 0
+
+(* Create new version of a variable *)
+let new_var_version ssa var_name =
+  let current = get_var_version ssa var_name in
+  let next = current + 1 in
+  Hashtbl.replace ssa.var_versions var_name next;
+  next
+
+(* Get versioned variable name *)
+let versioned_var_name var_name version =
+  if version = 0 then var_name
+  else Printf.sprintf "%s_v%d" var_name version
+
+(* Generate temporary variable name *)
+let gen_temp_var ssa =
+  ssa.temp_counter <- ssa.temp_counter + 1;
+  Printf.sprintf "temp_%d" ssa.temp_counter
+
+(* ============================================================================
+   DEPENDENCY ANALYSIS
+   ============================================================================ *)
+
+(* Check if expression reads a variable *)
+let rec expr_reads_var var_name expr =
+  match expr with
+  | VarRef { name; _ } -> name = var_name
+  | BinaryOp { lhs; rhs; _ } ->
+      expr_reads_var var_name lhs || expr_reads_var var_name rhs
+  | UnaryOp { operand; _ } ->
+      expr_reads_var var_name operand
+  | Cond { condition; then_val; else_val } ->
+      expr_reads_var var_name condition ||
+      expr_reads_var var_name then_val ||
+      expr_reads_var var_name else_val
+  | Sel { expr; lsb; width; _ } ->
+      expr_reads_var var_name expr ||
+      (match lsb with Some e -> expr_reads_var var_name e | None -> false) ||
+      (match width with Some e -> expr_reads_var var_name e | None -> false)
+  | ArraySel { expr; index } ->
+      expr_reads_var var_name expr || expr_reads_var var_name index
+  | Concat { parts } ->
+      List.exists (expr_reads_var var_name) parts
+  | Replicate { src; count; _ } ->
+      expr_reads_var var_name src || expr_reads_var var_name count
+  | FuncRef { args; _ } ->
+      List.exists (expr_reads_var var_name) args
+  | _ -> false
+
+(* Get all variables read by expression *)
+let rec get_expr_vars expr =
+  match expr with
+  | VarRef { name; _ } -> [name]
+  | BinaryOp { lhs; rhs; _ } ->
+      get_expr_vars lhs @ get_expr_vars rhs
+  | UnaryOp { operand; _ } ->
+      get_expr_vars operand
+  | Cond { condition; then_val; else_val } ->
+      get_expr_vars condition @ get_expr_vars then_val @ get_expr_vars else_val
+  | Sel { expr; lsb; width; _ } ->
+      get_expr_vars expr @
+      (match lsb with Some e -> get_expr_vars e | None -> []) @
+      (match width with Some e -> get_expr_vars e | None -> [])
+  | ArraySel { expr; index } ->
+      get_expr_vars expr @ get_expr_vars index
+  | Concat { parts } ->
+      List.concat (List.map get_expr_vars parts)
+  | Replicate { src; count; _ } ->
+      get_expr_vars src @ get_expr_vars count
+  | FuncRef { args; _ } ->
+      List.concat (List.map get_expr_vars args)
+  | _ -> []
+
+(* Check if statements have dependencies *)
+let has_dependency stmt1 stmt2 =
+  match stmt1, stmt2 with
+  | Assign { lhs = VarRef { name = lhs_name; _ }; _ },
+    Assign { rhs; _ } ->
+      expr_reads_var lhs_name rhs
+  | _ -> false
+
+(* ============================================================================
+   SSA TRANSFORMATION
+   ============================================================================ *)
+
+(* Convert expression to SSA form *)
+let rec expr_to_ssa ssa expr =
+  match expr with
+  | VarRef { name; access } ->
+      let version = get_var_version ssa name in
+      VarRef { name = versioned_var_name name version; access }
+  
+  | BinaryOp { op; lhs; rhs } ->
+      BinaryOp {
+        op;
+        lhs = expr_to_ssa ssa lhs;
+        rhs = expr_to_ssa ssa rhs;
+      }
+  
+  | UnaryOp { op; operand } ->
+      UnaryOp { op; operand = expr_to_ssa ssa operand }
+  
+  | Cond { condition; then_val; else_val } ->
+      Cond {
+        condition = expr_to_ssa ssa condition;
+        then_val = expr_to_ssa ssa then_val;
+        else_val = expr_to_ssa ssa else_val;
+      }
+  
+  | Sel { expr; lsb; width; range } ->
+      Sel {
+        expr = expr_to_ssa ssa expr;
+        lsb = Option.map (expr_to_ssa ssa) lsb;
+        width = Option.map (expr_to_ssa ssa) width;
+        range;
+      }
+  
+  | ArraySel { expr; index } ->
+      ArraySel {
+        expr = expr_to_ssa ssa expr;
+        index = expr_to_ssa ssa index;
+      }
+  
+  | Concat { parts } ->
+      Concat { parts = List.map (expr_to_ssa ssa) parts }
+  
+  | Replicate { src; count; dtype_ref } ->
+      Replicate {
+        src = expr_to_ssa ssa src;
+        count = expr_to_ssa ssa count;
+        dtype_ref;
+      }
+  
+  | _ -> expr
+
+(* ============================================================================
+   BLOCKING ASSIGNMENT ANALYSIS
+   ============================================================================ *)
+
+(* Analyze blocking assignments and determine conversion strategy *)
+type conversion_strategy =
+  | KeepBlocking          (* Keep as blocking (intermediate value) *)
+  | ConvertToWire         (* Convert to wire (combinational) *)
+  | ConvertToReg          (* Convert to register (sequential) *)
+  | ConvertToTemp         (* Convert to temporary variable *)
+
+(* Determine what to do with a blocking assignment *)
+let analyze_blocking_assignment context var_name stmts current_idx =
+  (* Check if variable is read after this assignment in same block *)
+  let read_after = ref false in
+  let written_after = ref false in
+  
+  for i = current_idx + 1 to List.length stmts - 1 do
+    let stmt = List.nth stmts i in
+    match stmt with
+    | Assign { lhs = VarRef { name = lhs_name; _ }; rhs; _ } ->
+        if lhs_name = var_name then
+          written_after := true
+        else if expr_reads_var var_name rhs then
+          read_after := true
+    | _ -> ()
+  done;
+  
+  match context with
+  | Sequential _ ->
+      if !read_after && not !written_after then
+        ConvertToTemp  (* Intermediate value, use temp *)
+      else if !written_after then
+        ConvertToTemp  (* Multiple assignments, use temps for intermediate *)
+      else
+        ConvertToReg   (* Final value, use register *)
+  
+  | Combinational ->
+      if !read_after && not !written_after then
+        ConvertToWire  (* Intermediate value, use wire *)
+      else if !written_after then
+        ConvertToTemp  (* Multiple assignments, SSA *)
+      else
+        ConvertToWire  (* Final value, use wire *)
+  
+  | Unknown ->
+      ConvertToTemp    (* Conservative: use temp *)
+
+(* ============================================================================
+   STATEMENT CONVERSION
+   ============================================================================ *)
+
+(* Convert blocking assignments to appropriate form *)
+let rec convert_blocking_stmts context ssa stmts =
+  let converted = ref [] in
+  let temp_assigns = ref [] in  (* Temporary variable assignments *)
+  
+  List.iteri (fun idx stmt ->
+    match stmt with
+    | Assign { lhs = VarRef { name = var_name; access }; rhs; is_blocking = true } ->
+        let strategy = analyze_blocking_assignment context var_name stmts idx in
+        let ssa_rhs = expr_to_ssa ssa rhs in
+        
+        (match strategy with
+        | ConvertToTemp ->
+            (* Create temporary variable *)
+            let temp_name = gen_temp_var ssa in
+            let new_version = new_var_version ssa var_name in
+            
+            if !debug then
+              Printf.eprintf "Converting blocking assignment: %s = ... to temp %s\n"
+                var_name temp_name;
+            
+            (* Assign to temp *)
+            temp_assigns := 
+              Assign {
+                lhs = VarRef { name = temp_name; access = "WR" };
+                rhs = ssa_rhs;
+                is_blocking = true;
+              } :: !temp_assigns;
+            
+            (* Track that var_name now refers to temp *)
+            Hashtbl.replace ssa.var_versions var_name new_version;
+            converted := 
+              Assign {
+                lhs = VarRef { name = versioned_var_name var_name new_version; access };
+                rhs = VarRef { name = temp_name; access = "RD" };
+                is_blocking = true;
+              } :: !converted
+        
+        | ConvertToWire ->
+            if !debug then
+              Printf.eprintf "Converting blocking to wire: %s\n" var_name;
+            
+            (* Convert to continuous assignment (wire) *)
+            converted := 
+              AssignW {
+                lhs = VarRef { name = var_name; access };
+                rhs = ssa_rhs;
+              } :: !converted
+        
+        | ConvertToReg ->
+            if !debug then
+              Printf.eprintf "Converting blocking to non-blocking: %s\n" var_name;
+            
+            (* Convert to non-blocking assignment *)
+            converted := 
+              Assign {
+                lhs = VarRef { name = var_name; access };
+                rhs = ssa_rhs;
+                is_blocking = false;  (* Non-blocking! *)
+              } :: !converted
+        
+        | KeepBlocking ->
+            (* Keep as-is (rare case) *)
+            converted := stmt :: !converted)
+    
+    | Assign { lhs; rhs; is_blocking } ->
+        (* Non-blocking or complex lhs *)
+        let ssa_rhs = expr_to_ssa ssa rhs in
+        converted := 
+          Assign { lhs; rhs = ssa_rhs; is_blocking } :: !converted
+    
+    | If { condition; then_stmt; else_stmt } ->
+        let ssa_condition = expr_to_ssa ssa condition in
+        let new_then = convert_blocking_stmt context ssa then_stmt in
+        let new_else = Option.map (convert_blocking_stmt context ssa) else_stmt in
+        converted := 
+          If { condition = ssa_condition; then_stmt = new_then; else_stmt = new_else } :: !converted
+    
+    | Begin { name; stmts; is_generate } ->
+        let new_stmts = convert_blocking_stmts context ssa stmts in
+        converted := 
+          Begin { name; stmts = new_stmts; is_generate } :: !converted
+    
+    | _ ->
+        converted := stmt :: !converted
+  ) stmts;
+  
+  (* Prepend temp variable assignments *)
+  List.rev (!temp_assigns @ List.rev !converted)
+
+and convert_blocking_stmt context ssa stmt =
+  match stmt with
+  | Begin { name; stmts; is_generate } ->
+      Begin { name; stmts = convert_blocking_stmts context ssa stmts; is_generate }
+  | _ ->
+      let result = convert_blocking_stmts context ssa [stmt] in
+      match result with
+      | [s] -> s
+      | _ -> Begin { name = ""; stmts = result; is_generate = false }
+
+(* ============================================================================
+   DETERMINE CONTEXT FROM ALWAYS BLOCK
+   ============================================================================ *)
+
+let get_assignment_context always_type senses =
+  match always_type with
+  | "always_ff" ->
+      (* Sequential - find clock *)
+      let rec find_clock = function
+        | SenTree items ->
+            List.find_map find_clock items
+        | SenItem { signal = VarRef { name; _ }; _ } 
+          when is_clock_signal name -> Some name
+        | _ -> None
+      in
+      (match List.find_map find_clock senses with
+      | Some clk -> Sequential clk
+      | None -> Unknown)
+  
+  | "always_comb" | "always_latch" ->
+      Combinational
+  
+  | "always" ->
+      (* Try to determine from sensitivity *)
+      let has_clock = List.exists (function
+        | SenTree items ->
+            List.exists (function
+              | SenItem { signal = VarRef { name; _ }; _ } -> is_clock_signal name
+              | _ -> false
+            ) items
+        | SenItem { signal = VarRef { name; _ }; _ } -> is_clock_signal name
+        | _ -> false
+      ) senses in
+      
+      if has_clock then
+        let rec find_clock = function
+          | SenTree items -> List.find_map find_clock items
+          | SenItem { signal = VarRef { name; _ }; _ } when is_clock_signal name -> Some name
+          | _ -> None
+        in
+        (match List.find_map find_clock senses with
+        | Some clk -> Sequential clk
+        | None -> Unknown)
+      else
+        Combinational
+  
+  | _ -> Unknown
+
+(* ============================================================================
+   MAIN TRANSFORMATION
+   ============================================================================ *)
+
+(* Transform always block - convert blocking assignments *)
+let transform_always_blocking always_type senses stmts =
+  let context = get_assignment_context always_type senses in
+  let ssa = create_ssa_state () in
+  
+  if !debug then begin
+    let ctx_str = match context with
+      | Sequential clk -> Printf.sprintf "Sequential (clk=%s)" clk
+      | Combinational -> "Combinational"
+      | Unknown -> "Unknown"
+    in
+    Printf.eprintf "Converting blocking assignments in %s context\n" ctx_str
+  end;
+  
+  let converted_stmts = convert_blocking_stmts context ssa stmts in
+  
+  if !debug then
+    Printf.eprintf "  Created %d temporary variables\n" ssa.temp_counter;
+  
+  converted_stmts
+
+(* ============================================================================
+   INTEGRATION WITH EXISTING TRANSFORM
+   ============================================================================ *)
+
+(* Add to transform_stmt in the Always case *)
+(*
+  | Always { always; senses; stmts } ->
+      (* EXISTING: Transform loops and inline functions *)
+      let transformed_stmts = List.map (transform_stmt symtab) stmts in
+      
+      (* NEW: Convert blocking to non-blocking *)
+      let final_stmts = transform_always_blocking always senses transformed_stmts in
+      
+      Always {
+        always;
+        senses;
+        stmts = final_stmts;
+      }
+*)
+
+(* Update statistics *)
+type transform_stats_extended = {
+  mutable loops_unrolled: int;
+  mutable functions_inlined: int;
+  mutable tasks_inlined: int;
+  mutable blocking_converted: int;  (* NEW *)
+  mutable temps_created: int;       (* NEW *)
+}
+
+(* Track when we convert blocking assignments *)
+let count_blocking_conversions stmts =
+  let count = ref 0 in
+  let rec count_stmt = function
+    | Assign { is_blocking = false; _ } -> incr count
+    | AssignW _ -> incr count
+    | Begin { stmts; _ } -> List.iter count_stmt stmts
+    | If { then_stmt; else_stmt; _ } ->
+        count_stmt then_stmt;
+        Option.iter count_stmt else_stmt
+    | _ -> ()
+  in
+  List.iter count_stmt stmts;
+  !count

@@ -1,0 +1,17 @@
+test_01_simple_dff.sv: PASS
+test_02_dff_async_reset_high.sv: PASS
+test_03_dff_async_reset_low.sv: PASS
+test_04_dff_sync_reset.sv: PASS
+test_05_dff_enable.sv: PASS
+test_06_counter.sv: PASS
+test_07_shift_register.sv: PASS
+test_08_fsm.sv: PASS
+test_13_negedge_clock.sv: PASS
+test_14_multi_reg.sv: PASS
+test_09_always_comb_simple.sv: PASS
+test_10_always_comb_mux.sv: PASS
+test_11_always_comb_case.sv: PASS
+test_12_always_star.sv: PASS
+test_15_priority_encoder.sv: PASS
+alu.sv: PASS
+continuous_assign.sv: PASS

@@ -159,11 +159,19 @@ let width_match op lhs rhs =
   else
     op lhs (uresize rhs wlhs)
 
+(* Sanitize 4-state Verilog values by converting x, z, ? to 0 *)
+let sanitize_4state_value str =
+  String.map (fun c ->
+    match Char.lowercase_ascii c with
+    | 'x' | 'z' | '?' -> '0'
+    | _ -> c
+  ) str
+
 (* Parse constant from Const node name like "4'h0" or "32'sh8" *)
 let parse_const_value name =
   try
     (* Format: <width>'<format><value> *)
-    (* Examples: "4'h0", "32'sh8", "8'd255" *)
+    (* Examples: "4'h0", "32'sh8", "8'd255", "32'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" *)
     let parts = String.split_on_char '\'' name in
     match parts with
     | [width_str; format_value] ->
@@ -173,13 +181,15 @@ let parse_const_value name =
         let fmt_start = if is_signed then 1 else 0 in
         let format_char = if String.length format_value > fmt_start then format_value.[fmt_start] else 'd' in
         let value_str = String.sub format_value (fmt_start + 1) (String.length format_value - fmt_start - 1) in
-        
+        (* Sanitize 4-state values (x, z) to 0 *)
+        let clean_value_str = sanitize_4state_value value_str in
+
         let value = match format_char with
-          | 'h' -> int_of_string ("0x" ^ value_str)
-          | 'd' -> int_of_string value_str
-          | 'b' -> int_of_string ("0b" ^ value_str)
-          | 'o' -> int_of_string ("0o" ^ value_str)
-          | _ -> int_of_string value_str
+          | 'h' -> int_of_string ("0x" ^ clean_value_str)
+          | 'd' -> int_of_string clean_value_str
+          | 'b' -> int_of_string ("0b" ^ clean_value_str)
+          | 'o' -> int_of_string ("0o" ^ clean_value_str)
+          | _ -> int_of_string clean_value_str
         in
         (width, value)
     | _ ->
