@@ -51,11 +51,39 @@ let verify_output original_json generated_sv =
   try
     (* Parse generated Verilog back to JSON *)
     Printf.fprintf stderr "  [Verify] Parsing generated Verilog...\n";
-    let module_name = Filename.chop_extension (Filename.basename generated_sv) in
+
+    (* Extract actual module name from the Verilog file content *)
+    let ic = open_in generated_sv in
+    let file_content = really_input_string ic (min 2000 (in_channel_length ic)) in
+    close_in ic;
+
+    let module_name =
+      try
+        let rex = Str.regexp "module[ \t]+\\([a-zA-Z_][a-zA-Z0-9_]*\\)" in
+        let _ = Str.search_forward rex file_content 0 in
+        Str.matched_group 1 file_content
+      with Not_found ->
+        (* Fallback to filename if module declaration not found *)
+        Filename.chop_extension (Filename.basename generated_sv)
+    in
     let gen_json = "obj_dir/V" ^ module_name ^ "_verify.tree.json" in
 
-    let cmd = Printf.sprintf "verilator --json-only --dump-tree-json --json-only-output %s %s 2>&1 > /dev/null"
-      gen_json generated_sv in
+    (* Check if generated file uses structural primitives *)
+    let contains_substring s sub =
+      try
+        let _ = Str.search_forward (Str.regexp_string sub) s 0 in true
+      with Not_found -> false in
+    let uses_primitives =
+      contains_substring file_content "structural_primitives" ||
+      contains_substring file_content "dff_en" ||
+      contains_substring file_content "mux2" in
+
+    let cmd = if uses_primitives then
+      Printf.sprintf "verilator --json-only --dump-tree-json --json-only-output %s --top-module %s structural_primitives.sv %s 2>&1 > /dev/null"
+        gen_json module_name generated_sv
+    else
+      Printf.sprintf "verilator --json-only --dump-tree-json --json-only-output %s --top-module %s %s 2>&1 > /dev/null"
+        gen_json module_name generated_sv in
     let ret = Sys.command cmd in
     if ret <> 0 then begin
       Printf.fprintf stderr "  ✗ Verification FAILED: Could not parse generated Verilog\n";
@@ -85,7 +113,18 @@ let scan output_dir backend verify =
   let lst = ref [] in
   let fd = Unix.opendir obj in
   (try while true do
-       let f = Unix.readdir(fd) in if f.[0]<>'.' then lst := f :: !lst;
+       let f = Unix.readdir(fd) in
+       (* Only process main tree.json files, not intermediate passes like *_NNN_*.tree.json *)
+       (* Intermediate files have _NNN_ patterns where NNN is exactly 3 digits *)
+       (* Also skip verification output files that end with _verify.tree.json *)
+       let is_intermediate =
+         try
+           let rex = Str.regexp "_[0-9][0-9][0-9]_" in
+           Str.string_match rex f 0 || Str.search_forward rex f 0 >= 0
+         with Not_found -> false in
+       let is_verify_output = Filename.check_suffix f "_verify.tree.json" in
+       if f.[0]<>'.' && Filename.check_suffix f ".tree.json" && not is_intermediate && not is_verify_output then
+         lst := f :: !lst;
        done with End_of_file -> Unix.closedir fd);
 
   (* Track statistics *)
@@ -133,7 +172,7 @@ let scan output_dir backend verify =
       end;
 
       (* Run verification if requested *)
-      if verify && backend = HardCaml then begin
+      if verify then begin
         if verify_output (obj^itm) out_file then
           incr verified
         else
@@ -159,7 +198,7 @@ let scan output_dir backend verify =
   Printf.printf "Total files:  %d\n" total_files;
   Printf.printf "Successful:   %d\n" !successful;
   Printf.printf "Failed:       %d\n" !failed;
-  if verify && backend = HardCaml then begin
+  if verify then begin
     Printf.printf "Verified:     %d\n" !verified;
     Printf.printf "Verify failed:%d\n" !verify_failed;
   end;
@@ -208,7 +247,7 @@ let print_usage () =
   Printf.eprintf "Usage:\n";
   Printf.eprintf "  %s scan <backend> <output_dir> [--verify]\n" Sys.argv.(0);
   Printf.eprintf "      Process all files in obj_dir/\n";
-  Printf.eprintf "      --verify: Run Z3 verification (HardCaml backend only)\n\n";
+  Printf.eprintf "      --verify: Run Z3 verification (all backends)\n\n";
   Printf.eprintf "  %s file <backend> <json_file> <output_file>\n" Sys.argv.(0);
   Printf.eprintf "      Process single file\n\n";
   Printf.eprintf "Backends:\n";

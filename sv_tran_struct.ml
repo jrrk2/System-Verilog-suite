@@ -109,24 +109,31 @@ let gen_unary_op ctx op operand result_wire width =
   
   let instance = Cell {
     name = inst_name;
-    modp_addr = Some (Module { 
-      name = module_name; 
-      stmts = [] 
+    modp_addr = Some (Module {
+      name = module_name;
+      stmts = [
+        (* Store parameters as Var nodes with var_type = "GPARAM" *)
+        Var {
+          name = "WIDTH";
+          dtype_ref = None;
+          var_type = "GPARAM";
+          direction = "NONE";
+          value = Some (Const { name = string_of_int width; dtype_ref = None });
+          dtype_name = "";
+          is_param = true;
+        }
+      ]
     });
     pins = [
-      Pin { name = "WIDTH"; expr = Some (Const { 
-        name = string_of_int width; 
-        dtype_ref = None 
+      Pin { name = "in"; expr = Some (VarRef {
+        name = operand;
+        access = "RD";
+        dtype_ref = None
       })};
-      Pin { name = "in"; expr = Some (VarRef { 
-        name = operand; 
-        access = "RD"; 
-        dtype_ref = None 
-      })};
-      Pin { name = "out"; expr = Some (VarRef { 
-        name = result_wire; 
-        access = "WR"; 
-        dtype_ref = None 
+      Pin { name = "out"; expr = Some (VarRef {
+        name = result_wire;
+        access = "WR";
+        dtype_ref = None
       })};
     ];
   } in
@@ -140,34 +147,41 @@ let gen_mux ctx sel in0 in1 result_wire width =
   
   let instance = Cell {
     name = inst_name;
-    modp_addr = Some (Module { 
-      name = "mux2"; 
-      stmts = [] 
+    modp_addr = Some (Module {
+      name = "mux2";
+      stmts = [
+        (* Store parameters as Var nodes with var_type = "GPARAM" *)
+        Var {
+          name = "WIDTH";
+          dtype_ref = None;
+          var_type = "GPARAM";
+          direction = "NONE";
+          value = Some (Const { name = string_of_int width; dtype_ref = None });
+          dtype_name = "";
+          is_param = true;
+        }
+      ]
     });
     pins = [
-      Pin { name = "WIDTH"; expr = Some (Const { 
-        name = string_of_int width; 
-        dtype_ref = None 
+      Pin { name = "sel"; expr = Some (VarRef {
+        name = sel;
+        access = "RD";
+        dtype_ref = None
       })};
-      Pin { name = "sel"; expr = Some (VarRef { 
-        name = sel; 
-        access = "RD"; 
-        dtype_ref = None 
+      Pin { name = "in0"; expr = Some (VarRef {
+        name = in0;
+        access = "RD";
+        dtype_ref = None
       })};
-      Pin { name = "in0"; expr = Some (VarRef { 
-        name = in0; 
-        access = "RD"; 
-        dtype_ref = None 
+      Pin { name = "in1"; expr = Some (VarRef {
+        name = in1;
+        access = "RD";
+        dtype_ref = None
       })};
-      Pin { name = "in1"; expr = Some (VarRef { 
-        name = in1; 
-        access = "RD"; 
-        dtype_ref = None 
-      })};
-      Pin { name = "out"; expr = Some (VarRef { 
-        name = result_wire; 
-        access = "WR"; 
-        dtype_ref = None 
+      Pin { name = "out"; expr = Some (VarRef {
+        name = result_wire;
+        access = "WR";
+        dtype_ref = None
       })};
     ];
   } in
@@ -185,47 +199,57 @@ let gen_dff_en ctx clk clk_edge rst en d q width reset_val =
     | None -> "dff_en"
   in
   
-  let pins = [
-    Pin { name = "WIDTH"; expr = Some (Const { 
-      name = string_of_int width; 
-      dtype_ref = None 
-    })};
-    Pin { name = "RESET_VAL"; expr = Some (Const { 
-      name = string_of_int reset_val; 
-      dtype_ref = None 
-    })};
-    Pin { name = "clk"; expr = Some (VarRef { 
-      name = clk; 
-      access = "RD"; 
-      dtype_ref = None 
-    })};
-    Pin { name = "rst"; expr = Some (match rst with
-      | Some r -> VarRef { name = r; access = "RD"; dtype_ref = None }
-      | None -> Const { name = "1'b0"; dtype_ref = None }
-    )};
-    Pin { name = "en"; expr = Some (match en with
-      | Some e -> VarRef { name = e; access = "RD"; dtype_ref = None }
-      | None -> Const { name = "1'b1"; dtype_ref = None }
-    )};
-    Pin { name = "d"; expr = Some (VarRef { 
-      name = d; 
-      access = "RD"; 
-      dtype_ref = None 
-    })};
-    Pin { name = "q"; expr = Some (VarRef { 
-      name = q; 
-      access = "WR"; 
-      dtype_ref = None 
-    })};
-  ] in
-  
   let instance = Cell {
     name = inst_name;
-    modp_addr = Some (Module { 
-      name = module_name; 
-      stmts = [] 
+    modp_addr = Some (Module {
+      name = module_name;
+      stmts = [
+        (* Store parameters as Var nodes with var_type = "GPARAM" *)
+        Var {
+          name = "WIDTH";
+          dtype_ref = None;
+          var_type = "GPARAM";
+          direction = "NONE";
+          value = Some (Const { name = string_of_int width; dtype_ref = None });
+          dtype_name = "";
+          is_param = true;
+        };
+        Var {
+          name = "RESET_VAL";
+          dtype_ref = None;
+          var_type = "GPARAM";
+          direction = "NONE";
+          value = Some (Const { name = string_of_int reset_val; dtype_ref = None });
+          dtype_name = "";
+          is_param = true;
+        }
+      ]
     });
-    pins;
+    pins = [
+      Pin { name = "clk"; expr = Some (VarRef {
+        name = clk;
+        access = "RD";
+        dtype_ref = None
+      })};
+      Pin { name = "rst"; expr = Some (match rst with
+        | Some r -> VarRef { name = r; access = "RD"; dtype_ref = None }
+        | None -> Const { name = "1'b0"; dtype_ref = None }
+      )};
+      Pin { name = "en"; expr = Some (match en with
+        | Some e -> VarRef { name = e; access = "RD"; dtype_ref = None }
+        | None -> Const { name = "1'b1"; dtype_ref = None }
+      )};
+      Pin { name = "d"; expr = Some (VarRef {
+        name = d;
+        access = "RD";
+        dtype_ref = None
+      })};
+      Pin { name = "q"; expr = Some (VarRef {
+        name = q;
+        access = "WR";
+        dtype_ref = None
+      })};
+    ];
   } in
   
   ctx.instances := instance :: !(ctx.instances);

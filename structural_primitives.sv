@@ -78,7 +78,7 @@ module adder_carry #(
   output logic [WIDTH-1:0] out,
   output logic cout
 );
-  assign {cout, out} = a + b + cin;
+  assign {cout, out} = a + b + {{WIDTH{1'b0}}, cin};
 endmodule
 
 // Subtractor
@@ -431,7 +431,7 @@ module priority_encoder #(
     valid = 1'b0;
     for (i = WIDTH-1; i >= 0; i = i - 1) begin
       if (in[i]) begin
-        out = i;
+        out = i[$clog2(WIDTH)-1:0];
         valid = 1'b1;
       end
     end
@@ -450,7 +450,7 @@ module onehot_to_binary #(
     out = '0;
     for (i = 0; i < WIDTH; i = i + 1) begin
       if (in[i])
-        out = out | i;
+        out = out | i[$clog2(WIDTH)-1:0];
     end
   end
 endmodule
