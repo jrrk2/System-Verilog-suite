@@ -324,9 +324,22 @@ let rec expr_to_remap decls = function
       let then_sig = sig' (expr_to_remap decls then_val) in
       let else_sig = sig' (expr_to_remap decls else_val) in
       (* Ensure condition is single bit *)
-      let cond_bit = if width cond_sig = 1 then cond_sig 
+      let cond_bit = if width cond_sig = 1 then cond_sig
                      else reduce ~f:(|:) [cond_sig] in
-      Sig (mux2 cond_bit then_sig else_sig)
+      (* Match widths of then and else branches *)
+      let w_then = width then_sig in
+      let w_else = width else_sig in
+      if w_then = w_else then
+        Sig (mux2 cond_bit then_sig else_sig)
+      else if w_then > w_else then begin
+        (* Extend else branch to match then *)
+        let else_extended = uresize else_sig w_then in
+        Sig (mux2 cond_bit then_sig else_extended)
+      end else begin
+        (* Extend then branch to match else *)
+        let then_extended = uresize then_sig w_else in
+        Sig (mux2 cond_bit then_extended else_sig)
+      end
       
   | Sv_ast.Replicate { count; src; _ } | Sv_ast.Replicate' { count; src; _ } ->
       (match expr_to_remap decls count with
@@ -391,6 +404,12 @@ let process_assign decls lhs rhs =
            Printf.eprintf "          Available vars: ";
            Hashtbl.iter (fun k _ -> Printf.eprintf "%s " k) decls;
            Printf.eprintf "\n%!"
+       | Sv_ast.Sel { expr; lsb; width; range; _ } ->
+           Printf.eprintf "          Sel assignment: range=%s\n%!" range;
+           (match expr with
+            | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+                Printf.eprintf "            Base variable: %s\n%!" name
+            | _ -> Printf.eprintf "            Base: complex expression\n%!")
        | _ -> ());
       None
   | _ ->
@@ -532,8 +551,13 @@ let build_circuit module_name stmts =
     List.iter (fun (name, width, dir) ->
       match dir with
       | `Input ->
-          Printf.eprintf "        Creating input: %s[%d]\n%!" name width;
-          Hashtbl.add decls name (Sig (input name width))
+          (* Skip zero-width inputs *)
+          if width <= 0 then begin
+            Printf.eprintf "        Skipping zero-width input: %s[%d]\n%!" name width
+          end else begin
+            Printf.eprintf "        Creating input: %s[%d]\n%!" name width;
+            Hashtbl.add decls name (Sig (input name width))
+          end
       | _ -> ()  (* Outputs computed from always blocks *)
     ) ports;
 
@@ -590,19 +614,24 @@ let build_circuit module_name stmts =
     (* SSA temporaries (blocking) use Variable.wire *)
     List.iter (fun (name, width, _signed) ->
       if not (Hashtbl.mem decls name) then begin
-        let is_state = Hashtbl.mem state_elements name in
-        if is_state && clock_signal <> None then begin
-          (* State element: Create as register with clock *)
-          Printf.eprintf "        Creating register: %s[%d] with clock\n%!" name width;
-          let clk = Option.get clock_signal in
-          let spec = Reg_spec.create ~clock:clk () in
-          Hashtbl.add decls name (Var (Variable.reg spec ~width))
+        (* Skip zero-width signals - they're invalid in HardCaml *)
+        if width <= 0 then begin
+          Printf.eprintf "        Skipping zero-width signal: %s[%d]\n%!" name width
         end else begin
-          (* SSA temporary or output: Create as wire with proper width *)
-          Printf.eprintf "        Creating wire variable: %s[%d]\n%!" name width;
-          let default_sig = Signal.of_int ~width 0 in
-          let wire_var = Variable.wire ~default:default_sig in
-          Hashtbl.add decls name (Var wire_var)
+          let is_state = Hashtbl.mem state_elements name in
+          if is_state && clock_signal <> None then begin
+            (* State element: Create as register with clock *)
+            Printf.eprintf "        Creating register: %s[%d] with clock\n%!" name width;
+            let clk = Option.get clock_signal in
+            let spec = Reg_spec.create ~clock:clk () in
+            Hashtbl.add decls name (Var (Variable.reg spec ~width))
+          end else begin
+            (* SSA temporary or output: Create as wire with proper width *)
+            Printf.eprintf "        Creating wire variable: %s[%d]\n%!" name width;
+            let default_sig = Signal.of_int ~width 0 in
+            let wire_var = Variable.wire ~default:default_sig in
+            Hashtbl.add decls name (Var wire_var)
+          end
         end
       end
     ) all_vars;
@@ -661,15 +690,26 @@ let build_circuit module_name stmts =
     in
     List.iter (List.iter track_assigns) always_blocks;
 
-    (* Check for unassigned Variables *)
+    (* Check for unassigned Variables and initialize them *)
     Printf.eprintf "      Checking for unassigned Variables:\n%!";
+    let unassigned_inits = ref [] in
     Hashtbl.iter (fun name value ->
       match value with
-      | Var _ ->
-          if not (Hashtbl.mem assigned_vars name) then
-            Printf.eprintf "        WARNING: Variable %s created but never assigned!\n%!" name
+      | Var v ->
+          if not (Hashtbl.mem assigned_vars name) then begin
+            Printf.eprintf "        WARNING: Variable %s created but never assigned - initializing to 0\n%!" name;
+            let w = width v.value in
+            unassigned_inits := (v <--zero w) :: !unassigned_inits
+          end
       | _ -> ()
     ) decls;
+
+    (* Add unassigned initializations as a new always block if needed *)
+    let always_blocks = if List.length !unassigned_inits > 0 then begin
+      Printf.eprintf "      Adding initialization block for %d unassigned variables\n%!" (List.length !unassigned_inits);
+      !unassigned_inits :: always_blocks
+    end else
+      always_blocks in
 
     (* Compile all always blocks *)
     List.iteri (fun i alw_list ->
@@ -688,19 +728,24 @@ let build_circuit module_name stmts =
       match dir with
       | `Output ->
           Printf.eprintf "        Building output %s[%d]\n%!" name width;
-          (match Hashtbl.find_opt decls name with
-           | Some (Var v) ->
-               let out_sig = v.value in
-               Printf.eprintf "          Found as Variable, using v.value (width=%d)\n%!" (Signal.width out_sig);
-               Some (output name out_sig)
-           | Some (Sig s) ->
-               Printf.eprintf "          Found as Signal (width=%d)\n%!" (Signal.width s);
-               Some (output name s)
-           | _ ->
-               (* Create default output if not found *)
-               Printf.eprintf "          NOT FOUND in decls, creating zero default\n%!";
-               Some (output name (zero width))
-          )
+          (* Skip zero-width outputs *)
+          if width <= 0 then begin
+            Printf.eprintf "          Skipping zero-width output\n%!";
+            None
+          end else
+            (match Hashtbl.find_opt decls name with
+             | Some (Var v) ->
+                 let out_sig = v.value in
+                 Printf.eprintf "          Found as Variable, using v.value (width=%d)\n%!" (Signal.width out_sig);
+                 Some (output name out_sig)
+             | Some (Sig s) ->
+                 Printf.eprintf "          Found as Signal (width=%d)\n%!" (Signal.width s);
+                 Some (output name s)
+             | _ ->
+                 (* Create default output if not found *)
+                 Printf.eprintf "          NOT FOUND in decls, creating zero default\n%!";
+                 Some (output name (zero width))
+            )
       | _ -> None
     ) ports in
 
