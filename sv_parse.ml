@@ -387,7 +387,8 @@ let rec parse_json attr json =
   | "AND" | "OR" | "XOR"
   | "EQ" | "NEQ" | "LT" | "LTE" | "LTES" | "GT" | "GTE" | "GTES" | "LTS" | "GTS"
   | "EQWILD" | "NEQWILD" | "NEQCASE"
-  | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "POW" | "POWSU" | "SHIFTL" | "SHIFTR" | "SHIFTRS" ->
+  | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "POW" | "POWSS" | "POWSU" | "POWUS" | "SHIFTL" | "SHIFTR" | "SHIFTRS"
+  | "STREAML" | "STREAMR" ->
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
       let dtype = json |> member "dtypep" |> to_string in
@@ -707,7 +708,13 @@ incs = rwlst attr incs;}
 | BinaryOp _
 | For _
 | Var _ as skip -> skip
-| Unknown (_, _) as oth -> othrw := Some oth; failwith "othrw"
+| Unknown (tag, json) as oth ->
+    othrw := Some oth;
+    Printf.eprintf "\n=== UNKNOWN AST NODE ===\n";
+    Printf.eprintf "Tag: %s\n" tag;
+    Printf.eprintf "JSON: %s\n" (Yojson.Safe.pretty_to_string json);
+    Printf.eprintf "=====================\n%!";
+    failwith "othrw"
 
 and rwitm attr = function
 | { conditions; statements } -> {

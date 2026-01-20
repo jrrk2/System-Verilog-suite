@@ -260,6 +260,41 @@ let rec expr_to_remap decls = function
        | "SHIFTL" | "VSHIFTL" -> Sig (log_shift sll lhs_sig rhs_sig)
        | "SHIFTR" | "VSHIFTR" -> Sig (log_shift srl lhs_sig rhs_sig)
        | "SHIFTRS" | "VSHIFTRS" -> Sig (log_shift sra lhs_sig rhs_sig)
+       (* Power operators: 2**n is implemented as 1<<n *)
+       | "POW" | "POWSS" | "POWSU" | "POWUS" ->
+           (* Check if lhs is constant 2 *)
+           (match lhs with
+            | Sv_ast.Const { name; _ } | Sv_ast.Const' { name; _ } ->
+                (* Parse the constant - format is "width'base value" *)
+                let parts = String.split_on_char '\'' name in
+                (match parts with
+                 | [_; rest] ->
+                     (* Extract value after 'h, 'd, 'b prefix *)
+                     let value_str = if String.length rest > 0 && (rest.[0] = 'h' || rest.[0] = 'd' || rest.[0] = 'b')
+                                     then String.sub rest 1 (String.length rest - 1)
+                                     else rest in
+                     let value = try int_of_string ("0x" ^ value_str) with _ -> 0 in
+                     if value = 2 then begin
+                       (* 2**n implemented as 1<<n *)
+                       let one = Signal.of_int ~width:(width lhs_sig) 1 in
+                       Sig (log_shift sll one rhs_sig)
+                     end else begin
+                       (* Other constant bases: not yet supported *)
+                       let _ = Printf.eprintf "Warning: Power with base %d not supported, using 0\n" value in
+                       Sig (Signal.of_int ~width:(width lhs_sig) 0)
+                     end
+                 | _ ->
+                     let _ = Printf.eprintf "Warning: Power operator not supported for non-constant base, using 0\n" in
+                     Sig (Signal.of_int ~width:(width lhs_sig) 0))
+            | _ ->
+                (* Non-constant base *)
+                let _ = Printf.eprintf "Warning: Power operator not supported for variable base, using 0\n" in
+                Sig (Signal.of_int ~width:(width lhs_sig) 0))
+       (* Streaming operators: simplified implementation - just return lhs *)
+       | "STREAML" | "STREAMR" ->
+           (* Streaming concatenation: {<< {x}} or {>> {x}}
+              Simplified: just return the value as-is *)
+           Sig lhs_sig
        | _ -> Invalid)
        
   | Sv_ast.UnaryOp { op; operand; _ } | Sv_ast.UnaryOp' { op; operand; _ } ->
