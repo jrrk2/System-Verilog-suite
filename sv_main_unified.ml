@@ -46,8 +46,40 @@ let get_extension backend =
   | Standard | Structural | Yosys | HardCaml -> ".sv"
   (* All backends output SystemVerilog/Verilog *)
 
+(* Verify generated output with Z3 *)
+let verify_output original_json generated_sv =
+  try
+    (* Parse generated Verilog back to JSON *)
+    Printf.fprintf stderr "  [Verify] Parsing generated Verilog...\n";
+    let module_name = Filename.chop_extension (Filename.basename generated_sv) in
+    let gen_json = "obj_dir/V" ^ module_name ^ "_verify.tree.json" in
+
+    let cmd = Printf.sprintf "verilator --json-only --dump-tree-json --json-only-output %s %s 2>&1 > /dev/null"
+      gen_json generated_sv in
+    let ret = Sys.command cmd in
+    if ret <> 0 then begin
+      Printf.fprintf stderr "  ✗ Verification FAILED: Could not parse generated Verilog\n";
+      false
+    end else begin
+      (* Run Z3 verification *)
+      Printf.fprintf stderr "  [Verify] Running Z3 equivalence check...\n";
+      let orig_ast = translate_tree_to_ast original_json in
+      let gen_ast = translate_tree_to_ast gen_json in
+
+      match Sv_verify_hardcaml.check_equivalence orig_ast gen_ast with
+      | true ->
+          Printf.fprintf stderr "  ✓ Verification PASSED: Functionally equivalent\n";
+          true
+      | false ->
+          Printf.fprintf stderr "  ✗ Verification FAILED: Not equivalent\n";
+          false
+    end
+  with e ->
+    Printf.fprintf stderr "  ✗ Verification EXCEPTION: %s\n" (Printexc.to_string e);
+    false
+
 (* Scan directory and process all files *)
-let scan output_dir backend =
+let scan output_dir backend verify =
   let obj = "obj_dir/" in
   (try Unix.mkdir output_dir 0o750 with e -> Printf.eprintf "%s: %s\n" output_dir (Printexc.to_string e));
   let lst = ref [] in
@@ -55,39 +87,42 @@ let scan output_dir backend =
   (try while true do
        let f = Unix.readdir(fd) in if f.[0]<>'.' then lst := f :: !lst;
        done with End_of_file -> Unix.closedir fd);
-  
+
   (* Track statistics *)
   let total_files = List.length !lst in
   let successful = ref 0 in
   let failed = ref 0 in
-  
+  let verified = ref 0 in
+  let verify_failed = ref 0 in
+
   (* Open warnings file *)
   let warnings_file = output_dir ^ "warnings.txt" in
   let warnings_fd = open_out warnings_file in
-  
-  Printf.printf "Processing %d files with backend: %s\n\n" total_files 
-    (match backend with 
-     | Standard -> "Standard" 
-     | Structural -> "Structural" 
+
+  Printf.printf "Processing %d files with backend: %s%s\n\n" total_files
+    (match backend with
+     | Standard -> "Standard"
+     | Structural -> "Structural"
      | Yosys -> "Yosys"
-     | HardCaml -> "HardCaml");
-  
+     | HardCaml -> "HardCaml")
+    (if verify then " (with verification)" else "");
+
   List.iter (fun itm ->
     Printf.fprintf stderr "Processing %s...\n" itm;
     try
       let ast = translate_tree_to_ast (obj^itm) in
       Hashtbl.add asthash itm ast;
-      
+
       (* Generate with selected backend *)
       let (result, warnings) = generate_output backend ast in
-      
+
       (* Write output *)
       let ext = get_extension backend in
       let out_file = output_dir ^ "decompile_" ^ itm ^ ext in
       let fd = open_out out_file in
       output_string fd result;
       close_out fd;
-      
+
       (* Write warnings for this file *)
       if List.length warnings > 0 then begin
         Printf.fprintf warnings_fd "\n=== %s ===\n" itm;
@@ -96,7 +131,15 @@ let scan output_dir backend =
       end else begin
         Printf.fprintf stderr "  Success\n"
       end;
-      
+
+      (* Run verification if requested *)
+      if verify && backend = HardCaml then begin
+        if verify_output (obj^itm) out_file then
+          incr verified
+        else
+          incr verify_failed
+      end;
+
       incr successful
     with
     | Failure msg ->
@@ -106,9 +149,9 @@ let scan output_dir backend =
         Printf.eprintf "  ✗ EXCEPTION: %s\n" (Printexc.to_string e);
         incr failed
   ) !lst;
-  
+
   close_out warnings_fd;
-  
+
   (* Print summary *)
   Printf.printf "\n========================================\n";
   Printf.printf "Conversion Summary\n";
@@ -116,6 +159,10 @@ let scan output_dir backend =
   Printf.printf "Total files:  %d\n" total_files;
   Printf.printf "Successful:   %d\n" !successful;
   Printf.printf "Failed:       %d\n" !failed;
+  if verify && backend = HardCaml then begin
+    Printf.printf "Verified:     %d\n" !verified;
+    Printf.printf "Verify failed:%d\n" !verify_failed;
+  end;
   Printf.printf "========================================\n";
   if !successful > 0 then
     Printf.printf "\nWarnings written to: %s\n" warnings_file
@@ -159,8 +206,9 @@ let parse_backend s =
 let print_usage () =
   Printf.eprintf "SystemVerilog Decompiler - Unified Backend Selector\n\n";
   Printf.eprintf "Usage:\n";
-  Printf.eprintf "  %s scan <backend> <output_dir>\n" Sys.argv.(0);
-  Printf.eprintf "      Process all files in obj_dir/\n\n";
+  Printf.eprintf "  %s scan <backend> <output_dir> [--verify]\n" Sys.argv.(0);
+  Printf.eprintf "      Process all files in obj_dir/\n";
+  Printf.eprintf "      --verify: Run Z3 verification (HardCaml backend only)\n\n";
   Printf.eprintf "  %s file <backend> <json_file> <output_file>\n" Sys.argv.(0);
   Printf.eprintf "      Process single file\n\n";
   Printf.eprintf "Backends:\n";
@@ -170,6 +218,7 @@ let print_usage () =
   Printf.eprintf "  hardcaml, hc       - HardCaml OCaml output\n\n";
   Printf.eprintf "Examples:\n";
   Printf.eprintf "  %s scan yosys results/\n" Sys.argv.(0);
+  Printf.eprintf "  %s scan hardcaml results/ --verify\n" Sys.argv.(0);
   Printf.eprintf "  %s file hardcaml input.json output.ml\n" Sys.argv.(0);
   exit 1
 
@@ -184,9 +233,11 @@ let () =
       | "scan" when Array.length Sys.argv >= 4 ->
           let backend = parse_backend Sys.argv.(2) in
           let output_dir = Sys.argv.(3) in
-          let output_dir = if output_dir.[String.length output_dir - 1] = '/' 
+          let output_dir = if output_dir.[String.length output_dir - 1] = '/'
                           then output_dir else output_dir ^ "/" in
-          scan output_dir backend
+          (* Check for --verify flag *)
+          let verify = Array.length Sys.argv >= 5 && Sys.argv.(4) = "--verify" in
+          scan output_dir backend verify
       | "file" when Array.length Sys.argv >= 5 ->
           let backend = parse_backend Sys.argv.(2) in
           let json_file = Sys.argv.(3) in

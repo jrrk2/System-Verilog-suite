@@ -1,0 +1,17 @@
+#!/bin/bash
+# HardCaml backend with Z3 verification
+
+rm -rf obj_dir results
+mkdir -p obj_dir
+for j in $*; do
+  top=`verilator --quiet --json-only -Wno-widthexpand -Wno-widthtrunc -Wno-ascrange -Wno-widthconcat --timing +define+INCLUDE_BITWISE +define+INCLUDE_SHIFT +define+INCLUDE_POW $j | grep 'Top module'|cut -d\' -f2`;
+  for i in $top; do echo === $i ===;
+    verilator --quiet --json-only --top-module $i -Wno-widthexpand -Wno-widthtrunc -Wno-ascrange -Wno-widthconcat --timing +define+INCLUDE_BITWISE +define+INCLUDE_SHIFT +define+INCLUDE_POW $j;
+    done
+  echo === $j ===;
+  done
+rm -f obj_dir/V*.meta.json
+_build/default/sv_main_unified.exe scan hc results --verify
+for i in results/*;
+    do echo === $i ===;
+    done
