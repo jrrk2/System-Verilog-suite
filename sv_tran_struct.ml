@@ -287,6 +287,50 @@ let gen_memory_primitive ctx mem_info =
   Printf.eprintf "        Generating %s instance for %s (%d reads, %d writes)\n%!"
     module_name mem_info.name num_reads num_writes;
 
+  (* Add wire declarations for read port outputs *)
+  if num_reads = 1 then begin
+    let rdata_wire = Var {
+      name = mem_info.name ^ "_rdata";
+      dtype_ref = Some (BasicType {
+        keyword = "logic";
+        range = Some (Printf.sprintf "%d:0" (mem_info.data_width - 1))
+      });
+      var_type = "VAR";
+      direction = "NONE";
+      value = None;
+      dtype_name = "";
+      is_param = false;
+    } in
+    ctx.wires := rdata_wire :: !(ctx.wires)
+  end else if num_reads >= 2 then begin
+    let rdata1_wire = Var {
+      name = mem_info.name ^ "_rdata1";
+      dtype_ref = Some (BasicType {
+        keyword = "logic";
+        range = Some (Printf.sprintf "%d:0" (mem_info.data_width - 1))
+      });
+      var_type = "VAR";
+      direction = "NONE";
+      value = None;
+      dtype_name = "";
+      is_param = false;
+    } in
+    let rdata2_wire = Var {
+      name = mem_info.name ^ "_rdata2";
+      dtype_ref = Some (BasicType {
+        keyword = "logic";
+        range = Some (Printf.sprintf "%d:0" (mem_info.data_width - 1))
+      });
+      var_type = "VAR";
+      direction = "NONE";
+      value = None;
+      dtype_name = "";
+      is_param = false;
+    } in
+    ctx.wires := rdata1_wire :: !(ctx.wires);
+    ctx.wires := rdata2_wire :: !(ctx.wires)
+  end;
+
   (* Build parameter list *)
   let params = [
     Var {
@@ -313,10 +357,20 @@ let gen_memory_primitive ctx mem_info =
   let pins =
     if module_name = "memory_sp" then begin
       (* Single-port: clk, we, addr, wdata, rdata *)
-      let we_signal = match mem_info.write_accesses with
-        | MemWrite { enable = Some en; _ } :: _ ->
-            (match en with VarRef { name; _ } -> name | _ -> "1'b1")
-        | _ -> "1'b1"
+      (* Try to find write enable signal from port variables *)
+      let we_signal =
+        try
+          let _ = Hashtbl.find ctx.variables "we" in
+          "we"
+        with Not_found ->
+          try
+            let _ = Hashtbl.find ctx.variables "write_enable" in
+            "write_enable"
+          with Not_found ->
+            match mem_info.write_accesses with
+            | MemWrite { enable = Some en; _ } :: _ ->
+                (match en with VarRef { name; _ } -> name | _ -> "1'b1")
+            | _ -> "1'b1"
       in
       let addr_signal = match mem_info.write_accesses, mem_info.read_accesses with
         | MemWrite { index; _ } :: _, _ ->
@@ -341,10 +395,20 @@ let gen_memory_primitive ctx mem_info =
       ]
     end else if module_name = "memory_1w2r" then begin
       (* 1W2R: clk, we, waddr, wdata, raddr1, raddr2, rdata1, rdata2 *)
-      let we_signal = match mem_info.write_accesses with
-        | MemWrite { enable = Some en; _ } :: _ ->
-            (match en with VarRef { name; _ } -> name | _ -> "1'b1")
-        | _ -> "1'b1"
+      (* Try to find write enable signal from port variables *)
+      let we_signal =
+        try
+          let _ = Hashtbl.find ctx.variables "we" in
+          "we"
+        with Not_found ->
+          try
+            let _ = Hashtbl.find ctx.variables "write_enable" in
+            "write_enable"
+          with Not_found ->
+            match mem_info.write_accesses with
+            | MemWrite { enable = Some en; _ } :: _ ->
+                (match en with VarRef { name; _ } -> name | _ -> "1'b1")
+            | _ -> "1'b1"
       in
       let waddr_signal = match mem_info.write_accesses with
         | MemWrite { index; _ } :: _ ->
@@ -357,15 +421,17 @@ let gen_memory_primitive ctx mem_info =
         | _ -> "0"
       in
 
-      (* Extract read addresses *)
-      let read_addrs = List.filter_map (function
+      (* Extract read addresses - reverse list to maintain source order *)
+      let read_addrs = List.rev (List.filter_map (function
         | MemRead { index; _ } ->
             Some (match index with VarRef { name; _ } -> name | _ -> "0")
         | _ -> None
-      ) mem_info.read_accesses in
+      ) mem_info.read_accesses) in
 
       let raddr1 = match read_addrs with h :: _ -> h | [] -> "0" in
       let raddr2 = match read_addrs with _ :: h :: _ -> h | _ -> raddr1 in
+
+      Printf.eprintf "          Read port mapping: raddr1=%s, raddr2=%s\n%!" raddr1 raddr2;
 
       [
         Pin { name = "clk"; expr = Some (VarRef { name = "clk"; access = "RD"; dtype_ref = None }) };
@@ -896,6 +962,10 @@ let add_assign_zero ctx lhs_name width =
 (* Fixed structural_expr with consistent wire declarations *)
 let rec structural_expr ctx expr =
   match expr with
+  | VarRef { name; _ } when Hashtbl.mem ctx.memories name ->
+      (* References to memory arrays as variables are invalid - they should be ArraySel *)
+      add_warning (Printf.sprintf "Invalid reference to memory array %s as variable" name);
+      "/* mem_ref */"
   | VarRef { name; _ } -> name
   
   | Const { name; _ } -> name
@@ -937,9 +1007,45 @@ let rec structural_expr ctx expr =
       | _ -> base)
   
   | ArraySel { expr; index } ->
-      let base_name = structural_expr ctx expr in
-      let idx_str = structural_expr ctx index in
-      Printf.sprintf "%s[%s]" base_name idx_str
+      (* Check if this is a memory array access *)
+      (match expr with
+      | VarRef { name; _ } when Hashtbl.mem ctx.memories name ->
+          (* This is a memory read - use memory read port *)
+          let mem_info = Hashtbl.find ctx.memories name in
+          let idx_str = structural_expr ctx index in
+
+          (* Reverse list to match source order, then find which read port *)
+          let read_accesses_ordered = List.rev mem_info.read_accesses in
+          let port_num = ref 0 in
+          let found = ref false in
+          List.iteri (fun i acc ->
+            match acc with
+            | Sv_memory.MemRead { index = read_idx; _ } ->
+                let read_idx_str = structural_expr ctx read_idx in
+                if not !found then begin
+                  if read_idx_str = idx_str then begin
+                    port_num := i;
+                    found := true
+                  end
+                end
+            | _ -> ()
+          ) read_accesses_ordered;
+
+          (* Return appropriate read port output *)
+          let num_reads = List.length mem_info.read_accesses in
+          if num_reads = 1 then
+            name ^ "_rdata"
+          else if !found && !port_num < num_reads then
+            Printf.sprintf "%s_rdata%d" name (!port_num + 1)
+          else
+            (* Fallback - couldn't match, use first port *)
+            name ^ "_rdata1"
+
+      | _ ->
+          (* Normal array access *)
+          let base_name = structural_expr ctx expr in
+          let idx_str = structural_expr ctx index in
+          Printf.sprintf "%s[%s]" base_name idx_str)
   
   | Concat { parts } ->
       (* For concat, need to create intermediate wire *)
@@ -969,41 +1075,58 @@ let rec structural_expr ctx expr =
    ============================================================================ *)
 
 let structural_assign ctx lhs rhs is_sequential =
-  let lhs_name = match lhs with
-    | VarRef { name; _ } -> name
-    | Sel _ | ArraySel _ -> structural_expr ctx lhs
-    | _ -> "unknown"
+  (* Check if LHS is a memory array write or memory variable *)
+  let is_memory_operation = match lhs with
+    | ArraySel { expr = VarRef { name; _ }; _ } ->
+        (* Array element write mem[addr] <= data *)
+        Hashtbl.mem ctx.memories name
+    | VarRef { name; _ } ->
+        (* Whole array assignment mem <= value *)
+        Hashtbl.mem ctx.memories name
+    | _ -> false
   in
-  let rhs_wire = structural_expr ctx rhs in
-  
-  if is_sequential then begin
-    let width = match get_var ctx lhs_name with
-      | Some { width; _ } -> width
-      | None -> infer_width ctx rhs
-    in
-    match ctx.current_clock with
-    | Some clk ->
-        let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
-        ()
-    | None ->
-        add_warning "Sequential assignment without clock context"
+
+  (* Memory operations are handled by memory primitive, skip DFF/assign generation *)
+  if is_memory_operation then begin
+    Printf.eprintf "        Skipping DFF/assign for memory operation\n%!";
+    ()
   end else begin
-    if rhs_wire <> lhs_name then begin
+    let lhs_name = match lhs with
+      | VarRef { name; _ } -> name
+      | Sel _ | ArraySel _ -> structural_expr ctx lhs
+      | _ -> "unknown"
+    in
+    let rhs_wire = structural_expr ctx rhs in
+
+    if is_sequential then begin
       let width = match get_var ctx lhs_name with
         | Some { width; _ } -> width
         | None -> infer_width ctx rhs
       in
-      let range_str = if width > 1 
-        then Some (Printf.sprintf "%d:0" (width - 1))
-        else None in
-      
-      let assign = AssignW {
-        lhs = VarRef { name = lhs_name; access = "WR";
-                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
-        rhs = VarRef { name = rhs_wire; access = "RD";
-                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
-      } in
-      ctx.instances := assign :: !(ctx.instances)
+      match ctx.current_clock with
+      | Some clk ->
+          let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
+          ()
+      | None ->
+          add_warning "Sequential assignment without clock context"
+    end else begin
+      if rhs_wire <> lhs_name then begin
+        let width = match get_var ctx lhs_name with
+          | Some { width; _ } -> width
+          | None -> infer_width ctx rhs
+        in
+        let range_str = if width > 1
+          then Some (Printf.sprintf "%d:0" (width - 1))
+          else None in
+
+        let assign = AssignW {
+          lhs = VarRef { name = lhs_name; access = "WR";
+                        dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+          rhs = VarRef { name = rhs_wire; access = "RD";
+                        dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+        } in
+        ctx.instances := assign :: !(ctx.instances)
+      end
     end
   end
 
@@ -1012,41 +1135,58 @@ let structural_assign ctx lhs rhs is_sequential =
    ============================================================================ *)
 
 let structural_assign ctx lhs rhs is_sequential =
-  let lhs_name = match lhs with
-    | VarRef { name; _ } -> name
-    | Sel _ | ArraySel _ -> structural_expr ctx lhs
-    | _ -> "unknown"
+  (* Check if LHS is a memory array write or memory variable *)
+  let is_memory_operation = match lhs with
+    | ArraySel { expr = VarRef { name; _ }; _ } ->
+        (* Array element write mem[addr] <= data *)
+        Hashtbl.mem ctx.memories name
+    | VarRef { name; _ } ->
+        (* Whole array assignment mem <= value *)
+        Hashtbl.mem ctx.memories name
+    | _ -> false
   in
-  let rhs_wire = structural_expr ctx rhs in
-  
-  if is_sequential then begin
-    let width = match get_var ctx lhs_name with
-      | Some { width; _ } -> width
-      | None -> infer_width ctx rhs
-    in
-    match ctx.current_clock with
-    | Some clk ->
-        let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
-        ()
-    | None ->
-        add_warning "Sequential assignment without clock context"
+
+  (* Memory operations are handled by memory primitive, skip DFF/assign generation *)
+  if is_memory_operation then begin
+    Printf.eprintf "        Skipping DFF/assign for memory operation\n%!";
+    ()
   end else begin
-    if rhs_wire <> lhs_name then begin
+    let lhs_name = match lhs with
+      | VarRef { name; _ } -> name
+      | Sel _ | ArraySel _ -> structural_expr ctx lhs
+      | _ -> "unknown"
+    in
+    let rhs_wire = structural_expr ctx rhs in
+
+    if is_sequential then begin
       let width = match get_var ctx lhs_name with
         | Some { width; _ } -> width
         | None -> infer_width ctx rhs
       in
-      let range_str = if width > 1 
-        then Some (Printf.sprintf "%d:0" (width - 1))
-        else None in
-      
-      let assign = AssignW {
-        lhs = VarRef { name = lhs_name; access = "WR";
-                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
-        rhs = VarRef { name = rhs_wire; access = "RD";
-                      dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
-      } in
-      ctx.instances := assign :: !(ctx.instances)
+      match ctx.current_clock with
+      | Some clk ->
+          let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
+          ()
+      | None ->
+          add_warning "Sequential assignment without clock context"
+    end else begin
+      if rhs_wire <> lhs_name then begin
+        let width = match get_var ctx lhs_name with
+          | Some { width; _ } -> width
+          | None -> infer_width ctx rhs
+        in
+        let range_str = if width > 1
+          then Some (Printf.sprintf "%d:0" (width - 1))
+          else None in
+
+        let assign = AssignW {
+          lhs = VarRef { name = lhs_name; access = "WR";
+                        dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+          rhs = VarRef { name = rhs_wire; access = "RD";
+                        dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
+        } in
+        ctx.instances := assign :: !(ctx.instances)
+      end
     end
   end
 
