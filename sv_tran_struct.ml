@@ -27,6 +27,8 @@ type structural_context = {
   mutable current_clock_edge: [`Posedge | `Negedge] option;
   mutable current_reset: string option;
   memories: (string, Sv_memory.memory_info) Hashtbl.t;  (* Detected memories *)
+  mutable registers_in_block: (string * int) list;  (* Track registers created in current always block *)
+  mutable always_block_count: int;  (* Counter for always blocks *)
 }
 
 let create_context () = {
@@ -38,12 +40,54 @@ let create_context () = {
   current_clock_edge = None;
   current_reset = None;
   memories = Hashtbl.create 10;
+  registers_in_block = [];
+  always_block_count = 0;
 }
 
 (* Generate unique instance names *)
 let gen_inst_name prefix =
   incr inst_counter;
   Printf.sprintf "%s_%d" prefix !inst_counter
+
+(* Report inferred registers in Synopsys Design Compiler style *)
+let report_inferred_registers ctx block_num clock_signal reset_signal =
+  if List.length ctx.registers_in_block = 0 then ()
+  else begin
+    (* Sort registers by name *)
+    let sorted_regs = List.sort (fun (n1, _) (n2, _) -> String.compare n1 n2) ctx.registers_in_block in
+
+    (* Calculate total bits *)
+    let total_bits = List.fold_left (fun acc (_, w) -> acc + w) 0 sorted_regs in
+
+    Printf.eprintf "\n";
+    Printf.eprintf "Inferred memory devices in process\n";
+    Printf.eprintf "    in routine always_seq_%d line 0 in file 'CURRENT_MODULE'.\n" block_num;
+    Printf.eprintf "===============================================================================\n";
+    Printf.eprintf "| Register Name                | Type  | Width | Bus | MB | AR | AS | SR | SS | ST |\n";
+    Printf.eprintf "===============================================================================\n";
+
+    List.iter (fun (reg_name, width) ->
+      let width_str = if width > 1 then Printf.sprintf "%d" width else "1" in
+      let bus_str = if width > 1 then "Y" else "N" in
+      (* Type: Flip-flop *)
+      Printf.eprintf "| %-28s | Flop  | %5s | %3s | -  | %s  | %s  | %s  | %s  | %s  |\n"
+        reg_name
+        width_str
+        bus_str
+        (if reset_signal <> None then "Y" else "N")  (* AR: async reset *)
+        (if reset_signal <> None then "Y" else "N")  (* AS: async set *)
+        "N"  (* SR: sync reset *)
+        "N"  (* SS: sync set *)
+        "N"  (* ST: state *)
+    ) sorted_regs;
+
+    Printf.eprintf "===============================================================================\n";
+    Printf.eprintf "| Total inferred registers: %3d                                 Bits: %6d |\n"
+      (List.length sorted_regs)
+      total_bits;
+    Printf.eprintf "===============================================================================\n";
+    Printf.eprintf "\n%!"
+  end
 
 (* ============================================================================
    HARDWARE PRIMITIVES - now return AST nodes
@@ -199,7 +243,11 @@ let gen_mux ctx sel in0 in1 result_wire width =
 (* Generate D flip-flop with enable *)
 let gen_dff_en ctx clk clk_edge rst en d q width reset_val =
   let inst_name = gen_inst_name "dff" in
-  
+
+  (* Track register creation for reporting *)
+  if ctx.in_sequential then
+    ctx.registers_in_block <- (q, width) :: ctx.registers_in_block;
+
   let module_name = match clk_edge with
     | Some `Posedge -> "dff_en"
     | Some `Negedge -> "dffn_en"
@@ -1537,14 +1585,21 @@ let rec structural_stmt ctx stmt =
             let old_clock = ctx.current_clock in
             let old_clock_edge = ctx.current_clock_edge in
             let old_reset = ctx.current_reset in
-            
+
+            (* Increment block counter and clear register list *)
+            ctx.always_block_count <- ctx.always_block_count + 1;
+            ctx.registers_in_block <- [];
+
             ctx.in_sequential <- true;
             ctx.current_clock <- Some clock;
             ctx.current_clock_edge <- Some clock_edge;
             ctx.current_reset <- (match reset with Some (r, _) -> Some r | None -> None);
-            
+
             List.iter (structural_stmt ctx) stmts;
-            
+
+            (* Report inferred registers after processing block *)
+            report_inferred_registers ctx ctx.always_block_count clock ctx.current_reset;
+
             ctx.in_sequential <- old_sequential;
             ctx.current_clock <- old_clock;
             ctx.current_clock_edge <- old_clock_edge;

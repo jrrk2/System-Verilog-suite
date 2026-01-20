@@ -239,6 +239,51 @@ let rec find_array_writes stmt memories is_clocked =
 
   | _ -> ()
 
+(* Check for conflicting memory accesses in the same cycle *)
+let check_memory_conflicts memories =
+  let has_error = ref false in
+  Hashtbl.iter (fun name mem ->
+    let num_reads = List.length mem.read_accesses in
+    let num_writes = List.length mem.write_accesses in
+    let total_accesses = num_reads + num_writes in
+
+    (* Check for multiple accesses to same memory in one cycle *)
+    if total_accesses > 2 then begin
+      Printf.eprintf "\n";
+      Printf.eprintf "Error:  Multiple conflicting accesses to memory '%s' in same cycle\n" name;
+      Printf.eprintf "        %d read port(s), %d write port(s) detected\n" num_reads num_writes;
+      Printf.eprintf "        Memory can support at most 2 read ports and 2 write ports\n";
+      Printf.eprintf "        Consider: using multi-ported memory or time-multiplexing accesses\n";
+      has_error := true
+    end;
+
+    (* Check for too many write ports *)
+    if num_writes > 2 then begin
+      Printf.eprintf "\n";
+      Printf.eprintf "Error:  Too many write ports to memory '%s'\n" name;
+      Printf.eprintf "        %d write port(s) detected, maximum 2 supported\n" num_writes;
+      Printf.eprintf "        Consider: arbitration logic or banking the memory\n";
+      has_error := true
+    end;
+
+    (* Check for too many read ports *)
+    if num_reads > 2 then begin
+      Printf.eprintf "\n";
+      Printf.eprintf "Error:  Too many read ports to memory '%s'\n" name;
+      Printf.eprintf "        %d read port(s) detected, maximum 2 supported\n" num_reads;
+      Printf.eprintf "        Consider: replicating memory or time-multiplexing reads\n";
+      has_error := true
+    end
+  ) memories;
+
+  if !has_error then begin
+    Printf.eprintf "\n";
+    Printf.eprintf "Fatal: Memory access conflicts detected. Cannot synthesize.\n";
+    Printf.eprintf "       Please resolve conflicts and retry.\n";
+    Printf.eprintf "\n%!"
+  end;
+  !has_error
+
 (* Analyze access patterns after detection *)
 let analyze_memory_accesses stmts memories =
   List.iter (fun stmt ->
@@ -254,7 +299,11 @@ let analyze_memory_accesses stmts memories =
         (List.length mem.write_accesses)
         (if mem.is_sequential then "sequential" else "combinational")
     end
-  ) memories
+  ) memories;
+
+  (* Check for conflicts and report errors *)
+  let _ = check_memory_conflicts memories in
+  ()
 
 (* Check if an array should use memory primitive *)
 let should_use_memory_primitive mem_info =
