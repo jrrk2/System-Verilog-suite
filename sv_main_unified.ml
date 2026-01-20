@@ -326,6 +326,7 @@ module Interactive = struct
   let print_help () =
     Printf.printf "\nAvailable Commands:\n\n";
     Printf.printf "File Operations:\n";
+    Printf.printf "  read_verilog <file.v> ...     Run Verilator on files and load result\n";
     Printf.printf "  load <file.json>              Load Verilator JSON into AST\n";
     Printf.printf "  list                          List all loaded ASTs\n";
     Printf.printf "  unload <name>                 Unload an AST from memory\n";
@@ -373,6 +374,60 @@ module Interactive = struct
       Printf.printf "✓ Loaded as '%s'\n" name
     with e ->
       Printf.printf "✗ Error loading file: %s\n" (Printexc.to_string e)
+
+  let read_verilog state files =
+    if List.length files = 0 then begin
+      Printf.printf "✗ Usage: read_verilog <file.v> [file2.v ...]\n"
+    end else begin
+      try
+        (* Extract module name from first file *)
+        Printf.printf "Reading Verilog files: %s\n" (String.concat " " files);
+
+        let first_file = List.hd files in
+        let ic = open_in first_file in
+        let file_content = really_input_string ic (in_channel_length ic) in
+        close_in ic;
+
+        let module_name =
+          try
+            let rex = Str.regexp "module[ \t]+\\([a-zA-Z_][a-zA-Z0-9_]*\\)" in
+            let _ = Str.search_forward rex file_content 0 in
+            Str.matched_group 1 file_content
+          with Not_found ->
+            (* Fallback to filename *)
+            Filename.chop_extension (Filename.basename first_file)
+        in
+
+        Printf.printf "Detected top module: %s\n" module_name;
+
+        (* Build verilator command *)
+        let files_str = String.concat " " (List.map (fun f -> "\"" ^ f ^ "\"") files) in
+        let json_output = "obj_dir/V" ^ module_name ^ ".tree.json" in
+        let cmd = Printf.sprintf "verilator --json-only --quiet -Wno-fatal --top-module %s %s 2>&1"
+          module_name files_str in
+
+        Printf.printf "Running: verilator --json-only --top-module %s %s\n"
+          module_name (String.concat " " files);
+
+        let exit_code = Sys.command cmd in
+        if exit_code <> 0 then begin
+          Printf.printf "✗ Verilator failed with exit code %d\n" exit_code
+        end else begin
+          Printf.printf "✓ Verilator succeeded\n";
+
+          (* Check if JSON file was created *)
+          if Sys.file_exists json_output then begin
+            Printf.printf "Generated: %s\n" json_output;
+            (* Automatically load the result *)
+            load_ast state json_output
+          end else begin
+            Printf.printf "✗ Expected output file not found: %s\n" json_output;
+            Printf.printf "  Check obj_dir/ for generated files\n"
+          end
+        end
+      with e ->
+        Printf.printf "✗ Error: %s\n" (Printexc.to_string e)
+    end
 
   let list_asts state =
     if List.length state.loaded_asts = 0 then
@@ -501,6 +556,8 @@ module Interactive = struct
         state.running <- false;
         Printf.printf "Goodbye!\n"
     | "history" :: _ -> show_history state
+    | "read_verilog" :: files when List.length files > 0 -> read_verilog state files
+    | "read_verilog" :: _ -> Printf.printf "✗ Usage: read_verilog <file.v> [file2.v ...]\n"
     | "load" :: filename :: _ -> load_ast state filename
     | "list" :: _ -> list_asts state
     | "unload" :: name :: _ -> unload_ast state name
