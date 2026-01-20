@@ -1,9 +1,9 @@
 (executables
- (names sv_main_unified verify_main test_verify)
- (modules sv_ast sv_gen sv_gen_struct sv_gen_yosys sv_gen_hardcaml 
-          sv_main_unified sv_parse sv_transform sv_tran_struct 
+ (names sv_main_unified verify_main)
+ (modules sv_ast sv_gen sv_gen_struct sv_gen_yosys sv_gen_hardcaml
+          sv_main_unified sv_parse sv_transform sv_tran_struct
           behavioural_to_opt_ir opt_ir_to_sv sv_opt_ir
-          sv_verify_hardcaml verify_main test_verify)
+          sv_verify_hardcaml verify_main)
  (libraries str yojson unix hardcaml z3)
  (preprocess (pps ppx_deriving_yojson)))
 

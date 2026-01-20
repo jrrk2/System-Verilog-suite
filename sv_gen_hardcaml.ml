@@ -99,6 +99,43 @@ let extract_signals stmts =
     | _ -> None
   ) stmts
 
+(* Extract ALL variables from LHS of assignments (including SSA variables) *)
+let extract_lhs_variables stmts =
+  let vars = Hashtbl.create 64 in
+
+  let rec extract_from_expr = function
+    | Sv_ast.VarRef { name; dtype_ref; _ } ->
+        if not (Hashtbl.mem vars name) then begin
+          let width = extract_width dtype_ref in
+          Printf.eprintf "        Found LHS variable: %s[%d]\n%!" name width;
+          Hashtbl.replace vars name width
+        end
+    | Sv_ast.VarRef' { name; _ } ->
+        if not (Hashtbl.mem vars name) then begin
+          (* VarRef' doesn't have width info, default to 1 *)
+          Printf.eprintf "        Found LHS variable: %s[1] (VarRef')\n%!" name;
+          Hashtbl.replace vars name 1
+        end
+    | _ -> ()
+  in
+
+  let rec scan_stmt = function
+    | Sv_ast.Assign { lhs; _ } | Sv_ast.AssignW { lhs; _ } ->
+        extract_from_expr lhs
+    | Sv_ast.Always { stmts; _ } -> List.iter scan_stmt stmts
+    | Sv_ast.Begin { stmts; _ } -> List.iter scan_stmt stmts
+    | Sv_ast.Initial { stmts; _ } -> List.iter scan_stmt stmts
+    | Sv_ast.If { then_stmt; else_stmt; _ } ->
+        scan_stmt then_stmt;
+        (match else_stmt with Some e -> scan_stmt e | None -> ())
+    | Sv_ast.Case { items; _ } ->
+        List.iter (fun item -> List.iter scan_stmt item.Sv_ast.statements) items
+    | _ -> ()
+  in
+
+  List.iter scan_stmt stmts;
+  Hashtbl.fold (fun name width acc -> (name, width, false) :: acc) vars []
+
 (* Helper functions *)
 let sig' = function
   | Con x -> Signal.of_constant x
@@ -267,8 +304,24 @@ let rec expr_to_remap decls = function
        
   | _ -> Invalid
 
+(* Debug helper to show AST node type *)
+let show_ast_node = function
+  | Sv_ast.VarRef { name; _ } -> Printf.sprintf "VarRef(%s)" name
+  | Sv_ast.VarRef' { name; _ } -> Printf.sprintf "VarRef'(%s)" name
+  | Sv_ast.Sel _ -> "Sel"
+  | Sv_ast.ArraySel _ -> "ArraySel"
+  | Sv_ast.Const { name; _ } -> Printf.sprintf "Const(%s)" name
+  | Sv_ast.BinaryOp { op; _ } -> Printf.sprintf "BinaryOp(%s)" op
+  | Sv_ast.UnaryOp { op; _ } -> Printf.sprintf "UnaryOp(%s)" op
+  | _ -> "OtherNode"
+
 (* Process assignment statement *)
 let process_assign decls lhs rhs =
+  Printf.eprintf "        process_assign: LHS node type = %s\n%!" (show_ast_node lhs);
+  (match lhs with
+   | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+       Printf.eprintf "          Assigning to variable: %s\n%!" name
+   | _ -> ());
   match expr_to_remap decls lhs with
   | Var v ->
       let rhs_sig = sig' (expr_to_remap decls rhs) in
@@ -296,15 +349,24 @@ let process_assign decls lhs rhs =
                           end in
         Some (v <-- rhs_resized)
   | Invalid ->
-      Printf.eprintf "        ERROR: LHS expression is Invalid\n%!";
+      Printf.eprintf "        ERROR: LHS expression is Invalid (type: %s)\n%!" (show_ast_node lhs);
+      (match lhs with
+       | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+           Printf.eprintf "          Variable '%s' not found in decls\n%!" name;
+           Printf.eprintf "          Available vars: ";
+           Hashtbl.iter (fun k _ -> Printf.eprintf "%s " k) decls;
+           Printf.eprintf "\n%!"
+       | _ -> ());
       None
-  | _ -> 
-      Printf.eprintf "        ERROR: LHS is not a Variable\n%!";
+  | _ ->
+      Printf.eprintf "        ERROR: LHS is not a Variable (type: %s)\n%!" (show_ast_node lhs);
       None
 
 (* Process statement to Always.t *)
 let rec process_stmt decls = function
   | Sv_ast.Assign { lhs; rhs; is_blocking = true } ->
+      (* Blocking assignment - SSA temporary variable *)
+      (* Treat same as non-blocking: use Always API *)
       process_assign decls lhs rhs
       
   | Sv_ast.Assign { lhs; rhs; is_blocking = false } ->
@@ -415,6 +477,7 @@ let build_circuit module_name stmts =
     (* Extract ports and signals *)
     let ports = extract_ports stmts in
     let signals = extract_signals stmts in
+    let lhs_vars = extract_lhs_variables stmts in
     let state_elements = identify_state_elements stmts in
 
     Printf.eprintf "      Found %d ports: " (List.length ports);
@@ -425,6 +488,7 @@ let build_circuit module_name stmts =
     Printf.eprintf "\n%!";
 
     Printf.eprintf "      Found %d internal signals\n%!" (List.length signals);
+    Printf.eprintf "      Found %d LHS variables (including SSA)\n%!" (List.length lhs_vars);
     Printf.eprintf "      Found %d state elements (registers)\n%!" (Hashtbl.length state_elements);
 
     let decls = Hashtbl.create 64 in
@@ -460,27 +524,50 @@ let build_circuit module_name stmts =
       ) stmts
     in
     Printf.eprintf "      Clock signal: %s\n%!" (if clock_signal = None then "None" else "Some");
-    
-    (* Create internal signals/registers AND output variables *)
-    let all_vars = signals @ (List.filter_map (fun (name, width, dir) ->
+
+    (* Merge signals, LHS variables, and outputs - removing duplicates *)
+    let all_vars_table = Hashtbl.create 128 in
+
+    (* Add signals *)
+    List.iter (fun (name, width, signed) ->
+      Hashtbl.replace all_vars_table name (width, signed)
+    ) signals;
+
+    (* Add LHS variables (may override with correct widths from SSA) *)
+    List.iter (fun (name, width, signed) ->
+      Hashtbl.replace all_vars_table name (width, signed)
+    ) lhs_vars;
+
+    (* Add outputs *)
+    List.iter (fun (name, width, dir) ->
       match dir with
-      | `Output -> Some (name, width, false)
-      | _ -> None
-    ) ports) in
-    
+      | `Output -> Hashtbl.replace all_vars_table name (width, false)
+      | _ -> ()
+    ) ports;
+
+    (* Convert to list *)
+    let all_vars = Hashtbl.fold (fun name (width, signed) acc ->
+      (name, width, signed) :: acc
+    ) all_vars_table [] in
+
+    (* Create Variables for ALL LHS targets *)
+    (* State elements (non-blocking) use Variable.reg *)
+    (* SSA temporaries (blocking) use Variable.wire *)
     List.iter (fun (name, width, _signed) ->
       if not (Hashtbl.mem decls name) then begin
         let is_state = Hashtbl.mem state_elements name in
         if is_state && clock_signal <> None then begin
-          (* Create as register with clock *)
+          (* State element: Create as register with clock *)
           Printf.eprintf "        Creating register: %s[%d] with clock\n%!" name width;
           let clk = Option.get clock_signal in
           let spec = Reg_spec.create ~clock:clk () in
           Hashtbl.add decls name (Var (Variable.reg spec ~width))
         end else begin
-          (* Create as wire *)
-          Printf.eprintf "        Creating wire: %s[%d]\n%!" name width;
-          Hashtbl.add decls name (Var (Variable.wire ~default:(zero width)))
+          (* SSA temporary or output: Create as wire with proper width *)
+          Printf.eprintf "        Creating wire variable: %s[%d]\n%!" name width;
+          let default_sig = Signal.of_int ~width 0 in
+          let wire_var = Variable.wire ~default:default_sig in
+          Hashtbl.add decls name (Var wire_var)
         end
       end
     ) all_vars;
@@ -490,44 +577,123 @@ let build_circuit module_name stmts =
       | Sv_ast.AssignW { lhs; rhs } -> Some (lhs, rhs)
       | _ -> None
     ) stmts in
-    
+
+    Printf.eprintf "      Processing %d continuous assignments\n%!" (List.length cont_assigns);
     List.iter (fun (lhs, rhs) ->
-      match process_assign decls lhs rhs with
-      | Some _ -> () (* Assignment processed *)
-      | None -> ()
+      (* Continuous assignments don't use Always API - just store as Signals *)
+      match lhs with
+      | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+          let rhs_sig = sig' (expr_to_remap decls rhs) in
+          Hashtbl.replace decls name (Sig rhs_sig);
+          Printf.eprintf "        Continuous: %s = <expr> (stored as Sig)\n%!" name
+      | _ ->
+          Printf.eprintf "        Continuous assignment with complex LHS\n%!"
     ) cont_assigns;
     
     (* Process always blocks *)
     let always_blocks = List.filter_map (function
       | Sv_ast.Always { senses; stmts; _ } ->
           (* Extract clock/reset from sensitivity list if present *)
+          Printf.eprintf "      Processing always block with %d statements\n%!" (List.length stmts);
           let alws = process_always decls None None stmts in
+          Printf.eprintf "        Generated %d Always.t assignments\n%!" (List.length alws);
           if List.length alws > 0 then Some alws else None
       | _ -> None
     ) stmts in
-    
+
+    Printf.eprintf "      Found %d always blocks to compile\n%!" (List.length always_blocks);
+
+    (* Track which Variables are assigned by name *)
+    let assigned_vars = Hashtbl.create 64 in
+    let find_var_name v =
+      Hashtbl.fold (fun name value acc ->
+        match (value, acc) with
+        | (Var v', None) when v == v' -> Some name
+        | _ -> acc
+      ) decls None
+    in
+    let rec track_assigns = function
+      | Always.Assign (v, _) ->
+          (match find_var_name v with
+           | Some name -> Hashtbl.replace assigned_vars name true
+           | None -> ())
+      | Always.If (_, then_list, else_list) ->
+          List.iter track_assigns then_list;
+          List.iter track_assigns else_list
+      | Always.Switch (_, cases) ->
+          List.iter (fun (_, stmts) -> List.iter track_assigns stmts) cases
+      | _ -> ()
+    in
+    List.iter (List.iter track_assigns) always_blocks;
+
+    (* Check for unassigned Variables *)
+    Printf.eprintf "      Checking for unassigned Variables:\n%!";
+    Hashtbl.iter (fun name value ->
+      match value with
+      | Var _ ->
+          if not (Hashtbl.mem assigned_vars name) then
+            Printf.eprintf "        WARNING: Variable %s created but never assigned!\n%!" name
+      | _ -> ()
+    ) decls;
+
     (* Compile all always blocks *)
-    List.iter compile (List.filter (fun l -> List.length l > 0) always_blocks);
+    List.iteri (fun i alw_list ->
+      Printf.eprintf "      Compiling always block %d with %d assignments\n%!" i (List.length alw_list);
+      try
+        compile alw_list;
+        Printf.eprintf "        Successfully compiled\n%!"
+      with e ->
+        Printf.eprintf "        ERROR compiling: %s\n%!" (Printexc.to_string e)
+    ) (List.filter (fun l -> List.length l > 0) always_blocks);
     
     (* Build outputs *)
+    Printf.eprintf "      Building outputs for %d output ports\n%!"
+      (List.length (List.filter (fun (_, _, d) -> d = `Output) ports));
     let outputs = List.filter_map (fun (name, width, dir) ->
       match dir with
       | `Output ->
+          Printf.eprintf "        Building output %s[%d]\n%!" name width;
           (match Hashtbl.find_opt decls name with
-           | Some (Var v) -> Some (output name v.value)
-           | Some (Sig s) -> Some (output name s)
-           | _ -> 
+           | Some (Var v) ->
+               let out_sig = v.value in
+               Printf.eprintf "          Found as Variable, using v.value (width=%d)\n%!" (Signal.width out_sig);
+               Some (output name out_sig)
+           | Some (Sig s) ->
+               Printf.eprintf "          Found as Signal (width=%d)\n%!" (Signal.width s);
+               Some (output name s)
+           | _ ->
                (* Create default output if not found *)
+               Printf.eprintf "          NOT FOUND in decls, creating zero default\n%!";
                Some (output name (zero width))
           )
       | _ -> None
     ) ports in
-    
-    if List.length outputs = 0 then
+
+    Printf.eprintf "      Created %d outputs\n%!" (List.length outputs);
+
+    (* Debug: Print all entries in decls *)
+    Printf.eprintf "      Decls table contents:\n%!";
+    Hashtbl.iter (fun name value ->
+      let type_str = match value with
+        | Invalid -> "Invalid"
+        | Con _ -> "Con"
+        | Sig s -> Printf.sprintf "Sig(width=%d)" (Signal.width s)
+        | Sigs _ -> "Sigs"
+        | Var v -> Printf.sprintf "Var(width=%d)" (Signal.width v.value)
+        | Alw _ -> "Alw"
+      in
+      Printf.eprintf "        %s -> %s\n%!" name type_str
+    ) decls;
+
+    Printf.eprintf "      Attempting to create circuit...\n%!";
+    if List.length outputs = 0 then begin
       (* Ensure at least one output for valid circuit *)
+      Printf.eprintf "      No outputs - creating dummy circuit\n%!";
       Circuit.create_exn ~name:module_name [output "dummy" (zero 1)]
-    else
+    end else begin
+      Printf.eprintf "      Creating circuit with %d outputs\n%!" (List.length outputs);
       Circuit.create_exn ~name:module_name outputs
+    end
       
   with e ->
     (* On error, create minimal valid circuit *)
