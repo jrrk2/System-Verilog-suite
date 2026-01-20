@@ -470,35 +470,113 @@ let transform_module stmts =
 (* Substitute variable in expression - you already have this *)
 (* Just making sure it handles all cases *)
 
-(* Recursively search for assignments to a variable in a single statement *)
-let rec find_assignment_in_stmt target_name stmt =
+(* Convert control flow (case/if statements) to nested conditional expressions *)
+let rec convert_stmt_to_expr target_name stmt =
   match stmt with
-  | Assign { lhs = VarRef { name; _ }; rhs; _ } when name = target_name -> Some rhs
-  | Case { items; _ } ->
-      (* Search in each case item's statements *)
-      List.find_map (fun item -> find_assignment_in_stmts target_name item.statements) items
-  | If { then_stmt; else_stmt; _ } ->
-      (* Search in then branch *)
-      (match find_assignment_in_stmt target_name then_stmt with
-      | Some expr -> Some expr
+  | Assign { lhs = VarRef { name; _ }; rhs; _ } when name = target_name ->
+      Some rhs
+
+  | Case { expr = case_expr; items } ->
+      (* Convert case statement to nested ternary operators *)
+      convert_case_to_expr target_name case_expr items
+
+  | If { condition; then_stmt; else_stmt } ->
+      (* Convert if statement to ternary operator *)
+      (match convert_stmt_to_expr target_name then_stmt with
+      | Some then_expr ->
+          let else_expr = match else_stmt with
+            | Some e_stmt -> convert_stmt_to_expr target_name e_stmt
+            | None -> None
+          in
+          (match else_expr with
+          | Some e_expr -> Some (Cond { condition; then_val = then_expr; else_val = e_expr })
+          | None -> Some then_expr  (* No else branch, just return then value *)
+          )
       | None ->
           match else_stmt with
-          | Some e_stmt -> find_assignment_in_stmt target_name e_stmt
+          | Some e_stmt -> convert_stmt_to_expr target_name e_stmt
           | None -> None)
+
   | JumpBlock { stmt; _ } ->
       (* Search in jump block (used for return statements) *)
-      find_assignment_in_stmts target_name stmt
+      convert_stmts_to_expr target_name stmt
+
   | Begin { stmts = inner_stmts; _ } ->
       (* Search in begin blocks *)
-      find_assignment_in_stmts target_name inner_stmts
+      convert_stmts_to_expr target_name inner_stmts
+
   | Always { stmts = inner_stmts; _ } ->
       (* Search in always blocks *)
-      find_assignment_in_stmts target_name inner_stmts
+      convert_stmts_to_expr target_name inner_stmts
+
   | _ -> None
 
-(* Recursively search for assignments to a variable in a list of statements *)
-and find_assignment_in_stmts target_name stmts =
-  List.find_map (find_assignment_in_stmt target_name) stmts
+and convert_stmts_to_expr target_name stmts =
+  (* Process statements in order, looking for the first one that assigns to target *)
+  List.find_map (convert_stmt_to_expr target_name) stmts
+
+and convert_case_to_expr target_name case_expr items =
+  (* Convert case items to nested conditionals *)
+  let rec process_items items =
+    match items with
+    | [] -> None
+    | item :: rest ->
+        (* Get the return expression from this case item *)
+        (match convert_stmts_to_expr target_name item.statements with
+        | Some return_expr ->
+            (* Build condition for this case item *)
+            let condition = build_case_condition case_expr item.conditions in
+            (* Get the else part (remaining items) *)
+            let else_expr = process_items rest in
+            (match condition with
+            | Some cond ->
+                (match else_expr with
+                | Some e_expr -> Some (Cond { condition = cond; then_val = return_expr; else_val = e_expr })
+                | None -> Some return_expr  (* Last item or default *)
+                )
+            | None ->
+                (* No condition (default case) *)
+                Some return_expr)
+        | None ->
+            (* No return in this case item, try next *)
+            process_items rest)
+  in
+  process_items items
+
+and build_case_condition case_expr conditions =
+  (* Build a condition expression by comparing case_expr with each condition *)
+  match conditions with
+  | [] -> None  (* Empty conditions = default case *)
+  | [single_cond] -> Some (build_single_condition case_expr single_cond)
+  | first :: rest ->
+      (* Multiple conditions: OR them together *)
+      let first_cond = build_single_condition case_expr first in
+      let rest_cond = List.fold_left (fun acc cond ->
+        let next_cond = build_single_condition case_expr cond in
+        BinaryOp { op = "LOGOR"; lhs = acc; rhs = next_cond; dtype_ref = None }
+      ) first_cond rest in
+      Some rest_cond
+
+and build_single_condition case_expr condition =
+  match condition with
+  | InsideRange { lhs; rhs } ->
+      (* [low:high] range check: (case_expr >= low) && (case_expr <= high) *)
+      let ge_check = BinaryOp {
+        op = "GTE";
+        lhs = case_expr;
+        rhs = lhs;
+        dtype_ref = None
+      } in
+      let le_check = BinaryOp {
+        op = "LTE";
+        lhs = case_expr;
+        rhs = rhs;
+        dtype_ref = None
+      } in
+      BinaryOp { op = "LOGAND"; lhs = ge_check; rhs = le_check; dtype_ref = None }
+  | _ ->
+      (* Simple equality check *)
+      BinaryOp { op = "EQ"; lhs = case_expr; rhs = condition; dtype_ref = None }
 
 (* Inline a function call by substituting parameters and returning the body *)
 let rec inline_function symtab func_name args =
@@ -513,8 +591,8 @@ let rec inline_function symtab func_name args =
         | _ -> None
       ) stmts in
 
-      (* Find the return value assignment (can be nested in case/if blocks) *)
-      let return_expr = find_assignment_in_stmts func_name stmts in
+      (* Convert function body to expression (handling case/if statements) *)
+      let return_expr = convert_stmts_to_expr func_name stmts in
 
       (match return_expr with
       | Some expr ->
