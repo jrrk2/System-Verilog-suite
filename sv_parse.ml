@@ -332,8 +332,9 @@ let rec parse_json attr json =
       let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
       let lsb = try Some (json |> member "lsbp" |> to_list |> List.hd |> parse' attr name) with _ -> None in
       let width = try Some (json |> member "widthp" |> to_list |> List.hd |> parse' attr name) with _ -> None in
+      let width_const = try Some (json |> member "widthConst" |> to_int) with _ -> None in
       let range = json |> member "declRange" |> to_string_option |> Option.value ~default:"" in
-      Sel { expr; lsb; width; range }
+      Sel { expr; lsb; width; width_const; range }
       
   | "ARRAYSEL" ->
       let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
@@ -577,7 +578,7 @@ let rec rw attr = function
 | Const' { name; dtype } ->
   Const { name; dtype_ref=rwtyp' attr (assoc_find_opt attr.type_table dtype) }
 | Begin { name; stmts; is_generate } -> Begin { name; stmts=rwlst attr stmts; is_generate }
-| Sel { expr; lsb; width; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; range }
+| Sel { expr; lsb; width; width_const; range } -> Sel { expr=rw attr expr; lsb=rwopt attr lsb; width=rwopt attr width; width_const; range }
 | Case {expr; items} -> Case {expr = rw attr expr; items = List.map (rwitm attr) items}
 | EventCtrl { sense; stmts} -> EventCtrl {sense = rwlst attr sense; stmts = rwlst attr stmts}
 | InitArray { inits} -> InitArray {inits = rwlst attr inits}

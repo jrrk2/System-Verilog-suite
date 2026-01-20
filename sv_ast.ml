@@ -201,6 +201,7 @@ and sv_node =
       expr: sv_node;
       lsb: sv_node option;
       width: sv_node option;
+      width_const: int option; (* widthConst field from JSON *)
       range: string;
     }
   | ArraySel of {
