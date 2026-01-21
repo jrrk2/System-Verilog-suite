@@ -71,13 +71,13 @@ let match_multibit_and lib netlist output_base inputs =
     match Sv_liberty.get_cell lib inst.cell_type with
     | Some cell when cell.cell_type = "combinational" ->
         (* Check if it's an AND operation *)
-        let output_pins = List.filter (fun p -> p.direction = Sv_liberty.Output) cell.pins in
+        let output_pins = List.filter (fun p -> p.Sv_liberty.direction = Sv_liberty.Output) cell.pins in
         List.iter (fun out_pin ->
-          match out_pin.function_expr with
+          match out_pin.Sv_liberty.function_expr with
           | Some func when String.contains (String.lowercase_ascii func) '&' ->
               (* This is an AND gate *)
               List.iter (fun conn ->
-                if conn.pin_name = out_pin.name then begin
+                if conn.pin_name = out_pin.Sv_liberty.name then begin
                   (* Check if output signal follows pattern *)
                   let sig_len = String.length conn.signal.sig_name in
                   let base_len = String.length output_base in
