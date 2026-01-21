@@ -1,0 +1,91 @@
+HardCaml Test Suite Report
+Generated: Wed 21 Jan 2026 08:20:42 GMT
+==========================================
+
+Summary:
+  Total:   76
+  Passed:  71
+  Failed:  1
+  Skipped: 4
+
+Passed Tests:
+  ✓ adder_test
+  ✓ asgn_binop
+  ✓ bitand
+  ✓ bitselect_test
+  ✓ blocking_add
+  ✓ blocking
+  ✓ casetest
+  ✓ casetest4
+  ✓ casetest8
+  ✓ comma
+  ✓ concat_test
+  ✓ const_test
+  ✓ counter_async_en_test
+  ✓ counter_async_test
+  ✓ counter_test
+  ✓ dff_nibble
+  ✓ dff
+  ✓ divider_test
+  ✓ equal
+  ✓ fadd
+  ✓ gencase
+  ✓ genscope
+  ✓ greater_equal
+  ✓ greater
+  ✓ less_equal
+  ✓ less_test
+  ✓ logand
+  ✓ mapped
+  ✓ mem_test
+  ✓ mem1
+  ✓ mem2
+  ✓ modulo_test
+  ✓ multiplier_dadda
+  ✓ multiplier_signed
+  ✓ multiplier_test
+  ✓ multiplier_wallace
+  ✓ mux
+  ✓ notequal
+  ✓ op_priority
+  ✓ optest
+  ✓ optest0_15
+  ✓ param_count
+  ✓ receiver
+  ✓ relational
+  ✓ shift_left
+  ✓ shift_test
+  ✓ simple_and
+  ✓ simple_or
+  ✓ simple
+  ✓ state_machine
+  ✓ subtract_test
+  ✓ subword
+  ✓ ternary_add_test
+  ✓ ternary_test
+  ✓ ternary
+  ✓ test_add
+  ✓ test_ashr
+  ✓ test_bit_and
+  ✓ test_bit_or
+  ✓ test_bit_xor
+  ✓ test_byte_and
+  ✓ test_mul
+  ✓ test_shl_const
+  ✓ test_shl
+  ✓ test_shr
+  ✓ test_sshl
+  ✓ test_sshr
+  ✓ test_sub
+  ✓ test02
+  ✓ types
+  ✓ unary
+
+Failed Tests:
+  ✗ uncon (verilator)
+
+Skipped Tests:
+  - attributes-operator
+  - less_test_tb
+  - multiplier_signed_tb
+  - test_shl_tb
