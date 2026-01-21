@@ -184,8 +184,7 @@ let rtlil_module_to_ir rtlil_module =
     match wire.wire_port with
     | Some (RInput, _) ->
         let id = Sv_opt_ir.add_input ir wire.wire_name wire.wire_width in
-        Hashtbl.add wire_to_id wire.wire_name id;
-        Printf.eprintf "Added input: %s (id=%d)\n" wire.wire_name id
+        Hashtbl.add wire_to_id wire.wire_name id
     | _ -> ()
   ) rtlil_module.mod_wires;
 
@@ -194,24 +193,19 @@ let rtlil_module_to_ir rtlil_module =
     match wire.wire_port with
     | Some (ROutput, _) ->
         let id = Sv_opt_ir.add_output ir wire.wire_name wire.wire_width in
-        Hashtbl.add wire_to_id wire.wire_name id;
-        Printf.eprintf "Added output: %s (id=%d)\n" wire.wire_name id
+        Hashtbl.add wire_to_id wire.wire_name id
     | _ -> ()
   ) rtlil_module.mod_wires;
 
   (* Process cells in topological order (multi-pass until all processed) *)
-  Printf.eprintf "Processing %d cells\n" (List.length rtlil_module.mod_cells);
   let remaining_cells = ref rtlil_module.mod_cells in
   let pass = ref 0 in
   while !remaining_cells <> [] && !pass < 10 do
     pass := !pass + 1;
-    Printf.eprintf "Pass %d: %d cells remaining\n" !pass (List.length !remaining_cells);
     let still_remaining = ref [] in
     List.iter (fun cell ->
-    Printf.eprintf "Cell: %s (type: %s)\n" cell.cell_inst cell.cell_type;
     match cell_to_ir_operation cell with
     | Some op ->
-        Printf.eprintf "  Mapped to operation\n";
         (* Extract input signals based on cell type *)
         let input_ids = match cell.cell_type with
           (* Standard two-input gates *)
@@ -286,10 +280,8 @@ let rtlil_module_to_ir rtlil_module =
         in
 
         (* Add node to IR if we have valid inputs *)
-        Printf.eprintf "  Found %d inputs\n" (List.length input_ids);
         if input_ids <> [] then begin
           let node_id = Sv_opt_ir.add_node ir op input_ids in
-          Printf.eprintf "  Created node %d\n" node_id;
 
           (* Map output signal to this node *)
           let out_sig = match cell.cell_type with
@@ -299,7 +291,6 @@ let rtlil_module_to_ir rtlil_module =
           (match out_sig with
            | Some signal_spec ->
                let out_name = sigspec_to_node_name signal_spec in
-               Printf.eprintf "  Output signal: %s -> node %d\n" out_name node_id;
                Hashtbl.add wire_to_id out_name node_id;
                (* If this is an output wire, map output ID to node ID *)
                (match Hashtbl.find_opt ir.ir_outputs out_name with
@@ -317,69 +308,47 @@ let rtlil_module_to_ir rtlil_module =
     remaining_cells := List.rev !still_remaining
   done;
 
-  if !remaining_cells <> [] then
-    Printf.eprintf "Warning: %d cells could not be processed\n" (List.length !remaining_cells);
-
   (* Process top-level connections (assigns, bit-select, range operations) *)
-  Printf.eprintf "Processing %d top-level connections\n" (List.length rtlil_module.mod_connects);
   List.iter (fun (lhs_sig, rhs_sig) ->
     let lhs_name = sigspec_to_node_name lhs_sig in
-    let rhs_name = sigspec_to_node_name rhs_sig in
-    Printf.eprintf "Connection: %s <- %s\n" lhs_name rhs_name;
+    let _rhs_name = sigspec_to_node_name rhs_sig in
 
     (* Find the source node ID *)
     let source_id_opt = match rhs_sig with
       | SigWire wire_name ->
-          let result = Hashtbl.find_opt wire_to_id wire_name in
-          Printf.eprintf "  SigWire %s -> %s\n" wire_name
-            (match result with Some id -> string_of_int id | None -> "not found");
-          result
+          Hashtbl.find_opt wire_to_id wire_name
       | SigBit (wire_name, bit) ->
           (* Create Extract node for bit select *)
           (match Hashtbl.find_opt wire_to_id wire_name with
            | Some src_id ->
-               Printf.eprintf "  SigBit %s[%d] found source %d\n" wire_name bit src_id;
                let extract_op = Extract { width = 1; lsb = bit; msb = bit } in
                let node_id = Sv_opt_ir.add_node ir extract_op [src_id] in
-               Printf.eprintf "  Created extract node %d\n" node_id;
                Hashtbl.add wire_to_id lhs_name node_id;
                Some node_id
-           | None ->
-               Printf.eprintf "  SigBit %s[%d] source not found\n" wire_name bit;
-               None)
+           | None -> None)
       | SigRange (wire_name, hi, lo) ->
           (* Create Extract node for range *)
           (match Hashtbl.find_opt wire_to_id wire_name with
            | Some src_id ->
-               Printf.eprintf "  SigRange %s[%d:%d] found source %d\n" wire_name hi lo src_id;
                let width = abs (hi - lo) + 1 in
                let lsb = min hi lo in
                let msb = max hi lo in
                let extract_op = Extract { width; lsb; msb } in
                let node_id = Sv_opt_ir.add_node ir extract_op [src_id] in
-               Printf.eprintf "  Created extract node %d\n" node_id;
                Hashtbl.add wire_to_id lhs_name node_id;
                Some node_id
-           | None ->
-               Printf.eprintf "  SigRange %s[%d:%d] source not found\n" wire_name hi lo;
-               None)
-      | _ ->
-          Printf.eprintf "  Unsupported sig type\n";
-          None
+           | None -> None)
+      | _ -> None
     in
 
     (* If LHS is an output, update ir_value_to_node *)
     (match source_id_opt with
      | Some node_id ->
-         Printf.eprintf "  Source node: %d\n" node_id;
          (match Hashtbl.find_opt ir.ir_outputs lhs_name with
           | Some (Output { id; _ }) ->
-              Printf.eprintf "  Mapping output %s (id=%d) to node %d\n" lhs_name id node_id;
               Hashtbl.add ir.ir_value_to_node id node_id
-          | _ ->
-              Printf.eprintf "  LHS %s is not an output\n" lhs_name)
-     | None ->
-         Printf.eprintf "  No source node found\n")
+          | _ -> ())
+     | None -> ())
   ) rtlil_module.mod_connects;
 
   ir

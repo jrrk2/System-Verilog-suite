@@ -23,6 +23,44 @@ let get_z3_var ir node_id width =
       Hashtbl.add z3_cache node_id v;
       v
 
+(* Helper to extend Z3 bitvectors to matching widths *)
+let extend_to_match_width ctx signed a b =
+  let width_a = Z3.BitVector.get_size (Z3.Expr.get_sort a) in
+  let width_b = Z3.BitVector.get_size (Z3.Expr.get_sort b) in
+  if width_a = width_b then
+    (a, b)
+  else if width_a < width_b then
+    (* Extend a to match b *)
+    let ext_a = if signed then
+      Z3.BitVector.mk_sign_ext ctx (width_b - width_a) a
+    else
+      Z3.BitVector.mk_zero_ext ctx (width_b - width_a) a
+    in
+    (ext_a, b)
+  else
+    (* Extend b to match a *)
+    let ext_b = if signed then
+      Z3.BitVector.mk_sign_ext ctx (width_a - width_b) b
+    else
+      Z3.BitVector.mk_zero_ext ctx (width_a - width_b) b
+    in
+    (a, ext_b)
+
+(* Helper to adjust Z3 bitvector to target width *)
+let adjust_to_width ctx signed expr target_width =
+  let current_width = Z3.BitVector.get_size (Z3.Expr.get_sort expr) in
+  if current_width = target_width then
+    expr
+  else if current_width < target_width then
+    (* Extend to target width *)
+    if signed then
+      Z3.BitVector.mk_sign_ext ctx (target_width - current_width) expr
+    else
+      Z3.BitVector.mk_zero_ext ctx (target_width - current_width) expr
+  else
+    (* Truncate to target width *)
+    Z3.BitVector.mk_extract ctx (target_width - 1) 0 expr
+
 (* Convert IR operation to Z3 expression *)
 let rec ir_op_to_z3 ir node =
   let get_input_z3 input_id =
@@ -55,52 +93,67 @@ let rec ir_op_to_z3 ir node =
   match node.node_op with
   | Add { width; signed } ->
       if List.length inputs_z3 >= 2 then
-        Z3.BitVector.mk_add ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+        let (a, b) = extend_to_match_width ctx signed (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
+        let result = Z3.BitVector.mk_add ctx a b in
+        adjust_to_width ctx signed result width
       else
         Z3.BitVector.mk_numeral ctx "0" width
 
   | Sub { width; signed } ->
       if List.length inputs_z3 >= 2 then
-        Z3.BitVector.mk_sub ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+        let (a, b) = extend_to_match_width ctx signed (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
+        let result = Z3.BitVector.mk_sub ctx a b in
+        adjust_to_width ctx signed result width
       else
         Z3.BitVector.mk_numeral ctx "0" width
 
   | Mul { width; signed } ->
       if List.length inputs_z3 >= 2 then
-        Z3.BitVector.mk_mul ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+        let (a, b) = extend_to_match_width ctx signed (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
+        let result = Z3.BitVector.mk_mul ctx a b in
+        adjust_to_width ctx signed result width
       else
         Z3.BitVector.mk_numeral ctx "0" width
 
   | Div { width; signed } ->
       if List.length inputs_z3 >= 2 then
-        if signed then
-          Z3.BitVector.mk_sdiv ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+        let (a, b) = extend_to_match_width ctx signed (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
+        let result = if signed then
+          Z3.BitVector.mk_sdiv ctx a b
         else
-          Z3.BitVector.mk_udiv ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+          Z3.BitVector.mk_udiv ctx a b
+        in
+        adjust_to_width ctx signed result width
       else
         Z3.BitVector.mk_numeral ctx "0" width
 
   | And { width } ->
       if List.length inputs_z3 >= 2 then
-        Z3.BitVector.mk_and ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+        let (a, b) = extend_to_match_width ctx false (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
+        let result = Z3.BitVector.mk_and ctx a b in
+        adjust_to_width ctx false result width
       else if List.length inputs_z3 = 1 then
-        List.nth inputs_z3 0  (* Single input AND is identity *)
+        adjust_to_width ctx false (List.nth inputs_z3 0) width
       else
         Z3.BitVector.mk_numeral ctx "0" width
 
   | Or { width } ->
       if List.length inputs_z3 >= 2 then
-        Z3.BitVector.mk_or ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+        let (a, b) = extend_to_match_width ctx false (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
+        let result = Z3.BitVector.mk_or ctx a b in
+        adjust_to_width ctx false result width
       else if List.length inputs_z3 = 1 then
-        List.nth inputs_z3 0
+        adjust_to_width ctx false (List.nth inputs_z3 0) width
       else
         Z3.BitVector.mk_numeral ctx "0" width
 
   | Xor { width } ->
       if List.length inputs_z3 >= 2 then
-        Z3.BitVector.mk_xor ctx (List.nth inputs_z3 0) (List.nth inputs_z3 1)
+        let (a, b) = extend_to_match_width ctx false (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
+        let result = Z3.BitVector.mk_xor ctx a b in
+        adjust_to_width ctx false result width
       else if List.length inputs_z3 = 1 then
-        List.nth inputs_z3 0
+        adjust_to_width ctx false (List.nth inputs_z3 0) width
       else
         Z3.BitVector.mk_numeral ctx "0" width
 
@@ -112,8 +165,7 @@ let rec ir_op_to_z3 ir node =
 
   | Compare { width; cmp_op; signed } ->
       if List.length inputs_z3 >= 2 then begin
-        let a = List.nth inputs_z3 0 in
-        let b = List.nth inputs_z3 1 in
+        let (a, b) = extend_to_match_width ctx signed (List.nth inputs_z3 0) (List.nth inputs_z3 1) in
         let cmp = match cmp_op, signed with
           | `Eq, _ -> Z3.Boolean.mk_eq ctx a b
           | `Ne, _ -> Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx a b)
@@ -147,16 +199,18 @@ let rec ir_op_to_z3 ir node =
   | Shift { width; direction; arithmetic; amount } ->
       if List.length inputs_z3 >= 1 then begin
         let value = List.nth inputs_z3 0 in
-        let shift_amount = match amount with
+        let shift_amount_raw = match amount with
           | Some amt -> Z3.BitVector.mk_numeral ctx (string_of_int amt) width
           | None ->
               if List.length inputs_z3 >= 2 then List.nth inputs_z3 1
               else Z3.BitVector.mk_numeral ctx "0" width
         in
+        (* Ensure shift amount has same width as value for Z3 *)
+        let (value_adj, shift_amount) = extend_to_match_width ctx false value shift_amount_raw in
         match direction, arithmetic with
-        | `Left, _ -> Z3.BitVector.mk_shl ctx value shift_amount
-        | `Right, true -> Z3.BitVector.mk_ashr ctx value shift_amount
-        | `Right, false -> Z3.BitVector.mk_lshr ctx value shift_amount
+        | `Left, _ -> Z3.BitVector.mk_shl ctx value_adj shift_amount
+        | `Right, true -> Z3.BitVector.mk_ashr ctx value_adj shift_amount
+        | `Right, false -> Z3.BitVector.mk_lshr ctx value_adj shift_amount
       end else
         Z3.BitVector.mk_numeral ctx "0" width
 
@@ -172,9 +226,16 @@ let rec ir_op_to_z3 ir node =
         Z3.BitVector.mk_numeral ctx "0" (List.fold_left (+) 0 widths)
 
   | Extract { width; lsb; msb } ->
-      if List.length inputs_z3 >= 1 then
-        Z3.BitVector.mk_extract ctx msb lsb (List.nth inputs_z3 0)
-      else
+      if List.length inputs_z3 >= 1 then begin
+        let input = List.nth inputs_z3 0 in
+        let input_width = Z3.BitVector.get_size (Z3.Expr.get_sort input) in
+        (* Validate extract bounds *)
+        if msb >= input_width || lsb < 0 || msb < lsb then begin
+          Printf.eprintf "Error: Invalid extract [%d:%d] from width %d\n" msb lsb input_width;
+          Z3.BitVector.mk_numeral ctx "0" width
+        end else
+          Z3.BitVector.mk_extract ctx msb lsb input
+      end else
         Z3.BitVector.mk_numeral ctx "0" width
 
   | ZeroExtend { from_width; to_width } ->
