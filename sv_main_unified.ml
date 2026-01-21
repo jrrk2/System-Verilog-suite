@@ -270,6 +270,248 @@ let verify_files original_json hardcaml_json =
       Printexc.print_backtrace stderr;
       exit 1
 
+(* SystemVerilog verification through both Yosys and Verilator *)
+let verify_sv_yosys_verilator sv_file =
+  if not (Sys.file_exists sv_file) then begin
+    Printf.eprintf "Error: File not found: %s\n" sv_file;
+    exit 1
+  end;
+
+  Printf.printf "=== SystemVerilog Verification (Yosys vs Verilator) ===\n\n";
+  Printf.printf "Input file: %s\n\n" sv_file;
+
+  (* Extract module name from file *)
+  let module_name =
+    try
+      let ic = open_in sv_file in
+      let file_content = really_input_string ic (min 2000 (in_channel_length ic)) in
+      close_in ic;
+      let rex = Str.regexp "module[ \t]+\\([a-zA-Z_][a-zA-Z0-9_]*\\)" in
+      let _ = Str.search_forward rex file_content 0 in
+      Str.matched_group 1 file_content
+    with Not_found ->
+      (* Fallback to filename *)
+      Filename.chop_extension (Filename.basename sv_file)
+  in
+
+  Printf.printf "Module name: %s\n\n" module_name;
+
+  (* Step 1: Run Yosys to generate RTLIL *)
+  Printf.printf "Step 1: Running Yosys synthesis...\n";
+  let rtlil_file = "obj_dir/" ^ module_name ^ ".il" in
+  let yosys_cmd = Printf.sprintf
+    "yosys -p 'read_verilog %s; hierarchy -check -top %s; proc; opt; write_rtlil %s' 2>&1 > /dev/null"
+    sv_file module_name rtlil_file in
+
+  let ret = Sys.command yosys_cmd in
+  if ret <> 0 then begin
+    Printf.eprintf "✗ Yosys failed to synthesize %s\n" sv_file;
+    exit 1
+  end;
+  Printf.printf "✓ Yosys synthesis complete: %s\n\n" rtlil_file;
+
+  (* Step 2: Run Verilator to generate tree JSON *)
+  Printf.printf "Step 2: Running Verilator...\n";
+  let json_file = "obj_dir/V" ^ module_name ^ ".tree.json" in
+  let verilator_cmd = Printf.sprintf
+    "verilator -Wno-fatal --json-only --dump-tree-json --json-only-output %s --top-module %s %s 2>&1 > /dev/null"
+    json_file module_name sv_file in
+
+  let ret = Sys.command verilator_cmd in
+  if ret <> 0 then begin
+    Printf.eprintf "✗ Verilator failed to parse %s\n" sv_file;
+    exit 1
+  end;
+  Printf.printf "✓ Verilator parsing complete: %s\n\n" json_file;
+
+  (* Step 3: Convert Yosys RTLIL to IR *)
+  Printf.printf "Step 3: Converting Yosys RTLIL to IR...\n";
+  let design = Sv_rtlil_reader.parse_rtlil_file rtlil_file in
+  let yosys_ir_opt = Sv_rtlil_to_ir.rtlil_design_to_ir design in
+
+  (match yosys_ir_opt with
+   | None ->
+       Printf.eprintf "✗ Failed to convert Yosys RTLIL to IR\n";
+       exit 1
+   | Some ir ->
+       Printf.printf "✓ Yosys IR created\n";
+       Sv_ir_verify.print_ir_stats ir);
+  Printf.printf "\n";
+
+  (* Step 4: Convert Verilator JSON to IR *)
+  Printf.printf "Step 4: Converting Verilator JSON to IR...\n";
+  let ast = translate_tree_to_ast json_file in
+  let verilator_ir = Behavioural_to_opt_ir.convert ~verbose:false ast in
+  Printf.printf "✓ Verilator IR created\n";
+  Sv_ir_verify.print_ir_stats verilator_ir;
+  Printf.printf "\n";
+
+  (* Step 5: Verify equivalence with Z3 *)
+  Printf.printf "Step 5: Verifying equivalence with Z3...\n";
+  let yosys_ir = match yosys_ir_opt with Some ir -> ir | None -> assert false in
+  let result = Sv_ir_verify.verify_ir_equivalence yosys_ir verilator_ir in
+  Printf.printf "\n";
+
+  if result then begin
+    Printf.printf "✓ VERIFICATION PASSED\n";
+    Printf.printf "  Yosys and Verilator produce equivalent results\n";
+    Printf.printf "  The synthesis and behavioral paths are consistent\n";
+    exit 0
+  end else begin
+    Printf.printf "✗ VERIFICATION FAILED\n";
+    Printf.printf "  Yosys and Verilator produce different outputs\n";
+    Printf.printf "  Counterexample found (see above)\n\n";
+
+    (* Show IR comparison *)
+    Printf.printf "IR Comparison:\n";
+    let yosys_ir = match yosys_ir_opt with Some ir -> ir | None -> assert false in
+    Printf.printf "  Yosys nodes: %d, Verilator nodes: %d\n"
+      (Hashtbl.length yosys_ir.ir_nodes)
+      (Hashtbl.length verilator_ir.ir_nodes);
+
+    (* Suggest Verible as tie-breaker *)
+    Printf.printf "\nNote: When Yosys and Verilator disagree, this could indicate:\n";
+    Printf.printf "  1. Different IR representations of the same logic (false negative)\n";
+    Printf.printf "  2. Width extension handling differences\n";
+    Printf.printf "  3. An actual semantic difference (true positive)\n\n";
+    Printf.printf "Suggestion: Use Verible as a third validator:\n";
+    Printf.printf "  verible-verilog-syntax --printtree %s\n" sv_file;
+    Printf.printf "  Or use the Verible parser in hardcaml-lua for formal analysis\n";
+    exit 1
+  end
+
+(* Three-way SystemVerilog verification (Yosys + Verilator + Verible) *)
+let verify_sv_3way sv_file =
+  if not (Sys.file_exists sv_file) then begin
+    Printf.eprintf "Error: File not found: %s\n" sv_file;
+    exit 1
+  end;
+
+  Printf.printf "=== Three-Way SystemVerilog Verification ===\n\n";
+  Printf.printf "Input file: %s\n\n" sv_file;
+
+  (* Step 0: Validate syntax with Verible *)
+  Printf.printf "Step 0: Validating syntax with Verible...\n";
+  let verible_cmd = Printf.sprintf "verible-verilog-syntax %s 2>&1 > /dev/null" sv_file in
+  let ret = Sys.command verible_cmd in
+  if ret <> 0 then begin
+    Printf.eprintf "✗ Verible syntax validation failed\n";
+    Printf.eprintf "  The file may contain syntax errors\n";
+    exit 1
+  end;
+  Printf.printf "✓ Verible syntax validation passed\n\n";
+
+  (* Continue with Yosys vs Verilator verification *)
+  verify_sv_yosys_verilator sv_file
+
+(* RTLIL verification commands *)
+let verify_rtlil_self rtlil_file =
+  if not (Sys.file_exists rtlil_file) then begin
+    Printf.eprintf "Error: File not found: %s\n" rtlil_file;
+    exit 1
+  end;
+
+  Printf.printf "=== RTLIL Self-Verification ===\n\n";
+  Printf.printf "File: %s\n\n" rtlil_file;
+
+  (* Parse RTLIL *)
+  Printf.printf "Step 1: Parsing RTLIL...\n";
+  let design = Sv_rtlil_reader.parse_rtlil_file rtlil_file in
+  Printf.printf "✓ Parsed successfully\n\n";
+
+  (* Print summary *)
+  Printf.printf "Step 2: Design Summary\n";
+  Sv_rtlil_reader.print_rtlil_summary design;
+  Printf.printf "\n";
+
+  (* Convert to IR *)
+  Printf.printf "Step 3: Converting to IR...\n";
+  match Sv_rtlil_to_ir.rtlil_design_to_ir design with
+  | None ->
+      Printf.eprintf "✗ Failed to convert RTLIL to IR\n";
+      exit 1
+  | Some ir ->
+      Printf.printf "✓ Converted to IR\n";
+      Sv_ir_verify.print_ir_stats ir;
+      Printf.printf "\n";
+
+      (* Self-equivalence check *)
+      Printf.printf "Step 4: Self-Equivalence Check\n";
+      Printf.printf "Verifying IR against itself...\n";
+      let result = Sv_ir_verify.verify_ir_equivalence ir ir in
+      Printf.printf "\n";
+
+      if result then begin
+        Printf.printf "✓ VERIFICATION PASSED\n";
+        Printf.printf "  The RTLIL design is internally consistent\n";
+        Printf.printf "  All outputs verified equivalent to themselves\n";
+        exit 0
+      end else begin
+        Printf.printf "✗ VERIFICATION FAILED\n";
+        Printf.printf "  Internal inconsistency detected\n";
+        exit 1
+      end
+
+let verify_rtlil_equiv rtlil_file1 rtlil_file2 =
+  if not (Sys.file_exists rtlil_file1) then begin
+    Printf.eprintf "Error: File not found: %s\n" rtlil_file1;
+    exit 1
+  end;
+  if not (Sys.file_exists rtlil_file2) then begin
+    Printf.eprintf "Error: File not found: %s\n" rtlil_file2;
+    exit 1
+  end;
+
+  Printf.printf "=== RTLIL Equivalence Verification ===\n\n";
+  Printf.printf "File 1: %s\n" rtlil_file1;
+  Printf.printf "File 2: %s\n\n" rtlil_file2;
+
+  (* Parse first RTLIL *)
+  Printf.printf "Step 1: Parsing first RTLIL...\n";
+  let design1 = Sv_rtlil_reader.parse_rtlil_file rtlil_file1 in
+  Printf.printf "✓ Parsed successfully\n\n";
+
+  (* Parse second RTLIL *)
+  Printf.printf "Step 2: Parsing second RTLIL...\n";
+  let design2 = Sv_rtlil_reader.parse_rtlil_file rtlil_file2 in
+  Printf.printf "✓ Parsed successfully\n\n";
+
+  (* Convert to IR *)
+  Printf.printf "Step 3: Converting to IR...\n";
+  let ir1_opt = Sv_rtlil_to_ir.rtlil_design_to_ir design1 in
+  let ir2_opt = Sv_rtlil_to_ir.rtlil_design_to_ir design2 in
+
+  match ir1_opt, ir2_opt with
+  | Some ir1, Some ir2 ->
+      Printf.printf "✓ Both designs converted to IR\n\n";
+
+      Printf.printf "Design 1:\n";
+      Sv_ir_verify.print_ir_stats ir1;
+      Printf.printf "\nDesign 2:\n";
+      Sv_ir_verify.print_ir_stats ir2;
+      Printf.printf "\n";
+
+      (* Verify equivalence *)
+      Printf.printf "Step 4: Checking Equivalence\n";
+      let result = Sv_ir_verify.verify_ir_equivalence ir1 ir2 in
+      Printf.printf "\n";
+
+      if result then begin
+        Printf.printf "✓ DESIGNS ARE EQUIVALENT\n";
+        Printf.printf "  Both RTLIL files produce identical outputs\n";
+        exit 0
+      end else begin
+        Printf.printf "✗ DESIGNS ARE NOT EQUIVALENT\n";
+        Printf.printf "  Counterexample found (see above)\n";
+        exit 1
+      end
+  | None, _ ->
+      Printf.eprintf "✗ Failed to convert first RTLIL to IR\n";
+      exit 1
+  | _, None ->
+      Printf.eprintf "✗ Failed to convert second RTLIL to IR\n";
+      exit 1
+
 (* Print usage *)
 let print_usage () =
   Printf.eprintf "SystemVerilog Decompiler - Unified Backend Selector\n\n";
@@ -281,6 +523,14 @@ let print_usage () =
   Printf.eprintf "      Process single file\n\n";
   Printf.eprintf "  %s verify <original.json> <hardcaml.json>\n" Sys.argv.(0);
   Printf.eprintf "      Verify equivalence between original and HardCaml output\n\n";
+  Printf.eprintf "  %s verify-sv <file.v>\n" Sys.argv.(0);
+  Printf.eprintf "      Verify SystemVerilog file by comparing Yosys and Verilator paths\n\n";
+  Printf.eprintf "  %s verify-sv-3way <file.v>\n" Sys.argv.(0);
+  Printf.eprintf "      Three-way verification: Verible syntax + Yosys + Verilator\n\n";
+  Printf.eprintf "  %s verify-rtlil <file.il>\n" Sys.argv.(0);
+  Printf.eprintf "      Verify RTLIL file (self-equivalence check)\n\n";
+  Printf.eprintf "  %s verify-rtlil-equiv <file1.il> <file2.il>\n" Sys.argv.(0);
+  Printf.eprintf "      Verify two RTLIL files are equivalent\n\n";
   Printf.eprintf "  %s interactive\n" Sys.argv.(0);
   Printf.eprintf "      Start interactive console mode\n";
   Printf.eprintf "      Provides REPL with all commands and shell access\n\n";
@@ -642,6 +892,19 @@ let () =
           let original_json = Sys.argv.(2) in
           let hardcaml_json = Sys.argv.(3) in
           verify_files original_json hardcaml_json
+      | "verify-sv" when Array.length Sys.argv >= 3 ->
+          let sv_file = Sys.argv.(2) in
+          verify_sv_yosys_verilator sv_file
+      | "verify-sv-3way" when Array.length Sys.argv >= 3 ->
+          let sv_file = Sys.argv.(2) in
+          verify_sv_3way sv_file
+      | "verify-rtlil" when Array.length Sys.argv >= 3 ->
+          let rtlil_file = Sys.argv.(2) in
+          verify_rtlil_self rtlil_file
+      | "verify-rtlil-equiv" when Array.length Sys.argv >= 4 ->
+          let rtlil_file1 = Sys.argv.(2) in
+          let rtlil_file2 = Sys.argv.(3) in
+          verify_rtlil_equiv rtlil_file1 rtlil_file2
       | "interactive" | "repl" | "i" ->
           Interactive.run ()
       | _ -> print_usage ()
