@@ -1,11 +1,11 @@
 (executables
- (names sv_main_unified test_gate_mapping example_round_trip)
+ (names sv_main_unified test_gate_mapping example_round_trip test_rtlil_reader)
  (modules sv_ast sv_gen sv_gen_struct sv_gen_yosys sv_gen_hardcaml
           sv_main_unified sv_parse sv_transform sv_tran_struct
           behavioural_to_opt_ir opt_ir_to_sv sv_opt_ir
           sv_verify_hardcaml sv_memory sv_liberty sv_gate_map
-          sv_netlist_reader sv_rtl_collapse test_gate_mapping
-          example_round_trip)
+          sv_netlist_reader sv_rtl_collapse sv_rtlil_reader
+          test_gate_mapping example_round_trip test_rtlil_reader)
  (libraries str yojson unix hardcaml z3)
  (preprocess (pps ppx_deriving_yojson)))
 

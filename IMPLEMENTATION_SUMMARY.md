@@ -218,6 +218,7 @@ sv_main_unified verify original.v collapsed.v \
 | sv_gate_map.ml | 177 | Operation → cell mapping |
 | sv_netlist_reader.ml | 260 | Gate-level netlist reader |
 | sv_rtl_collapse.ml | 171 | Gate → behavioral transformation |
+| sv_rtlil_reader.ml | 326 | Yosys RTLIL format parser |
 
 ### Test Programs
 | File | Lines | Purpose |
@@ -225,12 +226,14 @@ sv_main_unified verify original.v collapsed.v \
 | test_liberty.ml | 47 | Liberty parser tests |
 | test_gate_mapping.ml | 126 | Gate mapping tests |
 | example_round_trip.ml | 253 | Full round-trip demo |
+| test_rtlil_reader.ml | 78 | RTLIL parser tests |
 
 ### Documentation
 | File | Purpose |
 |------|---------|
 | LIBERTY_SUPPORT.md | Liberty parser API and usage |
 | GATE_MAPPING.md | Complete gate mapping guide |
+| RTLIL_ANALYSIS.md | Yosys RTLIL format analysis and implementation |
 | IMPLEMENTATION_SUMMARY.md | This document |
 
 ### Generated Artifacts
@@ -242,6 +245,7 @@ sv_main_unified verify original.v collapsed.v \
 | example_behavioral.v | Verilog | Original behavioral design |
 | example_gates.v | Verilog | Mapped gate-level netlist |
 | example_collapsed.v | Verilog | Reconstructed behavioral RTL |
+| test_design.il | RTLIL | Synthetic test design (3 modules) |
 
 ## Key Achievements
 
@@ -368,7 +372,8 @@ Key accomplishments:
 - ✅ Netlist reading
 - ✅ RTL collapse
 - ✅ Round-trip transformation
-- ✅ Comprehensive testing
-- ✅ Complete documentation
+- ✅ Yosys RTLIL format support
+- ✅ Comprehensive testing (4 test programs, all passing)
+- ✅ Complete documentation (4 comprehensive guides)
 
-The foundation is in place for technology-aware circuit generation and gate-level reverse engineering.
+The foundation is in place for technology-aware circuit generation and gate-level reverse engineering. With both Liberty-based and RTLIL-based approaches implemented, the system provides multiple pathways for high-confidence netlist processing and verification.
