@@ -45,6 +45,7 @@ type rtlil_design = {
 
 (* Parsing utilities *)
 let strip_backslash s =
+  let s = String.trim s in
   if String.length s > 0 && s.[0] = '\\' then
     String.sub s 1 (String.length s - 1)
   else s

@@ -480,16 +480,16 @@ type node = {
 (* The optimization IR *)
 type opt_ir = {
   ir_name: string;
-  ir_inputs: (string * value) list ref;
-  ir_outputs: (string * value) list ref;
-  ir_constants: (int * value_id) list ref;
-  ir_nodes: (value_id * node) list ref;
-  ir_value_to_node: (value_id * value_id) list ref;
+  ir_inputs: (string, value) Hashtbl.t;
+  ir_outputs: (string, value) Hashtbl.t;
+  ir_constants: (int, value_id) Hashtbl.t;
+  ir_nodes: (value_id, node) Hashtbl.t;
+  ir_value_to_node: (value_id, value_id) Hashtbl.t;
   mutable ir_next_id: int;
   (* Metadata for optimization *)
   mutable ir_critical_path_length: int;
   mutable ir_area_estimate: int;
-}  [@@deriving yojson]
+}
 
 (* Helper to track sharing opportunities *)
 type sharing_candidate = {
