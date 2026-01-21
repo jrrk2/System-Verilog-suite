@@ -41,26 +41,136 @@ let is_signed = function
   | Some (Sv_ast.BasicType { keyword = "int" | "integer" | "shortint" | "longint"; _ }) -> true
   | _ -> false
 
-(* Identify state elements (registers) - variables assigned with non-blocking *)
-let identify_state_elements stmts =
-  let state_vars = Hashtbl.create 16 in
+(* Check if we're in a clocked always block *)
+let is_clocked_always senses =
+  let rec check_clock = function
+    | [] -> false
+    | Sv_ast.SenTree items :: rest -> check_clock items || check_clock rest
+    | Sv_ast.SenItem { edge_str; _ } :: _ ->
+        let edge = String.uppercase_ascii edge_str in
+        edge = "POS" || edge = "POSEDGE" || edge = "NEG" || edge = "NEGEDGE"
+    | _ :: rest -> check_clock rest
+  in
+  check_clock senses
 
-  let rec find_nonblocking = function
-    | Sv_ast.Assign { lhs; is_blocking = false; _ } ->
+(* Find variables used as RHS in expressions *)
+let rec find_rhs_vars expr =
+  let vars = ref [] in
+  let rec traverse = function
+    | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+        vars := name :: !vars
+    | Sv_ast.BinaryOp { lhs; rhs; _ } | Sv_ast.BinaryOp' { lhs; rhs; _ } ->
+        traverse lhs; traverse rhs
+    | Sv_ast.UnaryOp { operand; _ } | Sv_ast.UnaryOp' { operand; _ } ->
+        traverse operand
+    | Sv_ast.Sel { expr; lsb; width; _ } ->
+        traverse expr;
+        Option.iter traverse lsb;
+        Option.iter traverse width
+    | Sv_ast.ArraySel { expr; index; _ } ->
+        traverse expr; traverse index
+    | Sv_ast.Concat { parts } -> List.iter traverse parts
+    | Sv_ast.Cond { condition; then_val; else_val } ->
+        traverse condition; traverse then_val; traverse else_val
+    | Sv_ast.Replicate { src; _ } | Sv_ast.Replicate' { src; _ } -> traverse src
+    | _ -> ()
+  in
+  traverse expr;
+  !vars
+
+(* Find blocking assignments that are used later in the same statement list *)
+let find_intermediate_blocking_vars stmts =
+  let intermediate = Hashtbl.create 16 in
+  let defined = Hashtbl.create 16 in
+
+  (* First pass: find all blocking assignments *)
+  let rec mark_blocking = function
+    | Sv_ast.Assign { lhs; is_blocking = true; _ } ->
         (match lhs with
-         | Sv_ast.VarRef { name; _ } -> Hashtbl.replace state_vars name true
+         | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+             Hashtbl.replace defined name true
          | _ -> ())
-    | Sv_ast.Always { stmts; _ } -> List.iter find_nonblocking stmts
-    | Sv_ast.Begin { stmts; _ } -> List.iter find_nonblocking stmts
+    | Sv_ast.Begin { stmts; _ } -> List.iter mark_blocking stmts
     | Sv_ast.If { then_stmt; else_stmt; _ } ->
-        find_nonblocking then_stmt;
-        (match else_stmt with Some e -> find_nonblocking e | None -> ())
+        mark_blocking then_stmt;
+        Option.iter mark_blocking else_stmt
     | Sv_ast.Case { items; _ } ->
-        List.iter (fun item -> List.iter find_nonblocking item.Sv_ast.statements) items
+        List.iter (fun item -> List.iter mark_blocking item.Sv_ast.statements) items
     | _ -> ()
   in
 
-  List.iter find_nonblocking stmts;
+  (* Second pass: find which ones are used later as RHS *)
+  let rec find_used defined_so_far = function
+    | [] -> ()
+    | stmt :: rest ->
+        (match stmt with
+         | Sv_ast.Assign { lhs; rhs; is_blocking = true; _ } ->
+             (* Check if RHS uses any blocking vars defined earlier *)
+             let rhs_vars = find_rhs_vars rhs in
+             List.iter (fun v ->
+               if Hashtbl.mem defined_so_far v then
+                 Hashtbl.replace intermediate v true
+             ) rhs_vars;
+             (* Mark this var as defined *)
+             (match lhs with
+              | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+                  Hashtbl.replace defined_so_far name true
+              | _ -> ())
+         | Sv_ast.Assign { rhs; is_blocking = false; _ } ->
+             (* Non-blocking: check if RHS uses blocking vars *)
+             let rhs_vars = find_rhs_vars rhs in
+             List.iter (fun v ->
+               if Hashtbl.mem defined_so_far v then
+                 Hashtbl.replace intermediate v true
+             ) rhs_vars
+         | Sv_ast.Begin { stmts; _ } -> find_used defined_so_far stmts
+         | _ -> ());
+        find_used defined_so_far rest
+  in
+
+  List.iter mark_blocking stmts;
+  find_used defined stmts;
+  intermediate
+
+(* Identify state elements (registers) - all assignments in clocked always blocks,
+   except blocking assignments that are intermediate values *)
+let identify_state_elements stmts =
+  let state_vars = Hashtbl.create 16 in
+
+  let rec process_always = function
+    | Sv_ast.Always { senses; stmts = always_stmts; _ } ->
+        let is_clocked = is_clocked_always senses in
+        if is_clocked then begin
+          Printf.eprintf "        Found clocked always block\n%!";
+          (* Find intermediate blocking assignments *)
+          let intermediate = find_intermediate_blocking_vars always_stmts in
+          (* All assignments are state elements except intermediates *)
+          let rec mark_state = function
+            | Sv_ast.Assign { lhs; is_blocking; _ } ->
+                (match lhs with
+                 | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+                     if is_blocking && Hashtbl.mem intermediate name then begin
+                       Printf.eprintf "          Blocking var %s is intermediate (used later)\n%!" name
+                     end else begin
+                       Printf.eprintf "          Marking %s as state element\n%!" name;
+                       Hashtbl.replace state_vars name true
+                     end
+                 | _ -> ())
+            | Sv_ast.Begin { stmts; _ } -> List.iter mark_state stmts
+            | Sv_ast.If { then_stmt; else_stmt; _ } ->
+                mark_state then_stmt;
+                Option.iter mark_state else_stmt
+            | Sv_ast.Case { items; _ } ->
+                List.iter (fun item -> List.iter mark_state item.Sv_ast.statements) items
+            | _ -> ()
+          in
+          List.iter mark_state always_stmts
+        end
+    | Sv_ast.Begin { stmts; _ } -> List.iter process_always stmts
+    | _ -> ()
+  in
+
+  List.iter process_always stmts;
   state_vars
 
 (* Extract ports from module statements *)
@@ -253,7 +363,7 @@ let rec expr_to_remap decls = function
       (match String.uppercase_ascii op with
        | "ADD" | "VADD" -> Sig (width_match (+:) lhs_sig rhs_sig)
        | "SUB" | "VSUB" -> Sig (width_match (-:) lhs_sig rhs_sig)
-       | "MUL" | "VMUL" -> Sig (width_match ( *: ) lhs_sig rhs_sig)
+       | "MUL" | "VMUL" | "MULS" -> Sig (width_match ( *: ) lhs_sig rhs_sig)
        | "DIV" | "VDIV" ->
            (* Division is not supported in hardware - return all 1's (matching Verilog div-by-zero) *)
            let w = max (width lhs_sig) (width rhs_sig) in
@@ -307,7 +417,7 @@ let rec expr_to_remap decls = function
            Sig lhs_sig
        | _ -> Invalid)
        
-  | Sv_ast.UnaryOp { op; operand; _ } | Sv_ast.UnaryOp' { op; operand; _ } ->
+  | Sv_ast.UnaryOp { op; operand; dtype_ref } ->
       let op_sig = sig' (expr_to_remap decls operand) in
       (match String.uppercase_ascii op with
        | "NOT" | "VNOT" -> Sig (~: op_sig)
@@ -315,6 +425,28 @@ let rec expr_to_remap decls = function
        | "REDAND" -> Sig (reduce ~f:(&:) [op_sig])
        | "REDOR" -> Sig (reduce ~f:(|:) [op_sig])
        | "REDXOR" -> Sig (reduce ~f:(^:) [op_sig])
+       | "EXTEND" ->
+           (* Zero/unsigned extension *)
+           let target_width = extract_width dtype_ref in
+           Sig (uresize op_sig target_width)
+       | "EXTENDS" ->
+           (* Sign extension *)
+           let target_width = extract_width dtype_ref in
+           Sig (sresize op_sig target_width)
+       | _ -> Invalid)
+
+  | Sv_ast.UnaryOp' { op; operand; _ } ->
+      let op_sig = sig' (expr_to_remap decls operand) in
+      (match String.uppercase_ascii op with
+       | "NOT" | "VNOT" -> Sig (~: op_sig)
+       | "NEGATE" | "VNEGATE" -> Sig (zero (width op_sig) -: op_sig)
+       | "REDAND" -> Sig (reduce ~f:(&:) [op_sig])
+       | "REDOR" -> Sig (reduce ~f:(|:) [op_sig])
+       | "REDXOR" -> Sig (reduce ~f:(^:) [op_sig])
+       | "EXTEND" | "EXTENDS" ->
+           (* For UnaryOp' without dtype_ref, we can't determine target width,
+              so just return the operand as-is. The resizing will happen at assignment. *)
+           Sig op_sig
        | _ -> Invalid)
        
   | Sv_ast.Concat { parts } ->
@@ -427,11 +559,21 @@ let process_assign decls lhs rhs =
       None
 
 (* Process statement to Always.t *)
-let rec process_stmt decls = function
+let rec process_stmt decls intermediate_set = function
   | Sv_ast.Assign { lhs; rhs; is_blocking = true } ->
-      (* Blocking assignment - SSA temporary variable *)
-      (* Treat same as non-blocking: use Always API *)
-      process_assign decls lhs rhs
+      (* Check if this is an intermediate blocking assignment *)
+      let is_intermediate = match lhs with
+        | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+            Hashtbl.mem intermediate_set name
+        | _ -> false
+      in
+      if is_intermediate then begin
+        (* Skip - already processed as continuous assignment *)
+        None
+      end else begin
+        (* Regular blocking assignment in always block *)
+        process_assign decls lhs rhs
+      end
       
   | Sv_ast.Assign { lhs; rhs; is_blocking = false } ->
       (* Non-blocking - for registers *)
@@ -448,28 +590,28 @@ let rec process_stmt decls = function
        
   | Sv_ast.If { condition; then_stmt; else_stmt = Some else_stmt } ->
       let cond_raw = sig' (expr_to_remap decls condition) in
-      let cond = if width cond_raw = 1 then cond_raw 
+      let cond = if width cond_raw = 1 then cond_raw
                  else reduce ~f:(|:) [cond_raw] in
-      (match (process_stmt decls then_stmt, process_stmt decls else_stmt) with
+      (match (process_stmt decls intermediate_set then_stmt, process_stmt decls intermediate_set else_stmt) with
        | (Some t, Some e) -> Some (if_ cond [t] [e])
        | (Some t, None) -> Some (when_ cond [t])
        | _ -> None)
-       
+
   | Sv_ast.If { condition; then_stmt; else_stmt = None } ->
       let cond_raw = sig' (expr_to_remap decls condition) in
-      let cond = if width cond_raw = 1 then cond_raw 
+      let cond = if width cond_raw = 1 then cond_raw
                  else reduce ~f:(|:) [cond_raw] in
-      (match process_stmt decls then_stmt with
+      (match process_stmt decls intermediate_set then_stmt with
        | Some t -> Some (when_ cond [t])
        | None -> None)
-       
+
   | Sv_ast.Begin { stmts; _ } ->
-      let alws = List.filter_map (process_stmt decls) stmts in
+      let alws = List.filter_map (process_stmt decls intermediate_set) stmts in
       if List.length alws > 0 then
         Some (proc alws)
       else
         None
-        
+
   | Sv_ast.Case { expr; items } ->
       let expr_sig = sig' (expr_to_remap decls expr) in
       let cases = List.filter_map (fun item ->
@@ -478,13 +620,13 @@ let rec process_stmt decls = function
             (match expr_to_remap decls cond with
              | Con c ->
                  let cond_sig = Signal.of_constant c in
-                 let stmts = List.filter_map (process_stmt decls) item.statements in
+                 let stmts = List.filter_map (process_stmt decls intermediate_set) item.statements in
                  if List.length stmts > 0 then
                    Some (cond_sig, stmts)
                  else
                    None
              | Sig s ->
-                 let stmts = List.filter_map (process_stmt decls) item.statements in
+                 let stmts = List.filter_map (process_stmt decls intermediate_set) item.statements in
                  if List.length stmts > 0 then
                    Some (s, stmts)
                  else
@@ -496,7 +638,7 @@ let rec process_stmt decls = function
         Some (switch expr_sig cases)
       else
         None
-        
+
   | _ -> None
 
 (* Extract clock signal from sensitivity list *)
@@ -530,8 +672,8 @@ let extract_clock senses =
   find_clock senses
 
 (* Process always block *)
-let process_always decls clock_opt reset_opt stmts =
-  List.filter_map (process_stmt decls) stmts
+let process_always decls intermediate_set stmts =
+  List.filter_map (process_stmt decls intermediate_set) stmts
 
 (* Build HardCaml circuit for module *)
 let build_circuit module_name stmts =
@@ -657,6 +799,38 @@ let build_circuit module_name stmts =
       end
     ) all_vars;
     
+    (* Extract intermediate blocking assignments from clocked always blocks *)
+    let intermediate_assigns = ref [] in
+    List.iter (function
+      | Sv_ast.Always { senses; stmts = always_stmts; _ } when is_clocked_always senses ->
+          let intermediate = find_intermediate_blocking_vars always_stmts in
+          let rec extract_intermediates = function
+            | Sv_ast.Assign { lhs; rhs; is_blocking = true; _ } ->
+                (match lhs with
+                 | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+                     if Hashtbl.mem intermediate name then
+                       intermediate_assigns := (name, rhs) :: !intermediate_assigns
+                 | _ -> ())
+            | Sv_ast.Begin { stmts; _ } -> List.iter extract_intermediates stmts
+            | Sv_ast.If { then_stmt; else_stmt; _ } ->
+                extract_intermediates then_stmt;
+                Option.iter extract_intermediates else_stmt
+            | Sv_ast.Case { items; _ } ->
+                List.iter (fun item -> List.iter extract_intermediates item.Sv_ast.statements) items
+            | _ -> ()
+          in
+          List.iter extract_intermediates always_stmts
+      | _ -> ()
+    ) stmts;
+
+    Printf.eprintf "      Processing %d intermediate blocking assignments as continuous\n%!"
+      (List.length !intermediate_assigns);
+    List.iter (fun (name, rhs) ->
+      let rhs_sig = sig' (expr_to_remap decls rhs) in
+      Hashtbl.replace decls name (Sig rhs_sig);
+      Printf.eprintf "        SSA: %s = <expr> (stored as Sig)\n%!" name
+    ) !intermediate_assigns;
+
     (* Process continuous assignments *)
     let cont_assigns = List.filter_map (function
       | Sv_ast.AssignW { lhs; rhs } -> Some (lhs, rhs)
@@ -677,10 +851,16 @@ let build_circuit module_name stmts =
     
     (* Process always blocks *)
     let always_blocks = List.filter_map (function
-      | Sv_ast.Always { senses; stmts; _ } ->
+      | Sv_ast.Always { senses; stmts = always_stmts; _ } ->
           (* Extract clock/reset from sensitivity list if present *)
-          Printf.eprintf "      Processing always block with %d statements\n%!" (List.length stmts);
-          let alws = process_always decls None None stmts in
+          Printf.eprintf "      Processing always block with %d statements\n%!" (List.length always_stmts);
+          (* Find intermediate blocking vars for this block *)
+          let intermediate_set = if is_clocked_always senses then
+            find_intermediate_blocking_vars always_stmts
+          else
+            Hashtbl.create 0  (* empty set for combinational blocks *)
+          in
+          let alws = process_always decls intermediate_set always_stmts in
           Printf.eprintf "        Generated %d Always.t assignments\n%!" (List.length alws);
           if List.length alws > 0 then Some alws else None
       | _ -> None
