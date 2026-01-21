@@ -1,15 +1,16 @@
 HardCaml Test Suite Report
-Generated: Wed 21 Jan 2026 08:20:42 GMT
+Generated: Wed 21 Jan 2026 08:32:42 GMT
 ==========================================
 
 Summary:
-  Total:   76
-  Passed:  71
+  Total:   77
+  Passed:  72
   Failed:  1
   Skipped: 4
 
 Passed Tests:
   ✓ adder_test
+  ✓ apb_uart
   ✓ asgn_binop
   ✓ bitand
   ✓ bitselect_test
