@@ -1,0 +1,14 @@
+library (test_lib) {
+  cell (AND2) {
+    pin (A) {
+      direction : input;
+    }
+    pin (B) {
+      direction : input;
+    }
+    pin (Z) {
+      direction : output;
+      function : "(A & B)";
+    }
+  }
+}

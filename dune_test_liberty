@@ -1,0 +1,4 @@
+(executable
+ (name test_liberty)
+ (modules test_liberty)
+ (libraries str))
