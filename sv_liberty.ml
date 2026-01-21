@@ -1,8 +1,6 @@
 (* Liberty file parser for gate mapping *)
 (* Simplified version for SystemVerilog decompiler *)
 
-open Str
-
 (* Liberty cell representation *)
 type pin_direction = Input | Output | Inout | Internal
 type pin_info = {
@@ -228,6 +226,7 @@ let parse_liberty_file filename =
         | None -> ()
       ) body;
       {lib_name; cells}
+  | Some _ -> failwith ("Unexpected parse result for: " ^ filename)
   | None -> failwith ("Failed to parse library file: " ^ filename)
 
 (* Query functions *)

@@ -1,0 +1,26 @@
+
+library (test_lib) {
+  cell (AND2) {
+    pin (A1) { direction : input; }
+    pin (A2) { direction : input; }
+    pin (ZN) { direction : output; function : "(A1 & A2)"; }
+  }
+  cell (OR2) {
+    pin (A1) { direction : input; }
+    pin (A2) { direction : input; }
+    pin (ZN) { direction : output; function : "(A1 | A2)"; }
+  }
+  cell (XOR2) {
+    pin (A1) { direction : input; }
+    pin (A2) { direction : input; }
+    pin (ZN) { direction : output; function : "(A1 ^ A2)"; }
+  }
+  cell (INV) {
+    pin (I) { direction : input; }
+    pin (ZN) { direction : output; function : "(!I)"; }
+  }
+  cell (BUF) {
+    pin (I) { direction : input; }
+    pin (Z) { direction : output; function : "I"; }
+  }
+}
