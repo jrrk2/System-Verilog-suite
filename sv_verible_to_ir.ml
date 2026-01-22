@@ -1014,6 +1014,12 @@ let file_to_ir filename =
   match parse_verible_file filename with
   | None -> None
   | Some ast ->
-      (* Extract module name from filename as fallback *)
-      let module_name = Filename.chop_extension (Filename.basename filename) in
+      (* Elaborate to get the actual module name *)
+      let elab_ctx = Sv_elaborate.elaborate ast in
+      let module_name = match elab_ctx.Sv_elaborate.module_name with
+        | Some name -> name
+        | None ->
+            (* Fallback to filename if no module found *)
+            Filename.chop_extension (Filename.basename filename)
+      in
       Some (verible_to_ir ast module_name)

@@ -8,7 +8,7 @@
 (executables
  (names sv_main_unified test_gate_mapping example_round_trip test_rtlil_reader
         test_verify_yosys_verilator test_verible_elab test_verible_parse
-        test_3way_verify test_3way_suite test_parser_comparison)
+        test_3way_verify test_3way_suite test_parser_comparison test_apb_uart_z3 test_simple_z3)
  (modules sv_ast sv_gen sv_gen_struct sv_gen_yosys sv_gen_hardcaml
           sv_main_unified sv_parse sv_transform sv_tran_struct
           behavioural_to_opt_ir opt_ir_to_sv sv_opt_ir
@@ -22,7 +22,7 @@
           sv_elaborate sv_verible_to_ir
           test_gate_mapping example_round_trip test_rtlil_reader
           test_verify_yosys_verilator test_verible_elab test_verible_parse
-          test_3way_verify test_3way_suite test_parser_comparison)
+          test_3way_verify test_3way_suite test_parser_comparison test_apb_uart_z3 test_simple_z3)
  (libraries str yojson unix hardcaml z3)
  (preprocess (pps ppx_deriving_yojson)))
 

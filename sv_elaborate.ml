@@ -961,8 +961,16 @@ let extract_always_construct ctx token =
       extract_always_comb ctx stmt
   | TUPLE3 (STRING "always_construct1", Always_ff,
             TUPLE3 (STRING "procedural_timing_control_statement2", event_ctrl, stmt)) ->
-      Printf.printf "Always_ff block:\n";
-      extract_always_ff ctx event_ctrl stmt
+      (* Check if this is an async reset pattern *)
+      (match extract_clock_and_reset_event event_ctrl with
+       | Some (_, _, Some _, Some _) ->
+           (* Has async reset/set - use traditional always handler *)
+           Printf.printf "Always_ff block with async reset:\n";
+           extract_traditional_always ctx event_ctrl stmt
+       | _ ->
+           (* Simple clock event - use always_ff handler *)
+           Printf.printf "Always_ff block:\n";
+           extract_always_ff ctx event_ctrl stmt)
   | TUPLE3 (STRING "always_construct1", Always,
             TUPLE3 (STRING "procedural_timing_control_statement2",
                     (TUPLE3 (STRING "event_control4", AT, STAR) |
