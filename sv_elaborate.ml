@@ -445,6 +445,74 @@ let extract_clock_event token =
        | None -> None)
   | _ -> None
 
+(* Extract clock and reset from event control with multiple events *)
+(* Returns: (clock_name, clock_edge, reset_name_opt, reset_edge_opt) *)
+let extract_clock_and_reset_event token =
+  match token with
+  (* Pattern: @(posedge clk or posedge rst) - TUPLE5 with event_control2 *)
+  | TUPLE5 (STRING "event_control2", _at, LPAREN, event_list, RPAREN) ->
+      let rec find_edges events_list =
+        match events_list with
+        | TLIST events ->
+            let rec process_events events =
+              match events with
+              | [] -> (None, None)
+              | TUPLE3 (STRING "event_expression1", edge_token, signal_id) :: rest ->
+                  let edge = (match edge_token with
+                    | Posedge -> `Posedge
+                    | Negedge -> `Negedge
+                    | _ -> `Posedge) in
+                  let signal_name = extract_identifier signal_id in
+                  (match process_events rest with
+                   | (None, None) -> (Some (signal_name, edge), None)
+                   | (Some first, None) -> (Some first, Some (signal_name, edge))
+                   | (first, second) -> (first, second))
+              | _ :: rest -> process_events rest
+            in
+            process_events events
+        | TUPLE3 (STRING "event_expression1", edge_token, signal_id) ->
+            (* Single event *)
+            let edge = (match edge_token with
+              | Posedge -> `Posedge
+              | Negedge -> `Negedge
+              | _ -> `Posedge) in
+            (Some (extract_identifier signal_id, edge), None)
+        | _ -> (None, None)
+      in
+      (match find_edges event_list with
+       | (Some (Some clk, clk_edge), Some (Some rst, rst_edge)) ->
+           Some (clk, clk_edge, Some rst, Some rst_edge)
+       | (Some (Some clk, clk_edge), None) ->
+           Some (clk, clk_edge, None, None)
+       | _ -> None)
+  (* Pattern: @(posedge clk) with TUPLE4 - event_control1 *)
+  | TUPLE4 (STRING "event_control1", AT, LPAREN, event_expr) ->
+      (match event_expr with
+       | TUPLE3 (STRING "event_expression1", edge_token, signal_id) ->
+           let edge = (match edge_token with
+             | Posedge -> `Posedge
+             | Negedge -> `Negedge
+             | _ -> `Posedge) in
+           (match extract_identifier signal_id with
+            | Some clk -> Some (clk, edge, None, None)
+            | None -> None)
+       | _ -> None)
+  (* Fallback to old parser *)
+  | _ ->
+      (match extract_clock_event token with
+       | Some (clk, edge) -> Some (clk, edge, None, None)
+       | None -> None)
+
+(* Check if a statement is a sensitivity list (combinational always) *)
+let is_sensitivity_list token =
+  match token with
+  | TUPLE4 (STRING "event_control1", AT, LPAREN, TLIST _) ->
+      (* Check if it contains only signal names without edges *)
+      true  (* TODO: More precise detection *)
+  | TUPLE3 (STRING "event_control4", AT, STAR) -> true
+  | TUPLE5 (STRING "event_control3", AT, LPAREN, STAR, RPAREN) -> true
+  | _ -> false
+
 (* Extract assignments from case items *)
 let rec extract_case_items case_items =
   match case_items with
@@ -489,6 +557,11 @@ let extract_case_stmt ctx token =
 let rec extract_assigns_from_stmt ctx stmt =
   match stmt with
   | TUPLE3 (STRING "statement_item6", _assign_stmt, _) ->
+      (match extract_assignment_from_stmt stmt with
+       | Some assign -> [assign]
+       | None -> [])
+  | TUPLE6 (STRING "nonblocking_assignment1", _, _, _, _, _) ->
+      (* Direct nonblocking assignment *)
       (match extract_assignment_from_stmt stmt with
        | Some assign -> [assign]
        | None -> [])
@@ -543,6 +616,119 @@ let extract_always_ff ctx event_ctrl stmt =
        | None -> ())
   | None -> ()
 
+(* Extract assignments from if/else statement *)
+let rec extract_if_else_assigns stmt =
+  match stmt with
+  (* if (cond) stmt *)
+  | TUPLE4 (STRING "conditional_statement1", _if_kw, _cond, then_stmt) ->
+      extract_assigns_from_if_branch then_stmt
+  (* if (cond) stmt1 else stmt2 *)
+  | TUPLE6 (STRING "conditional_statement2", _if_kw, _cond, then_stmt, _else_kw, else_stmt) ->
+      let then_assigns = extract_assigns_from_if_branch then_stmt in
+      let else_assigns = extract_assigns_from_if_branch else_stmt in
+      then_assigns @ else_assigns
+  | _ -> []
+
+and extract_assigns_from_if_branch stmt =
+  match stmt with
+  | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
+      (match extract_assignment_from_stmt stmt with
+       | Some assign -> [assign]
+       | None -> extract_if_else_assigns inner_stmt)
+  | TUPLE4 (STRING "seq_block1", _begin, stmts, _end) ->
+      extract_assigns_from_seq_block stmts
+  | _ ->
+      (match extract_assignment_from_stmt stmt with
+       | Some assign -> [assign]
+       | None -> [])
+
+and extract_assigns_from_seq_block stmts =
+  match stmts with
+  | TLIST lst -> List.flatten (List.map extract_assigns_from_if_branch lst)
+  | single -> extract_assigns_from_if_branch single
+
+(* Extract traditional always block with timing control *)
+let extract_traditional_always ctx event_ctrl stmt =
+
+  (* Try to extract clock and reset from event control *)
+  match extract_clock_and_reset_event event_ctrl with
+  | Some (clock, clock_edge, Some reset, Some reset_edge) ->
+      (* Sequential logic with async reset: always @(posedge clk or posedge rst) *)
+      Printf.printf "  Always @(%s %s or %s %s): Sequential with async reset\n"
+        (match clock_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
+        clock
+        (match reset_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
+        reset;
+
+      (* Extract assignments from if/else structure *)
+      let assigns = extract_if_else_assigns stmt in
+      if assigns <> [] then begin
+        List.iter (fun assign ->
+          Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
+        ) assigns;
+        let always_blk = {
+          always_type = AlwaysFF { clock; edge = clock_edge };
+          always_stmts = assigns;
+        } in
+        (* Add to current module's always_blocks *)
+        (match get_current_module_data ctx with
+         | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+         | None -> ());
+        ctx.always_blocks <- always_blk :: ctx.always_blocks
+      end else begin
+        (* Fallback: try extracting from statement directly *)
+        let direct_assigns = extract_assigns_from_stmt ctx stmt in
+        if direct_assigns <> [] then begin
+          List.iter (fun assign ->
+            Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
+          ) direct_assigns;
+          let always_blk = {
+            always_type = AlwaysFF { clock; edge = clock_edge };
+            always_stmts = direct_assigns;
+          } in
+          (match get_current_module_data ctx with
+           | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+           | None -> ());
+          ctx.always_blocks <- always_blk :: ctx.always_blocks
+        end
+      end
+
+  | Some (clock, clock_edge, None, None) ->
+      (* Sequential logic without async reset: always @(posedge clk) *)
+      Printf.printf "  Always @(%s %s): Sequential logic\n"
+        (match clock_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
+        clock;
+
+      (* Extract assignments *)
+      let assigns = extract_assigns_from_stmt ctx stmt in
+      if assigns <> [] then begin
+        List.iter (fun assign ->
+          Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
+        ) assigns;
+        let always_blk = {
+          always_type = AlwaysFF { clock; edge = clock_edge };
+          always_stmts = assigns;
+        } in
+        (* Add to current module's always_blocks *)
+        (match get_current_module_data ctx with
+         | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+         | None -> ());
+        ctx.always_blocks <- always_blk :: ctx.always_blocks
+      end
+
+  | Some (_, _, Some _, None) | Some (_, _, None, Some _) ->
+      (* Malformed reset event *)
+      Printf.printf "  Note: Malformed reset event in always block\n"
+
+  | None ->
+      (* Might be combinational logic with explicit sensitivity list *)
+      if is_sensitivity_list event_ctrl then begin
+        Printf.printf "  Always @(sensitivity list): Combinational logic\n";
+        extract_always_comb ctx stmt
+      end else begin
+        Printf.printf "  Note: Could not parse event control for traditional always block\n"
+      end
+
 (* Extract always construct *)
 let extract_always_construct ctx token =
   match token with
@@ -561,6 +747,11 @@ let extract_always_construct ctx token =
       (* always-at-star or always-at-(star) - treat as always_comb *)
       Printf.printf "Always @* block:\n";
       extract_always_comb ctx stmt
+  | TUPLE3 (STRING "always_construct1", Always,
+            TUPLE3 (STRING "procedural_timing_control_statement2", event_ctrl, stmt)) ->
+      (* Traditional always blocks with timing control: always @(posedge clk), always @(a or b), etc. *)
+      Printf.printf "Traditional always block:\n";
+      extract_traditional_always ctx event_ctrl stmt
   | _ -> ()
 
 (* Extract data declaration (reg, wire, logic) *)
