@@ -705,110 +705,70 @@ let extract_always_ff ctx event_ctrl stmt =
        | None -> ())
   | None -> ()
 
+(* Helper function to recursively extract signal identifier from expression *)
+(* Handles: identifiers, comparisons like (RST == 1'b1), nested parentheses *)
+let rec extract_signal_from_expr expr =
+  match expr with
+  (* Direct identifier *)
+  | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
+  | SymbolIdentifier id -> Some id
+
+  (* Comparison: extract left operand (e.g., RST == 1'b1 -> RST) *)
+  | TUPLE4 (STRING "binary_eq_expr1", left_expr, _, _) ->
+      extract_signal_from_expr left_expr
+  | TUPLE4 (STRING "binary_ne_expr1", left_expr, _, _) ->
+      extract_signal_from_expr left_expr
+  | TUPLE4 (STRING "logeq_expr2", left_expr, _, _) ->
+      extract_signal_from_expr left_expr
+  | TUPLE4 (STRING "logneq_expr2", left_expr, _, _) ->
+      extract_signal_from_expr left_expr
+
+  (* Parentheses: unwrap and recurse *)
+  | TUPLE4 (STRING "expression_in_parens1", _lparen, inner, _rparen) ->
+      extract_signal_from_expr inner
+  | TUPLE4 (STRING "expr_primary_parens1", _lparen, inner, _rparen) ->
+      extract_signal_from_expr inner
+
+  (* Negation: extract inner signal *)
+  | TUPLE3 (STRING "unary_prefix_expr2", PLING, inner) ->
+      extract_signal_from_expr inner
+
+  (* Single-element list: unwrap *)
+  | TLIST [single] ->
+      extract_signal_from_expr single
+
+  (* Multi-element list: try each element *)
+  | TLIST lst ->
+      List.fold_left (fun acc item ->
+        match acc with
+        | Some _ -> acc
+        | None -> extract_signal_from_expr item
+      ) None lst
+
+  (* Verible expression wrappers: unwrap *)
+  | TUPLE3 (STRING "sequence_repetition_expr1", inner, _) ->
+      extract_signal_from_expr inner
+  | TUPLE3 (STRING "expression_or_dist1", inner, _) ->
+      extract_signal_from_expr inner
+
+  (* Other cases: not recognized *)
+  | _ -> None
+
 (* Analyze if/else structure for async reset/set pattern *)
 (* Returns: (reset_signal, reset_polarity, reset_assigns, normal_assigns) *)
 let rec analyze_async_reset_structure reset_signal stmt =
-  (* Debug: print statement structure *)
-  (match stmt with
-   | TUPLE3 (STRING s, _, _) -> Printf.printf "      analyze_async_reset: TUPLE3(%s)\n" s
-   | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      analyze_async_reset: TUPLE4(%s)\n" s
-   | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      analyze_async_reset: TUPLE6(%s)\n" s
-   | TUPLE7 (STRING s, _, _, _, _, _, _) -> Printf.printf "      analyze_async_reset: TUPLE7(%s)\n" s
-   | TLIST _ -> Printf.printf "      analyze_async_reset: TLIST\n"
-   | _ -> Printf.printf "      analyze_async_reset: Other\n");
   match stmt with
   (* TUPLE7 conditional statement - handle this pattern *)
   | TUPLE7 (STRING "conditional_statement2", elem1, elem2, elem3, elem4, elem5, elem6) ->
-      Printf.printf "      TUPLE7 conditional_statement2 found\n";
       let _label = elem1 in
       let _if_kw = elem2 in
       let cond_expr = elem3 in
       let then_stmt = elem4 in
       let _else_kw = elem5 in
       let else_stmt = elem6 in
-      (* Debug: print condition structure *)
-      (match cond_expr with
-       | TUPLE3 (STRING s, _, _) -> Printf.printf "      TUPLE7 cond: TUPLE3(%s)\n" s
-       | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      TUPLE7 cond: TUPLE4(%s)\n" s
-       | _ -> Printf.printf "      TUPLE7 cond: Other\n");
-      (* Check if condition references the reset signal *)
-      let cond_str = match cond_expr with
-        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-        | SymbolIdentifier id -> Some id
-        | TUPLE4 (STRING "expression_in_parens1", _lparen, inner_expr, _rparen) ->
-            (* Unwrap expression_in_parens1 *)
-            Printf.printf "      Unwrapping expression_in_parens1\n";
-            (match inner_expr with
-             | TUPLE3 (STRING s, _, _) -> Printf.printf "      Inner expr: TUPLE3(%s)\n" s
-             | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      Inner expr: TUPLE4(%s)\n" s
-             | _ -> Printf.printf "      Inner expr: Other\n");
-            (match inner_expr with
-             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-             | SymbolIdentifier id -> Some id
-             | TUPLE3 (STRING "unary_prefix_expr2", PLING, negated) ->
-                 (* Negated condition: if (!rst) *)
-                 (match negated with
-                  | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-                  | SymbolIdentifier id -> Some id
-                  | _ -> None)
-             | TUPLE4 (STRING "expr_primary_parens1", _lparen2, inner_expr2, _rparen2) ->
-                 (* Double parentheses: ((expr)) - unwrap  again *)
-                 Printf.printf "      Unwrapping expr_primary_parens1\n";
-                 (* Recursively extract identifier from inner expression *)
-                 let rec extract_id_from_comparison expr =
-                   match expr with
-                   | TUPLE4 (STRING "binary_eq_expr1", left_expr, _, _) ->
-                       Printf.printf "      Found binary_eq_expr1 in double parens\n";
-                       (match left_expr with
-                        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) ->
-                            Printf.printf "      Left expr is identifier: %s\n" id;
-                            Some id
-                        | SymbolIdentifier id ->
-                            Printf.printf "      Left expr is identifier: %s\n" id;
-                            Some id
-                        | _ -> None)
-                   | TLIST [single] -> extract_id_from_comparison single
-                   | TLIST lst ->
-                       (* Find first comparison in list *)
-                       List.fold_left (fun acc item ->
-                         match acc with
-                         | Some _ -> acc
-                         | None -> extract_id_from_comparison item
-                       ) None lst
-                   | _ -> None
-                 in
-                 extract_id_from_comparison inner_expr2
-             | TUPLE4 (STRING "binary_eq_expr1", left_expr, _, _right_expr) ->
-                 (* Comparison: if (rst == 1'b1) or if (rst == 1'b0) *)
-                 Printf.printf "      Found binary_eq_expr1\n";
-                 (match left_expr with
-                  | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) ->
-                      Printf.printf "      Left expr is identifier: %s\n" id;
-                      Some id
-                  | SymbolIdentifier id ->
-                      Printf.printf "      Left expr is identifier: %s\n" id;
-                      Some id
-                  | TUPLE3 (STRING s, _, _) ->
-                      Printf.printf "      Left expr is TUPLE3(%s)\n" s;
-                      None
-                  | _ ->
-                      Printf.printf "      Left expr is Other\n";
-                      None)
-             | _ -> None)
-        | TUPLE3 (STRING "unary_prefix_expr2", PLING, inner) ->
-            (* Negated condition: if (!rst) *)
-            (match inner with
-             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-             | SymbolIdentifier id -> Some id
-             | _ -> None)
-        | TUPLE4 (STRING "binary_eq_expr1", left_expr, _, _right_expr) ->
-            (* Comparison: if (rst == 1'b1) or if (rst == 1'b0) *)
-            (match left_expr with
-             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-             | SymbolIdentifier id -> Some id
-             | _ -> None)
-        | _ -> None
-      in
+
+      (* Extract signal from condition using helper function *)
+      let cond_str = extract_signal_from_expr cond_expr in
 
       (match cond_str with
        | Some cond_id when cond_id = reset_signal ->
@@ -839,24 +799,14 @@ let rec analyze_async_reset_structure reset_signal stmt =
 
   (* Unwrap statement_item wrapper *)
   | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
-      Printf.printf "      Unwrapping statement_item6\n";
-      (match inner_stmt with
-       | TUPLE3 (STRING s, _, _) -> Printf.printf "      Inner: TUPLE3(%s)\n" s
-       | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      Inner: TUPLE4(%s)\n" s
-       | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      Inner: TUPLE6(%s)\n" s
-       | TUPLE7 (STRING s, _, _, _, _, _, _) -> Printf.printf "      Inner: TUPLE7(%s)\n" s
-       | _ -> Printf.printf "      Inner: Other\n");
       analyze_async_reset_structure reset_signal inner_stmt
 
   (* Unwrap seq_block (begin...end) *)
   | TUPLE4 (STRING "seq_block1", _begin, inner_stmts, _end) ->
-      Printf.printf "      Unwrapping seq_block1\n";
       (match inner_stmts with
        | TLIST [single] ->
-           Printf.printf "      TLIST with single statement\n";
            analyze_async_reset_structure reset_signal single
        | TLIST lst ->
-           Printf.printf "      TLIST with %d statements\n" (List.length lst);
            (* Multiple statements in block - look for the if/else *)
            (match List.find_opt (fun s ->
               match s with
@@ -866,59 +816,16 @@ let rec analyze_async_reset_structure reset_signal stmt =
               | TUPLE3 (STRING "statement_item6", TUPLE7 (STRING "conditional_statement2", _, _, _, _, _, _), _) -> true
               | _ -> false) lst with
             | Some if_stmt ->
-                Printf.printf "      Found if statement in TLIST\n";
                 analyze_async_reset_structure reset_signal if_stmt
             | None ->
-                Printf.printf "      No if statement found in TLIST\n";
                 None)
        | single ->
-           Printf.printf "      Non-TLIST statement\n";
-           (match single with
-            | TUPLE3 (STRING s, _, _) -> Printf.printf "      Non-TLIST: TUPLE3(%s)\n" s
-            | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      Non-TLIST: TUPLE4(%s)\n" s
-            | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      Non-TLIST: TUPLE6(%s)\n" s
-            | TUPLE7 (STRING s, _, _, _, _, _, _) -> Printf.printf "      Non-TLIST: TUPLE7(%s)\n" s
-            | _ -> Printf.printf "      Non-TLIST: Other\n");
            analyze_async_reset_structure reset_signal single)
 
   (* if (cond) then_stmt else else_stmt - typical async reset pattern *)
   | TUPLE6 (STRING "conditional_statement2", _if_kw, cond_expr, then_stmt, _else_kw, else_stmt) ->
-      Printf.printf "      Found conditional_statement2\n";
-      (* Debug: print condition expression structure *)
-      (match cond_expr with
-       | TUPLE3 (STRING s, _, _) -> Printf.printf "      Condition: TUPLE3(%s)\n" s
-       | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      Condition: TUPLE4(%s)\n" s
-       | _ -> Printf.printf "      Condition: Other\n");
-      (* Check if condition references the reset signal *)
-      let cond_str = match cond_expr with
-        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-        | SymbolIdentifier id -> Some id
-        | TUPLE4 (STRING "expression_in_parens1", _lparen, inner_expr, _rparen) ->
-            (* Unwrap expression_in_parens1 *)
-            (match inner_expr with
-             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-             | SymbolIdentifier id -> Some id
-             | TUPLE4 (STRING "binary_eq_expr1", left_expr, _, _right_expr) ->
-                 (* Comparison: if (rst == 1'b1) or if (rst == 1'b0) *)
-                 (match left_expr with
-                  | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-                  | SymbolIdentifier id -> Some id
-                  | _ -> None)
-             | _ -> None)
-        | TUPLE3 (STRING "unary_prefix_expr2", PLING, inner) ->
-            (* Negated condition: if (!rst) *)
-            (match inner with
-             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-             | SymbolIdentifier id -> Some id
-             | _ -> None)
-        | TUPLE4 (STRING "binary_eq_expr1", left_expr, _, _right_expr) ->
-            (* Comparison: if (rst == 1'b1) or if (rst == 1'b0) *)
-            (match left_expr with
-             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
-             | SymbolIdentifier id -> Some id
-             | _ -> None)
-        | _ -> None
-      in
+      (* Extract signal from condition using helper function *)
+      let cond_str = extract_signal_from_expr cond_expr in
 
       (match cond_str with
        | Some cond_id when cond_id = reset_signal ->
@@ -926,16 +833,12 @@ let rec analyze_async_reset_structure reset_signal stmt =
            let reset_assigns = extract_assigns_from_if_branch then_stmt in
            let normal_assigns = extract_assigns_from_if_branch else_stmt in
            Some (`Posedge, reset_assigns, normal_assigns)
-       | Some cond_id ->
+       | Some _cond_id ->
            (* Condition might be negated reset or different signal *)
-           (* For now, assume then branch is reset if it's simpler *)
            let then_assigns = extract_assigns_from_if_branch then_stmt in
            let else_assigns = extract_assigns_from_if_branch else_stmt in
-           (* Heuristic: reset branch typically has constant assignments *)
            Some (`Posedge, then_assigns, else_assigns)
-       | None ->
-           (* Can't determine - extract all *)
-           None)
+       | None -> None)
 
   (* if (cond) stmt - no else branch *)
   | TUPLE4 (STRING "conditional_statement1", _if_kw, _cond, then_stmt) ->
