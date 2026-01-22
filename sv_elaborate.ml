@@ -755,6 +755,112 @@ let rec extract_signal_from_expr expr =
   (* Other cases: not recognized *)
   | _ -> None
 
+(* Helper to combine two conditions with AND *)
+let combine_conditions_with_and parent_cond new_cond =
+  match parent_cond with
+  | None -> Some new_cond
+  | Some parent ->
+      (* Build logical AND: parent && new_cond *)
+      Some (TUPLE4 (STRING "logand_expr2", parent, AMPERSAND_AMPERSAND, new_cond))
+
+(* Extract assignments WITH conditions for MUX tree generation *)
+let rec extract_assigns_with_cond condition stmt =
+  match stmt with
+  | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
+      (match extract_assignment_from_stmt stmt with
+       | Some assign ->
+           [{ assign with assign_condition = condition }]
+       | None ->
+           (* Check if inner_stmt is a conditional *)
+           (match inner_stmt with
+            | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _)
+            | TUPLE4 (STRING "conditional_statement1", _, _, _)
+            | TUPLE5 (STRING "conditional_statement1", _, _, _, _) ->
+                extract_if_else_assigns_with_cond condition inner_stmt
+            | _ -> []))
+  | TUPLE4 (STRING "seq_block1", _begin, stmts, _end) ->
+      extract_assigns_from_seq_block_with_cond condition stmts
+  | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _) ->
+      extract_if_else_assigns_with_cond condition stmt
+  | TUPLE7 (STRING "conditional_statement2", _, _, _, _, _, _) ->
+      extract_if_else_assigns_with_cond condition stmt
+  | TUPLE4 (STRING "conditional_statement1", _, _, _) ->
+      extract_if_else_assigns_with_cond condition stmt
+  | TUPLE5 (STRING "conditional_statement1", _, _, _, _) ->
+      extract_if_else_assigns_with_cond condition stmt
+  | TUPLE6 (STRING "nonblocking_assignment1", _, _, _, _, _) ->
+      (* Direct nonblocking assignment *)
+      (match extract_assignment_from_stmt stmt with
+       | Some assign ->
+           [{ assign with assign_condition = condition }]
+       | None -> [])
+  | _ ->
+      (match extract_assignment_from_stmt stmt with
+       | Some assign ->
+           [{ assign with assign_condition = condition }]
+       | None -> [])
+
+and extract_assigns_from_seq_block_with_cond condition stmts =
+  match stmts with
+  | TLIST lst -> List.flatten (List.map (extract_assigns_with_cond condition) lst)
+  | single -> extract_assigns_with_cond condition single
+
+and extract_if_else_assigns_with_cond parent_cond stmt =
+  match stmt with
+  (* if (cond) stmt *)
+  | TUPLE4 (STRING "conditional_statement1", _if_kw, cond_expr, then_stmt) ->
+      (* Combine parent condition with current condition using AND *)
+      let combined_cond = combine_conditions_with_and parent_cond cond_expr in
+      extract_assigns_with_cond combined_cond then_stmt
+  | TUPLE5 (STRING "conditional_statement1", _label, _if_kw, cond_expr, then_stmt) ->
+      (* if (cond) stmt with label *)
+      let combined_cond = combine_conditions_with_and parent_cond cond_expr in
+      extract_assigns_with_cond combined_cond then_stmt
+  (* if (cond) stmt1 else stmt2 *)
+  | TUPLE6 (STRING "conditional_statement2", _if_kw, cond_expr, then_stmt, _else_kw, else_stmt) ->
+      (* Then branch: parent AND current condition *)
+      let then_cond = combine_conditions_with_and parent_cond cond_expr in
+      let then_assigns = extract_assigns_with_cond then_cond then_stmt in
+      (* Else branch: keep parent condition only (condition is false in else branch) *)
+      let else_assigns = extract_assigns_with_cond parent_cond else_stmt in
+      then_assigns @ else_assigns
+  | TUPLE7 (STRING "conditional_statement2", _label, _if_kw, cond_expr, then_stmt, _else_kw, else_stmt) ->
+      (* if (cond) stmt1 else stmt2 with label *)
+      let then_cond = combine_conditions_with_and parent_cond cond_expr in
+      let then_assigns = extract_assigns_with_cond then_cond then_stmt in
+      let else_assigns = extract_assigns_with_cond parent_cond else_stmt in
+      then_assigns @ else_assigns
+  | _ -> []
+
+and extract_assigns_from_if_branch stmt =
+  (* Use new condition-tracking version with no parent condition *)
+  extract_assigns_with_cond None stmt
+
+and extract_assigns_from_seq_block stmts =
+  match stmts with
+  | TLIST lst -> List.flatten (List.map extract_assigns_from_if_branch lst)
+  | single -> extract_assigns_from_if_branch single
+
+and extract_if_else_assigns stmt =
+  match stmt with
+  (* if (cond) stmt *)
+  | TUPLE4 (STRING "conditional_statement1", _if_kw, _cond, then_stmt) ->
+      extract_assigns_from_if_branch then_stmt
+  | TUPLE5 (STRING "conditional_statement1", _label, _if_kw, _cond, then_stmt) ->
+      (* if (cond) stmt with label *)
+      extract_assigns_from_if_branch then_stmt
+  (* if (cond) stmt1 else stmt2 *)
+  | TUPLE6 (STRING "conditional_statement2", _if_kw, _cond, then_stmt, _else_kw, else_stmt) ->
+      let then_assigns = extract_assigns_from_if_branch then_stmt in
+      let else_assigns = extract_assigns_from_if_branch else_stmt in
+      then_assigns @ else_assigns
+  | TUPLE7 (STRING "conditional_statement2", _label, _if_kw, _cond, then_stmt, _else_kw, else_stmt) ->
+      (* if (cond) stmt1 else stmt2 with label *)
+      let then_assigns = extract_assigns_from_if_branch then_stmt in
+      let else_assigns = extract_assigns_from_if_branch else_stmt in
+      then_assigns @ else_assigns
+  | _ -> []
+
 (* Analyze if/else structure for async reset/set pattern *)
 (* Returns: (reset_signal, reset_polarity, reset_assigns, normal_assigns) *)
 let rec analyze_async_reset_structure reset_signal stmt =
@@ -847,111 +953,6 @@ let rec analyze_async_reset_structure reset_signal stmt =
       None
 
   | _ -> None
-
-(* Extract assignments WITH conditions for MUX tree generation *)
-and extract_assigns_with_cond condition stmt =
-  match stmt with
-  | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
-      (match extract_assignment_from_stmt stmt with
-       | Some assign ->
-           [{ assign with assign_condition = condition }]
-       | None ->
-           (* Check if inner_stmt is a conditional *)
-           (match inner_stmt with
-            | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _)
-            | TUPLE4 (STRING "conditional_statement1", _, _, _)
-            | TUPLE5 (STRING "conditional_statement1", _, _, _, _) ->
-                extract_if_else_assigns_with_cond condition inner_stmt
-            | _ -> []))
-  | TUPLE4 (STRING "seq_block1", _begin, stmts, _end) ->
-      extract_assigns_from_seq_block_with_cond condition stmts
-  | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _) ->
-      extract_if_else_assigns_with_cond condition stmt
-  | TUPLE7 (STRING "conditional_statement2", _, _, _, _, _, _) ->
-      extract_if_else_assigns_with_cond condition stmt
-  | TUPLE4 (STRING "conditional_statement1", _, _, _) ->
-      extract_if_else_assigns_with_cond condition stmt
-  | TUPLE5 (STRING "conditional_statement1", _, _, _, _) ->
-      extract_if_else_assigns_with_cond condition stmt
-  | TUPLE6 (STRING "nonblocking_assignment1", _, _, _, _, _) ->
-      (* Direct nonblocking assignment *)
-      (match extract_assignment_from_stmt stmt with
-       | Some assign ->
-           [{ assign with assign_condition = condition }]
-       | None -> [])
-  | _ ->
-      (match extract_assignment_from_stmt stmt with
-       | Some assign ->
-           [{ assign with assign_condition = condition }]
-       | None -> [])
-
-and extract_assigns_from_seq_block_with_cond condition stmts =
-  match stmts with
-  | TLIST lst -> List.flatten (List.map (extract_assigns_with_cond condition) lst)
-  | single -> extract_assigns_with_cond condition single
-
-and extract_if_else_assigns_with_cond parent_cond stmt =
-  match stmt with
-  (* if (cond) stmt *)
-  | TUPLE4 (STRING "conditional_statement1", _if_kw, cond_expr, then_stmt) ->
-      let combined_cond = match parent_cond with
-        | None -> Some cond_expr
-        | Some _ -> parent_cond  (* Keep parent condition for now *)
-      in
-      extract_assigns_with_cond combined_cond then_stmt
-  | TUPLE5 (STRING "conditional_statement1", _label, _if_kw, cond_expr, then_stmt) ->
-      let combined_cond = match parent_cond with
-        | None -> Some cond_expr
-        | Some _ -> parent_cond
-      in
-      extract_assigns_with_cond combined_cond then_stmt
-  (* if (cond) stmt1 else stmt2 *)
-  | TUPLE6 (STRING "conditional_statement2", _if_kw, cond_expr, then_stmt, _else_kw, else_stmt) ->
-      let then_cond = match parent_cond with
-        | None -> Some cond_expr
-        | Some _ -> parent_cond
-      in
-      let then_assigns = extract_assigns_with_cond then_cond then_stmt in
-      let else_assigns = extract_assigns_with_cond parent_cond else_stmt in
-      then_assigns @ else_assigns
-  | TUPLE7 (STRING "conditional_statement2", _label, _if_kw, cond_expr, then_stmt, _else_kw, else_stmt) ->
-      let then_cond = match parent_cond with
-        | None -> Some cond_expr
-        | Some _ -> parent_cond
-      in
-      let then_assigns = extract_assigns_with_cond then_cond then_stmt in
-      let else_assigns = extract_assigns_with_cond parent_cond else_stmt in
-      then_assigns @ else_assigns
-  | _ -> []
-
-and extract_assigns_from_if_branch stmt =
-  (* Use new condition-tracking version with no parent condition *)
-  extract_assigns_with_cond None stmt
-
-and extract_assigns_from_seq_block stmts =
-  match stmts with
-  | TLIST lst -> List.flatten (List.map extract_assigns_from_if_branch lst)
-  | single -> extract_assigns_from_if_branch single
-
-and extract_if_else_assigns stmt =
-  match stmt with
-  (* if (cond) stmt *)
-  | TUPLE4 (STRING "conditional_statement1", _if_kw, _cond, then_stmt) ->
-      extract_assigns_from_if_branch then_stmt
-  | TUPLE5 (STRING "conditional_statement1", _label, _if_kw, _cond, then_stmt) ->
-      (* if (cond) stmt with label *)
-      extract_assigns_from_if_branch then_stmt
-  (* if (cond) stmt1 else stmt2 *)
-  | TUPLE6 (STRING "conditional_statement2", _if_kw, _cond, then_stmt, _else_kw, else_stmt) ->
-      let then_assigns = extract_assigns_from_if_branch then_stmt in
-      let else_assigns = extract_assigns_from_if_branch else_stmt in
-      then_assigns @ else_assigns
-  | TUPLE7 (STRING "conditional_statement2", _label, _if_kw, _cond, then_stmt, _else_kw, else_stmt) ->
-      (* if (cond) stmt1 else stmt2 with label *)
-      let then_assigns = extract_assigns_from_if_branch then_stmt in
-      let else_assigns = extract_assigns_from_if_branch else_stmt in
-      then_assigns @ else_assigns
-  | _ -> []
 
 (* Extract traditional always block with timing control *)
 let extract_traditional_always ctx event_ctrl stmt =
