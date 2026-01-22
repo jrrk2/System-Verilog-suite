@@ -877,48 +877,8 @@ let verible_to_ir verible_ast module_name =
     | _ -> ()
   ) symbol_table;
 
-  (* Step 4: Convert assign statements from this module only *)
+  (* Step 4: Convert always blocks to IR operations *)
   let expr_cache = Hashtbl.create 50 in
-  List.iter (fun (assign : Sv_elaborate.assign_info) ->
-    Printf.printf "Converting assign: %s = <expr>\n" assign.assign_lhs;
-    (* Debug: Show RHS expression structure if unhandled *)
-    let value_id =
-      try
-        expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.assign_rhs
-      with
-      | e ->
-          Printf.eprintf "\nException while converting RHS of %s:\n" assign.assign_lhs;
-          Printf.eprintf "%s\n" (token_to_json_string ~max_depth:3 0 assign.assign_rhs);
-          raise e
-    in
-
-    (* Try to connect to wire first, then output *)
-    (try
-      let wire_val = Hashtbl.find ir.ir_wires assign.assign_lhs in
-      (match wire_val with
-       | Sv_ast.Wire { width; name; _ } ->
-           (* Replace the wire's ID with the computed value ID *)
-           Hashtbl.replace ir.ir_wires assign.assign_lhs
-             (Sv_ast.Wire { id = value_id; name; width });
-           Printf.printf "  Connected to wire %s (value_id=%d)\n" assign.assign_lhs value_id
-       | _ -> ())
-    with Not_found ->
-      (* Not a wire, try output *)
-      (try
-        let output_val = Hashtbl.find ir.ir_outputs assign.assign_lhs in
-        (match output_val with
-         | Sv_ast.Output { width; name; _ } ->
-             (* Replace the output's ID with the computed value ID *)
-             Hashtbl.replace ir.ir_outputs assign.assign_lhs
-               (Sv_ast.Output { id = value_id; name; width });
-             Printf.printf "  Connected to output %s (value_id=%d)\n" assign.assign_lhs value_id
-         | _ ->
-             Printf.eprintf "Warning: '%s' is not an output\n" assign.assign_lhs)
-      with Not_found ->
-        Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.assign_lhs))
-  ) (List.rev module_data.mod_assigns);
-
-  (* Step 5: Convert always blocks to IR operations *)
   List.iter (fun (always_blk : Sv_elaborate.always_info) ->
     match always_blk.Sv_elaborate.always_type with
     | Sv_elaborate.AlwaysComb ->
@@ -1058,6 +1018,46 @@ let verible_to_ir verible_ast module_name =
               Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.Sv_elaborate.assign_lhs))
         ) always_blk.Sv_elaborate.always_stmts
   ) (List.rev module_data.Sv_elaborate.mod_always_blocks);
+
+  (* Step 5: Convert assign statements from this module only *)
+  List.iter (fun (assign : Sv_elaborate.assign_info) ->
+    Printf.printf "Converting assign: %s = <expr>\n" assign.assign_lhs;
+    (* Debug: Show RHS expression structure if unhandled *)
+    let value_id =
+      try
+        expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.assign_rhs
+      with
+      | e ->
+          Printf.eprintf "\nException while converting RHS of %s:\n" assign.assign_lhs;
+          Printf.eprintf "%s\n" (token_to_json_string ~max_depth:3 0 assign.assign_rhs);
+          raise e
+    in
+
+    (* Try to connect to wire first, then output *)
+    (try
+      let wire_val = Hashtbl.find ir.ir_wires assign.assign_lhs in
+      (match wire_val with
+       | Sv_ast.Wire { width; name; _ } ->
+           (* Replace the wire's ID with the computed value ID *)
+           Hashtbl.replace ir.ir_wires assign.assign_lhs
+             (Sv_ast.Wire { id = value_id; name; width });
+           Printf.printf "  Connected to wire %s (value_id=%d)\n" assign.assign_lhs value_id
+       | _ -> ())
+    with Not_found ->
+      (* Not a wire, try output *)
+      (try
+        let output_val = Hashtbl.find ir.ir_outputs assign.assign_lhs in
+        (match output_val with
+         | Sv_ast.Output { width; name; _ } ->
+             (* Replace the output's ID with the computed value ID *)
+             Hashtbl.replace ir.ir_outputs assign.assign_lhs
+               (Sv_ast.Output { id = value_id; name; width });
+             Printf.printf "  Connected to output %s (value_id=%d)\n" assign.assign_lhs value_id
+         | _ ->
+             Printf.eprintf "Warning: '%s' is not an output\n" assign.assign_lhs)
+      with Not_found ->
+        Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.assign_lhs))
+  ) (List.rev module_data.mod_assigns);
 
   Printf.printf "\n✓ IR conversion complete\n";
   Printf.printf "  Inputs: %d, Outputs: %d, Nodes: %d\n"
