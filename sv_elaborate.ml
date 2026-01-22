@@ -43,6 +43,7 @@ type signal_info = {
 type assign_info = {
   assign_lhs: string;
   assign_rhs: token;  (* Expression tree *)
+  assign_condition: token option;  (* Condition expression, None for unconditional *)
 }
 
 (* Always block information *)
@@ -471,10 +472,10 @@ let extract_continuous_assign ctx token =
                 Printf.printf "  LHS: %s = " name;
                 (* Add to current module's assigns *)
                 (match get_current_module_data ctx with
-                 | Some data -> data.mod_assigns <- {assign_lhs = name; assign_rhs = rhs} :: data.mod_assigns
+                 | Some data -> data.mod_assigns <- {assign_lhs = name; assign_rhs = rhs; assign_condition = None} :: data.mod_assigns
                  | None -> ());
                 (* Also add to deprecated global list for compatibility *)
-                ctx.assigns <- {assign_lhs = name; assign_rhs = rhs} :: ctx.assigns
+                ctx.assigns <- {assign_lhs = name; assign_rhs = rhs; assign_condition = None} :: ctx.assigns
             | None -> Printf.printf "  LHS: <unknown> = ");
            ignore (extract_expression rhs);
            Printf.printf "\n";
@@ -489,11 +490,11 @@ let rec extract_assignment_from_stmt stmt =
             TUPLE4 (STRING "assignment_statement_no_expr1", lhs, EQUALS, rhs),
             SEMICOLON) ->
       (match extract_identifier lhs with
-       | Some name -> Some { assign_lhs = name; assign_rhs = rhs }
+       | Some name -> Some { assign_lhs = name; assign_rhs = rhs; assign_condition = None }
        | None -> None)
   | TUPLE6 (STRING "nonblocking_assignment1", lhs, _, EMPTY_TOKEN, rhs, SEMICOLON) ->
       (match extract_identifier lhs with
-       | Some name -> Some { assign_lhs = name; assign_rhs = rhs }
+       | Some name -> Some { assign_lhs = name; assign_rhs = rhs; assign_condition = None }
        | None -> None)
   | _ -> None
 
@@ -615,7 +616,7 @@ let extract_case_stmt ctx token =
        | Some lhs ->
            Printf.printf "    Case assigns to: %s\n" lhs;
            (* Return the entire case statement as the RHS *)
-           [{ assign_lhs = lhs; assign_rhs = case_token }]
+           [{ assign_lhs = lhs; assign_rhs = case_token; assign_condition = None }]
        | None -> [])
   | _ -> []
 
@@ -931,45 +932,62 @@ let extract_traditional_always ctx event_ctrl stmt =
            Printf.printf "    Found %d reset assignments, %d normal assignments\n"
              (List.length reset_assigns) (List.length normal_assigns);
 
-           (* For each signal, create an AlwaysFF block with reset info *)
-           (* Group assignments by signal name *)
-           let signal_map = Hashtbl.create 10 in
+           (* Group all assignments by signal name to create one AlwaysFF per signal *)
+           (* First, map reset assignments by signal *)
+           let reset_map = Hashtbl.create 10 in
            List.iter (fun assign ->
-             Hashtbl.replace signal_map assign.assign_lhs (`Reset, assign)
+             Hashtbl.replace reset_map assign.assign_lhs assign
            ) reset_assigns;
+
+           (* Second, group normal assignments by signal *)
+           let normal_map = Hashtbl.create 10 in
            List.iter (fun assign ->
-             (* Find if there's a reset assignment for this signal *)
-             let reset_assign_opt = try Some (Hashtbl.find signal_map assign.assign_lhs) with Not_found -> None in
+             let existing = try Hashtbl.find normal_map assign.assign_lhs with Not_found -> [] in
+             Hashtbl.replace normal_map assign.assign_lhs (assign :: existing)
+           ) normal_assigns;
+
+           (* Third, collect all unique signals *)
+           let all_signals = Hashtbl.create 10 in
+           List.iter (fun assign -> Hashtbl.replace all_signals assign.assign_lhs ()) reset_assigns;
+           List.iter (fun assign -> Hashtbl.replace all_signals assign.assign_lhs ()) normal_assigns;
+
+           (* Finally, create ONE AlwaysFF block per signal with ALL its assignments *)
+           Hashtbl.iter (fun signal_name () ->
+             let reset_assign_opt = try Some (Hashtbl.find reset_map signal_name) with Not_found -> None in
+             let normal_assigns_list = try List.rev (Hashtbl.find normal_map signal_name) with Not_found -> [] in
+
              (match reset_assign_opt with
-              | Some (`Reset, reset_assign) ->
-                  (* Create AlwaysFF with reset info *)
-                  Printf.printf "    Signal %s: has reset value\n" assign.assign_lhs;
+              | Some reset_assign ->
+                  (* Create AlwaysFF with reset info and ALL normal assignments for this signal *)
+                  Printf.printf "    Signal %s: has reset value\n" signal_name;
                   let reset_info = {
                     reset_signal = reset;
                     reset_edge = reset_edge;
                     reset_value = reset_assign.assign_rhs;
-                    is_set = false;  (* TODO: Detect if it's a set vs reset *)
+                    is_set = false;
                   } in
                   let always_blk = {
                     always_type = AlwaysFF { clock; edge = clock_edge; async_reset = Some reset_info };
-                    always_stmts = [assign];  (* Normal operation assignment *)
+                    always_stmts = normal_assigns_list;  (* ALL normal assignments for this signal *)
                   } in
                   (match get_current_module_data ctx with
                    | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
                    | None -> ());
                   ctx.always_blocks <- always_blk :: ctx.always_blocks
-              | _ ->
-                  (* No reset for this signal - just sequential *)
-                  Printf.printf "    Signal %s: no reset value\n" assign.assign_lhs;
-                  let always_blk = {
-                    always_type = AlwaysFF { clock; edge = clock_edge; async_reset = None };
-                    always_stmts = [assign];
-                  } in
-                  (match get_current_module_data ctx with
-                   | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
-                   | None -> ());
-                  ctx.always_blocks <- always_blk :: ctx.always_blocks)
-           ) normal_assigns
+              | None ->
+                  (* No reset for this signal *)
+                  if normal_assigns_list <> [] then begin
+                    Printf.printf "    Signal %s: no reset value\n" signal_name;
+                    let always_blk = {
+                      always_type = AlwaysFF { clock; edge = clock_edge; async_reset = None };
+                      always_stmts = normal_assigns_list;
+                    } in
+                    (match get_current_module_data ctx with
+                     | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+                     | None -> ());
+                    ctx.always_blocks <- always_blk :: ctx.always_blocks
+                  end)
+           ) all_signals
 
        | None ->
            (* Couldn't analyze structure - fall back to extracting all assignments *)

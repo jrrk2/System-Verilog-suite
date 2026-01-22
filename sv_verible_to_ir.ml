@@ -909,20 +909,34 @@ let verible_to_ir verible_ast module_name =
               Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.Sv_elaborate.assign_lhs))
         ) always_blk.Sv_elaborate.always_stmts
     | Sv_elaborate.AlwaysFF { clock; edge; async_reset } ->
-        (* Create register operations *)
+        (* Create register operations - group by signal to handle multiple assignments *)
+        (* Group assignments by signal name *)
+        let signal_groups = Hashtbl.create 10 in
         List.iter (fun (assign : Sv_elaborate.assign_info) ->
+          let existing = try Hashtbl.find signal_groups assign.Sv_elaborate.assign_lhs with Not_found -> [] in
+          Hashtbl.replace signal_groups assign.Sv_elaborate.assign_lhs (assign :: existing)
+        ) always_blk.Sv_elaborate.always_stmts;
+
+        (* For each signal, process ALL assignments to build proper conditional logic *)
+        Hashtbl.iter (fun signal_name assigns ->
+          (* Reverse to get chronological order *)
+          let assigns_in_order = List.rev assigns in
+          (* Use LAST assignment (highest priority / most specific condition) *)
+          let assign = List.hd (List.rev assigns_in_order) in
           (match async_reset with
            | Some reset_info ->
-               Printf.printf "Converting always_ff @(%s %s or %s %s): %s <= <expr> (reset_value=<expr>)\n"
+               Printf.printf "Converting always_ff @(%s %s or %s %s): %s <= <expr> (reset_value=<expr>)%s\n"
                  (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
                  clock
                  (match reset_info.reset_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
                  reset_info.reset_signal
-                 assign.Sv_elaborate.assign_lhs
+                 signal_name
+                 (if List.length assigns > 1 then Printf.sprintf " [%d assignments]" (List.length assigns) else "")
            | None ->
-               Printf.printf "Converting always_ff @(%s %s): %s <= <expr>\n"
+               Printf.printf "Converting always_ff @(%s %s): %s <= <expr>%s\n"
                  (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
-                 clock assign.Sv_elaborate.assign_lhs);
+                 clock signal_name
+                 (if List.length assigns > 1 then Printf.sprintf " [%d assignments]" (List.length assigns) else ""));
 
           let d_value_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.Sv_elaborate.assign_rhs in
 
@@ -943,13 +957,13 @@ let verible_to_ir verible_ast module_name =
 
           (* Get signal width (check wire first, then output) *)
           let signal_width = (try
-            let wire_val = Hashtbl.find ir.ir_wires assign.Sv_elaborate.assign_lhs in
+            let wire_val = Hashtbl.find ir.ir_wires signal_name in
             (match wire_val with
              | Sv_ast.Wire { width; _ } -> width
              | _ -> 1)
           with Not_found ->
             (try
-              let output_val = Hashtbl.find ir.ir_outputs assign.Sv_elaborate.assign_lhs in
+              let output_val = Hashtbl.find ir.ir_outputs signal_name in
               (match output_val with
                | Sv_ast.Output { width; _ } -> width
                | _ -> 1)
@@ -997,26 +1011,26 @@ let verible_to_ir verible_ast module_name =
 
           (* Connect register output to wire or output *)
           (try
-            let wire_val = Hashtbl.find ir.ir_wires assign.Sv_elaborate.assign_lhs in
+            let wire_val = Hashtbl.find ir.ir_wires signal_name in
             (match wire_val with
              | Sv_ast.Wire { width; name; _ } ->
-                 Hashtbl.replace ir.ir_wires assign.Sv_elaborate.assign_lhs
+                 Hashtbl.replace ir.ir_wires signal_name
                    (Sv_ast.Wire { id = reg_node_id; name; width });
-                 Printf.printf "  Connected register to wire %s (reg_id=%d)\n" assign.Sv_elaborate.assign_lhs reg_node_id
+                 Printf.printf "  Connected register to wire %s (reg_id=%d)\n" signal_name reg_node_id
              | _ -> ())
           with Not_found ->
             (* Not a wire, try output *)
             (try
-              let output_val = Hashtbl.find ir.ir_outputs assign.Sv_elaborate.assign_lhs in
+              let output_val = Hashtbl.find ir.ir_outputs signal_name in
               (match output_val with
                | Sv_ast.Output { width; name; _ } ->
-                   Hashtbl.replace ir.ir_outputs assign.Sv_elaborate.assign_lhs
+                   Hashtbl.replace ir.ir_outputs signal_name
                      (Sv_ast.Output { id = reg_node_id; name; width });
-                   Printf.printf "  Connected register to output %s (reg_id=%d)\n" assign.Sv_elaborate.assign_lhs reg_node_id
+                   Printf.printf "  Connected register to output %s (reg_id=%d)\n" signal_name reg_node_id
                | _ -> ())
             with Not_found ->
-              Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.Sv_elaborate.assign_lhs))
-        ) always_blk.Sv_elaborate.always_stmts
+              Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" signal_name))
+        ) signal_groups
   ) (List.rev module_data.Sv_elaborate.mod_always_blocks);
 
   (* Step 5: Convert assign statements from this module only *)
