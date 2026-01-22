@@ -196,6 +196,14 @@ let rec eval_const_expr ctx expr =
          try List.assoc name ctx.localparams
          with Not_found -> EUnknown)
 
+  | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier name, _) ->
+      (* Look up parameter value *)
+      (try
+        List.assoc name ctx.params
+       with Not_found ->
+         try List.assoc name ctx.localparams
+         with Not_found -> EUnknown)
+
   | TUPLE4 (STRING "add_expr2", a, PLUS, b) ->
       (match eval_const_expr ctx a, eval_const_expr ctx b with
        | EInt x, EInt y -> EInt (x + y)
@@ -216,6 +224,46 @@ let rec eval_const_expr ctx expr =
        | EInt x, EInt y when y <> 0 -> EInt (x / y)
        | _ -> EUnknown)
 
+  | TUPLE4 (STRING "expr_primary_parens1", _lparen, inner_expr, _rparen) ->
+      (* Unwrap parentheses *)
+      eval_const_expr ctx inner_expr
+
+  | TUPLE3 (STRING "reference_or_call_base1", func_name, args) ->
+      (* System function call like $clog2(expr) *)
+      let name = (match func_name with
+        | SymbolIdentifier n -> n
+        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier n, _) -> n
+        | _ -> "unknown") in
+      if name = "$clog2" then
+        (* Extract argument and evaluate *)
+        let arg_val = (match args with
+          | TUPLE4 (STRING "argument_list_opt1", _lparen, arg_expr, _rparen) ->
+              eval_const_expr ctx arg_expr
+          | TUPLE5 (STRING "argument_list_opt2", _lparen, arg_list, _, _rparen) ->
+              (* First argument from list *)
+              (match arg_list with
+               | TUPLE3 (STRING "expression_list_proper2", first_arg, _) ->
+                   eval_const_expr ctx first_arg
+               | _ -> eval_const_expr ctx arg_list)
+          | TUPLE4 (STRING "call_base1", _lparen, arg_expr, _rparen) ->
+              eval_const_expr ctx arg_expr
+          | _ -> EUnknown) in
+        (match arg_val with
+         | EInt n when n > 0 ->
+             (* Compute ceiling log2 *)
+             let rec clog2 x acc =
+               if x <= 1 then acc
+               else clog2 ((x + 1) / 2) (acc + 1)
+             in
+             EInt (clog2 n 0)
+         | _ -> EUnknown)
+      else
+        EUnknown
+
+  | TLIST [single] ->
+      (* Unwrap single-element list *)
+      eval_const_expr ctx single
+
   | _ -> EUnknown
 
 (* Evaluate width from range expression [msb:lsb] *)
@@ -232,7 +280,7 @@ let extract_identifier token =
   | _ -> None
 
 (* Extract range from TUPLE6 decl_variable_dimension1 pattern *)
-let extract_range token =
+let extract_range ctx token =
   match token with
   | TUPLE6 (STRING "decl_variable_dimension1", LBRACK, TK_DecNumber high, COLON, TK_DecNumber low, RBRACK) ->
       (try
@@ -240,13 +288,18 @@ let extract_range token =
         let l = int_of_string low in
         Some (h, l)
       with _ -> None)
+  | TUPLE6 (STRING "decl_variable_dimension1", LBRACK, high_expr, COLON, low_expr, RBRACK) ->
+      (* Dynamic range expression like [$clog2(RATIO-1)-1:0] *)
+      (match eval_const_expr ctx high_expr, eval_const_expr ctx low_expr with
+       | EInt h, EInt l -> Some (h, l)
+       | _ -> None)
   | _ -> None
 
 (* Extract width from data_type_primitive1 pattern *)
-let extract_width_from_primitive data_type =
+let extract_width_from_primitive ctx data_type =
   match data_type with
   | TUPLE3 (STRING "data_type_primitive1", _, range_token) ->
-      extract_range range_token
+      extract_range ctx range_token
   | _ -> None
 
 (* Extract port declaration: direction, name, width *)
@@ -259,7 +312,7 @@ let extract_port_decl ctx token =
        | TUPLE4 (STRING "data_type_or_implicit_basic_followed_by_id_and_dimensions_opt4",
                  data_type_primitive, id_token, _) ->
            let name = extract_identifier id_token in
-           let range = extract_width_from_primitive data_type_primitive in
+           let range = extract_width_from_primitive ctx data_type_primitive in
            let direction = (match dir with
              | Input -> "input"
              | Output -> "output"
@@ -1145,7 +1198,7 @@ let extract_data_declaration ctx token =
         | _ -> None) in
 
       (* Extract width from data_type *)
-      let width = (match extract_width_from_primitive data_type with
+      let width = (match extract_width_from_primitive ctx data_type with
         | Some (h, l) -> h - l + 1
         | None -> 1) in
 
@@ -1262,9 +1315,9 @@ let rec extract_assigns_from_items ctx token =
 (* Extract function declaration *)
 and extract_function_declaration ctx return_type_and_id params body =
   (* Extract function name from return_type_and_id *)
-  let (func_name, return_width) = extract_function_name_and_width return_type_and_id in
+  let (func_name, return_width) = extract_function_name_and_width ctx return_type_and_id in
   (* Extract parameter list *)
-  let param_list = extract_function_params params in
+  let param_list = extract_function_params ctx params in
   (* Store function info *)
   (match get_current_module_data ctx with
    | Some mod_data ->
@@ -1279,7 +1332,7 @@ and extract_function_declaration ctx return_type_and_id params body =
          func_name return_width (List.length param_list)
    | None -> ())
 
-and extract_function_name_and_width token =
+and extract_function_name_and_width ctx token =
   (* function_return_type_and_id passes through data_type_or_implicit_basic_followed_by_id_and_dimensions_opt *)
   match token with
   | TUPLE4 (STRING "data_type_or_implicit_basic_followed_by_id_and_dimensions_opt1", dtype, class_id, _dimensions) ->
@@ -1288,7 +1341,7 @@ and extract_function_name_and_width token =
         | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier n, _) -> n
         | TUPLE3 (STRING "class_id1", SymbolIdentifier n, _) -> n
         | _ -> "unknown_func") in
-      let width = (match extract_width_from_primitive dtype with
+      let width = (match extract_width_from_primitive ctx dtype with
         | Some (h, l) -> h - l + 1
         | None -> 1) in
       (name, width)
@@ -1296,44 +1349,44 @@ and extract_function_name_and_width token =
       let name = (match id with
         | SymbolIdentifier n -> n
         | _ -> "unknown_func") in
-      let width = extract_width_from_type return_type in
+      let width = extract_width_from_type ctx return_type in
       (name, width)
   | _ -> ("unknown_func", 1)
 
-and extract_function_params token =
+and extract_function_params ctx token =
   (* tf_port_list_opt can be EMPTY_TOKEN or a list of ports *)
   match token with
   | EMPTY_TOKEN -> []
   | TUPLE3 (STRING "tf_port_list1", _items, port_list) ->
-      extract_param_list port_list
+      extract_param_list ctx port_list
   | TLIST items ->
-      List.concat_map extract_param_list items
+      List.concat_map (extract_param_list ctx) items
   | _ ->
-      extract_param_list token
+      extract_param_list ctx token
 
-and extract_param_list token =
+and extract_param_list ctx token =
   match token with
   | TLIST items ->
-      List.filter_map extract_single_param items
+      List.filter_map (extract_single_param ctx) items
   | single ->
-      (match extract_single_param single with
+      (match extract_single_param ctx single with
        | Some p -> [p]
        | None -> [])
 
-and extract_single_param token =
+and extract_single_param ctx token =
   (* Extract parameter from tf_port_item *)
   match token with
   | TUPLE3 (STRING "tf_port_item1", dtype, id_token) ->
       (* data_type identifier *)
       let param_name = extract_param_name id_token in
-      let param_width = (match extract_width_from_primitive dtype with
+      let param_width = (match extract_width_from_primitive ctx dtype with
         | Some (h, l) -> h - l + 1
         | None -> 1) in
       Some { param_name; param_width }
   | TUPLE4 (STRING "tf_port_item2", _var, dtype, id_token) ->
       (* var data_type identifier *)
       let param_name = extract_param_name id_token in
-      let param_width = (match extract_width_from_primitive dtype with
+      let param_width = (match extract_width_from_primitive ctx dtype with
         | Some (h, l) -> h - l + 1
         | None -> 1) in
       Some { param_name; param_width }
@@ -1347,16 +1400,105 @@ and extract_param_name token =
   | TUPLE4 (STRING "tf_port_id2", SymbolIdentifier name, _, _) -> name
   | _ -> "unknown_param"
 
-and extract_width_from_type token =
+and extract_width_from_type ctx token =
   (* Extract width from data type - simplified for now *)
   match token with
   | TUPLE3 (STRING "data_type_or_implicit1", dtype, _) ->
-      (match extract_width_from_primitive dtype with
+      (match extract_width_from_primitive ctx dtype with
        | Some (h, l) -> h - l + 1
        | None -> 1)
   | _ -> 1
 
 (* Extract module information from TUPLE12 module declaration *)
+let rec extract_parameters ctx token =
+  match token with
+  | TLIST lst ->
+      List.iter (extract_parameters ctx) lst
+  | TUPLE5 (STRING "module_parameter_port_list_opt1", _hash, _lparen, param_decls, _rparen) ->
+      (* Module parameter list: #(parameter ..., parameter ...) *)
+      extract_parameters ctx param_decls
+  | TUPLE5 (STRING "parameter_port_list2", _hash, _lparen, param_decls, _rparen) ->
+      (* Module parameter list: #(parameter ..., parameter ...) *)
+      extract_parameters ctx param_decls
+  | TUPLE4 (STRING "module_parameter_port1", _param_kw, param_decl, after_decl) ->
+      (* Single parameter declaration *)
+      (* First extract the parameter name from param_decl *)
+      extract_parameters ctx param_decl;
+      (* Then extract the assignment value from after_decl *)
+      (match after_decl with
+       | TUPLE4 (STRING "trailing_assign1", _eq, value_expr, _semicolon) ->
+           (* Extract the parameter name that was just added *)
+           (match ctx.params with
+            | (name, _) :: rest ->
+                let value = eval_param_value ctx value_expr in
+                Printf.printf "  Parameter %s = %d\n" name value;
+                (* Update the most recent parameter with the actual value *)
+                ctx.params <- (name, EInt value) :: rest
+            | [] -> ())
+       | _ -> ())
+  | TUPLE3 (STRING "param_declaration2", _param_kw, type_assign_list) ->
+      (* Parameter declaration *)
+      extract_parameters ctx type_assign_list
+  | TUPLE3 (STRING "type_assignment_list1", item, _) ->
+      (* Single parameter *)
+      extract_single_param_decl ctx item
+  | TUPLE3 (STRING "type_assignment_list2", rest, item) ->
+      (* Multiple parameters *)
+      extract_parameters ctx rest;
+      extract_single_param_decl ctx item
+  | TUPLE5 (STRING "param_type_followed_by_id_and_dimensions_opt3", type_token, name_token, dimensions, trailing_assign) ->
+      (* parameter declaration: TYPE NAME [dimensions] = VALUE *)
+      (* Extract name from dimensions token (name_token is typically EMPTY_TOKEN) *)
+      let name = match name_token with
+        | SymbolIdentifier n -> n
+        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier n, _) -> n
+        | EMPTY_TOKEN ->
+            (* Name is in dimensions token *)
+            (match dimensions with
+             | SymbolIdentifier n -> n
+             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier n, _) -> n
+             | _ -> "unknown_param")
+        | _ -> "unknown_param"
+      in
+      (* trailing_assign is typically EMPTY_TOKEN; value comes from after_decl in parent pattern *)
+      Printf.printf "  Parameter: %s = %d\n" name 0;
+      ctx.params <- (name, EInt 0) :: ctx.params
+  | TUPLE5 (STRING "type_assignment1", _param_type, name_token, _eq, value_expr) ->
+      (* parameter TYPE NAME = VALUE *)
+      let name = match name_token with
+        | SymbolIdentifier n -> n
+        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier n, _) -> n
+        | _ -> "unknown_param"
+      in
+      let value = eval_param_value ctx value_expr in
+      Printf.printf "  Parameter: %s = %d\n" name value;
+      ctx.params <- (name, EInt value) :: ctx.params
+  | _ ->
+      ()
+
+and extract_single_param_decl ctx token =
+  match token with
+  | TUPLE5 (STRING "type_assignment1", _param_type, name_token, _eq, value_expr) ->
+      let name = match name_token with
+        | SymbolIdentifier n -> n
+        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier n, _) -> n
+        | _ -> "unknown_param"
+      in
+      let value = eval_param_value ctx value_expr in
+      Printf.printf "  Parameter: %s = %d\n" name value;
+      ctx.params <- (name, EInt value) :: ctx.params
+  | _ -> ()
+
+and eval_param_value ctx expr =
+  (* Evaluate constant parameter expression *)
+  match eval_const_expr ctx expr with
+  | EInt i -> i
+  | _ ->
+      (* Fallback for simple cases *)
+      (match expr with
+       | TK_DecNumber n -> (try int_of_string n with _ -> 0)
+       | TK_UnBasedNumber n -> (try int_of_string n with _ -> 0)
+       | _ -> 0)
 let extract_module_info ctx token =
   match token with
   | TUPLE12 (STRING "module_or_interface_declaration1", Module, _, name_token, _, params, ports, _, _, items, _, _) ->
@@ -1369,7 +1511,9 @@ let extract_module_info ctx token =
            (* Extract parameters if present *)
            (match params with
             | EMPTY_TOKEN -> ()
-            | _ -> Printf.printf "Parameters: <present>\n");
+            | _ ->
+                Printf.printf "Parameters:\n";
+                extract_parameters ctx params);
            (* Extract ports *)
            (match ports with
             | EMPTY_TOKEN ->
@@ -1392,13 +1536,6 @@ let extract_module_info ctx token =
   | _ -> None
 
 (* Extract parameter declarations - simplified stub *)
-let rec extract_parameters ctx token =
-  match token with
-  | TLIST lst ->
-      List.iter (extract_parameters ctx) lst
-  | _ ->
-      (* TODO: Implement proper extraction based on actual parse tree structure *)
-      ()
 
 (* Resolve width - stub *)
 let resolve_width _ctx _token = 1
