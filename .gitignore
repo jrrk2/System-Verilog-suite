@@ -22,3 +22,27 @@ slpp_all/
 sysver_tests/*.v
 testcase2.sv
 test_results/
+
+# Generated test files and outputs
+*.il
+*_out
+test_*.v
+simple_*.v
+synth.ys
+parser_stderr.log
+unhandled_tokens.txt
+*_verible.v
+*_verilator.v
+*_rtlil.v
+signed_mult*
+test_liberty
+
+# Analysis and report files (from previous sessions)
+*_REPORT.md
+*_RESULTS.md
+*_ANALYSIS.md
+*_SUMMARY.md
+*_IMPLEMENTATION.md
+*.backup
+convert_cons_to_tlist.py
+run_*_tests.sh

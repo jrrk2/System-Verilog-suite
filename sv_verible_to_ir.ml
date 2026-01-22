@@ -709,6 +709,43 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
             Sv_opt_ir.add_node ir pmux_op pmux_inputs
           end
 
+      (* Logical equality: == operator *)
+      | TUPLE4 (STRING "logeq_expr2", left, EQ_EQ, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Eq; signed = false }) [left_id; right_id]
+
+      (* Logical inequality: != operator *)
+      | TUPLE4 (STRING "logeq_expr3", left, PLING_EQ, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Ne; signed = false }) [left_id; right_id]
+
+      (* Logical AND: && operator *)
+      | TUPLE4 (STRING "logand_expr2", left, AMPERSAND_AMPERSAND, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          (* Logical AND returns 1-bit result *)
+          Sv_opt_ir.add_node ir (And { width = 1 }) [left_id; right_id]
+
+      (* Logical OR: || operator *)
+      | TUPLE4 (STRING "logor_expr2", left, VBAR_VBAR, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          (* Logical OR returns 1-bit result *)
+          Sv_opt_ir.add_node ir (Or { width = 1 }) [left_id; right_id]
+
+      (* Sequence repetition - unwrap the expression inside *)
+      | TUPLE3 (STRING "sequence_repetition_expr1", expr, EMPTY_TOKEN) ->
+          (* This wraps expression_or_dist1, just unwrap it *)
+          expr_to_ir ir expr_cache symbol_table functions expr
+
+      (* Expression or dist - unwrap to get the actual expression *)
+      | TUPLE3 (STRING "expression_or_dist1", expr, EMPTY_TOKEN) ->
+          expr_to_ir ir expr_cache symbol_table functions expr
+
       | _ ->
           Printf.eprintf "\n=== Warning: Unhandled expression type ===\n";
           (* Write full token to file for inspection *)
