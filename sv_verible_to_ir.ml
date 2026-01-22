@@ -890,12 +890,22 @@ let verible_to_ir verible_ast module_name =
             with Not_found ->
               Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.Sv_elaborate.assign_lhs))
         ) always_blk.Sv_elaborate.always_stmts
-    | Sv_elaborate.AlwaysFF { clock; edge } ->
+    | Sv_elaborate.AlwaysFF { clock; edge; async_reset } ->
         (* Create register operations *)
         List.iter (fun (assign : Sv_elaborate.assign_info) ->
-          Printf.printf "Converting always_ff @(%s %s): %s <= <expr>\n"
-            (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
-            clock assign.Sv_elaborate.assign_lhs;
+          (match async_reset with
+           | Some reset_info ->
+               Printf.printf "Converting always_ff @(%s %s or %s %s): %s <= <expr> (reset_value=<expr>)\n"
+                 (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
+                 clock
+                 (match reset_info.reset_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
+                 reset_info.reset_signal
+                 assign.Sv_elaborate.assign_lhs
+           | None ->
+               Printf.printf "Converting always_ff @(%s %s): %s <= <expr>\n"
+                 (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
+                 clock assign.Sv_elaborate.assign_lhs);
+
           let d_value_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.Sv_elaborate.assign_rhs in
 
           (* Get clock input *)
@@ -904,7 +914,14 @@ let verible_to_ir verible_ast module_name =
             (match clock_val with
              | Sv_ast.Input { id; _ } -> id
              | _ -> 0)
-          with Not_found -> 0) in
+          with Not_found ->
+            (* Clock might be a wire *)
+            (try
+              let wire_val = Hashtbl.find ir.ir_wires clock in
+              (match wire_val with
+               | Sv_ast.Wire { id; _ } -> id
+               | _ -> 0)
+            with Not_found -> 0)) in
 
           (* Get signal width (check wire first, then output) *)
           let signal_width = (try
@@ -920,9 +937,44 @@ let verible_to_ir verible_ast module_name =
                | _ -> 1)
             with Not_found -> 1)) in
 
+          (* Process async reset if present *)
+          let (reset_id_opt, reset_value) = (match async_reset with
+            | Some reset_info ->
+                (* Get reset signal ID *)
+                let reset_id = (try
+                  let reset_val = Hashtbl.find ir.ir_inputs reset_info.reset_signal in
+                  (match reset_val with
+                   | Sv_ast.Input { id; _ } -> id
+                   | _ -> 0)
+                with Not_found ->
+                  (try
+                    let wire_val = Hashtbl.find ir.ir_wires reset_info.reset_signal in
+                    (match wire_val with
+                     | Sv_ast.Wire { id; _ } -> id
+                     | _ -> 0)
+                  with Not_found -> 0)) in
+
+                (* Convert reset value expression to IR *)
+                let reset_val_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions reset_info.reset_value in
+
+                (* For now, try to extract constant value - TODO: handle expressions *)
+                (* Search for the constant value in the constants table *)
+                let reset_const = (
+                  let found = ref None in
+                  Hashtbl.iter (fun value value_id ->
+                    if value_id = reset_val_id then found := Some value
+                  ) ir.ir_constants;
+                  match !found with
+                  | Some v -> v
+                  | None -> 0  (* Default to 0 if we can't extract the value *)
+                ) in
+
+                (Some reset_id, reset_const)
+            | None -> (None, 0)) in
+
           (* Create register node *)
           let reg_node_id = Sv_opt_ir.add_node ir
-            (Sv_ast.Register { width = signal_width; clock = clock_id; reset = None; enable = None; reset_value = 0 })
+            (Sv_ast.Register { width = signal_width; clock = clock_id; reset = reset_id_opt; enable = None; reset_value })
             [d_value_id] in
 
           (* Connect register output to wire or output *)

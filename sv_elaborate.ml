@@ -46,7 +46,20 @@ type assign_info = {
 }
 
 (* Always block information *)
-type always_type = AlwaysComb | AlwaysFF of { clock: string; edge: [`Posedge | `Negedge] }
+type reset_info = {
+  reset_signal: string;
+  reset_edge: [`Posedge | `Negedge];
+  reset_value: token;  (* The value assigned during reset *)
+  is_set: bool;        (* true = async set (reset to 1), false = async reset (reset to 0) *)
+}
+
+type always_type =
+  | AlwaysComb
+  | AlwaysFF of {
+      clock: string;
+      edge: [`Posedge | `Negedge];
+      async_reset: reset_info option;
+    }
 
 type always_info = {
   always_type: always_type;
@@ -604,7 +617,7 @@ let extract_always_ff ctx event_ctrl stmt =
            let edge_str = match edge with `Posedge -> "posedge" | `Negedge -> "negedge" in
            Printf.printf "  Always_ff @(%s %s): %s <= <expr>\n" edge_str clock assign.assign_lhs;
            let always_blk = {
-             always_type = AlwaysFF { clock; edge };
+             always_type = AlwaysFF { clock; edge; async_reset = None };
              always_stmts = [assign];
            } in
            (* Add to current module's always_blocks *)
@@ -616,8 +629,118 @@ let extract_always_ff ctx event_ctrl stmt =
        | None -> ())
   | None -> ()
 
-(* Extract assignments from if/else statement *)
-let rec extract_if_else_assigns stmt =
+(* Analyze if/else structure for async reset/set pattern *)
+(* Returns: (reset_signal, reset_polarity, reset_assigns, normal_assigns) *)
+let rec analyze_async_reset_structure reset_signal stmt =
+  Printf.printf "      analyze_async_reset_structure: reset_signal=%s\n" reset_signal;
+  (match stmt with
+   | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      Statement: TUPLE4(%s, ...)\n" s
+   | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      Statement: TUPLE6(%s, ...)\n" s
+   | _ -> Printf.printf "      Statement: Other\n");
+  match stmt with
+  (* Unwrap statement_item wrapper *)
+  | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
+      Printf.printf "      Unwrapping statement_item6\n";
+      analyze_async_reset_structure reset_signal inner_stmt
+
+  (* Unwrap seq_block (begin...end) *)
+  | TUPLE4 (STRING "seq_block1", _begin, inner_stmts, _end) ->
+      Printf.printf "      Unwrapping seq_block1\n";
+      (match inner_stmts with
+       | TLIST [single] ->
+           (match single with
+            | TUPLE3 (STRING s, _, _) -> Printf.printf "      TLIST single: TUPLE3(%s)\n" s
+            | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      TLIST single: TUPLE4(%s)\n" s
+            | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      TLIST single: TUPLE6(%s)\n" s
+            | _ -> Printf.printf "      TLIST single: Other\n");
+           analyze_async_reset_structure reset_signal single
+       | TLIST lst ->
+           Printf.printf "      TLIST with %d elements\n" (List.length lst);
+           (* Multiple statements in block - look for the if/else *)
+           (match List.find_opt (fun s ->
+              match s with
+              | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _) -> true
+              | TUPLE3 (STRING "statement_item6", TUPLE6 (STRING "conditional_statement2", _, _, _, _, _), _) -> true
+              | _ -> false) lst with
+            | Some if_stmt -> analyze_async_reset_structure reset_signal if_stmt
+            | None -> None)
+       | single ->
+           (match single with
+            | TUPLE3 (STRING s, _, _) -> Printf.printf "      Non-TLIST: TUPLE3(%s)\n" s
+            | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      Non-TLIST: TUPLE4(%s)\n" s
+            | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      Non-TLIST: TUPLE6(%s)\n" s
+            | _ -> Printf.printf "      Non-TLIST: Other\n");
+           analyze_async_reset_structure reset_signal single)
+
+  (* if (cond) then_stmt else else_stmt - typical async reset pattern *)
+  | TUPLE6 (STRING "conditional_statement2", _if_kw, cond_expr, then_stmt, _else_kw, else_stmt) ->
+      Printf.printf "      Found conditional_statement2\n";
+      (* Check if condition references the reset signal *)
+      let cond_str = match cond_expr with
+        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
+        | SymbolIdentifier id -> Some id
+        | TUPLE3 (STRING "unary_prefix_expr2", PLING, inner) ->
+            (* Negated condition: if (!rst) *)
+            (match inner with
+             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
+             | SymbolIdentifier id -> Some id
+             | _ -> None)
+        | _ -> None
+      in
+
+      (match cond_str with
+       | Some cond_id when cond_id = reset_signal ->
+           (* Condition is "if (reset)" - positive polarity *)
+           let reset_assigns = extract_assigns_from_if_branch then_stmt in
+           let normal_assigns = extract_assigns_from_if_branch else_stmt in
+           Some (`Posedge, reset_assigns, normal_assigns)
+       | Some cond_id ->
+           (* Condition might be negated reset or different signal *)
+           (* For now, assume then branch is reset if it's simpler *)
+           let then_assigns = extract_assigns_from_if_branch then_stmt in
+           let else_assigns = extract_assigns_from_if_branch else_stmt in
+           (* Heuristic: reset branch typically has constant assignments *)
+           Some (`Posedge, then_assigns, else_assigns)
+       | None ->
+           (* Can't determine - extract all *)
+           None)
+
+  (* if (cond) stmt - no else branch *)
+  | TUPLE4 (STRING "conditional_statement1", _if_kw, _cond, then_stmt) ->
+      (* This is not a typical async reset pattern *)
+      None
+
+  | _ -> None
+
+and extract_assigns_from_if_branch stmt =
+  match stmt with
+  | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
+      (match extract_assignment_from_stmt stmt with
+       | Some assign -> [assign]
+       | None ->
+           (* Check if inner_stmt is a conditional *)
+           (match inner_stmt with
+            | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _)
+            | TUPLE4 (STRING "conditional_statement1", _, _, _) ->
+                extract_if_else_assigns inner_stmt
+            | _ -> []))
+  | TUPLE4 (STRING "seq_block1", _begin, stmts, _end) ->
+      extract_assigns_from_seq_block stmts
+  | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _) ->
+      extract_if_else_assigns stmt
+  | TUPLE4 (STRING "conditional_statement1", _, _, _) ->
+      extract_if_else_assigns stmt
+  | _ ->
+      (match extract_assignment_from_stmt stmt with
+       | Some assign -> [assign]
+       | None -> [])
+
+and extract_assigns_from_seq_block stmts =
+  match stmts with
+  | TLIST lst -> List.flatten (List.map extract_assigns_from_if_branch lst)
+  | single -> extract_assigns_from_if_branch single
+
+and extract_if_else_assigns stmt =
   match stmt with
   (* if (cond) stmt *)
   | TUPLE4 (STRING "conditional_statement1", _if_kw, _cond, then_stmt) ->
@@ -629,69 +752,105 @@ let rec extract_if_else_assigns stmt =
       then_assigns @ else_assigns
   | _ -> []
 
-and extract_assigns_from_if_branch stmt =
-  match stmt with
-  | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
-      (match extract_assignment_from_stmt stmt with
-       | Some assign -> [assign]
-       | None -> extract_if_else_assigns inner_stmt)
-  | TUPLE4 (STRING "seq_block1", _begin, stmts, _end) ->
-      extract_assigns_from_seq_block stmts
-  | _ ->
-      (match extract_assignment_from_stmt stmt with
-       | Some assign -> [assign]
-       | None -> [])
-
-and extract_assigns_from_seq_block stmts =
-  match stmts with
-  | TLIST lst -> List.flatten (List.map extract_assigns_from_if_branch lst)
-  | single -> extract_assigns_from_if_branch single
-
 (* Extract traditional always block with timing control *)
 let extract_traditional_always ctx event_ctrl stmt =
 
   (* Try to extract clock and reset from event control *)
   match extract_clock_and_reset_event event_ctrl with
   | Some (clock, clock_edge, Some reset, Some reset_edge) ->
-      (* Sequential logic with async reset: always @(posedge clk or posedge rst) *)
-      Printf.printf "  Always @(%s %s or %s %s): Sequential with async reset\n"
+      (* Sequential logic with async reset/set: always @(posedge clk or posedge rst) *)
+      Printf.printf "  Always @(%s %s or %s %s): Sequential with async reset/set\n"
         (match clock_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
         clock
         (match reset_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
         reset;
 
-      (* Extract assignments from if/else structure *)
-      let assigns = extract_if_else_assigns stmt in
-      if assigns <> [] then begin
-        List.iter (fun assign ->
-          Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
-        ) assigns;
-        let always_blk = {
-          always_type = AlwaysFF { clock; edge = clock_edge };
-          always_stmts = assigns;
-        } in
-        (* Add to current module's always_blocks *)
-        (match get_current_module_data ctx with
-         | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
-         | None -> ());
-        ctx.always_blocks <- always_blk :: ctx.always_blocks
-      end else begin
-        (* Fallback: try extracting from statement directly *)
-        let direct_assigns = extract_assigns_from_stmt ctx stmt in
-        if direct_assigns <> [] then begin
-          List.iter (fun assign ->
-            Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
-          ) direct_assigns;
-          let always_blk = {
-            always_type = AlwaysFF { clock; edge = clock_edge };
-            always_stmts = direct_assigns;
-          } in
-          (match get_current_module_data ctx with
-           | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
-           | None -> ());
-          ctx.always_blocks <- always_blk :: ctx.always_blocks
-        end
-      end
+      (* Debug: print statement structure *)
+      (match stmt with
+       | TUPLE4 (STRING s, _, _, _) -> Printf.printf "    Statement structure: TUPLE4(%s, ...)\n" s
+       | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "    Statement structure: TUPLE6(%s, ...)\n" s
+       | _ -> Printf.printf "    Statement structure: Other\n");
+
+      (* Analyze if/else structure to separate reset and normal assignments *)
+      (match analyze_async_reset_structure reset stmt with
+       | Some (_reset_polarity, reset_assigns, normal_assigns) ->
+           (* We have a proper if/else structure *)
+           Printf.printf "    Found %d reset assignments, %d normal assignments\n"
+             (List.length reset_assigns) (List.length normal_assigns);
+
+           (* For each signal, create an AlwaysFF block with reset info *)
+           (* Group assignments by signal name *)
+           let signal_map = Hashtbl.create 10 in
+           List.iter (fun assign ->
+             Hashtbl.replace signal_map assign.assign_lhs (`Reset, assign)
+           ) reset_assigns;
+           List.iter (fun assign ->
+             (* Find if there's a reset assignment for this signal *)
+             let reset_assign_opt = try Some (Hashtbl.find signal_map assign.assign_lhs) with Not_found -> None in
+             (match reset_assign_opt with
+              | Some (`Reset, reset_assign) ->
+                  (* Create AlwaysFF with reset info *)
+                  Printf.printf "    Signal %s: has reset value\n" assign.assign_lhs;
+                  let reset_info = {
+                    reset_signal = reset;
+                    reset_edge = reset_edge;
+                    reset_value = reset_assign.assign_rhs;
+                    is_set = false;  (* TODO: Detect if it's a set vs reset *)
+                  } in
+                  let always_blk = {
+                    always_type = AlwaysFF { clock; edge = clock_edge; async_reset = Some reset_info };
+                    always_stmts = [assign];  (* Normal operation assignment *)
+                  } in
+                  (match get_current_module_data ctx with
+                   | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+                   | None -> ());
+                  ctx.always_blocks <- always_blk :: ctx.always_blocks
+              | _ ->
+                  (* No reset for this signal - just sequential *)
+                  Printf.printf "    Signal %s: no reset value\n" assign.assign_lhs;
+                  let always_blk = {
+                    always_type = AlwaysFF { clock; edge = clock_edge; async_reset = None };
+                    always_stmts = [assign];
+                  } in
+                  (match get_current_module_data ctx with
+                   | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+                   | None -> ());
+                  ctx.always_blocks <- always_blk :: ctx.always_blocks)
+           ) normal_assigns
+
+       | None ->
+           (* Couldn't analyze structure - fall back to extracting all assignments *)
+           Printf.printf "    Could not analyze reset structure, extracting all assignments\n";
+           let assigns = extract_if_else_assigns stmt in
+           if assigns <> [] then begin
+             List.iter (fun assign ->
+               Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
+             ) assigns;
+             let always_blk = {
+               always_type = AlwaysFF { clock; edge = clock_edge; async_reset = None };
+               always_stmts = assigns;
+             } in
+             (match get_current_module_data ctx with
+              | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+              | None -> ());
+             ctx.always_blocks <- always_blk :: ctx.always_blocks
+           end else begin
+             (* Try extracting from statement directly *)
+             let direct_assigns = extract_assigns_from_stmt ctx stmt in
+             if direct_assigns <> [] then begin
+               List.iter (fun assign ->
+                 Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
+               ) direct_assigns;
+               let always_blk = {
+                 always_type = AlwaysFF { clock; edge = clock_edge; async_reset = None };
+                 always_stmts = direct_assigns;
+               } in
+               (match get_current_module_data ctx with
+                | Some data -> data.mod_always_blocks <- always_blk :: data.mod_always_blocks
+                | None -> ());
+               ctx.always_blocks <- always_blk :: ctx.always_blocks
+             end
+           end)
 
   | Some (clock, clock_edge, None, None) ->
       (* Sequential logic without async reset: always @(posedge clk) *)
@@ -706,7 +865,7 @@ let extract_traditional_always ctx event_ctrl stmt =
           Printf.printf "    Assignment: %s <= <expr>\n" assign.assign_lhs
         ) assigns;
         let always_blk = {
-          always_type = AlwaysFF { clock; edge = clock_edge };
+          always_type = AlwaysFF { clock; edge = clock_edge; async_reset = None };
           always_stmts = assigns;
         } in
         (* Add to current module's always_blocks *)
