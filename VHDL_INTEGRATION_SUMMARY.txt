@@ -33,7 +33,8 @@ WHAT WAS ACCOMPLISHED
 5. ✅ Copied libraries to project (vhd_libs/)
    - ver_front.cma (1.1MB)
    - vhd_front.cma (2.3MB)
-   - 20 interface files (.cmi)
+   - 11 interface source files (.mli) - NOT .cmi!
+   - 14 key source files (.ml)
 
 6. ✅ Documented everything (VHDL_INTEGRATION.md)
    - Complete usage guide
@@ -120,7 +121,10 @@ VHDL_INTEGRATION.md           - Complete documentation
 vhd_libs/                     - Library directory
   ├── ver_front.cma           - Verilog frontend (1.1MB)
   ├── vhd_front.cma           - VHDL frontend (2.3MB)
-  └── *.cmi                   - Interface files (20)
+  ├── *.mli                   - Interface source files (11)
+  └── *.ml                    - Key source files (14)
+
+  Note: Using .mli source files (not .cmi compiled) for portability!
 
 COMMITTED
 ─────────────────────────────────────────────────────────────

@@ -39,7 +39,12 @@ Previously, we compared our SystemVerilog decompiler output against Verilator's 
 Located in **vhd_libs/**:
 - `ver_front.cma` - Verilog front-end library (1.1MB)
 - `vhd_front.cma` - VHDL front-end library (2.3MB)
-- `*.cmi` - Interface files (20 files)
+- `*.mli` - Interface source files (11 files)
+- `*.ml` - Key source files (VhdlTypes, VhdlTree, etc.)
+
+Note: We copy `.mli` interface source files (not `.cmi` compiled interfaces)
+because they can be recompiled for any OCaml version, while `.cmi` files
+are version-specific and cause compatibility issues.
 
 ## Dependencies
 
@@ -69,12 +74,20 @@ cd ~/gnusynthesis/vhd_front
 make clean
 make vhd_front.cma
 
-# Copy to project
+# Copy to project (using .mli source files, not .cmi compiled)
 cp ~/gnusynthesis/ver_front/ver_front.cma ~/System-Verilog-decompiler/vhd_libs/
 cp ~/gnusynthesis/vhd_front/vhd_front.cma ~/System-Verilog-decompiler/vhd_libs/
-cp ~/gnusynthesis/ver_front/*.cmi ~/System-Verilog-decompiler/vhd_libs/
-cp ~/gnusynthesis/vhd_front/*.cmi ~/System-Verilog-decompiler/vhd_libs/
+cp ~/gnusynthesis/ver_front/*.mli ~/System-Verilog-decompiler/vhd_libs/
+cp ~/gnusynthesis/vhd_front/*.mli ~/System-Verilog-decompiler/vhd_libs/
+cp ~/gnusynthesis/vhd_front/VhdlTypes.ml ~/System-Verilog-decompiler/vhd_libs/
+cp ~/gnusynthesis/vhd_front/VhdlTree.ml ~/System-Verilog-decompiler/vhd_libs/
 ```
+
+**Why .mli not .cmi?**
+- `.mli` = Interface source files (text)
+- `.cmi` = Compiled interface files (binary, OCaml version-specific)
+- `.mli` files can be recompiled for any OCaml version
+- `.cmi` files cause "not a compiled interface for this version" errors
 
 ## Compilation
 
