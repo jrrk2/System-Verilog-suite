@@ -1,14 +1,14 @@
 (ocamllex
- (modules Source_text_verible_lex))
+ (modules Source_text_verible_lex Rtlil_input_lex))
 
 (menhir
- (modules Source_text_verible)
+ (modules Source_text_verible Rtlil_input)
  (flags -la 2))
 
 (executables
  (names sv_main_unified test_gate_mapping example_round_trip test_rtlil_reader
         test_verify_yosys_verilator test_verible_elab test_verible_parse
-        test_3way_verify test_3way_suite)
+        test_3way_verify test_3way_suite test_parser_comparison)
  (modules sv_ast sv_gen sv_gen_struct sv_gen_yosys sv_gen_hardcaml
           sv_main_unified sv_parse sv_transform sv_tran_struct
           behavioural_to_opt_ir opt_ir_to_sv sv_opt_ir
@@ -17,10 +17,12 @@
           sv_rtlil_to_ir sv_ir_verify
           Source_text_verible_types Source_text_verible_tokens
           Source_text_verible_lex Source_text_verible
+          Rtlil_input_types Rtlil_input_tokens
+          Rtlil_input_lex Rtlil_input
           sv_elaborate sv_verible_to_ir
           test_gate_mapping example_round_trip test_rtlil_reader
           test_verify_yosys_verilator test_verible_elab test_verible_parse
-          test_3way_verify test_3way_suite)
+          test_3way_verify test_3way_suite test_parser_comparison)
  (libraries str yojson unix hardcaml z3)
  (preprocess (pps ppx_deriving_yojson)))
 

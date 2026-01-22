@@ -19,13 +19,16 @@ let operation_to_module_info op =
   | Or { width } -> ("bitwise_or", width, [])
   | Xor { width } -> ("bitwise_xor", width, [])
   | Not { width } -> ("bitwise_not", width, [])
-  | Shift { width; direction = `Left; arithmetic = false; amount } -> 
-      ("shifter_left", width, 
+  | Shift { width; direction = `Left; arithmetic = false; amount } ->
+      ("shifter_left", width,
        match amount with Some n -> [("AMOUNT", n)] | None -> [])
-  | Shift { width; direction = `Right; arithmetic = false; amount } -> 
+  | Shift { width; direction = `Left; arithmetic = true; amount } ->
+      ("shifter_left_arith", width,
+       match amount with Some n -> [("AMOUNT", n)] | None -> [])
+  | Shift { width; direction = `Right; arithmetic = false; amount } ->
       ("shifter_right", width,
        match amount with Some n -> [("AMOUNT", n)] | None -> [])
-  | Shift { width; direction = `Right; arithmetic = true; amount } -> 
+  | Shift { width; direction = `Right; arithmetic = true; amount } ->
       ("shifter_right_arith", width,
        match amount with Some n -> [("AMOUNT", n)] | None -> [])
   | Compare { width; cmp_op = `Eq; _ } -> ("comparator_eq", width, [])
@@ -39,11 +42,12 @@ let operation_to_module_info op =
   | Compare { width; cmp_op = `Ge; signed = false; _ } -> ("comparator_ge", width, [])
   | Compare { width; cmp_op = `Ge; signed = true; _ } -> ("comparator_ge_signed", width, [])
   | Mux { width } -> ("mux2", width, [])
+  | Pmux { width; num_cases } -> ("pmux", width, [("NUM_CASES", num_cases)])
   | Register { width; reset_value; _ } -> ("dff_en", width, [("RESET_VAL", reset_value)])
   | ZeroExtend { from_width; to_width } -> ("zero_extender", to_width, [("WIDTH_IN", from_width); ("WIDTH_OUT", to_width)])
   | SignExtend { from_width; to_width } -> ("sign_extender", to_width, [("WIDTH_IN", from_width); ("WIDTH_OUT", to_width)])
   | Extract { width; lsb; msb } -> ("extractor", width, [("LSB", lsb); ("MSB", msb)])
-  | Concat { widths } -> 
+  | Concat { widths } ->
       let total_width = List.fold_left (+) 0 widths in
       ("concatenator", total_width, [("NUM_INPUTS", List.length widths)])
 
@@ -372,6 +376,42 @@ let convert_to_structural ir =
             access = "WR";
             dtype_ref = None
           })}]
+
+      | Pmux { num_cases; _ } ->
+          (* Priority mux with multiple inputs: default, selectors, data values *)
+          (* Inputs: [default; sel0; sel1; ...; selN-1; data0; data1; ...; dataN-1] *)
+          let total_inputs = 1 + (2 * num_cases) in
+          if List.length node.node_inputs >= total_inputs then
+            let default_id = List.hd node.node_inputs in
+            let selector_ids = List.filteri (fun i _ -> i > 0 && i <= num_cases) node.node_inputs in
+            let data_ids = List.filteri (fun i _ -> i > num_cases && i <= (1 + 2 * num_cases)) node.node_inputs in
+
+            [Pin { name = "default"; expr = Some (VarRef {
+                name = id_to_wire_name id_to_name default_id;
+                access = "RD";
+                dtype_ref = None
+              })}] @
+            (List.mapi (fun i sel_id ->
+              Pin { name = Printf.sprintf "sel%d" i; expr = Some (VarRef {
+                name = id_to_wire_name id_to_name sel_id;
+                access = "RD";
+                dtype_ref = None
+              })}
+            ) selector_ids) @
+            (List.mapi (fun i data_id ->
+              Pin { name = Printf.sprintf "data%d" i; expr = Some (VarRef {
+                name = id_to_wire_name id_to_name data_id;
+                access = "RD";
+                dtype_ref = None
+              })}
+            ) data_ids) @
+            [Pin { name = "out"; expr = Some (VarRef {
+              name = output_name;
+              access = "WR";
+              dtype_ref = None
+            })}]
+          else
+            []
     in
     
     let cell = Cell {

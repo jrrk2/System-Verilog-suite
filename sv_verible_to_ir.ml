@@ -4,6 +4,90 @@
 
 open Sv_ast
 open Source_text_verible
+open Source_text_verible_tokens
+
+(* ============================================================================
+   TOKEN DUMPING - Convert tokens to readable JSON-like format for debugging
+   ============================================================================ *)
+
+let rec token_to_json_string ?(max_depth=3) depth token =
+  if depth > max_depth then "..." else
+  let indent = String.make (depth * 2) ' ' in
+  let next_indent = String.make ((depth + 1) * 2) ' ' in
+  match token with
+  | EMPTY_TOKEN -> "EMPTY"
+  | STRING s -> Printf.sprintf "\"%s\"" s
+  | SymbolIdentifier id -> Printf.sprintf "SymbolIdentifier(%s)" id
+  | TK_UnBasedNumber n -> Printf.sprintf "UnBasedNumber(%s)" n
+  | TK_DecNumber n -> Printf.sprintf "DecNumber(%s)" n
+  | TUPLE2 (a, b) ->
+      Printf.sprintf "TUPLE2(\n%s%s,\n%s%s\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        indent
+  | TUPLE3 (a, b, c) ->
+      Printf.sprintf "TUPLE3(\n%s%s,\n%s%s,\n%s%s\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent (token_to_json_string ~max_depth (depth+1) c)
+        indent
+  | TUPLE4 (a, b, c, d) ->
+      Printf.sprintf "TUPLE4(\n%s%s,\n%s%s,\n%s%s,\n%s%s\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent (token_to_json_string ~max_depth (depth+1) c)
+        next_indent (token_to_json_string ~max_depth (depth+1) d)
+        indent
+  | TUPLE5 (a, b, c, d, e) ->
+      Printf.sprintf "TUPLE5(\n%s%s,\n%s%s,\n%s%s,\n%s%s,\n%s%s\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent (token_to_json_string ~max_depth (depth+1) c)
+        next_indent (token_to_json_string ~max_depth (depth+1) d)
+        next_indent (token_to_json_string ~max_depth (depth+1) e)
+        indent
+  | TUPLE6 (a, b, c, d, e, f) ->
+      Printf.sprintf "TUPLE6(\n%s%s,\n%s%s,\n%s%s,\n%s%s,\n%s%s,\n%s%s\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent (token_to_json_string ~max_depth (depth+1) c)
+        next_indent (token_to_json_string ~max_depth (depth+1) d)
+        next_indent (token_to_json_string ~max_depth (depth+1) e)
+        next_indent (token_to_json_string ~max_depth (depth+1) f)
+        indent
+  | TUPLE7 (a, b, c, d, e, f, g) ->
+      Printf.sprintf "TUPLE7(\n%s%s,\n%s%s,\n%s...\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent indent
+  | TUPLE8 (a, b, c, d, e, f, g, h) ->
+      Printf.sprintf "TUPLE8(\n%s%s,\n%s%s,\n%s...\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent indent
+  | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+      Printf.sprintf "TUPLE9(\n%s%s,\n%s%s,\n%s...\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent indent
+  | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+      Printf.sprintf "TUPLE12(\n%s%s,\n%s%s,\n%s...\n%s)"
+        next_indent (token_to_json_string ~max_depth (depth+1) a)
+        next_indent (token_to_json_string ~max_depth (depth+1) b)
+        next_indent indent
+  | TLIST items ->
+      if List.length items = 0 then "[]"
+      else if List.length items <= 3 then
+        Printf.sprintf "[\n%s%s\n%s]"
+          next_indent
+          (String.concat (",\n" ^ next_indent) (List.map (token_to_json_string ~max_depth (depth+1)) items))
+          indent
+      else
+        Printf.sprintf "[%d items: %s, ...]"
+          (List.length items)
+          (token_to_json_string ~max_depth (depth+1) (List.hd items))
+  (* Use getstr for any other token *)
+  | other -> getstr other
 
 (* Parse Verilog file using Verible parser *)
 let parse_verible_file filename =
@@ -446,8 +530,9 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
           let width = max (get_value_width ir true_id) (get_value_width ir false_id) in
           Sv_opt_ir.add_node ir (Sv_ast.Mux { width }) [cond_id; true_id; false_id]
 
-      | TUPLE6 (STRING "cond_expr2", _a, cond, _qmark, true_expr, false_expr) ->
+      | TUPLE6 (STRING "cond_expr2", cond, _query, true_expr, _colon, false_expr) ->
           (* Ternary operator: cond ? true_val : false_val *)
+          (* Grammar: logor_expr QUERY expression COLON cond_expr *)
           let cond_id = expr_to_ir ir expr_cache symbol_table functions cond in
           let true_id = expr_to_ir ir expr_cache symbol_table functions true_expr in
           let false_id = expr_to_ir ir expr_cache symbol_table functions false_expr in
@@ -575,17 +660,9 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
                   (* Pattern 3: Direct blocking_assignment1 *)
                   | TUPLE4 (STRING "blocking_assignment1", _lhs, _eq, rhs) -> rhs
                   | _ ->
-                      Printf.eprintf "Warning: Unexpected case item statement structure: ";
-                      (match stmt with
-                       | TUPLE3 (STRING s, second, _) ->
-                           Printf.eprintf "TUPLE3(%s, " s;
-                           (match second with
-                            | TUPLE3 (STRING s2, _, _) -> Printf.eprintf "TUPLE3(%s, ...), ...)\n" s2
-                            | TUPLE4 (STRING s2, _, _, _) -> Printf.eprintf "TUPLE4(%s, ...), ...)\n" s2
-                            | STRING s2 -> Printf.eprintf "STRING(%s), ...)\n" s2
-                            | _ -> Printf.eprintf "<other>, ...)\n")
-                       | TUPLE4 (STRING s, _, _, _) -> Printf.eprintf "TUPLE4(%s, ...)\n" s
-                       | _ -> Printf.eprintf "<unknown>\n");
+                      Printf.eprintf "\n=== Warning: Unexpected case item statement structure ===\n";
+                      Printf.eprintf "%s\n" (token_to_json_string ~max_depth:3 0 stmt);
+                      Printf.eprintf "========================================================\n\n";
                       TK_DecNumber "0") in
                 [(case_values, result_val)]
             | TUPLE3 (STRING "case_items1", rest, item) ->
@@ -633,19 +710,15 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
           end
 
       | _ ->
-          Printf.eprintf "Warning: Unhandled expression type: ";
-          (match expr with
-           | TUPLE3 (STRING s, _, _) -> Printf.eprintf "TUPLE3(%s, ...)\n" s
-           | TUPLE4 (STRING s, _, _, _) -> Printf.eprintf "TUPLE4(%s, ...)\n" s
-           | TUPLE5 (STRING s, _, _, _, _) -> Printf.eprintf "TUPLE5(%s, ...)\n" s
-           | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.eprintf "TUPLE6(%s, ...)\n" s
-           | TUPLE8 (STRING s, _, _, _, _, _, _, _) -> Printf.eprintf "TUPLE8(%s, ...)\n" s
-           | TUPLE12 (STRING s, _, _, _, _, _, _, _, _, _, _, _) -> Printf.eprintf "TUPLE12(%s, ...)\n" s
-           | STRING s -> Printf.eprintf "STRING(%s)\n" s
-           | TLIST lst -> Printf.eprintf "TLIST[%d items]\n" (List.length lst)
-           | SymbolIdentifier s -> Printf.eprintf "SymbolIdentifier(%s)\n" s
-           | TK_DecNumber s -> Printf.eprintf "TK_DecNumber(%s)\n" s
-           | _ -> Printf.eprintf "<unknown token constructor>\n");
+          Printf.eprintf "\n=== Warning: Unhandled expression type ===\n";
+          (* Write full token to file for inspection *)
+          let oc = open_out_gen [Open_wronly; Open_append; Open_creat] 0o644 "unhandled_tokens.txt" in
+          Printf.fprintf oc "\n=== Unhandled Expression ===\n";
+          Printf.fprintf oc "%s\n" (token_to_json_string ~max_depth:5 0 expr);
+          Printf.fprintf oc "============================\n\n";
+          close_out oc;
+          Printf.eprintf "Token structure dumped to unhandled_tokens.txt\n";
+          Printf.eprintf "==========================================\n\n";
           Sv_opt_ir.get_new_id ir
     in
     Hashtbl.add expr_cache expr result;
@@ -713,7 +786,16 @@ let verible_to_ir verible_ast module_name =
   let expr_cache = Hashtbl.create 50 in
   List.iter (fun (assign : Sv_elaborate.assign_info) ->
     Printf.printf "Converting assign: %s = <expr>\n" assign.assign_lhs;
-    let value_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.assign_rhs in
+    (* Debug: Show RHS expression structure if unhandled *)
+    let value_id =
+      try
+        expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.assign_rhs
+      with
+      | e ->
+          Printf.eprintf "\nException while converting RHS of %s:\n" assign.assign_lhs;
+          Printf.eprintf "%s\n" (token_to_json_string ~max_depth:3 0 assign.assign_rhs);
+          raise e
+    in
 
     (* Try to connect to wire first, then output *)
     (try
