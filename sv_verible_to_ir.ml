@@ -448,12 +448,44 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
                Sv_opt_ir.get_new_id ir)
 
       | TUPLE3 (STRING "reference3", base_expr, index_expr) ->
-          (* Array indexing: array[index] *)
-          (* TODO: Proper memory/array support needed in IR *)
-          Printf.printf "  Note: Array indexing not yet fully supported, creating placeholder\n";
-          let _base_id = expr_to_ir ir expr_cache symbol_table functions base_expr in
-          let _index_id = expr_to_ir ir expr_cache symbol_table functions index_expr in
-          Sv_opt_ir.get_new_id ir
+          (* Array indexing or bit selection: array[index] or signal[bit] *)
+          (* Check if this is actually bit-select (index is select_variable_dimension) *)
+          (match index_expr with
+           | TUPLE4 (STRING "select_variable_dimension2", _lbracket, idx, _rbracket) ->
+               (* This is bit selection: signal[index] *)
+               let base_id = expr_to_ir ir expr_cache symbol_table functions base_expr in
+               let index_val = (match idx with
+                 | TK_DecNumber n -> (try int_of_string n with _ -> 0)
+                 | TK_UnBasedNumber n -> (try int_of_string n with _ -> 0)
+                 | _ ->
+                     Printf.printf "  Warning: Dynamic bit index, using index 0\n";
+                     0
+               ) in
+               Printf.printf "  Creating bit-select [%d] from signal (id=%d)\n" index_val base_id;
+               let extract_op = Sv_ast.Extract { width = 1; lsb = index_val; msb = index_val } in
+               Sv_opt_ir.add_node ir extract_op [base_id]
+           | TUPLE6 (STRING "select_variable_dimension1", _lbracket, high_expr, _colon, low_expr, _rbracket) ->
+               (* This is bit slice: signal[high:low] *)
+               let base_id = expr_to_ir ir expr_cache symbol_table functions base_expr in
+               let high_val = (match high_expr with
+                 | TK_DecNumber n -> (try int_of_string n with _ -> 0)
+                 | TK_UnBasedNumber n -> (try int_of_string n with _ -> 0)
+                 | _ -> 0) in
+               let low_val = (match low_expr with
+                 | TK_DecNumber n -> (try int_of_string n with _ -> 0)
+                 | TK_UnBasedNumber n -> (try int_of_string n with _ -> 0)
+                 | _ -> 0) in
+               let width = high_val - low_val + 1 in
+               Printf.printf "  Creating bit-slice [%d:%d] (width=%d) from signal (id=%d)\n"
+                 high_val low_val width base_id;
+               let extract_op = Sv_ast.Extract { width; lsb = low_val; msb = high_val } in
+               Sv_opt_ir.add_node ir extract_op [base_id]
+           | _ ->
+               (* True array indexing *)
+               Printf.printf "  Note: Array indexing not yet fully supported, creating placeholder\n";
+               let _base_id = expr_to_ir ir expr_cache symbol_table functions base_expr in
+               let _index_id = expr_to_ir ir expr_cache symbol_table functions index_expr in
+               Sv_opt_ir.get_new_id ir)
 
       | TUPLE3 (STRING "reference_or_call_base1", func_name, args) ->
           (* Function call: func(args) *)
@@ -562,17 +594,43 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
       | TUPLE4 (STRING "select1", base, _lbracket, index) ->
           (* Bit selection: signal[index] *)
           let base_id = expr_to_ir ir expr_cache symbol_table functions base in
-          let _index_id = expr_to_ir ir expr_cache symbol_table functions index in
-          (* For now, return the base (simplified - should extract single bit) *)
-          Printf.printf "  Note: Bit selection not fully supported, using base signal\n";
-          base_id
+          (* Try to extract constant index value *)
+          let index_val = (match index with
+            | TK_DecNumber n -> (try int_of_string n with _ -> 0)
+            | TK_UnBasedNumber n -> (try int_of_string n with _ -> 0)
+            | _ ->
+                (* Dynamic index - for now use 0, but this needs proper support *)
+                Printf.printf "  Warning: Dynamic bit index not fully supported, using index 0\n";
+                0
+          ) in
+          Printf.printf "  Creating bit-select [%d] from signal (id=%d)\n" index_val base_id;
+          let extract_op = Sv_ast.Extract { width = 1; lsb = index_val; msb = index_val } in
+          Sv_opt_ir.add_node ir extract_op [base_id]
 
       | TUPLE4 (STRING "select2", base, _lbracket, range) ->
           (* Bit slice: signal[high:low] *)
           let base_id = expr_to_ir ir expr_cache symbol_table functions base in
-          (* For now, return the base (simplified - should extract bit range) *)
-          Printf.printf "  Note: Bit slicing not fully supported, using base signal\n";
-          base_id
+          (* Extract high and low from range *)
+          let (high_val, low_val) = (match range with
+            | TUPLE6 (STRING "select_variable_dimension1", _lb, high_expr, _colon, low_expr, _rb) ->
+                let high = (match high_expr with
+                  | TK_DecNumber n -> (try int_of_string n with _ -> 0)
+                  | TK_UnBasedNumber n -> (try int_of_string n with _ -> 0)
+                  | _ -> 0) in
+                let low = (match low_expr with
+                  | TK_DecNumber n -> (try int_of_string n with _ -> 0)
+                  | TK_UnBasedNumber n -> (try int_of_string n with _ -> 0)
+                  | _ -> 0) in
+                (high, low)
+            | _ ->
+                Printf.printf "  Warning: Unexpected range format in bit slice\n";
+                (0, 0)
+          ) in
+          let width = high_val - low_val + 1 in
+          Printf.printf "  Creating bit-slice [%d:%d] (width=%d) from signal (id=%d)\n"
+            high_val low_val width base_id;
+          let extract_op = Sv_ast.Extract { width; lsb = low_val; msb = high_val } in
+          Sv_opt_ir.add_node ir extract_op [base_id]
 
       | TK_DecNumber n ->
           (try

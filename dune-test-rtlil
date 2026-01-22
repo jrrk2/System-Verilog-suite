@@ -1,0 +1,4 @@
+(executable
+ (name test_rtlil_apb)
+ (modules test_rtlil_apb)
+ (libraries sv_rtlil_reader sv_rtlil_to_ir sv_ast))
