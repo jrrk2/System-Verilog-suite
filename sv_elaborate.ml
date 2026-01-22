@@ -802,7 +802,9 @@ let rec extract_assigns_with_cond condition stmt =
 
 and extract_assigns_from_seq_block_with_cond condition stmts =
   match stmts with
-  | TLIST lst -> List.flatten (List.map (extract_assigns_with_cond condition) lst)
+  | TLIST lst ->
+      let results_per_stmt = List.map (extract_assigns_with_cond condition) lst in
+      List.flatten results_per_stmt
   | single -> extract_assigns_with_cond condition single
 
 and extract_if_else_assigns_with_cond parent_cond stmt =
@@ -821,13 +823,14 @@ and extract_if_else_assigns_with_cond parent_cond stmt =
       (* Then branch: parent AND current condition *)
       let then_cond = combine_conditions_with_and parent_cond cond_expr in
       let then_assigns = extract_assigns_with_cond then_cond then_stmt in
-      (* Else branch: keep parent condition only (condition is false in else branch) *)
+      (* Else branch: keep parent condition (else branch may have nested conditions) *)
       let else_assigns = extract_assigns_with_cond parent_cond else_stmt in
       then_assigns @ else_assigns
   | TUPLE7 (STRING "conditional_statement2", _label, _if_kw, cond_expr, then_stmt, _else_kw, else_stmt) ->
       (* if (cond) stmt1 else stmt2 with label *)
       let then_cond = combine_conditions_with_and parent_cond cond_expr in
       let then_assigns = extract_assigns_with_cond then_cond then_stmt in
+      (* Else branch: keep parent condition *)
       let else_assigns = extract_assigns_with_cond parent_cond else_stmt in
       then_assigns @ else_assigns
   | _ -> []
@@ -1002,7 +1005,8 @@ let extract_traditional_always ctx event_ctrl stmt =
            (* Finally, create ONE AlwaysFF block per signal with ALL its assignments *)
            Hashtbl.iter (fun signal_name () ->
              let reset_assign_opt = try Some (Hashtbl.find reset_map signal_name) with Not_found -> None in
-             let normal_assigns_list = try List.rev (Hashtbl.find normal_map signal_name) with Not_found -> [] in
+             (* Don't reverse - if Verible gives reverse chronological order, prepending already gives chronological *)
+             let normal_assigns_list = try (Hashtbl.find normal_map signal_name) with Not_found -> [] in
 
              (match reset_assign_opt with
               | Some reset_assign ->

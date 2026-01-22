@@ -936,47 +936,31 @@ let verible_to_ir verible_ast module_name =
                | _ -> 1)
             with Not_found -> 1)) in
 
-          (* Build MUX tree: later assignments override earlier ones *)
-          (* Process in reverse order: last assignment has highest priority *)
-          let rec build_mux_tree_from_last assigns_list =
-            match assigns_list with
+          (* Build MUX tree with proper priority: later assignments override earlier ones *)
+          (* In SystemVerilog: signal <= a; if(c1) signal <= b; if(c2) signal <= c;
+             Result should be: c2 ? c : (c1 ? b : a)
+             Later assignments have HIGHER priority *)
+          let rec build_priority_mux assigns_reversed =
+            match assigns_reversed with
             | [] -> failwith "Empty assignment list"
-            | [single] ->
-                (* Single assignment - just convert the RHS *)
-                (expr_to_ir ir expr_cache symbol_table module_data.mod_functions single.Sv_elaborate.assign_rhs, single.Sv_elaborate.assign_condition)
-            | _ ->
-                (* Process from right to left (highest to lowest priority) *)
-                let rec build_from_end lst =
-                  match lst with
-                  | [] -> failwith "Empty list"
-                  | [last] ->
-                      (* Highest priority assignment *)
-                      let last_val = expr_to_ir ir expr_cache symbol_table module_data.mod_functions last.Sv_elaborate.assign_rhs in
-                      (match last.Sv_elaborate.assign_condition with
-                       | Some cond_expr ->
-                           (* Has condition - need to MUX with default *)
-                           (last_val, last.Sv_elaborate.assign_condition)
-                       | None ->
-                           (* Unconditional - this is the final value *)
-                           (last_val, None))
-                  | first :: rest ->
-                      (* Build MUX for rest (higher priority) *)
-                      let (rest_val, rest_cond_opt) = build_from_end rest in
-                      let first_val = expr_to_ir ir expr_cache symbol_table module_data.mod_functions first.Sv_elaborate.assign_rhs in
+            | [oldest] ->
+                (* Base case: oldest/lowest priority assignment *)
+                expr_to_ir ir expr_cache symbol_table module_data.mod_functions oldest.Sv_elaborate.assign_rhs
+            | newest :: older_rest ->
+                (* newest has highest priority among this sublist *)
+                let newest_val = expr_to_ir ir expr_cache symbol_table module_data.mod_functions newest.Sv_elaborate.assign_rhs in
+                let older_val = build_priority_mux older_rest in
 
-                      (match rest_cond_opt with
-                       | Some rest_cond ->
-                           (* Rest has condition - create MUX(rest_cond, rest_val, first_val) *)
-                           let cond_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions rest_cond in
-                           let mux_node_id = Sv_opt_ir.add_node ir
-                             (Sv_ast.Mux { width = signal_width })
-                             [cond_id; rest_val; first_val] in
-                           (mux_node_id, first.Sv_elaborate.assign_condition)
-                       | None ->
-                           (* Rest is unconditional, just use it *)
-                           (rest_val, None))
-                in
-                build_from_end assigns_list
+                (match newest.Sv_elaborate.assign_condition with
+                 | Some cond_expr ->
+                     (* Conditional: MUX(condition, newest_value, older_value) *)
+                     let cond_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions cond_expr in
+                     Sv_opt_ir.add_node ir
+                       (Sv_ast.Mux { width = signal_width })
+                       [cond_id; newest_val; older_val]
+                 | None ->
+                     (* Unconditional - always use newest, ignore older *)
+                     newest_val)
           in
 
           (* Build the MUX tree or use single assignment *)
@@ -986,9 +970,9 @@ let verible_to_ir verible_ast module_name =
               let assign = List.hd assigns_in_order in
               expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.Sv_elaborate.assign_rhs
             else
-              (* Multiple assignments - build MUX tree *)
-              let (mux_val, _) = build_mux_tree_from_last assigns_in_order in
-              mux_val
+              (* Multiple assignments - build priority MUX tree *)
+              (* Reverse list so newest/highest priority is first *)
+              build_priority_mux (List.rev assigns_in_order)
           in
 
           (* Build enable signal from OR of all conditions *)
