@@ -453,16 +453,17 @@ type operation =
   | Shift of { width: int; direction: [`Left | `Right]; arithmetic: bool; amount: int option }
   | Compare of { width: int; cmp_op: [`Eq | `Ne | `Lt | `Le | `Gt | `Ge]; signed: bool }
   | Mux of { width: int }
+  | Pmux of { width: int; num_cases: int }  (* Priority mux: default + selectors + data values *)
   | Concat of { widths: int list }
   | Extract of { width: int; lsb: int; msb: int }
   | ZeroExtend of { from_width: int; to_width: int }
   | SignExtend of { from_width: int; to_width: int }
-  | Register of { 
-      width: int; 
-      clock: value_id; 
-      reset: value_id option; 
+  | Register of {
+      width: int;
+      clock: value_id;
+      reset: value_id option;
       enable: value_id option;
-      reset_value: int 
+      reset_value: int
     }
  [@@deriving yojson]
  
@@ -482,6 +483,7 @@ type opt_ir = {
   ir_name: string;
   ir_inputs: (string, value) Hashtbl.t;
   ir_outputs: (string, value) Hashtbl.t;
+  ir_wires: (string, value) Hashtbl.t;  (* Internal signals: wire/reg/logic *)
   ir_constants: (int, value_id) Hashtbl.t;
   ir_nodes: (value_id, node) Hashtbl.t;
   ir_value_to_node: (value_id, value_id) Hashtbl.t;

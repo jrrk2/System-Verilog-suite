@@ -28,8 +28,233 @@ let parse_verible_file filename =
       Printexc.print_backtrace stderr;
       None
 
+(* ============================================================================
+   FUNCTION INLINING - Convert function bodies to ternary expressions
+   ============================================================================ *)
+
+(* Convert function body (token tree) to expression token
+   This handles case statements and return statements, converting them to nested ternary expressions *)
+let rec convert_function_body_to_expr func_name body_token =
+
+  (* Search for return statements in the function body *)
+  match body_token with
+  | TUPLE8 (STRING "case_statement1", _case_or_casex, _unique_or_priority, _lparen, sel_expr, _rparen, items, _endcase) ->
+      (* case (...) case_item* endcase *)
+      Some (convert_case_body_to_ternary sel_expr items)
+
+  | TUPLE9 (STRING "case_statement3", _pos1, _pos2, _pos3, pos4, _pos5, _pos6, pos7, _pos8) ->
+      (* case (...) inside case_item* endcase *)
+      (* pos4 is the selector expression, pos7 is case_inside_items1 *)
+      Some (convert_case_body_to_ternary pos4 pos7)
+
+  | TUPLE3 (STRING "case_statement1", Case, case_items) ->
+      (* case (...) ... endcase *)
+      (match case_items with
+       | TUPLE6 (STRING s, _lparen, sel_expr, _rparen, items, _endcase) when s = "case_statement_body1" || s = "case_inside_statement_body1" ->
+           Some (convert_case_body_to_ternary sel_expr items)
+       | _ -> None)
+
+  | TUPLE4 (STRING "jump_statement1", Return, return_expr, _semicolon) ->
+      (* return <expr>; *)
+      Some return_expr
+
+  | TUPLE3 (STRING "seq_block1", Begin, items) ->
+      (* begin ... end *)
+      convert_items_to_expr func_name items
+
+  | TUPLE4 (STRING "seq_block2", Begin, _label, items) ->
+      (* begin:label ... end *)
+      convert_items_to_expr func_name items
+
+  | TLIST items ->
+      (* List of statements - search through them *)
+      List.find_map (convert_function_body_to_expr func_name) items
+
+  | _ -> None
+
+and convert_items_to_expr func_name items_token =
+  match items_token with
+  | TLIST items -> List.find_map (convert_function_body_to_expr func_name) items
+  | _ -> convert_function_body_to_expr func_name items_token
+
+and convert_case_body_to_ternary sel_expr case_items =
+  (* Convert case items to nested ternary expressions *)
+  match case_items with
+  | TLIST items -> convert_case_items_list sel_expr items
+  | TUPLE3 (STRING "case_items1", _left, items) ->
+      (* case_items1 wrapper *)
+      convert_case_body_to_ternary sel_expr items
+  | TUPLE3 (STRING "case_inside_items1", _left, items) ->
+      (* case_inside_items1 wrapper *)
+      convert_case_body_to_ternary sel_expr items
+  | single_item ->
+      (* Single case item, not wrapped in TLIST *)
+      convert_case_items_list sel_expr [single_item]
+
+and convert_case_items_list sel_expr items =
+  (* Process case items from last to first, building nested ternary expressions *)
+  let rec process_items items =
+    match items with
+    | [] ->
+        (* No items, return 0 as default *)
+        TK_UnBasedNumber "0"
+    | [single_item] ->
+        (* Last item (or only item) *)
+        (match extract_case_item_value single_item with
+         | Some (conditions, value_expr) ->
+             if conditions = [] then
+               (* Default case *)
+               value_expr
+             else
+               (* Last conditional case - use value or default 0 *)
+               let condition = build_case_condition sel_expr conditions in
+               TUPLE5 (STRING "cond_expr1", condition, STRING "?", value_expr, TK_UnBasedNumber "0")
+         | None -> TK_UnBasedNumber "0")
+    | first_item :: rest ->
+        (* Build nested ternary: condition ? value : rest *)
+        let else_expr = process_items rest in
+        (match extract_case_item_value first_item with
+         | Some (conditions, value_expr) ->
+             if conditions = [] then
+               (* Default case at non-last position - use it as final else *)
+               value_expr
+             else
+               let condition = build_case_condition sel_expr conditions in
+               TUPLE5 (STRING "cond_expr1", condition, STRING "?", value_expr, else_expr)
+         | None -> else_expr)
+  in
+  process_items items
+
+and extract_case_item_value item_token =
+  (* Extract condition and value from a case item *)
+  match item_token with
+  | TUPLE4 (STRING "case_item1", condition_list, _colon, stmt) ->
+      (* condition: statement *)
+      let conditions = extract_case_conditions condition_list in
+      let value = find_return_value stmt in
+      Some (conditions, value)
+  | TUPLE5 (STRING "case_item2", condition_list, _colon, stmt, _) ->
+      (* condition: statement *)
+      let conditions = extract_case_conditions condition_list in
+      let value = find_return_value stmt in
+      Some (conditions, value)
+  | TUPLE4 (STRING "case_item3", Default, _colon, stmt) ->
+      (* default: statement *)
+      let value = find_return_value stmt in
+      Some ([], value) (* Empty conditions = default *)
+  | TUPLE4 (STRING "case_inside_item2", condition_list, _colon, stmt) ->
+      (* case inside: condition: statement *)
+      let conditions = extract_case_conditions condition_list in
+      let value = find_return_value stmt in
+      Some (conditions, value)
+  | _ -> None
+
+and extract_case_conditions condition_token =
+  (* Extract list of conditions from case item *)
+  match condition_token with
+  | TLIST items -> items
+  | single -> [single]
+
+and find_return_value stmt_token =
+  (* Find the return value in a statement *)
+  match stmt_token with
+  | TUPLE4 (STRING "jump_statement1", Return, return_expr, _semicolon) ->
+      return_expr
+  | TUPLE3 (STRING "seq_block1", Begin, items) ->
+      (match convert_items_to_expr "return" items with
+       | Some expr -> expr
+       | None -> TK_UnBasedNumber "0")
+  | TUPLE4 (STRING "seq_block2", Begin, _label, items) ->
+      (match convert_items_to_expr "return" items with
+       | Some expr -> expr
+       | None -> TK_UnBasedNumber "0")
+  | TLIST items ->
+      (match List.find_map (fun item ->
+         match find_return_value item with
+         | TK_UnBasedNumber "0" -> None
+         | v -> Some v
+       ) items with
+       | Some v -> v
+       | None -> TK_UnBasedNumber "0")
+  | _ -> TK_UnBasedNumber "0"
+
+and build_case_condition sel_expr conditions =
+  (* Build comparison expression(s) for case conditions *)
+  match conditions with
+  | [] -> TK_UnBasedNumber "1" (* Always true for default *)
+  | [single_cond] ->
+      (* Single condition: sel_expr == condition *)
+      TUPLE4 (STRING "binary_eq_expr1", sel_expr, STRING "==", single_cond)
+  | first :: rest ->
+      (* Multiple conditions: (sel_expr == c1) || (sel_expr == c2) || ... *)
+      let first_cmp = TUPLE4 (STRING "binary_eq_expr1", sel_expr, STRING "==", first) in
+      List.fold_left (fun acc cond ->
+        let cmp = TUPLE4 (STRING "binary_eq_expr1", sel_expr, STRING "==", cond) in
+        TUPLE4 (STRING "binary_logor_expr1", acc, STRING "||", cmp)
+      ) first_cmp rest
+
+(* Substitute parameter in expression token tree *)
+let rec substitute_param_in_token param_name arg_token token =
+  match token with
+  | SymbolIdentifier name when name = param_name ->
+      arg_token
+  | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier name, rest) when name = param_name ->
+      arg_token
+  | TUPLE3 (s, a, b) ->
+      TUPLE3 (s, substitute_param_in_token param_name arg_token a, substitute_param_in_token param_name arg_token b)
+  | TUPLE4 (s, a, b, c) ->
+      TUPLE4 (s, substitute_param_in_token param_name arg_token a, substitute_param_in_token param_name arg_token b, substitute_param_in_token param_name arg_token c)
+  | TUPLE5 (s, a, b, c, d) ->
+      TUPLE5 (s, substitute_param_in_token param_name arg_token a, substitute_param_in_token param_name arg_token b, substitute_param_in_token param_name arg_token c, substitute_param_in_token param_name arg_token d)
+  | TUPLE6 (s, a, b, c, d, e) ->
+      TUPLE6 (s, substitute_param_in_token param_name arg_token a, substitute_param_in_token param_name arg_token b, substitute_param_in_token param_name arg_token c, substitute_param_in_token param_name arg_token d, substitute_param_in_token param_name arg_token e)
+  | TLIST items ->
+      TLIST (List.map (substitute_param_in_token param_name arg_token) items)
+  | _ -> token
+
+(* Extract arguments from function call *)
+let rec extract_function_args args_token =
+  match args_token with
+  | TUPLE3 (STRING "list_of_arguments1", _lparen, arg_list) ->
+      extract_arg_list arg_list
+  | TUPLE4 (STRING "list_of_arguments2", _lparen, arg_list, _rparen) ->
+      extract_arg_list arg_list
+  | _ -> []
+
+and extract_arg_list arg_list =
+  match arg_list with
+  | TLIST items ->
+      List.filter_map (fun item ->
+        match item with
+        | TUPLE3 (STRING "argument1", _name, expr) -> Some expr
+        | expr -> Some expr
+      ) items
+  | single -> [single]
+
+(* Get width of a value by looking it up in IR *)
+let get_value_width ir value_id =
+  (* Check if it's an input *)
+  let input_width = Hashtbl.fold (fun _name value acc ->
+    match acc with
+    | Some w -> Some w
+    | None ->
+        match value with
+        | Sv_ast.Input { id; width; _ } when id = value_id -> Some width
+        | _ -> None
+  ) ir.ir_inputs None in
+  match input_width with
+  | Some w -> w
+  | None ->
+      (* Check if it's a node *)
+      match Hashtbl.find_opt ir.ir_nodes value_id with
+      | Some node -> (match node.node_op with
+          | Sv_ast.Add { width; _ } | Sv_ast.Sub { width; _ } | Sv_ast.Mul { width; _ }
+          | Sv_ast.And { width } | Sv_ast.Or { width } | Sv_ast.Xor { width } | Sv_ast.Not { width } -> width
+          | _ -> 32)
+      | None -> 32  (* Default width *)
+
 (* Convert expression tree to IR value_id *)
-let rec expr_to_ir ir expr_cache expr =
+let rec expr_to_ir ir expr_cache symbol_table functions expr =
   (* Check if we've already converted this expression *)
   try
     Hashtbl.find expr_cache expr
@@ -37,44 +262,232 @@ let rec expr_to_ir ir expr_cache expr =
     let result =
       match expr with
       | TUPLE4 (STRING "add_expr2", left, PLUS, right) ->
-          let left_id = expr_to_ir ir expr_cache left in
-          let right_id = expr_to_ir ir expr_cache right in
-          (* TODO: Properly infer width and signedness from operands *)
-          Sv_opt_ir.add_node ir (Add { width = 4; signed = false }) [left_id; right_id]
-
-      | TUPLE4 (STRING "mul_expr2", left, STAR, right) ->
-          let left_id = expr_to_ir ir expr_cache left in
-          let right_id = expr_to_ir ir expr_cache right in
-          (* TODO: Properly infer width and signedness from operands *)
-          Sv_opt_ir.add_node ir (Mul { width = 8; signed = false }) [left_id; right_id]
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Add { width; signed = false }) [left_id; right_id]
 
       | TUPLE4 (STRING "add_expr3", left, HYPHEN, right) ->
-          let left_id = expr_to_ir ir expr_cache left in
-          let right_id = expr_to_ir ir expr_cache right in
-          (* TODO: Properly infer width and signedness from operands *)
-          Sv_opt_ir.add_node ir (Sub { width = 4; signed = false }) [left_id; right_id]
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Sub { width; signed = false }) [left_id; right_id]
+
+      | TUPLE4 (STRING "mul_expr2", left, STAR, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width_l = get_value_width ir left_id in
+          let width_r = get_value_width ir right_id in
+          let width = width_l + width_r in  (* Multiply result width *)
+          Sv_opt_ir.add_node ir (Mul { width; signed = false }) [left_id; right_id]
+
+      | TUPLE4 (STRING "xor_expr2", left, _, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Xor { width }) [left_id; right_id]
+
+      | TUPLE4 (STRING "and_expr2", left, _, right)
+      | TUPLE4 (STRING "bitand_expr2", left, _, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (And { width }) [left_id; right_id]
+
+      | TUPLE4 (STRING "or_expr2", left, _, right)
+      | TUPLE4 (STRING "bitor_expr2", left, _, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Or { width }) [left_id; right_id]
+
+      | TUPLE4 (STRING "binary_eq_expr1", left, _, right) ->
+          (* Equality comparison: left == right *)
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Eq; signed = false }) [left_id; right_id]
+
+      | TUPLE4 (STRING "binary_logor_expr1", left, _, right) ->
+          (* Logical OR: left || right *)
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = 1 in (* Logical operations return 1 bit *)
+          Sv_opt_ir.add_node ir (Or { width }) [left_id; right_id]
 
       | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier name, _) ->
-          (* Look up input or intermediate value *)
-          (try
-            let v = Hashtbl.find ir.ir_inputs name in
-            (match v with
-             | Input { id; _ } -> id
-             | _ -> Sv_opt_ir.get_new_id ir)
-          with Not_found ->
-            Printf.eprintf "Warning: Unknown identifier '%s' in expression\n" name;
-            Sv_opt_ir.get_new_id ir)
+          (* Look up in symbol table *)
+          (match Hashtbl.find_opt symbol_table name with
+           | Some signal_info ->
+               (* Check if it's an input in the IR *)
+               (try
+                 let v = Hashtbl.find ir.ir_inputs name in
+                 (match v with
+                  | Sv_ast.Input { id; _ } -> id
+                  | _ -> Sv_opt_ir.get_new_id ir)
+               with Not_found ->
+                 (* Check if it's a wire *)
+                 (try
+                   let v = Hashtbl.find ir.ir_wires name in
+                   (match v with
+                    | Sv_ast.Wire { id; _ } -> id
+                    | _ -> Sv_opt_ir.get_new_id ir)
+                 with Not_found ->
+                   (* Not found in IR - might not be assigned yet *)
+                   Sv_opt_ir.get_new_id ir))
+           | None ->
+               Printf.eprintf "Warning: Unknown identifier '%s' in expression\n" name;
+               Sv_opt_ir.get_new_id ir)
 
       | SymbolIdentifier name ->
-          (* Look up input *)
-          (try
-            let v = Hashtbl.find ir.ir_inputs name in
-            (match v with
-             | Input { id; _ } -> id
-             | _ -> Sv_opt_ir.get_new_id ir)
-          with Not_found ->
-            Printf.eprintf "Warning: Unknown identifier '%s'\n" name;
-            Sv_opt_ir.get_new_id ir)
+          (* Look up in symbol table *)
+          (match Hashtbl.find_opt symbol_table name with
+           | Some signal_info ->
+               (* Check if it's an input in the IR *)
+               (try
+                 let v = Hashtbl.find ir.ir_inputs name in
+                 (match v with
+                  | Sv_ast.Input { id; _ } -> id
+                  | _ -> Sv_opt_ir.get_new_id ir)
+               with Not_found ->
+                 (* Check if it's a wire *)
+                 (try
+                   let v = Hashtbl.find ir.ir_wires name in
+                   (match v with
+                    | Sv_ast.Wire { id; _ } -> id
+                    | _ -> Sv_opt_ir.get_new_id ir)
+                 with Not_found ->
+                   (* Not found in IR - might not be assigned yet *)
+                   Sv_opt_ir.get_new_id ir))
+           | None ->
+               Printf.eprintf "Warning: Unknown identifier '%s'\n" name;
+               Sv_opt_ir.get_new_id ir)
+
+      | TUPLE3 (STRING "reference3", base_expr, index_expr) ->
+          (* Array indexing: array[index] *)
+          (* TODO: Proper memory/array support needed in IR *)
+          Printf.printf "  Note: Array indexing not yet fully supported, creating placeholder\n";
+          let _base_id = expr_to_ir ir expr_cache symbol_table functions base_expr in
+          let _index_id = expr_to_ir ir expr_cache symbol_table functions index_expr in
+          Sv_opt_ir.get_new_id ir
+
+      | TUPLE3 (STRING "reference_or_call_base1", func_name, args) ->
+          (* Function call: func(args) *)
+          (* Extract function name *)
+          let name = (match func_name with
+            | SymbolIdentifier n -> n
+            | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier n, _) -> n
+            | _ -> "unknown_func") in
+
+          (* Look up function in the functions list *)
+          let func_opt = List.find_opt (fun (f : Sv_elaborate.function_info) ->
+            f.func_name = name
+          ) functions in
+
+          (match func_opt with
+           | Some func ->
+               Printf.printf "  Inlining function '%s' (width=%d)...\n" name func.func_return_width;
+
+               (* Extract actual arguments from the call *)
+               let actual_args = extract_function_args args in
+
+               (* Convert function body to expression *)
+               (match convert_function_body_to_expr name func.func_body with
+                | Some body_expr ->
+                    (* Substitute parameters with actual arguments *)
+                    let substituted_expr =
+                      if List.length func.func_params = List.length actual_args then
+                        List.fold_left2 (fun acc_expr param arg ->
+                          substitute_param_in_token param.Sv_elaborate.param_name arg acc_expr
+                        ) body_expr func.func_params actual_args
+                      else begin
+                        Printf.eprintf "Warning: Parameter count mismatch for function '%s' (expected %d, got %d)\n"
+                          name (List.length func.func_params) (List.length actual_args);
+                        body_expr
+                      end
+                    in
+
+                    (* Now convert the substituted expression to IR *)
+                    Printf.printf "  Successfully inlined function '%s'\n" name;
+                    expr_to_ir ir expr_cache symbol_table functions substituted_expr
+
+                | None ->
+                    Printf.eprintf "Warning: Could not convert function '%s' body to expression\n" name;
+                    Sv_opt_ir.get_or_create_constant ir 0 func.func_return_width)
+           | None ->
+               (* Not a function, might be a signal reference *)
+               Printf.eprintf "Warning: Unknown identifier '%s' in expression\n" name;
+               Sv_opt_ir.get_new_id ir)
+
+      | TUPLE4 (STRING "expr_primary_parens1", _lparen, inner_expr, _rparen) ->
+          (* Parenthesized expression: (expr) *)
+          expr_to_ir ir expr_cache symbol_table functions inner_expr
+
+      | TUPLE4 (STRING "select_variable_dimension2", _lbracket, index_expr, _rbracket) ->
+          (* Array index selector: [expr] *)
+          expr_to_ir ir expr_cache symbol_table functions index_expr
+
+      | TUPLE6 (STRING "select_variable_dimension1", _lbracket, high_expr, _colon, low_expr, _rbracket) ->
+          (* Bit slice range selector: [high:low] *)
+          (* For now, just return the high expression (simplified) *)
+          Printf.printf "  Note: Bit slice range [high:low] not fully supported\n";
+          expr_to_ir ir expr_cache symbol_table functions high_expr
+
+      | TLIST [single_item] ->
+          (* Singleton list - unwrap and process *)
+          expr_to_ir ir expr_cache symbol_table functions single_item
+
+      | TUPLE5 (STRING "cond_expr1", cond, _qmark, true_expr, false_expr) ->
+          (* Ternary operator: cond ? true_val : false_val *)
+          let cond_id = expr_to_ir ir expr_cache symbol_table functions cond in
+          let true_id = expr_to_ir ir expr_cache symbol_table functions true_expr in
+          let false_id = expr_to_ir ir expr_cache symbol_table functions false_expr in
+          (* Create a mux: output = cond ? true : false *)
+          let width = max (get_value_width ir true_id) (get_value_width ir false_id) in
+          Sv_opt_ir.add_node ir (Sv_ast.Mux { width }) [cond_id; true_id; false_id]
+
+      | TUPLE6 (STRING "cond_expr2", _a, cond, _qmark, true_expr, false_expr) ->
+          (* Ternary operator: cond ? true_val : false_val *)
+          let cond_id = expr_to_ir ir expr_cache symbol_table functions cond in
+          let true_id = expr_to_ir ir expr_cache symbol_table functions true_expr in
+          let false_id = expr_to_ir ir expr_cache symbol_table functions false_expr in
+          (* Create a mux: output = cond ? true : false *)
+          let width = max (get_value_width ir true_id) (get_value_width ir false_id) in
+          Sv_opt_ir.add_node ir (Sv_ast.Mux { width }) [cond_id; true_id; false_id]
+
+      | TUPLE3 (STRING "concatenation_expression1", _lbrace, expr_list) ->
+          (* Concatenation: {a, b, c} *)
+          (* For now, treat as the first element (simplified) *)
+          Printf.printf "  Note: Concatenation not fully supported, using first element\n";
+          (match expr_list with
+           | TLIST (first :: _) -> expr_to_ir ir expr_cache symbol_table functions first
+           | TLIST [] -> Sv_opt_ir.get_or_create_constant ir 0 1
+           | single -> expr_to_ir ir expr_cache symbol_table functions single)
+
+      | TUPLE4 (STRING "range_list_in_braces1", _lbrace, range_expr, _rbrace) ->
+          (* Range in braces like {8{1'b0}} - replication *)
+          Printf.printf "  Note: Replication not fully supported, creating constant\n";
+          (* Extract the replicated value *)
+          (match range_expr with
+           | TUPLE3 (STRING "replication1", _count, value_expr) ->
+               (* For now, just use the value expression *)
+               expr_to_ir ir expr_cache symbol_table functions value_expr
+           | _ -> Sv_opt_ir.get_or_create_constant ir 0 8)
+
+      | TUPLE4 (STRING "select1", base, _lbracket, index) ->
+          (* Bit selection: signal[index] *)
+          let base_id = expr_to_ir ir expr_cache symbol_table functions base in
+          let _index_id = expr_to_ir ir expr_cache symbol_table functions index in
+          (* For now, return the base (simplified - should extract single bit) *)
+          Printf.printf "  Note: Bit selection not fully supported, using base signal\n";
+          base_id
+
+      | TUPLE4 (STRING "select2", base, _lbracket, range) ->
+          (* Bit slice: signal[high:low] *)
+          let base_id = expr_to_ir ir expr_cache symbol_table functions base in
+          (* For now, return the base (simplified - should extract bit range) *)
+          Printf.printf "  Note: Bit slicing not fully supported, using base signal\n";
+          base_id
 
       | TK_DecNumber n ->
           (try
@@ -85,8 +498,154 @@ let rec expr_to_ir ir expr_cache expr =
             Printf.eprintf "Warning: Invalid number '%s'\n" n;
             Sv_opt_ir.get_new_id ir)
 
+      | TK_UnBasedNumber n ->
+          (try
+            let value = int_of_string n in
+            Sv_opt_ir.get_or_create_constant ir value 32
+          with _ ->
+            Printf.eprintf "Warning: Invalid unbased number '%s'\n" n;
+            Sv_opt_ir.get_new_id ir)
+
+      (* Binary numbers: 2'b00, 4'b1010, etc. *)
+      | TUPLE3 (STRING "bin_based_number1", TK_BinBase width_base, TK_BinDigits digits) ->
+          (try
+            (* Parse width from "N'b" format *)
+            let width_str = String.sub width_base 0 (String.index width_base '\'') in
+            let width = int_of_string width_str in
+            (* Parse binary digits to integer *)
+            let value = int_of_string ("0b" ^ digits) in
+            Sv_opt_ir.get_or_create_constant ir value width
+          with _ ->
+            Printf.eprintf "Warning: Invalid binary number %s%s\n" width_base digits;
+            Sv_opt_ir.get_or_create_constant ir 0 32)
+
+      (* Hex numbers: 4'hF, 8'hAB, etc. *)
+      | TUPLE3 (STRING "hex_based_number1", TK_HexBase width_base, TK_HexDigits digits) ->
+          (try
+            let width_str = String.sub width_base 0 (String.index width_base '\'') in
+            let width = int_of_string width_str in
+            let value = int_of_string ("0x" ^ digits) in
+            Sv_opt_ir.get_or_create_constant ir value width
+          with _ ->
+            Printf.eprintf "Warning: Invalid hex number %s%s\n" width_base digits;
+            Sv_opt_ir.get_or_create_constant ir 0 32)
+
+      (* Octal numbers: 3'o7, 6'o77, etc. *)
+      | TUPLE3 (STRING "oct_based_number1", TK_OctBase width_base, TK_OctDigits digits) ->
+          (try
+            let width_str = String.sub width_base 0 (String.index width_base '\'') in
+            let width = int_of_string width_str in
+            let value = int_of_string ("0o" ^ digits) in
+            Sv_opt_ir.get_or_create_constant ir value width
+          with _ ->
+            Printf.eprintf "Warning: Invalid octal number %s%s\n" width_base digits;
+            Sv_opt_ir.get_or_create_constant ir 0 32)
+
+      (* Decimal based numbers: 8'd255, etc. *)
+      | TUPLE3 (STRING "dec_based_number1", TK_DecBase width_base, TK_DecDigits digits) ->
+          (try
+            let width_str = String.sub width_base 0 (String.index width_base '\'') in
+            let width = int_of_string width_str in
+            let value = int_of_string digits in
+            Sv_opt_ir.get_or_create_constant ir value width
+          with _ ->
+            Printf.eprintf "Warning: Invalid decimal based number %s%s\n" width_base digits;
+            Sv_opt_ir.get_or_create_constant ir 0 32)
+
+      | TUPLE8 (STRING "case_statement1", _unique, _case_kw, LPAREN, sel_expr, RPAREN, case_items, Endcase) ->
+          (* Convert case statement to Pmux *)
+          Printf.printf "  Converting case statement to Pmux\n";
+          let sel_id = expr_to_ir ir expr_cache symbol_table functions sel_expr in
+
+          (* Extract case items: each has condition expression(s) and result value *)
+          let rec extract_cases items =
+            match items with
+            | TUPLE4 (STRING "case_item1", expr_list, COLON, stmt) ->
+                (* Single case item *)
+                let case_values = (match expr_list with
+                  | TLIST lst -> lst
+                  | single -> [single]) in
+                let result_val = (match stmt with
+                  (* Pattern 1: statement_item6 with blocking_assignment1 *)
+                  | TUPLE3 (STRING "statement_item6",
+                            TUPLE4 (STRING "blocking_assignment1", _lhs, _eq, rhs), _) -> rhs
+                  (* Pattern 2: statement_item6 with assignment_statement_no_expr1 *)
+                  | TUPLE3 (STRING "statement_item6",
+                            TUPLE4 (STRING "assignment_statement_no_expr1", _lhs, _eq, rhs), _) -> rhs
+                  (* Pattern 3: Direct blocking_assignment1 *)
+                  | TUPLE4 (STRING "blocking_assignment1", _lhs, _eq, rhs) -> rhs
+                  | _ ->
+                      Printf.eprintf "Warning: Unexpected case item statement structure: ";
+                      (match stmt with
+                       | TUPLE3 (STRING s, second, _) ->
+                           Printf.eprintf "TUPLE3(%s, " s;
+                           (match second with
+                            | TUPLE3 (STRING s2, _, _) -> Printf.eprintf "TUPLE3(%s, ...), ...)\n" s2
+                            | TUPLE4 (STRING s2, _, _, _) -> Printf.eprintf "TUPLE4(%s, ...), ...)\n" s2
+                            | STRING s2 -> Printf.eprintf "STRING(%s), ...)\n" s2
+                            | _ -> Printf.eprintf "<other>, ...)\n")
+                       | TUPLE4 (STRING s, _, _, _) -> Printf.eprintf "TUPLE4(%s, ...)\n" s
+                       | _ -> Printf.eprintf "<unknown>\n");
+                      TK_DecNumber "0") in
+                [(case_values, result_val)]
+            | TUPLE3 (STRING "case_items1", rest, item) ->
+                (* Multiple case items - recursive *)
+                let rest_cases = extract_cases rest in
+                let item_cases = extract_cases item in
+                rest_cases @ item_cases
+            | _ -> []
+          in
+
+          let cases = extract_cases case_items in
+
+          if cases = [] then begin
+            Printf.eprintf "Warning: No case items found\n";
+            Sv_opt_ir.get_or_create_constant ir 0 4
+          end else begin
+            (* Create comparison nodes for each case *)
+            let selector_ids = List.map (fun (case_vals, _result_val) ->
+              (* For now, take first case value if multiple *)
+              let case_val_expr = List.hd case_vals in
+              let case_val_id = expr_to_ir ir expr_cache symbol_table functions case_val_expr in
+              (* Create equality comparison: sel == case_value *)
+              let sel_width = get_value_width ir sel_id in
+              let cmp_op = Sv_ast.Compare { width = sel_width; cmp_op = `Eq; signed = false } in
+              Sv_opt_ir.add_node ir cmp_op [sel_id; case_val_id]
+            ) cases in
+
+            (* Convert result values to IR *)
+            let data_ids = List.map (fun (_case_vals, result_val) ->
+              expr_to_ir ir expr_cache symbol_table functions result_val
+            ) cases in
+
+            (* Get output width from first data value *)
+            let output_width = get_value_width ir (List.hd data_ids) in
+
+            (* Create default value (0) *)
+            let default_id = Sv_opt_ir.get_or_create_constant ir 0 output_width in
+
+            (* Create Pmux node: inputs are [default; selectors...; data...] *)
+            let num_cases = List.length cases in
+            let pmux_inputs = default_id :: selector_ids @ data_ids in
+            let pmux_op = Sv_ast.Pmux { width = output_width; num_cases } in
+            Printf.printf "  Created Pmux with %d cases, width=%d\n" num_cases output_width;
+            Sv_opt_ir.add_node ir pmux_op pmux_inputs
+          end
+
       | _ ->
-          Printf.eprintf "Warning: Unhandled expression type\n";
+          Printf.eprintf "Warning: Unhandled expression type: ";
+          (match expr with
+           | TUPLE3 (STRING s, _, _) -> Printf.eprintf "TUPLE3(%s, ...)\n" s
+           | TUPLE4 (STRING s, _, _, _) -> Printf.eprintf "TUPLE4(%s, ...)\n" s
+           | TUPLE5 (STRING s, _, _, _, _) -> Printf.eprintf "TUPLE5(%s, ...)\n" s
+           | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.eprintf "TUPLE6(%s, ...)\n" s
+           | TUPLE8 (STRING s, _, _, _, _, _, _, _) -> Printf.eprintf "TUPLE8(%s, ...)\n" s
+           | TUPLE12 (STRING s, _, _, _, _, _, _, _, _, _, _, _) -> Printf.eprintf "TUPLE12(%s, ...)\n" s
+           | STRING s -> Printf.eprintf "STRING(%s)\n" s
+           | TLIST lst -> Printf.eprintf "TLIST[%d items]\n" (List.length lst)
+           | SymbolIdentifier s -> Printf.eprintf "SymbolIdentifier(%s)\n" s
+           | TK_DecNumber s -> Printf.eprintf "TK_DecNumber(%s)\n" s
+           | _ -> Printf.eprintf "<unknown token constructor>\n");
           Sv_opt_ir.get_new_id ir
     in
     Hashtbl.add expr_cache expr result;
@@ -106,46 +665,170 @@ let verible_to_ir verible_ast module_name =
   (* Step 2: Create IR with elaborated information *)
   let ir = Sv_opt_ir.create_ir module_name in
 
-  (* Step 3: Add ports to IR *)
+  (* Step 3: Get data for this specific module *)
+  let symbol_table = match Sv_elaborate.get_module_symbol_table elab_ctx module_name with
+    | Some tbl -> tbl
+    | None ->
+        Printf.eprintf "Warning: No symbol table found for module '%s'\n" module_name;
+        Hashtbl.create 1  (* Empty fallback table *)
+  in
+
+  let module_data = match Sv_elaborate.get_module_data elab_ctx module_name with
+    | Some data -> data
+    | None ->
+        Printf.eprintf "Warning: No module_data found for module '%s'\n" module_name;
+        { mod_ports = []; mod_assigns = []; mod_always_blocks = []; mod_functions = [] }
+  in
+
   Printf.printf "\n=== Converting to IR ===\n\n";
 
-  (* Add inputs *)
+  (* Add inputs from this module only *)
   List.iter (fun (port : Sv_elaborate.port_info) ->
     match port.port_direction with
     | "input" ->
         ignore (Sv_opt_ir.add_input ir port.port_name port.port_width);
         Printf.printf "Added input: %s[%d]\n" port.port_name port.port_width
     | _ -> ()
-  ) (List.rev elab_ctx.ports);  (* Reverse to get original order *)
+  ) (List.rev module_data.mod_ports);  (* Reverse to get original order *)
 
-  (* Add outputs *)
+  (* Add outputs from this module only *)
   List.iter (fun (port : Sv_elaborate.port_info) ->
     match port.port_direction with
     | "output" ->
         ignore (Sv_opt_ir.add_output ir port.port_name port.port_width);
         Printf.printf "Added output: %s[%d]\n" port.port_name port.port_width
     | _ -> ()
-  ) (List.rev elab_ctx.ports);
+  ) (List.rev module_data.mod_ports);
 
-  (* Step 4: Convert assign statements to IR operations *)
+  (* Add internal signals (wires/regs/logic) from symbol table *)
+  Hashtbl.iter (fun name signal_info ->
+    match signal_info.Sv_elaborate.signal_kind with
+    | Sv_elaborate.Reg | Sv_elaborate.Wire | Sv_elaborate.Logic ->
+        ignore (Sv_opt_ir.add_wire ir name signal_info.Sv_elaborate.signal_width);
+        Printf.printf "Added wire: %s[%d]\n" name signal_info.Sv_elaborate.signal_width
+    | _ -> ()
+  ) symbol_table;
+
+  (* Step 4: Convert assign statements from this module only *)
   let expr_cache = Hashtbl.create 50 in
   List.iter (fun (assign : Sv_elaborate.assign_info) ->
     Printf.printf "Converting assign: %s = <expr>\n" assign.assign_lhs;
-    let value_id = expr_to_ir ir expr_cache assign.assign_rhs in
+    let value_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.assign_rhs in
 
-    (* Connect the computed value to the output *)
+    (* Try to connect to wire first, then output *)
     (try
-      let output_val = Hashtbl.find ir.ir_outputs assign.assign_lhs in
-      (match output_val with
-       | Output { id; _ } ->
-           (* Map output to the computed value *)
-           Hashtbl.replace ir.ir_value_to_node id value_id;
-           Printf.printf "  Connected to output %s (id=%d -> value_id=%d)\n" assign.assign_lhs id value_id
-       | _ ->
-           Printf.eprintf "Warning: '%s' is not an output\n" assign.assign_lhs)
+      let wire_val = Hashtbl.find ir.ir_wires assign.assign_lhs in
+      (match wire_val with
+       | Sv_ast.Wire { width; name; _ } ->
+           (* Replace the wire's ID with the computed value ID *)
+           Hashtbl.replace ir.ir_wires assign.assign_lhs
+             (Sv_ast.Wire { id = value_id; name; width });
+           Printf.printf "  Connected to wire %s (value_id=%d)\n" assign.assign_lhs value_id
+       | _ -> ())
     with Not_found ->
-      Printf.eprintf "Warning: Output '%s' not found\n" assign.assign_lhs)
-  ) (List.rev elab_ctx.assigns);
+      (* Not a wire, try output *)
+      (try
+        let output_val = Hashtbl.find ir.ir_outputs assign.assign_lhs in
+        (match output_val with
+         | Sv_ast.Output { width; name; _ } ->
+             (* Replace the output's ID with the computed value ID *)
+             Hashtbl.replace ir.ir_outputs assign.assign_lhs
+               (Sv_ast.Output { id = value_id; name; width });
+             Printf.printf "  Connected to output %s (value_id=%d)\n" assign.assign_lhs value_id
+         | _ ->
+             Printf.eprintf "Warning: '%s' is not an output\n" assign.assign_lhs)
+      with Not_found ->
+        Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.assign_lhs))
+  ) (List.rev module_data.mod_assigns);
+
+  (* Step 5: Convert always blocks to IR operations *)
+  List.iter (fun (always_blk : Sv_elaborate.always_info) ->
+    match always_blk.Sv_elaborate.always_type with
+    | Sv_elaborate.AlwaysComb ->
+        (* Treat always_comb like continuous assignments *)
+        List.iter (fun (assign : Sv_elaborate.assign_info) ->
+          Printf.printf "Converting always_comb: %s = <expr>\n" assign.Sv_elaborate.assign_lhs;
+          let value_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.Sv_elaborate.assign_rhs in
+          (* Try to connect to wire first, then output *)
+          (try
+            let wire_val = Hashtbl.find ir.ir_wires assign.Sv_elaborate.assign_lhs in
+            (match wire_val with
+             | Sv_ast.Wire { width; name; _ } ->
+                 Hashtbl.replace ir.ir_wires assign.Sv_elaborate.assign_lhs
+                   (Sv_ast.Wire { id = value_id; name; width });
+                 Printf.printf "  Connected to wire %s (value_id=%d)\n" assign.Sv_elaborate.assign_lhs value_id
+             | _ -> ())
+          with Not_found ->
+            (* Not a wire, try output *)
+            (try
+              let output_val = Hashtbl.find ir.ir_outputs assign.Sv_elaborate.assign_lhs in
+              (match output_val with
+               | Sv_ast.Output { width; name; _ } ->
+                   Hashtbl.replace ir.ir_outputs assign.Sv_elaborate.assign_lhs
+                     (Sv_ast.Output { id = value_id; name; width });
+                   Printf.printf "  Connected to output %s (value_id=%d)\n" assign.Sv_elaborate.assign_lhs value_id
+               | _ -> ())
+            with Not_found ->
+              Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.Sv_elaborate.assign_lhs))
+        ) always_blk.Sv_elaborate.always_stmts
+    | Sv_elaborate.AlwaysFF { clock; edge } ->
+        (* Create register operations *)
+        List.iter (fun (assign : Sv_elaborate.assign_info) ->
+          Printf.printf "Converting always_ff @(%s %s): %s <= <expr>\n"
+            (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
+            clock assign.Sv_elaborate.assign_lhs;
+          let d_value_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.Sv_elaborate.assign_rhs in
+
+          (* Get clock input *)
+          let clock_id = (try
+            let clock_val = Hashtbl.find ir.ir_inputs clock in
+            (match clock_val with
+             | Sv_ast.Input { id; _ } -> id
+             | _ -> 0)
+          with Not_found -> 0) in
+
+          (* Get signal width (check wire first, then output) *)
+          let signal_width = (try
+            let wire_val = Hashtbl.find ir.ir_wires assign.Sv_elaborate.assign_lhs in
+            (match wire_val with
+             | Sv_ast.Wire { width; _ } -> width
+             | _ -> 1)
+          with Not_found ->
+            (try
+              let output_val = Hashtbl.find ir.ir_outputs assign.Sv_elaborate.assign_lhs in
+              (match output_val with
+               | Sv_ast.Output { width; _ } -> width
+               | _ -> 1)
+            with Not_found -> 1)) in
+
+          (* Create register node *)
+          let reg_node_id = Sv_opt_ir.add_node ir
+            (Sv_ast.Register { width = signal_width; clock = clock_id; reset = None; enable = None; reset_value = 0 })
+            [d_value_id] in
+
+          (* Connect register output to wire or output *)
+          (try
+            let wire_val = Hashtbl.find ir.ir_wires assign.Sv_elaborate.assign_lhs in
+            (match wire_val with
+             | Sv_ast.Wire { width; name; _ } ->
+                 Hashtbl.replace ir.ir_wires assign.Sv_elaborate.assign_lhs
+                   (Sv_ast.Wire { id = reg_node_id; name; width });
+                 Printf.printf "  Connected register to wire %s (reg_id=%d)\n" assign.Sv_elaborate.assign_lhs reg_node_id
+             | _ -> ())
+          with Not_found ->
+            (* Not a wire, try output *)
+            (try
+              let output_val = Hashtbl.find ir.ir_outputs assign.Sv_elaborate.assign_lhs in
+              (match output_val with
+               | Sv_ast.Output { width; name; _ } ->
+                   Hashtbl.replace ir.ir_outputs assign.Sv_elaborate.assign_lhs
+                     (Sv_ast.Output { id = reg_node_id; name; width });
+                   Printf.printf "  Connected register to output %s (reg_id=%d)\n" assign.Sv_elaborate.assign_lhs reg_node_id
+               | _ -> ())
+            with Not_found ->
+              Printf.eprintf "Warning: Signal '%s' not found (not a wire or output)\n" assign.Sv_elaborate.assign_lhs))
+        ) always_blk.Sv_elaborate.always_stmts
+  ) (List.rev module_data.Sv_elaborate.mod_always_blocks);
 
   Printf.printf "\n✓ IR conversion complete\n";
   Printf.printf "  Inputs: %d, Outputs: %d, Nodes: %d\n"

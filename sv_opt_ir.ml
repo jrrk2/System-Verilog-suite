@@ -10,6 +10,7 @@ let create_ir name = {
   ir_name = name;
   ir_inputs = Hashtbl.create 20;
   ir_outputs = Hashtbl.create 20;
+  ir_wires = Hashtbl.create 50;
   ir_constants = Hashtbl.create 50;
   ir_nodes = Hashtbl.create 100;
   ir_value_to_node = Hashtbl.create 100;
@@ -35,6 +36,12 @@ let add_output ir name width =
   Hashtbl.add ir.ir_outputs name output;
   id
 
+let add_wire ir name width =
+  let id = get_new_id ir in
+  let wire = Wire { id; name; width } in
+  Hashtbl.add ir.ir_wires name wire;
+  id
+
 let get_or_create_constant ir value width =
   match Hashtbl.find_opt ir.ir_constants value with
   | Some id -> id
@@ -46,10 +53,10 @@ let get_or_create_constant ir value width =
 let add_node ir op inputs =
   let id = get_new_id ir in
   let width = match op with
-    | Add { width; _ } | Sub { width; _ } | Mul { width; _ } 
-    | Div { width; _ } | And { width } | Or { width } 
+    | Add { width; _ } | Sub { width; _ } | Mul { width; _ }
+    | Div { width; _ } | And { width } | Or { width }
     | Xor { width } | Not { width } | Shift { width; _ }
-    | Mux { width } | Extract { width; _ } | Register { width; _ } -> width
+    | Mux { width } | Pmux { width; _ } | Extract { width; _ } | Register { width; _ } -> width
     | ZeroExtend { to_width; _ } | SignExtend { to_width; _ } -> to_width
     | Compare _ -> 1
     | Concat { widths } -> List.fold_left (+) 0 widths
@@ -84,6 +91,7 @@ let operation_delay = function
   | Compare _ -> 1
   | Shift _ -> 1
   | Mux _ -> 1
+  | Pmux _ -> 2  (* Priority mux has slightly higher delay *)
   | Mul _ -> 3
   | Div _ -> 8
   | Concat _ | Extract _ -> 0  (* Just wiring *)
@@ -98,6 +106,7 @@ let operation_area = function
   | Shift _ -> 0  (* Usually free with muxes *)
   | Compare { width; _ } -> width
   | Mux { width } -> width * 2
+  | Pmux { width; num_cases } -> width * num_cases * 2
   | Concat _ | Extract _ -> 0
   | ZeroExtend _ | SignExtend _ -> 0
   | Register { width; _ } -> width * 6
@@ -539,6 +548,7 @@ let print_operation = function
         | `Eq -> "eq" | `Ne -> "ne" | `Lt -> "lt"
         | `Le -> "le" | `Gt -> "gt" | `Ge -> "ge")
   | Mux _ -> "mux"
+  | Pmux { num_cases; _ } -> Printf.sprintf "pmux<%d>" num_cases
   | Concat _ -> "concat"
   | Extract { lsb; msb; _ } -> Printf.sprintf "extract[%d:%d]" msb lsb
   | ZeroExtend { from_width; to_width } -> Printf.sprintf "zext<%d->%d>" from_width to_width
