@@ -917,28 +917,126 @@ let verible_to_ir verible_ast module_name =
           Hashtbl.replace signal_groups assign.Sv_elaborate.assign_lhs (assign :: existing)
         ) always_blk.Sv_elaborate.always_stmts;
 
-        (* For each signal, process ALL assignments to build proper conditional logic *)
+        (* For each signal, build MUX tree from all conditional assignments *)
         Hashtbl.iter (fun signal_name assigns ->
-          (* Reverse to get chronological order *)
+          (* Reverse to get chronological order (first assigned = lowest priority) *)
           let assigns_in_order = List.rev assigns in
-          (* Use LAST assignment (highest priority / most specific condition) *)
-          let assign = List.hd (List.rev assigns_in_order) in
+
+          (* Get signal width first - needed for MUX nodes *)
+          let signal_width = (try
+            let wire_val = Hashtbl.find ir.ir_wires signal_name in
+            (match wire_val with
+             | Sv_ast.Wire { width; _ } -> width
+             | _ -> 1)
+          with Not_found ->
+            (try
+              let output_val = Hashtbl.find ir.ir_outputs signal_name in
+              (match output_val with
+               | Sv_ast.Output { width; _ } -> width
+               | _ -> 1)
+            with Not_found -> 1)) in
+
+          (* Build MUX tree: later assignments override earlier ones *)
+          (* Process in reverse order: last assignment has highest priority *)
+          let rec build_mux_tree_from_last assigns_list =
+            match assigns_list with
+            | [] -> failwith "Empty assignment list"
+            | [single] ->
+                (* Single assignment - just convert the RHS *)
+                (expr_to_ir ir expr_cache symbol_table module_data.mod_functions single.Sv_elaborate.assign_rhs, single.Sv_elaborate.assign_condition)
+            | _ ->
+                (* Process from right to left (highest to lowest priority) *)
+                let rec build_from_end lst =
+                  match lst with
+                  | [] -> failwith "Empty list"
+                  | [last] ->
+                      (* Highest priority assignment *)
+                      let last_val = expr_to_ir ir expr_cache symbol_table module_data.mod_functions last.Sv_elaborate.assign_rhs in
+                      (match last.Sv_elaborate.assign_condition with
+                       | Some cond_expr ->
+                           (* Has condition - need to MUX with default *)
+                           (last_val, last.Sv_elaborate.assign_condition)
+                       | None ->
+                           (* Unconditional - this is the final value *)
+                           (last_val, None))
+                  | first :: rest ->
+                      (* Build MUX for rest (higher priority) *)
+                      let (rest_val, rest_cond_opt) = build_from_end rest in
+                      let first_val = expr_to_ir ir expr_cache symbol_table module_data.mod_functions first.Sv_elaborate.assign_rhs in
+
+                      (match rest_cond_opt with
+                       | Some rest_cond ->
+                           (* Rest has condition - create MUX(rest_cond, rest_val, first_val) *)
+                           let cond_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions rest_cond in
+                           let mux_node_id = Sv_opt_ir.add_node ir
+                             (Sv_ast.Mux { width = signal_width })
+                             [cond_id; rest_val; first_val] in
+                           (mux_node_id, first.Sv_elaborate.assign_condition)
+                       | None ->
+                           (* Rest is unconditional, just use it *)
+                           (rest_val, None))
+                in
+                build_from_end assigns_list
+          in
+
+          (* Build the MUX tree or use single assignment *)
+          let d_value_id =
+            if List.length assigns_in_order = 1 then
+              (* Single assignment - just use it *)
+              let assign = List.hd assigns_in_order in
+              expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.Sv_elaborate.assign_rhs
+            else
+              (* Multiple assignments - build MUX tree *)
+              let (mux_val, _) = build_mux_tree_from_last assigns_in_order in
+              mux_val
+          in
+
+          (* Build enable signal from OR of all conditions *)
+          (* Enable is only needed if ALL assignments are conditional *)
+          let enable_id_opt =
+            let has_unconditional = List.exists (fun (a : Sv_elaborate.assign_info) -> a.assign_condition = None) assigns_in_order in
+            if has_unconditional then
+              None  (* At least one unconditional assignment - always enabled *)
+            else
+              (* All assignments are conditional - need enable *)
+              let conditions = List.filter_map (fun (a : Sv_elaborate.assign_info) -> a.assign_condition) assigns_in_order in
+              match conditions with
+              | [] -> None
+              | [single_cond] ->
+                  Some (expr_to_ir ir expr_cache symbol_table module_data.mod_functions single_cond)
+              | first_cond :: rest_conds ->
+                  let rec or_conditions cond_list =
+                    match cond_list with
+                    | [] -> failwith "Empty condition list"
+                    | [single] -> expr_to_ir ir expr_cache symbol_table module_data.mod_functions single
+                    | first :: rest ->
+                        let first_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions first in
+                        let rest_id = or_conditions rest in
+                        let or_node_id = Sv_opt_ir.add_node ir
+                          (Sv_ast.Or { width = 1 })
+                          [first_id; rest_id] in
+                        or_node_id
+                  in
+                  Some (or_conditions conditions)
+          in
+
+          let assign = List.hd assigns_in_order in  (* Use first for reference *)
           (match async_reset with
            | Some reset_info ->
-               Printf.printf "Converting always_ff @(%s %s or %s %s): %s <= <expr> (reset_value=<expr>)%s\n"
+               Printf.printf "Converting always_ff @(%s %s or %s %s): %s <= <expr> (reset_value=<expr>)%s%s\n"
                  (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
                  clock
                  (match reset_info.reset_edge with `Posedge -> "posedge" | `Negedge -> "negedge")
                  reset_info.reset_signal
                  signal_name
-                 (if List.length assigns > 1 then Printf.sprintf " [%d assignments]" (List.length assigns) else "")
+                 (if List.length assigns > 1 then Printf.sprintf " [%d assignments, MUX tree]" (List.length assigns) else "")
+                 (match enable_id_opt with Some _ -> " with enable" | None -> "")
            | None ->
-               Printf.printf "Converting always_ff @(%s %s): %s <= <expr>%s\n"
+               Printf.printf "Converting always_ff @(%s %s): %s <= <expr>%s%s\n"
                  (match edge with `Posedge -> "posedge" | `Negedge -> "negedge")
                  clock signal_name
-                 (if List.length assigns > 1 then Printf.sprintf " [%d assignments]" (List.length assigns) else ""));
-
-          let d_value_id = expr_to_ir ir expr_cache symbol_table module_data.mod_functions assign.Sv_elaborate.assign_rhs in
+                 (if List.length assigns > 1 then Printf.sprintf " [%d assignments, MUX tree]" (List.length assigns) else "")
+                 (match enable_id_opt with Some _ -> " with enable" | None -> ""));
 
           (* Get clock input *)
           let clock_id = (try
@@ -954,20 +1052,6 @@ let verible_to_ir verible_ast module_name =
                | Sv_ast.Wire { id; _ } -> id
                | _ -> 0)
             with Not_found -> 0)) in
-
-          (* Get signal width (check wire first, then output) *)
-          let signal_width = (try
-            let wire_val = Hashtbl.find ir.ir_wires signal_name in
-            (match wire_val with
-             | Sv_ast.Wire { width; _ } -> width
-             | _ -> 1)
-          with Not_found ->
-            (try
-              let output_val = Hashtbl.find ir.ir_outputs signal_name in
-              (match output_val with
-               | Sv_ast.Output { width; _ } -> width
-               | _ -> 1)
-            with Not_found -> 1)) in
 
           (* Process async reset if present *)
           let (reset_id_opt, reset_value) = (match async_reset with
@@ -1004,9 +1088,9 @@ let verible_to_ir verible_ast module_name =
                 (Some reset_id, reset_const)
             | None -> (None, 0)) in
 
-          (* Create register node *)
+          (* Create register node with enable signal *)
           let reg_node_id = Sv_opt_ir.add_node ir
-            (Sv_ast.Register { width = signal_width; clock = clock_id; reset = reset_id_opt; enable = None; reset_value })
+            (Sv_ast.Register { width = signal_width; clock = clock_id; reset = reset_id_opt; enable = enable_id_opt; reset_value })
             [d_value_id] in
 
           (* Connect register output to wire or output *)
