@@ -86,15 +86,15 @@
 %token  COLON_EQ
 %token  COLON_SLASH
 %token  COMMA
-%token <token> CONS1
-%token <token*token> CONS2
-%token <token*token*token> CONS3
-%token <token*token*token*token> CONS4
-%token <token*token*token*token*token> CONS5
-%token <token*token*token*token*token*token> CONS6
-%token <token*token*token*token*token*token*token> CONS7
-%token <token*token*token*token*token*token*token*token> CONS8
-%token <token*token*token*token*token*token*token*token*token> CONS9
+// REMOVED: %token <token> CONS1
+// REMOVED: %token <token*token> CONS2
+// REMOVED: %token <token*token*token> CONS3
+// REMOVED: %token <token*token*token*token> CONS4
+// REMOVED: %token <token*token*token*token*token> CONS5
+// REMOVED: %token <token*token*token*token*token*token> CONS6
+// REMOVED: %token <token*token*token*token*token*token*token> CONS7
+// REMOVED: %token <token*token*token*token*token*token*token*token> CONS8
+// REMOVED: %token <token*token*token*token*token*token*token*token*token> CONS9
 %token  Case
 %token  Casex
 %token  Casez
@@ -589,8 +589,8 @@ preprocessor_action: BACKQUOTE_undef PP_Identifier { TUPLE3(STRING("preprocessor
 macro_formals_list_opt: macro_formals_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-macro_formals_list: macro_formals_list COMMA macro_formal_parameter { CONS3($1,COMMA,$3) }
-	|	macro_formal_parameter { CONS1 ($1) }
+macro_formals_list: macro_formals_list COMMA macro_formal_parameter { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	macro_formal_parameter { TLIST [$1] }
 
 macro_formal_parameter: PP_Identifier { (PP_Identifier) }
 	|	PP_Identifier EQUALS LT_LT_default_HYPHEN_text_GT_GT { TUPLE4(STRING("macro_formal_parameter2"),PP_Identifier,EQUALS,LT_LT_default_HYPHEN_text_GT_GT) }
@@ -630,8 +630,8 @@ assignment_pattern_expression: assignment_pattern { ($1) }
 	|	reference assignment_pattern { TUPLE3(STRING("assignment_pattern_expression3"),$1,$2) }
 	|	reference call_base assignment_pattern { TUPLE4(STRING("assignment_pattern_expression4"),$1,$2,$3) }
 
-structure_or_array_pattern_expression_list: structure_or_array_pattern_expression_list COMMA structure_or_array_pattern_expression { CONS3($1,COMMA,$3) }
-	|	structure_or_array_pattern_expression { CONS1 ($1) }
+structure_or_array_pattern_expression_list: structure_or_array_pattern_expression_list COMMA structure_or_array_pattern_expression { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	structure_or_array_pattern_expression { TLIST [$1] }
 
 structure_or_array_pattern_expression: structure_or_array_pattern_key COLON expression { TUPLE4(STRING("structure_or_array_pattern_expression1"),$1,COLON,$3) }
 
@@ -650,20 +650,20 @@ interface_class_declaration: Interface Class GenericIdentifier module_parameter_
 declaration_extends_list_opt: declaration_extends_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-declaration_extends_list: Extends class_id { CONS2(Extends,$2) }
-	|	declaration_extends_list COMMA class_id { CONS3($1,COMMA,$3) }
+declaration_extends_list: Extends class_id { TLIST [$2] }
+	|	declaration_extends_list COMMA class_id { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 implements_interface_list_opt: implements_interface_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-implements_interface_list: implements_interface_list COMMA class_id { CONS3($1,COMMA,$3) }
-	|	Implements class_id { CONS2(Implements,$2) }
+implements_interface_list: implements_interface_list COMMA class_id { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	Implements class_id { TLIST [$2] }
 
 interface_class_item_list_opt: interface_class_item_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-interface_class_item_list: interface_class_item_list interface_class_item { CONS2($1,$2) }
-	|	interface_class_item { CONS1 ($1) }
+interface_class_item_list: interface_class_item_list interface_class_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	interface_class_item { TLIST [$1] }
 
 interface_class_item: type_declaration { ($1) }
 	|	any_param_declaration { ($1) }
@@ -764,8 +764,8 @@ class_item_qualifier: Static { (Static) }
 class_item_qualifier_list_opt: class_item_qualifier_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-class_item_qualifier_list: class_item_qualifier_list class_item_qualifier { CONS2($1,$2) }
-	|	class_item_qualifier { CONS1 ($1) }
+class_item_qualifier_list: class_item_qualifier_list class_item_qualifier { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	class_item_qualifier { TLIST [$1] }
 
 class_new: New call_base { TUPLE3(STRING("class_new1"),New,$2) }
 	|	New reference { TUPLE3(STRING("class_new2"),New,$2) }
@@ -816,11 +816,11 @@ constraint_block: LBRACE constraint_block_item_list_opt RBRACE { TUPLE4(STRING("
 constraint_block_item: constraint_expression_no_preprocessor { ($1) }
 	|	preprocessor_balanced_constraint_block_item { ($1) }
 
-constraint_primary_list: constraint_primary_list COMMA constraint_primary { CONS3($1,COMMA,$3) }
-	|	constraint_primary { CONS1 ($1) }
+constraint_primary_list: constraint_primary_list COMMA constraint_primary { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	constraint_primary { TLIST [$1] }
 
-constraint_block_item_list: constraint_block_item_list constraint_block_item { CONS2($1,$2) }
-	|	constraint_block_item { CONS1 ($1) }
+constraint_block_item_list: constraint_block_item_list constraint_block_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	constraint_block_item { TLIST [$1] }
 
 constraint_block_item_list_opt: constraint_block_item_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
@@ -861,8 +861,8 @@ constraint_primary: reference { ($1) }
 
 uniqueness_constraint: Unique LBRACE open_range_list RBRACE { TUPLE5(STRING("uniqueness_constraint1"),Unique,LBRACE,$3,RBRACE) }
 
-constraint_expression_list: constraint_expression_list constraint_expression { CONS2($1,$2) }
-	|	constraint_expression { CONS1 ($1) }
+constraint_expression_list: constraint_expression_list constraint_expression { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	constraint_expression { TLIST [$1] }
 
 constraint_expression_list_opt: constraint_expression_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
@@ -998,16 +998,16 @@ description: module_or_interface_declaration { ($1) }
 description_list_opt: description_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-description_list: description { CONS1 ($1) }
-	|	description_list description { CONS2($1,$2) }
+description_list: description { TLIST [$1] }
+	|	description_list description { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 library_source: BACKQUOTE_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_begin____ library_description_list_opt BACKQUOTE_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_end____ { TUPLE4(STRING("library_source1"),BACKQUOTE_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_begin____,$2,BACKQUOTE_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_end____) }
 
 library_description_list_opt: library_description_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-library_description_list: library_description_list library_description { CONS2($1,$2) }
-	|	library_description { CONS1 ($1) }
+library_description_list: library_description_list library_description { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	library_description { TLIST [$1] }
 
 library_description: library_declaration { ($1) }
 	|	include_statement { ($1) }
@@ -1104,8 +1104,8 @@ for_init_decl_or_assign: lpvalue EQUALS expression { TUPLE4(STRING("for_init_dec
 	|	data_type GenericIdentifier EQUALS expression { TUPLE5(STRING("for_init_decl_or_assign2"),$1,$2,EQUALS,$4) }
 	|	Var data_type GenericIdentifier EQUALS expression { TUPLE6(STRING("for_init_decl_or_assign3"),Var,$2,$3,EQUALS,$5) }
 
-list_of_variable_decl_assignments: variable_decl_assignment { CONS1 ($1) }
-	|	list_of_variable_decl_assignments COMMA variable_decl_assignment { CONS3($1,COMMA,$3) }
+list_of_variable_decl_assignments: variable_decl_assignment { TLIST [$1] }
+	|	list_of_variable_decl_assignments COMMA variable_decl_assignment { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 variable_decl_assignment: GenericIdentifier decl_dimensions_opt trailing_decl_assignment_opt { TUPLE4(STRING("variable_decl_assignment1"),$1,$2,$3) }
 
@@ -1119,8 +1119,8 @@ trailing_decl_assignment: EQUALS dynamic_array_new { TUPLE3(STRING("trailing_dec
 method_qualifier_list_opt: method_qualifier_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-method_qualifier_list: method_qualifier_list method_qualifier { CONS2($1,$2) }
-	|	method_qualifier { CONS1 ($1) }
+method_qualifier_list: method_qualifier_list method_qualifier { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	method_qualifier { TLIST [$1] }
 
 method_property_qualifier_list_not_starting_with_virtual: method_property_qualifier_list_not_starting_with_virtual method_property_qualifier { TUPLE3(STRING("method_property_qualifier_list_not_starting_with_virtual1"),$1,$2) }
 	|	property_qualifier { ($1) }
@@ -1135,14 +1135,14 @@ method_property_qualifier: Virtual { (Virtual) }
 
 modport_declaration: Modport modport_item_list SEMICOLON { TUPLE4(STRING("modport_declaration1"),Modport,$2,SEMICOLON) }
 
-modport_item_list: modport_item { CONS1 ($1) }
-	|	modport_item_list COMMA modport_item { CONS3($1,COMMA,$3) }
+modport_item_list: modport_item { TLIST [$1] }
+	|	modport_item_list COMMA modport_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 modport_item: GenericIdentifier LPAREN modport_ports_list RPAREN { TUPLE5(STRING("modport_item1"),$1,LPAREN,$3,RPAREN) }
 
-modport_ports_list: modport_simple_ports_declaration_last { CONS1 ($1) }
-	|	modport_tf_ports_declaration_last { CONS1 ($1) }
-	|	modport_clocking_declaration_last { CONS1 ($1) }
+modport_ports_list: modport_simple_ports_declaration_last { TLIST [$1] }
+	|	modport_tf_ports_declaration_last { TLIST [$1] }
+	|	modport_clocking_declaration_last { TLIST [$1] }
 
 dpi_spec_string: TK_StringLiteral { (TK_StringLiteral $1) }
 
@@ -1233,16 +1233,16 @@ number: based_number { ($1) }
 constant_dec_number: TK_DecNumber { (TK_DecNumber $1) }
 	|	MacroNumericWidth { (MacroNumericWidth) }
 
-open_range_list: open_range_list COMMA value_range { CONS3($1,COMMA,$3) }
-	|	value_range { CONS1 ($1) }
+open_range_list: open_range_list COMMA value_range { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	value_range { TLIST [$1] }
 
 package_declaration: Package lifetime_opt GenericIdentifier SEMICOLON package_item_list_opt Endpackage label_opt { TUPLE8(STRING("package_declaration1"),Package,$2,$3,SEMICOLON,$5,Endpackage,$7) }
 
 module_package_import_list_opt: package_import_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-package_import_list: package_import_declaration { CONS1 ($1) }
-	|	package_import_list package_import_declaration { CONS2($1,$2) }
+package_import_list: package_import_declaration { TLIST [$1] }
+	|	package_import_list package_import_declaration { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 package_import_declaration: Import package_import_item_list SEMICOLON { TUPLE4(STRING("package_import_declaration1"),Import,$2,SEMICOLON) }
 
@@ -1252,8 +1252,8 @@ package_export_declaration: Export STAR COLON_COLON STAR SEMICOLON { TUPLE6(STRI
 package_import_item: scope_prefix GenericIdentifier { TUPLE3(STRING("package_import_item1"),$1,$2) }
 	|	scope_prefix STAR { TUPLE3(STRING("package_import_item2"),$1,STAR) }
 
-package_import_item_list: package_import_item_list COMMA package_import_item { CONS3($1,COMMA,$3) }
-	|	package_import_item { CONS1 ($1) }
+package_import_item_list: package_import_item_list COMMA package_import_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	package_import_item { TLIST [$1] }
 
 package_item: package_item_no_pp { ($1) }
 	|	preprocessor_balanced_package_items { ($1) }
@@ -1293,8 +1293,8 @@ preprocessor_else_package_item_opt: preprocessor_else_package_item { ($1) }
 
 preprocessor_else_package_item: BACKQUOTE_else package_item_list_opt { TUPLE3(STRING("preprocessor_else_package_item1"),BACKQUOTE_else,$2) }
 
-package_item_list: package_item_list package_item { CONS2($1,$2) }
-	|	package_item { CONS1 ($1) }
+package_item_list: package_item_list package_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	package_item { TLIST [$1] }
 
 package_item_list_opt: package_item_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
@@ -1373,16 +1373,16 @@ block_item_or_statement_or_null: block_item_decl { ($1) }
 	|	reference SEMICOLON { TUPLE3(STRING("block_item_or_statement_or_null6"),$1,SEMICOLON) }
 	|	reference DOT builtin_array_method SEMICOLON { TUPLE5(STRING("block_item_or_statement_or_null7"),$1,DOT,$3,SEMICOLON) }
 
-block_item_or_statement_or_null_list: block_item_or_statement_or_null_list block_item_or_statement_or_null { CONS2($1,$2) }
-	|	block_item_or_statement_or_null { CONS1 ($1) }
+block_item_or_statement_or_null_list: block_item_or_statement_or_null_list block_item_or_statement_or_null { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	block_item_or_statement_or_null { TLIST [$1] }
 
 block_item_or_statement_or_null_list_opt: block_item_or_statement_or_null_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
 stream_expression: expression { ($1) }
 
-stream_expression_list: stream_expression_list COMMA stream_expression { CONS3($1,COMMA,$3) }
-	|	stream_expression { CONS1 ($1) }
+stream_expression_list: stream_expression_list COMMA stream_expression { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	stream_expression { TLIST [$1] }
 
 stream_operator: LT_LT { (LT_LT) }
 	|	GT_GT { (GT_GT) }
@@ -1414,8 +1414,8 @@ tf_port_declaration: tf_port_direction signed_unsigned_opt qualified_id decl_dim
 	|	tf_port_direction signed_unsigned_opt list_of_tf_variable_identifiers SEMICOLON { TUPLE5(STRING("tf_port_declaration4"),$1,$2,$3,SEMICOLON) }
 	|	tf_port_direction data_type_primitive list_of_tf_variable_identifiers SEMICOLON { TUPLE5(STRING("tf_port_declaration5"),$1,$2,$3,SEMICOLON) }
 
-list_of_tf_variable_identifiers: list_of_tf_variable_identifiers COMMA tf_variable_identifier { CONS3($1,COMMA,$3) }
-	|	tf_variable_identifier_first { CONS1 ($1) }
+list_of_tf_variable_identifiers: list_of_tf_variable_identifiers COMMA tf_variable_identifier { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	tf_variable_identifier_first { TLIST [$1] }
 
 tf_variable_identifier_first: unqualified_id decl_dimensions_opt trailing_assign_opt { TUPLE4(STRING("tf_variable_identifier_first1"),$1,$2,$3) }
 
@@ -1427,8 +1427,8 @@ tf_port_item: tf_port_direction_opt data_type_or_implicit_basic_followed_by_id_a
 tf_port_item_expr_opt: EQUALS expression { TUPLE3(STRING("tf_port_item_expr_opt1"),EQUALS,$2) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-tf_port_list: tf_port_list_item_last { CONS1 ($1) }
-	|	tf_port_list_preprocessor_last { CONS1 ($1) }
+tf_port_list: tf_port_list_item_last { TLIST [$1] }
+	|	tf_port_list_preprocessor_last { TLIST [$1] }
 
 tf_port_list_trailing_comma: tf_port_list COMMA { TUPLE3(STRING("tf_port_list_trailing_comma1"),$1,COMMA) }
 
@@ -1494,8 +1494,8 @@ non_anonymous_gate_instance_or_register_variable: GenericIdentifier decl_dimensi
 	|	GenericIdentifier decl_dimensions_opt LPAREN any_port_list_opt RPAREN { TUPLE6(STRING("non_anonymous_gate_instance_or_register_variable2"),$1,$2,LPAREN,$4,RPAREN) }
 	|	MacroCall { ($1) }
 
-non_anonymous_gate_instance_or_register_variable_list: non_anonymous_gate_instance_or_register_variable_list COMMA gate_instance_or_register_variable { CONS3($1,COMMA,$3) }
-	|	non_anonymous_gate_instance_or_register_variable { CONS1 ($1) }
+non_anonymous_gate_instance_or_register_variable_list: non_anonymous_gate_instance_or_register_variable_list COMMA gate_instance_or_register_variable { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	non_anonymous_gate_instance_or_register_variable { TLIST [$1] }
 
 non_anonymous_instantiation_base: instantiation_type non_anonymous_gate_instance_or_register_variable_list { TUPLE3(STRING("non_anonymous_instantiation_base1"),$1,$2) }
 
@@ -1526,8 +1526,8 @@ type_declaration: Typedef data_type GenericIdentifier decl_dimensions_opt SEMICO
 enum_data_type: Enum LBRACE enum_name_list RBRACE { TUPLE5(STRING("enum_data_type1"),Enum,LBRACE,$3,RBRACE) }
 	|	Enum data_type LBRACE enum_name_list RBRACE { TUPLE6(STRING("enum_data_type2"),Enum,$2,LBRACE,$4,RBRACE) }
 
-enum_name_list: enum_name_list_preprocessor_last { CONS1 ($1) }
-	|	enum_name_list_item_last { CONS1 ($1) }
+enum_name_list: enum_name_list_preprocessor_last { TLIST [$1] }
+	|	enum_name_list_item_last { TLIST [$1] }
 
 enum_name_list_trailing_comma: enum_name_list COMMA { TUPLE3(STRING("enum_name_list_trailing_comma1"),$1,COMMA) }
 
@@ -1555,8 +1555,8 @@ struct_data_type: Struct packed_signing_opt LBRACE struct_union_member_list RBRA
 packed_signing_opt: Packed signed_unsigned_opt { TUPLE3(STRING("packed_signing_opt1"),Packed,$2) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-struct_union_member_list: struct_union_member_list struct_union_member { CONS2($1,$2) }
-	|	struct_union_member { CONS1 ($1) }
+struct_union_member_list: struct_union_member_list struct_union_member { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	struct_union_member { TLIST [$1] }
 
 struct_union_member: random_qualifier_opt data_type_or_implicit_followed_by_id_and_dimensions_opt trailing_assign_opt SEMICOLON { TUPLE5(STRING("struct_union_member1"),$1,$2,$3,SEMICOLON) }
 	|	random_qualifier_opt data_type_or_implicit_followed_by_id_and_dimensions_opt trailing_assign_opt COMMA list_of_variable_decl_assignments SEMICOLON { TUPLE7(STRING("struct_union_member2"),$1,$2,$3,COMMA,$5,SEMICOLON) }
@@ -1599,9 +1599,9 @@ charge_strength_opt: charge_strength { ($1) }
 
 defparam_assign: reference EQUALS expression { TUPLE4(STRING("defparam_assign1"),$1,EQUALS,$3) }
 
-defparam_assign_list: defparam_assign { CONS1 ($1) }
-	|	decl_dimensions defparam_assign { CONS2($1,$2) }
-	|	defparam_assign_list COMMA defparam_assign { CONS3($1,COMMA,$3) }
+defparam_assign_list: defparam_assign { TLIST [$1] }
+	|	decl_dimensions defparam_assign { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	defparam_assign_list COMMA defparam_assign { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 delay1: HASH delay_value_simple { TUPLE3(STRING("delay11"),HASH,$2) }
 	|	HASH LPAREN delay_value RPAREN { TUPLE5(STRING("delay12"),HASH,LPAREN,$3,RPAREN) }
@@ -1614,8 +1614,8 @@ delay3: HASH delay_value_simple { TUPLE3(STRING("delay31"),HASH,$2) }
 delay3_opt: delay3 { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-delay_value_list: delay_value { CONS1 ($1) }
-	|	delay_value_list COMMA delay_value { CONS3($1,COMMA,$3) }
+delay_value_list: delay_value { TLIST [$1] }
+	|	delay_value_list COMMA delay_value { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 delay_value: expression { ($1) }
 	|	expression COLON expression COLON expression { TUPLE6(STRING("delay_value2"),$1,COLON,$3,COLON,$5) }
@@ -1673,8 +1673,8 @@ incdir_spec: HYPHEN Incdir file_path_spec_list { TUPLE4(STRING("incdir_spec1"),H
 
 include_statement: Include file_path_spec SEMICOLON { TUPLE4(STRING("include_statement1"),Include,$2,SEMICOLON) }
 
-file_path_spec_list: file_path_spec_list COMMA file_path_spec { CONS3($1,COMMA,$3) }
-	|	file_path_spec { CONS1 ($1) }
+file_path_spec_list: file_path_spec_list COMMA file_path_spec { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	file_path_spec { TLIST [$1] }
 
 file_path_spec: LT_LT_filepath_GT_GT { (LT_LT_filepath_GT_GT) }
 
@@ -1688,11 +1688,11 @@ lib_cell_identifiers_opt: lib_cell_identifiers { ($1) }
 lib_cell_identifiers: lib_cell_identifiers lib_cell_id { TUPLE3(STRING("lib_cell_identifiers1"),$1,$2) }
 	|	lib_cell_id { ($1) }
 
-list_of_config_rule_statements_opt: list_of_config_rule_statements { CONS1 ($1) }
+list_of_config_rule_statements_opt: list_of_config_rule_statements { TLIST [$1] }
 	|	/* empty */ { EMPTY_TOKEN }
 
-list_of_config_rule_statements: list_of_config_rule_statements config_rule_statement { CONS2($1,$2) }
-	|	config_rule_statement { CONS1 ($1) }
+list_of_config_rule_statements: list_of_config_rule_statements config_rule_statement { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	config_rule_statement { TLIST [$1] }
 
 config_rule_statement: Default liblist_clause SEMICOLON { TUPLE4(STRING("config_rule_statement1"),Default,$2,SEMICOLON) }
 	|	inst_clause liblist_clause SEMICOLON { TUPLE4(STRING("config_rule_statement2"),$1,$2,SEMICOLON) }
@@ -1725,8 +1725,8 @@ preprocessor_else_config_rule_statement_opt: preprocessor_else_config_rule_state
 
 preprocessor_else_config_rule_statement: BACKQUOTE_else list_of_config_rule_statements_opt { TUPLE3(STRING("preprocessor_else_config_rule_statement1"),BACKQUOTE_else,$2) }
 
-named_parameter_assignment_list: named_parameter_assignment_list COMMA named_parameter_assignment { CONS3($1,COMMA,$3) }
-	|	named_parameter_assignment { CONS1 ($1) }
+named_parameter_assignment_list: named_parameter_assignment_list COMMA named_parameter_assignment { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	named_parameter_assignment { TLIST [$1] }
 
 named_parameter_assignment: DOT member_name LPAREN parameter_expr RPAREN { TUPLE6(STRING("named_parameter_assignment1"),DOT,$2,LPAREN,$4,RPAREN) }
 	|	DOT member_name LPAREN RPAREN { TUPLE5(STRING("named_parameter_assignment2"),DOT,$2,LPAREN,RPAREN) }
@@ -1737,11 +1737,11 @@ opt_config: COLON Config { TUPLE3(STRING("opt_config1"),COLON,Config) }
 lib_cell_id: GenericIdentifier { ($1) }
 	|	GenericIdentifier DOT GenericIdentifier { TUPLE4(STRING("lib_cell_id2"),$1,DOT,$3) }
 
-list_of_libraries_opt: list_of_libraries { CONS1 ($1) }
+list_of_libraries_opt: list_of_libraries { TLIST [$1] }
 	|	/* empty */ { EMPTY_TOKEN }
 
-list_of_libraries: list_of_libraries GenericIdentifier { CONS2($1,$2) }
-	|	GenericIdentifier { CONS1 ($1) }
+list_of_libraries: list_of_libraries GenericIdentifier { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	GenericIdentifier { TLIST [$1] }
 
 drive_strength: LPAREN dr_strength0 COMMA dr_strength1 RPAREN { TUPLE6(STRING("drive_strength1"),LPAREN,$2,COMMA,$4,RPAREN) }
 	|	LPAREN dr_strength1 COMMA dr_strength0 RPAREN { TUPLE6(STRING("drive_strength2"),LPAREN,$2,COMMA,$4,RPAREN) }
@@ -1774,9 +1774,9 @@ event_control: AT hierarchy_event_identifier { TUPLE3(STRING("event_control1"),A
 event_control_opt: event_control { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-event_expression_list: event_expression { CONS1 ($1) }
-	|	event_expression_list Or event_expression { CONS3($1,Or,$3) }
-	|	event_expression_list COMMA event_expression { CONS3($1,COMMA,$3) }
+event_expression_list: event_expression { TLIST [$1] }
+	|	event_expression_list Or event_expression { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	event_expression_list COMMA event_expression { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 event_expression: edge_operator expression { TUPLE3(STRING("event_expression1"),$1,$2) }
 	|	expression { ($1) }
@@ -1796,13 +1796,13 @@ pattern: DOT member_name { TUPLE3(STRING("pattern1"),DOT,$2) }
 	|	QUOTE_LBRACE pattern_list RBRACE { TUPLE4(STRING("pattern5"),QUOTE_LBRACE,$2,RBRACE) }
 	|	QUOTE_LBRACE member_pattern_list RBRACE { TUPLE4(STRING("pattern6"),QUOTE_LBRACE,$2,RBRACE) }
 
-pattern_list: pattern_list COMMA pattern { CONS3($1,COMMA,$3) }
-	|	pattern { CONS1 ($1) }
+pattern_list: pattern_list COMMA pattern { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	pattern { TLIST [$1] }
 
 member_pattern: GenericIdentifier COLON pattern { TUPLE4(STRING("member_pattern1"),$1,COLON,$3) }
 
-member_pattern_list: member_pattern_list COMMA member_pattern { CONS3($1,COMMA,$3) }
-	|	member_pattern { CONS1 ($1) }
+member_pattern_list: member_pattern_list COMMA member_pattern { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	member_pattern { TLIST [$1] }
 
 expression: equiv_impl_expr { ($1) }
 
@@ -1899,8 +1899,8 @@ expr_mintypmax_trans_set: expr_mintypmax_trans_set EQ_GT expr_mintypmax_generali
 expr_mintypmax_generalized: expr_mintypmax_generalized COLON property_expr_or_assignment_list { TUPLE4(STRING("expr_mintypmax_generalized1"),$1,COLON,$3) }
 	|	property_expr_or_assignment_list { ($1) }
 
-property_expr_or_assignment_list: property_expr_or_assignment_list COMMA property_expr_or_assignment { CONS3($1,COMMA,$3) }
-	|	property_expr_or_assignment { CONS1 ($1) }
+property_expr_or_assignment_list: property_expr_or_assignment_list COMMA property_expr_or_assignment { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	property_expr_or_assignment { TLIST [$1] }
 
 property_expr_or_assignment: property_expr { ($1) }
 	|	LBRACK expression COLON expression RBRACK { TUPLE6(STRING("property_expr_or_assignment2"),LBRACK,$2,COLON,$4,RBRACK) }
@@ -1909,9 +1909,9 @@ property_expr_or_assignment: property_expr { ($1) }
 argument_list_opt: any_argument_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-any_argument_list: any_argument_list_trailing_comma { CONS1 ($1) }
-	|	any_argument_list_preprocessor_last { CONS1 ($1) }
-	|	any_argument_list_item_last { CONS1 ($1) }
+any_argument_list: any_argument_list_trailing_comma { TLIST [$1] }
+	|	any_argument_list_preprocessor_last { TLIST [$1] }
+	|	any_argument_list_item_last { TLIST [$1] }
 
 any_argument_list_trailing_comma: any_argument_list COMMA { TUPLE3(STRING("any_argument_list_trailing_comma1"),$1,COMMA) }
 	|	COMMA { (COMMA) }
@@ -2013,16 +2013,16 @@ identifier_list_in_parens_opt: LPAREN identifier_list RPAREN { TUPLE4(STRING("id
 	|	LPAREN RPAREN { TUPLE3(STRING("identifier_list_in_parens_opt3"),LPAREN,RPAREN) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-identifier_list: identifier_list COMMA reference { CONS3($1,COMMA,$3) }
-	|	reference { CONS1 ($1) }
+identifier_list: identifier_list COMMA reference { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	reference { TLIST [$1] }
 
 with_constraint_block_opt: with_constraint_block { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
 with_constraint_block: With identifier_list_in_parens_opt constraint_block { TUPLE4(STRING("with_constraint_block1"),With,$2,$3) }
 
-function_item_list: function_item { CONS1 ($1) }
-	|	function_item_list function_item { CONS2($1,$2) }
+function_item_list: function_item { TLIST [$1] }
+	|	function_item_list function_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 function_item: tf_port_declaration { ($1) }
 	|	function_item_data_declaration { ($1) }
@@ -2036,16 +2036,16 @@ primitive_gate_instance: GenericIdentifier decl_dimensions_opt LPAREN any_port_l
 	|	LPAREN any_port_list_opt RPAREN { TUPLE4(STRING("primitive_gate_instance2"),LPAREN,$2,RPAREN) }
 	|	GenericIdentifier decl_dimensions { TUPLE3(STRING("primitive_gate_instance3"),$1,$2) }
 
-primitive_gate_instance_list: primitive_gate_instance_list COMMA primitive_gate_instance { CONS3($1,COMMA,$3) }
-	|	primitive_gate_instance { CONS1 ($1) }
+primitive_gate_instance_list: primitive_gate_instance_list COMMA primitive_gate_instance { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	primitive_gate_instance { TLIST [$1] }
 
 gate_instance_or_register_variable: GenericIdentifier decl_dimensions_opt trailing_decl_assignment_opt { TUPLE4(STRING("gate_instance_or_register_variable1"),$1,$2,$3) }
 	|	GenericIdentifier decl_dimensions_opt LPAREN any_port_list_opt RPAREN { TUPLE6(STRING("gate_instance_or_register_variable2"),$1,$2,LPAREN,$4,RPAREN) }
 	|	MacroCall { ($1) }
 	|	call_base { ($1) }
 
-gate_instance_or_register_variable_list: gate_instance_or_register_variable_list COMMA gate_instance_or_register_variable { CONS3($1,COMMA,$3) }
-	|	gate_instance_or_register_variable { CONS1 ($1) }
+gate_instance_or_register_variable_list: gate_instance_or_register_variable_list COMMA gate_instance_or_register_variable { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	gate_instance_or_register_variable { TLIST [$1] }
 
 gatetype: And { (And) }
 	|	Nand { (Nand) }
@@ -2127,21 +2127,21 @@ hierarchy_event_identifier: hierarchy_event_identifier DOT hierarchy_segment { T
 
 hierarchy_segment: GenericIdentifier select_dimensions_opt { TUPLE3(STRING("hierarchy_segment1"),$1,$2) }
 
-list_of_identifiers: GenericIdentifier { CONS1 ($1) }
-	|	list_of_identifiers COMMA GenericIdentifier { CONS3($1,COMMA,$3) }
+list_of_identifiers: GenericIdentifier { TLIST [$1] }
+	|	list_of_identifiers COMMA GenericIdentifier { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
-list_of_identifiers_unpacked_dimensions: list_of_identifiers_unpacked_dimensions COMMA identifier_optional_unpacked_dimensions { CONS3($1,COMMA,$3) }
-	|	identifier_optional_unpacked_dimensions { CONS1 ($1) }
+list_of_identifiers_unpacked_dimensions: list_of_identifiers_unpacked_dimensions COMMA identifier_optional_unpacked_dimensions { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	identifier_optional_unpacked_dimensions { TLIST [$1] }
 
 identifier_optional_unpacked_dimensions: GenericIdentifier decl_dimensions_opt { TUPLE3(STRING("identifier_optional_unpacked_dimensions1"),$1,$2) }
 
-list_of_module_item_identifiers: list_of_module_item_identifiers COMMA identifier_optional_unpacked_dimensions { CONS3($1,COMMA,$3) }
-	|	unqualified_id decl_dimensions_opt { CONS2($1,$2) }
+list_of_module_item_identifiers: list_of_module_item_identifiers COMMA identifier_optional_unpacked_dimensions { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	unqualified_id decl_dimensions_opt { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
-list_of_port_identifiers: GenericIdentifier { CONS1 ($1) }
-	|	GenericIdentifier EQUALS expression { CONS3($1,EQUALS,$3) }
-	|	list_of_port_identifiers COMMA GenericIdentifier { CONS3($1,COMMA,$3) }
-	|	list_of_port_identifiers COMMA GenericIdentifier EQUALS expression { CONS5($1,COMMA,$3,EQUALS,$5) }
+list_of_port_identifiers: GenericIdentifier { TLIST [$1] }
+	|	GenericIdentifier EQUALS expression { TLIST [TUPLE3($1,EQUALS,$3)] }
+	|	list_of_port_identifiers COMMA GenericIdentifier { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	list_of_port_identifiers COMMA GenericIdentifier EQUALS expression { match $1 with TLIST lst -> TLIST (TUPLE3($3,EQUALS,$5) :: lst) | _ -> TLIST [TUPLE3($3,EQUALS,$5); $1] }
 
 identifier_opt: GenericIdentifier { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
@@ -2149,21 +2149,21 @@ identifier_opt: GenericIdentifier { ($1) }
 preprocessor_list_of_ports_or_port_declarations_opt: list_of_ports_or_port_declarations_opt { ($1) }
 	|	list_of_ports_or_port_declarations_trailing_comma { ($1) }
 
-list_of_ports_or_port_declarations_opt: list_of_ports_or_port_declarations { CONS1 ($1) }
+list_of_ports_or_port_declarations_opt: list_of_ports_or_port_declarations { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-list_of_ports_or_port_declarations: list_of_ports_or_port_declarations_preprocessor_last { CONS1 ($1) }
-	|	list_of_ports_or_port_declarations_item_last { CONS1 ($1) }
+list_of_ports_or_port_declarations: list_of_ports_or_port_declarations_preprocessor_last { ($1) }
+	|	list_of_ports_or_port_declarations_item_last { ($1) }
 
-list_of_ports_or_port_declarations_preprocessor_last: list_of_ports_or_port_declarations preprocessor_balanced_port_declarations { CONS2($1,$2) }
-	|	list_of_ports_or_port_declarations_trailing_comma preprocessor_balanced_port_declarations { CONS2($1,$2) }
-	|	preprocessor_balanced_port_declarations { CONS1 ($1) }
+list_of_ports_or_port_declarations_preprocessor_last: list_of_ports_or_port_declarations preprocessor_balanced_port_declarations { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	list_of_ports_or_port_declarations_trailing_comma preprocessor_balanced_port_declarations { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	preprocessor_balanced_port_declarations { TLIST [$1] }
 
-list_of_ports_or_port_declarations_item_last: list_of_ports_or_port_declarations_preprocessor_last port_or_port_declaration { CONS2($1,$2) }
-	|	list_of_ports_or_port_declarations_trailing_comma port_or_port_declaration { CONS2($1,$2) }
-	|	port_or_port_declaration { CONS1 ($1) }
+list_of_ports_or_port_declarations_item_last: list_of_ports_or_port_declarations_preprocessor_last port_or_port_declaration { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	list_of_ports_or_port_declarations_trailing_comma port_or_port_declaration { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	port_or_port_declaration { TLIST [$1] }
 
-list_of_ports_or_port_declarations_trailing_comma: list_of_ports_or_port_declarations COMMA { CONS2($1,COMMA) }
+list_of_ports_or_port_declarations_trailing_comma: list_of_ports_or_port_declarations COMMA { match $1 with TLIST lst -> TLIST (COMMA :: lst) | _ -> TLIST [COMMA; $1] }
 
 port_or_port_declaration: port { ($1) }
 	|	port_declaration { ($1) }
@@ -2211,8 +2211,8 @@ lpvalue: reference { ($1) }
 cont_assign: lpvalue EQUALS expression { TUPLE4(STRING("cont_assign1"),$1,EQUALS,$3) }
 	|	reference DOT builtin_array_method EQUALS expression { TUPLE6(STRING("cont_assign2"),$1,DOT,$3,EQUALS,$5) }
 
-cont_assign_list: cont_assign_list COMMA cont_assign { CONS3($1,COMMA,$3) }
-	|	cont_assign { CONS1 ($1) }
+cont_assign_list: cont_assign_list COMMA cont_assign { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	cont_assign { TLIST [$1] }
 
 symbol_or_label: GenericIdentifier { ($1) }
 	|	MacroIdItem { (MacroIdItem) }
@@ -2250,14 +2250,14 @@ parameter_opt: Parameter { (Parameter) }
 module_parameter_port: parameter_opt param_type_followed_by_id_and_dimensions_opt trailing_assign_opt { TUPLE4(STRING("module_parameter_port1"),$1,$2,$3) }
 	|	parameter_opt Type type_assignment { TUPLE4(STRING("module_parameter_port2"),$1,Type,$3) }
 
-type_assignment_list: type_assignment_list COMMA type_assignment { CONS3($1,COMMA,$3) }
-	|	type_assignment { CONS1 ($1) }
+type_assignment_list: type_assignment_list COMMA type_assignment { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	type_assignment { TLIST [$1] }
 
 type_assignment: GenericIdentifier EQUALS parameter_expr { TUPLE4(STRING("type_assignment1"),$1,EQUALS,$3) }
 	|	GenericIdentifier { ($1) }
 
-module_parameter_port_list: module_parameter_port_list_item_last { CONS1 ($1) }
-	|	module_parameter_port_list_preprocessor_last { CONS1 ($1) }
+module_parameter_port_list: module_parameter_port_list_item_last { TLIST [$1] }
+	|	module_parameter_port_list_preprocessor_last { TLIST [$1] }
 
 module_parameter_port_list_trailing_comma: module_parameter_port_list COMMA { TUPLE3(STRING("module_parameter_port_list_trailing_comma1"),$1,COMMA) }
 
@@ -2308,8 +2308,8 @@ generate_region: Generate generate_item_list_opt Endgenerate { TUPLE4(STRING("ge
 continuous_assign: Assign drive_strength_opt delay3_opt cont_assign_list SEMICOLON { TUPLE6(STRING("continuous_assign1"),Assign,$2,$3,$4,SEMICOLON) }
 	|	Assign drive_strength_opt delay3_opt macro_call_or_item { TUPLE5(STRING("continuous_assign2"),Assign,$2,$3,$4) }
 
-net_alias_assign_lvalue_list: net_alias_assign_lvalue_list EQUALS lpvalue { CONS3($1,EQUALS,$3) }
-	|	lpvalue EQUALS lpvalue { CONS3($1,EQUALS,$3) }
+net_alias_assign_lvalue_list: net_alias_assign_lvalue_list EQUALS lpvalue { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	lpvalue EQUALS lpvalue { TLIST [$3; $1] }
 
 net_alias: Alias net_alias_assign_lvalue_list SEMICOLON { TUPLE4(STRING("net_alias1"),Alias,$2,SEMICOLON) }
 
@@ -2445,14 +2445,14 @@ end_rule: End label_opt { TUPLE3(STRING("end1"),End,$2) }
 generate_block: begin_rule generate_item_list_opt end_rule { TUPLE4(STRING("generate_block1"),$1,$2,$3) }
 	|	unqualified_id COLON Begin generate_item_list_opt end_rule { TUPLE6(STRING("generate_block2"),$1,COLON,Begin,$4,$5) }
 
-generate_item_list: generate_item_list generate_item { CONS2($1,$2) }
-	|	generate_item { CONS1 ($1) }
+generate_item_list: generate_item_list generate_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	generate_item { TLIST [$1] }
 
 generate_item_list_opt: generate_item_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-module_item_list: module_item_list module_item { CONS2($1,$2) }
-	|	module_item { CONS1 ($1) }
+module_item_list: module_item_list module_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	module_item { TLIST [$1] }
 
 module_item_list_opt: module_item_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
@@ -2501,11 +2501,11 @@ param_type_followed_by_id_and_dimensions_opt: bit_logic_opt signed_unsigned_opt 
 	|	Reg decl_dimensions_opt GenericIdentifier decl_dimensions_opt { TUPLE5(STRING("param_type_followed_by_id_and_dimensions_opt7"),Reg,$2,$3,$4) }
 	|	String decl_dimensions_opt GenericIdentifier decl_dimensions_opt { TUPLE5(STRING("param_type_followed_by_id_and_dimensions_opt8"),String,$2,$3,$4) }
 
-parameter_assign_list: parameter_assign { CONS1 ($1) }
-	|	parameter_assign_list COMMA parameter_assign { CONS3($1,COMMA,$3) }
+parameter_assign_list: parameter_assign { TLIST [$1] }
+	|	parameter_assign_list COMMA parameter_assign { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
-localparam_assign_list: localparam_assign { CONS1 ($1) }
-	|	localparam_assign_list COMMA localparam_assign { CONS3($1,COMMA,$3) }
+localparam_assign_list: localparam_assign { TLIST [$1] }
+	|	localparam_assign_list COMMA localparam_assign { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 parameter_assign: GenericIdentifier EQUALS expression parameter_value_ranges_opt { TUPLE5(STRING("parameter_assign1"),$1,EQUALS,$3,$4) }
 
@@ -2545,16 +2545,16 @@ parameters: HASH LPAREN parameter_expr_list RPAREN { TUPLE5(STRING("parameters1"
 	|	HASH TK_DecNumber { TUPLE3(STRING("parameters4"),HASH,TK_DecNumber $2) }
 	|	HASH TK_RealTime { TUPLE3(STRING("parameters5"),HASH,TK_RealTime $2) }
 
-parameter_expr_list: parameter_expr_list COMMA parameter_expr { CONS3($1,COMMA,$3) }
-	|	parameter_expr { CONS1 ($1) }
+parameter_expr_list: parameter_expr_list COMMA parameter_expr { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	parameter_expr { TLIST [$1] }
 
 parameter_value_byname: DOT member_name LPAREN parameter_expr RPAREN { TUPLE6(STRING("parameter_value_byname1"),DOT,$2,LPAREN,$4,RPAREN) }
 	|	DOT member_name LPAREN RPAREN { TUPLE5(STRING("parameter_value_byname2"),DOT,$2,LPAREN,RPAREN) }
 	|	DOT member_name { TUPLE3(STRING("parameter_value_byname3"),DOT,$2) }
 
-parameter_value_byname_list: parameter_value_byname_list_item_last { CONS1 ($1) }
-	|	parameter_value_byname_list_preprocessor_last { CONS1 ($1) }
-	|	parameter_value_byname_list_trailing_comma { CONS1 ($1) }
+parameter_value_byname_list: parameter_value_byname_list_item_last { TLIST [$1] }
+	|	parameter_value_byname_list_preprocessor_last { TLIST [$1] }
+	|	parameter_value_byname_list_trailing_comma { TLIST [$1] }
 
 parameter_value_byname_list_trailing_comma: parameter_value_byname_list COMMA { TUPLE3(STRING("parameter_value_byname_list_trailing_comma1"),$1,COMMA) }
 	|	COMMA { (COMMA) }
@@ -2576,9 +2576,9 @@ port: port_expression trailing_assign_opt { TUPLE3(STRING("port1"),$1,$2) }
 any_port_list_opt: any_port_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-any_port_list: any_port_list_item_last { CONS1 ($1) }
-	|	any_port_list_preprocessor_last { CONS1 ($1) }
-	|	any_port_list_trailing_comma { CONS1 ($1) }
+any_port_list: any_port_list_item_last { TLIST [$1] }
+	|	any_port_list_preprocessor_last { TLIST [$1] }
+	|	any_port_list_trailing_comma { TLIST [$1] }
 
 any_port_list_trailing_comma: any_port_list COMMA { TUPLE3(STRING("any_port_list_trailing_comma1"),$1,COMMA) }
 	|	COMMA { (COMMA) }
@@ -2609,8 +2609,8 @@ port_expression: port_reference { ($1) }
 
 port_reference: unqualified_id decl_dimensions_opt { TUPLE3(STRING("port_reference1"),$1,$2) }
 
-port_reference_list: port_reference { CONS1 ($1) }
-	|	port_reference_list COMMA port_reference { CONS3($1,COMMA,$3) }
+port_reference_list: port_reference { TLIST [$1] }
+	|	port_reference_list COMMA port_reference { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 select_dimensions_opt: select_dimensions { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
@@ -2652,8 +2652,8 @@ specify_item: Specparam specparam_decl SEMICOLON { TUPLE4(STRING("specify_item1"
 	|	Noshowcancelled specify_path_identifiers SEMICOLON { TUPLE4(STRING("specify_item24"),Noshowcancelled,$2,SEMICOLON) }
 	|	preprocessor_directive { ($1) }
 
-specify_item_list: specify_item { CONS1 ($1) }
-	|	specify_item_list specify_item { CONS2($1,$2) }
+specify_item_list: specify_item { TLIST [$1] }
+	|	specify_item_list specify_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 specify_item_list_opt: /* empty */ { EMPTY_TOKEN }
 	|	specify_item_list { ($1) }
@@ -2688,8 +2688,8 @@ specify_path_identifiers: GenericIdentifier { ($1) }
 specparam: GenericIdentifier EQUALS expression { TUPLE4(STRING("specparam1"),$1,EQUALS,$3) }
 	|	GenericIdentifier EQUALS expression COLON expression COLON expression { TUPLE8(STRING("specparam2"),$1,EQUALS,$3,COLON,$5,COLON,$7) }
 
-specparam_list: specparam { CONS1 ($1) }
-	|	specparam_list COMMA specparam { CONS3($1,COMMA,$3) }
+specparam_list: specparam { TLIST [$1] }
+	|	specparam_list COMMA specparam { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 specparam_decl: specparam_list { ($1) }
 	|	decl_dimensions specparam_list { TUPLE3(STRING("specparam_decl2"),$1,$2) }
@@ -2705,8 +2705,8 @@ spec_reference_event: edge_operator specify_terminal_descriptor { TUPLE3(STRING(
 	|	specify_terminal_descriptor AMPERSAND_AMPERSAND_AMPERSAND expression { TUPLE4(STRING("spec_reference_event5"),$1,AMPERSAND_AMPERSAND_AMPERSAND,$3) }
 	|	specify_terminal_descriptor { ($1) }
 
-edge_descriptor_list: edge_descriptor_list COMMA TK_edge_descriptor { CONS3($1,COMMA,TK_edge_descriptor) }
-	|	TK_edge_descriptor { CONS1 (TK_edge_descriptor) }
+edge_descriptor_list: edge_descriptor_list COMMA TK_edge_descriptor { match $1 with TLIST lst -> TLIST (TK_edge_descriptor :: lst) | _ -> TLIST [TK_edge_descriptor; $1] }
+	|	TK_edge_descriptor { TLIST [TK_edge_descriptor] }
 
 specify_terminal_descriptor: reference { ($1) }
 
@@ -2834,8 +2834,8 @@ unique_priority_opt: Unique { (Unique) }
 statement_or_null_list_opt: statement_or_null_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-statement_or_null_list: statement_or_null_list statement_or_null { CONS2($1,$2) }
-	|	statement_or_null { CONS1 ($1) }
+statement_or_null_list: statement_or_null_list statement_or_null { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	statement_or_null { TLIST [$1] }
 
 analog_statement: branch_probe_expression LT_PLUS expression SEMICOLON { TUPLE5(STRING("analog_statement1"),$1,LT_PLUS,$3,SEMICOLON) }
 
@@ -2850,8 +2850,8 @@ task_item: function_item_data_declaration { ($1) }
 tf_item_or_statement_or_null: task_item { ($1) }
 	|	statement_or_null { ($1) }
 
-tf_item_or_statement_or_null_list: tf_item_or_statement_or_null { CONS1 ($1) }
-	|	tf_item_or_statement_or_null_list tf_item_or_statement_or_null { CONS2($1,$2) }
+tf_item_or_statement_or_null_list: tf_item_or_statement_or_null { TLIST [$1] }
+	|	tf_item_or_statement_or_null_list tf_item_or_statement_or_null { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 tf_item_or_statement_or_null_list_opt: tf_item_or_statement_or_null_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
@@ -2865,24 +2865,24 @@ tf_port_list_opt: tf_port_list { ($1) }
 udp_body: Table udp_entry_list Endtable { TUPLE4(STRING("udp_body1"),Table,$2,Endtable) }
 	|	Table Endtable { TUPLE3(STRING("udp_body2"),Table,Endtable) }
 
-udp_entry_list: udp_comb_entry_list { CONS1 ($1) }
-	|	udp_sequ_entry_list { CONS1 ($1) }
-	|	udp_unknown_list { CONS1 ($1) }
+udp_entry_list: udp_comb_entry_list { TLIST [$1] }
+	|	udp_sequ_entry_list { TLIST [$1] }
+	|	udp_unknown_list { TLIST [$1] }
 
-udp_unknown_list: udp_unknown_list preprocessor_directive { CONS2($1,$2) }
-	|	preprocessor_directive { CONS1 ($1) }
+udp_unknown_list: udp_unknown_list preprocessor_directive { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	preprocessor_directive { TLIST [$1] }
 
 udp_comb_entry: udp_input_list COLON udp_output_sym SEMICOLON { TUPLE5(STRING("udp_comb_entry1"),$1,COLON,$3,SEMICOLON) }
 
-udp_comb_entry_list: udp_comb_entry { CONS1 ($1) }
-	|	udp_comb_entry_list udp_comb_entry { CONS2($1,$2) }
-	|	udp_comb_entry_list preprocessor_directive { CONS2($1,$2) }
-	|	udp_unknown_list udp_comb_entry { CONS2($1,$2) }
+udp_comb_entry_list: udp_comb_entry { TLIST [$1] }
+	|	udp_comb_entry_list udp_comb_entry { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	udp_comb_entry_list preprocessor_directive { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	udp_unknown_list udp_comb_entry { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
-udp_sequ_entry_list: udp_sequ_entry { CONS1 ($1) }
-	|	udp_sequ_entry_list udp_sequ_entry { CONS2($1,$2) }
-	|	udp_sequ_entry_list preprocessor_directive { CONS2($1,$2) }
-	|	udp_unknown_list udp_sequ_entry { CONS2($1,$2) }
+udp_sequ_entry_list: udp_sequ_entry { TLIST [$1] }
+	|	udp_sequ_entry_list udp_sequ_entry { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	udp_sequ_entry_list preprocessor_directive { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	udp_unknown_list udp_sequ_entry { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 udp_sequ_entry: udp_input_list COLON udp_input_sym COLON udp_output_sym SEMICOLON { TUPLE7(STRING("udp_sequ_entry1"),$1,COLON,$3,COLON,$5,SEMICOLON) }
 
@@ -2891,8 +2891,8 @@ udp_initial: Initial GenericIdentifier EQUALS number SEMICOLON { TUPLE6(STRING("
 udp_init_opt: udp_initial { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-udp_input_list: udp_input_sym { CONS1 ($1) }
-	|	udp_input_list udp_input_sym { CONS2($1,$2) }
+udp_input_list: udp_input_sym { TLIST [$1] }
+	|	udp_input_list udp_input_sym { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 udp_input_sym: CHAR { (CHAR) }
 	|	CHAR { (CHAR) }
@@ -2933,14 +2933,14 @@ udp_port_decl: Input list_of_identifiers SEMICOLON { TUPLE4(STRING("udp_port_dec
 udp_port_decls: udp_port_decl { ($1) }
 	|	udp_port_decls udp_port_decl { TUPLE3(STRING("udp_port_decls2"),$1,$2) }
 
-udp_port_list: GenericIdentifier { CONS1 ($1) }
-	|	udp_port_list COMMA GenericIdentifier { CONS3($1,COMMA,$3) }
+udp_port_list: GenericIdentifier { TLIST [$1] }
+	|	udp_port_list COMMA GenericIdentifier { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 udp_initial_expr_opt: EQUALS expression { TUPLE3(STRING("udp_initial_expr_opt1"),EQUALS,$2) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-udp_input_declaration_list: Input GenericIdentifier { CONS2(Input,$2) }
-	|	udp_input_declaration_list COMMA Input GenericIdentifier { CONS4($1,COMMA,Input,$4) }
+udp_input_declaration_list: Input GenericIdentifier { TLIST [$2; Input] }
+	|	udp_input_declaration_list COMMA Input GenericIdentifier { match $1 with TLIST lst -> TLIST ($4 :: Input :: lst) | _ -> TLIST [$4; Input; $1] }
 
 udp_primitive: Primitive GenericIdentifier LPAREN udp_port_list RPAREN SEMICOLON udp_port_decls udp_init_opt udp_body Endprimitive label_opt { TUPLE12(STRING("udp_primitive1"),Primitive,$2,LPAREN,$4,RPAREN,SEMICOLON,$7,$8,$9,Endprimitive,$11) }
 	|	Primitive GenericIdentifier LPAREN Output TK_reg_opt GenericIdentifier udp_initial_expr_opt COMMA udp_input_declaration_list RPAREN SEMICOLON udp_body Endprimitive label_opt { TUPLE15(STRING("udp_primitive2"),Primitive,$2,LPAREN,Output,$5,$6,$7,COMMA,$9,RPAREN,SEMICOLON,$12,Endprimitive,$14) }
@@ -2966,8 +2966,8 @@ TK_virtual_opt: Virtual { (Virtual) }
 bind_directive: Bind reference COLON bind_target_instance_list bind_instantiation SEMICOLON { TUPLE7(STRING("bind_directive1"),Bind,$2,COLON,$4,$5,SEMICOLON) }
 	|	Bind reference bind_instantiation SEMICOLON { TUPLE5(STRING("bind_directive2"),Bind,$2,$3,SEMICOLON) }
 
-bind_target_instance_list: bind_target_instance_list COMMA bind_target_instance { CONS3($1,COMMA,$3) }
-	|	bind_target_instance { CONS1 ($1) }
+bind_target_instance_list: bind_target_instance_list COMMA bind_target_instance { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	bind_target_instance { TLIST [$1] }
 
 bind_target_instance: reference { ($1) }
 
@@ -2980,8 +2980,8 @@ clocking_declaration: Default Clocking identifier_opt event_control SEMICOLON cl
 clocking_item_list_opt: clocking_item_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-clocking_item_list: clocking_item_list clocking_item { CONS2($1,$2) }
-	|	clocking_item { CONS1 ($1) }
+clocking_item_list: clocking_item_list clocking_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	clocking_item { TLIST [$1] }
 
 clocking_item: Default default_skew SEMICOLON { TUPLE4(STRING("clocking_item1"),Default,$2,SEMICOLON) }
 	|	clocking_direction list_of_clocking_decl_assign SEMICOLON { TUPLE4(STRING("clocking_item2"),$1,$2,SEMICOLON) }
@@ -3003,8 +3003,8 @@ clocking_direction: Input clocking_skew_opt { TUPLE3(STRING("clocking_direction1
 	|	Output clocking_skew_opt { TUPLE3(STRING("clocking_direction3"),Output,$2) }
 	|	Inout { (Inout) }
 
-list_of_clocking_decl_assign: list_of_clocking_decl_assign COMMA clocking_decl_assign { CONS3($1,COMMA,$3) }
-	|	clocking_decl_assign { CONS1 ($1) }
+list_of_clocking_decl_assign: list_of_clocking_decl_assign COMMA clocking_decl_assign { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	clocking_decl_assign { TLIST [$1] }
 
 clocking_decl_assign: GenericIdentifier trailing_assign_opt { TUPLE3(STRING("clocking_decl_assign1"),$1,$2) }
 
@@ -3017,8 +3017,8 @@ let_port_list_in_parens_opt: LPAREN let_port_list RPAREN { TUPLE4(STRING("let_po
 	|	LPAREN RPAREN { TUPLE3(STRING("let_port_list_in_parens_opt2"),LPAREN,RPAREN) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-let_port_list: let_port_list COMMA let_port_item { CONS3($1,COMMA,$3) }
-	|	let_port_item { CONS1 ($1) }
+let_port_list: let_port_list COMMA let_port_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	let_port_item { TLIST [$1] }
 
 let_port_item: let_formal_type_followed_by_id decl_dimensions_opt { TUPLE3(STRING("let_port_item1"),$1,$2) }
 	|	let_formal_type_followed_by_id decl_dimensions_opt EQUALS expression { TUPLE5(STRING("let_port_item2"),$1,$2,EQUALS,$4) }
@@ -3035,8 +3035,8 @@ sequence_port_list_in_parens_opt: LPAREN sequence_port_list_opt RPAREN { TUPLE4(
 sequence_port_list_opt: sequence_port_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-sequence_port_list: sequence_port_list COMMA sequence_port_item { CONS3($1,COMMA,$3) }
-	|	sequence_port_item { CONS1 ($1) }
+sequence_port_list: sequence_port_list COMMA sequence_port_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	sequence_port_item { TLIST [$1] }
 
 sequence_port_item: local_sequence_lvar_port_direction_opt sequence_port_type_followed_by_id decl_dimensions_opt trailing_assign_opt { TUPLE5(STRING("sequence_port_item1"),$1,$2,$3,$4) }
 
@@ -3054,8 +3054,8 @@ property_declaration: Property GenericIdentifier property_port_list_in_parens_op
 property_port_list_in_parens_opt: LPAREN property_port_list RPAREN { TUPLE4(STRING("property_port_list_in_parens_opt1"),LPAREN,$2,RPAREN) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-property_port_list: property_port_list COMMA property_port_item { CONS3($1,COMMA,$3) }
-	|	property_port_item { CONS1 ($1) }
+property_port_list: property_port_list COMMA property_port_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	property_port_item { TLIST [$1] }
 
 property_port_item: property_port_modifiers_opt property_formal_type_followed_by_id decl_dimensions_opt property_actual_arg_opt { TUPLE5(STRING("property_port_item1"),$1,$2,$3,$4) }
 
@@ -3071,8 +3071,8 @@ property_formal_type_followed_by_id: data_type_or_implicit_basic_followed_by_id 
 property_actual_arg_opt: EQUALS property_actual_arg { TUPLE3(STRING("property_actual_arg_opt1"),EQUALS,$2) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-assertion_variable_declaration_list: assertion_variable_declaration_list SEMICOLON assertion_variable_declaration { CONS3($1,SEMICOLON,$3) }
-	|	assertion_variable_declaration { CONS1 ($1) }
+assertion_variable_declaration_list: assertion_variable_declaration_list SEMICOLON assertion_variable_declaration { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	assertion_variable_declaration { TLIST [$1] }
 
 assertion_variable_declaration: var_opt data_type_or_implicit_basic_followed_by_id_and_dimensions_opt trailing_assign_opt { TUPLE4(STRING("assertion_variable_declaration1"),$1,$2,$3) }
 	|	var_opt data_type_or_implicit_basic_followed_by_id_and_dimensions_opt trailing_assign_opt COMMA net_variable_or_decl_assigns { TUPLE6(STRING("assertion_variable_declaration2"),$1,$2,$3,COMMA,$5) }
@@ -3112,15 +3112,15 @@ simple_sequence_expr: First_match LPAREN sequence_expr_match_item_list RPAREN { 
 
 property_case_statement: Case LPAREN expression_or_dist RPAREN property_case_item_list optional_semicolon Endcase { TUPLE8(STRING("property_case_statement1"),Case,LPAREN,$3,RPAREN,$5,$6,Endcase) }
 
-property_case_item_list: property_case_item_list SEMICOLON property_case_item { CONS3($1,SEMICOLON,$3) }
-	|	property_case_item { CONS1 ($1) }
+property_case_item_list: property_case_item_list SEMICOLON property_case_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	property_case_item { TLIST [$1] }
 
 property_case_item: expression_or_dist_list COLON property_expr { TUPLE4(STRING("property_case_item1"),$1,COLON,$3) }
 	|	Default COLON property_expr { TUPLE4(STRING("property_case_item2"),Default,COLON,$3) }
 	|	Default property_expr { TUPLE3(STRING("property_case_item3"),Default,$2) }
 
-expression_or_dist_list: expression_or_dist_list COMMA expression_or_dist { CONS3($1,COMMA,$3) }
-	|	expression_or_dist { CONS1 ($1) }
+expression_or_dist_list: expression_or_dist_list COMMA expression_or_dist { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	expression_or_dist { TLIST [$1] }
 
 property_implication_expr: property_implication_expr property_operator property_prefix_expr { TUPLE4(STRING("property_implication_expr1"),$1,$2,$3) }
 	|	property_prefix_expr { ($1) }
@@ -3145,11 +3145,11 @@ followed_by_operator: HASH_EQ_HASH { (HASH_EQ_HASH) }
 system_tf_call: SystemTFIdentifier call_base { TUPLE3(STRING("system_tf_call1"),SystemTFIdentifier $1,$2) }
 	|	SystemTFIdentifier { (SystemTFIdentifier $1) }
 
-sequence_match_item_list: sequence_match_item_list COMMA sequence_match_item { CONS3($1,COMMA,$3) }
-	|	sequence_match_item { CONS1 ($1) }
+sequence_match_item_list: sequence_match_item_list COMMA sequence_match_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	sequence_match_item { TLIST [$1] }
 
-sequence_expr_match_item_list: property_expr COMMA sequence_match_item_list { CONS3($1,COMMA,$3) }
-	|	property_expr { CONS1 ($1) }
+sequence_expr_match_item_list: property_expr COMMA sequence_match_item_list { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	property_expr { TLIST [$1] }
 
 sequence_match_item: assignment_statement { ($1) }
 	|	subroutine_call { ($1) }
@@ -3178,8 +3178,8 @@ sequence_throughout_expr: sequence_delay_range_expr { ($1) }
 sequence_delay_range_expr: sequence_delay_repetition_list { ($1) }
 	|	cycle_delay_range sequence_delay_repetition_list { TUPLE3(STRING("sequence_delay_range_expr2"),$1,$2) }
 
-sequence_delay_repetition_list: sequence_delay_repetition_list cycle_delay_range sequence_expr_primary { CONS3($1,$2,$3) }
-	|	sequence_expr_primary { CONS1 ($1) }
+sequence_delay_repetition_list: sequence_delay_repetition_list cycle_delay_range sequence_expr_primary { match $1 with TLIST lst -> TLIST ($3 :: $2 :: lst) | _ -> TLIST [$3; $2; $1] }
+	|	sequence_expr_primary { TLIST [$1] }
 
 cycle_delay: HASH_HASH TK_DecNumber { TUPLE3(STRING("cycle_delay1"),HASH_HASH,TK_DecNumber $2) }
 	|	HASH_HASH GenericIdentifier { TUPLE3(STRING("cycle_delay2"),HASH_HASH,$2) }
@@ -3200,8 +3200,8 @@ cycle_range: expression COLON expression { TUPLE4(STRING("cycle_range1"),$1,COLO
 dist_opt: Dist LBRACE dist_list RBRACE { TUPLE5(STRING("dist_opt1"),Dist,LBRACE,$3,RBRACE) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-dist_list: dist_item { CONS1 ($1) }
-	|	dist_list COMMA dist_item { CONS3($1,COMMA,$3) }
+dist_list: dist_item { TLIST [$1] }
+	|	dist_list COMMA dist_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 dist_item: value_range dist_weight { TUPLE3(STRING("dist_item1"),$1,$2) }
 	|	value_range { ($1) }
@@ -3235,8 +3235,8 @@ covergroup_declaration: Covergroup GenericIdentifier tf_port_list_paren_opt cove
 coverage_spec_or_option_list_opt: coverage_spec_or_option_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-coverage_spec_or_option_list: coverage_spec_or_option_list coverage_spec_or_option { CONS2($1,$2) }
-	|	coverage_spec_or_option { CONS1 ($1) }
+coverage_spec_or_option_list: coverage_spec_or_option_list coverage_spec_or_option { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	coverage_spec_or_option { TLIST [$1] }
 
 coverage_spec_or_option: coverage_spec { ($1) }
 	|	coverage_option SEMICOLON { TUPLE3(STRING("coverage_spec_or_option2"),$1,SEMICOLON) }
@@ -3273,11 +3273,11 @@ cross_body: LBRACE cross_body_item_list_opt RBRACE { TUPLE4(STRING("cross_body1"
 cross_body_item_list_opt: cross_body_item_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-cross_body_item_list: cross_body_item_list cross_body_item { CONS2($1,$2) }
-	|	cross_body_item { CONS1 ($1) }
+cross_body_item_list: cross_body_item_list cross_body_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	cross_body_item { TLIST [$1] }
 
-cross_item_list: cross_item_list COMMA cross_item { CONS3($1,COMMA,$3) }
-	|	cross_item COMMA cross_item { CONS3($1,COMMA,$3) }
+cross_item_list: cross_item_list COMMA cross_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	cross_item COMMA cross_item { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
 
 cross_body_item: function_declaration { ($1) }
 	|	bins_selection SEMICOLON { TUPLE3(STRING("cross_body_item2"),$1,SEMICOLON) }
@@ -3295,8 +3295,8 @@ bins_or_options_list_opt: LBRACE bins_or_options_list RBRACE { TUPLE4(STRING("bi
 	|	SEMICOLON { (SEMICOLON) }
 	|	LBRACE ERROR_TOKEN RBRACE { TUPLE4(STRING("bins_or_options_list_opt3"),LBRACE,ERROR_TOKEN,RBRACE) }
 
-bins_or_options_list: bins_or_options_list bins_or_options { CONS2($1,$2) }
-	|	bins_or_options { CONS1 ($1) }
+bins_or_options_list: bins_or_options_list bins_or_options { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	bins_or_options { TLIST [$1] }
 
 bins_or_options: coverage_option SEMICOLON { TUPLE3(STRING("bins_or_options1"),$1,SEMICOLON) }
 	|	coverage_bin SEMICOLON { TUPLE3(STRING("bins_or_options2"),$1,SEMICOLON) }
@@ -3307,13 +3307,13 @@ bins_or_options: coverage_option SEMICOLON { TUPLE3(STRING("bins_or_options1"),$
 bins_or_options_list_opt_pp: bins_or_options_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-preprocessor_balanced_bins_or_options_list: preprocessor_if_header bins_or_options_list_opt_pp preprocessor_elsif_bins_or_options_list_opt preprocessor_else_bins_or_options_opt BACKQUOTE_endif { CONS5($1,$2,$3,$4,BACKQUOTE_endif) }
+preprocessor_balanced_bins_or_options_list: preprocessor_if_header bins_or_options_list_opt_pp preprocessor_elsif_bins_or_options_list_opt preprocessor_else_bins_or_options_opt BACKQUOTE_endif { TUPLE5($1,$2,$3,$4,BACKQUOTE_endif) }
 
 preprocessor_elsif_bins_or_options_list_opt: preprocessor_elsif_bins_or_options_list { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-preprocessor_elsif_bins_or_options_list: preprocessor_elsif_bins_or_options_list preprocessor_elsif_bins_or_options { CONS2($1,$2) }
-	|	preprocessor_elsif_bins_or_options { CONS1 ($1) }
+preprocessor_elsif_bins_or_options_list: preprocessor_elsif_bins_or_options_list preprocessor_elsif_bins_or_options { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	preprocessor_elsif_bins_or_options { TLIST [$1] }
 
 preprocessor_elsif_bins_or_options: preprocessor_elsif_header bins_or_options_list_opt_pp { TUPLE3(STRING("preprocessor_elsif_bins_or_options1"),$1,$2) }
 
@@ -3339,7 +3339,7 @@ covergroup_expression_bracketed_opt: LBRACK expression RBRACK { TUPLE4(STRING("c
 	|	LBRACK RBRACK { TUPLE3(STRING("covergroup_expression_bracketed_opt2"),LBRACK,RBRACK) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-set_covergroup_expression_or_covergroup_range_list_or_trans_list: expression_list_proper { CONS1 ($1) }
+set_covergroup_expression_or_covergroup_range_list_or_trans_list: expression_list_proper { TLIST [$1] }
 
 bins_selection: bins_keyword GenericIdentifier EQUALS select_expression { TUPLE5(STRING("bins_selection1"),$1,$2,EQUALS,$4) }
 
@@ -3355,15 +3355,15 @@ with_covergroup_expression: expression { ($1) }
 
 randsequence_statement: Randsequence LPAREN identifier_opt RPAREN production_list Endsequence { TUPLE7(STRING("randsequence_statement1"),Randsequence,LPAREN,$3,RPAREN,$5,Endsequence) }
 
-production_list: production_list production { CONS2($1,$2) }
-	|	production { CONS1 ($1) }
+production_list: production_list production { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	production { TLIST [$1] }
 
 production: data_type_or_void_with_id tf_port_list_paren_opt COLON rs_rule_list SEMICOLON { TUPLE6(STRING("production1"),$1,$2,COLON,$4,SEMICOLON) }
 
 data_type_or_void_with_id: data_type_or_implicit_basic_followed_by_id_and_dimensions_opt { ($1) }
 
-rs_rule_list: rs_rule_list VBAR rs_rule { CONS3($1,VBAR,$3) }
-	|	rs_rule { CONS1 ($1) }
+rs_rule_list: rs_rule_list VBAR rs_rule { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	rs_rule { TLIST [$1] }
 
 rs_rule: rs_production_list_or_rand_join { ($1) }
 	|	rs_production_list_or_rand_join COLON_EQ weight_specification { TUPLE4(STRING("rs_rule2"),$1,COLON_EQ,$3) }
@@ -3378,8 +3378,8 @@ expression_in_parens: LPAREN expression RPAREN { TUPLE4(STRING("expression_in_pa
 expression_in_parens_opt: expression_in_parens { ($1) }
 	|	/* empty */ { EMPTY_TOKEN }
 
-rs_production_list: rs_production_list rs_prod { CONS2($1,$2) }
-	|	rs_prod { CONS1 ($1) }
+rs_production_list: rs_production_list rs_prod { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	rs_prod { TLIST [$1] }
 
 weight_specification: number { ($1) }
 	|	GenericIdentifier { ($1) }
@@ -3387,8 +3387,8 @@ weight_specification: number { ($1) }
 
 rs_code_block: LBRACE block_item_or_statement_or_null_list_opt RBRACE { TUPLE4(STRING("rs_code_block1"),LBRACE,$2,RBRACE) }
 
-production_items_list: production_items_list production_item { CONS2($1,$2) }
-	|	production_item production_item { CONS2($1,$2) }
+production_items_list: production_items_list production_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	production_item production_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
 
 rs_prod: production_item { ($1) }
 	|	rs_code_block { ($1) }
@@ -3406,15 +3406,15 @@ rs_repeat: repeat_control production_item { TUPLE3(STRING("rs_repeat1"),$1,$2) }
 
 rs_case: Case LPAREN expression RPAREN rs_case_item_list Endcase { TUPLE7(STRING("rs_case1"),Case,LPAREN,$3,RPAREN,$5,Endcase) }
 
-rs_case_item_list: rs_case_item_list rs_case_item { CONS2($1,$2) }
-	|	rs_case_item { CONS1 ($1) }
+rs_case_item_list: rs_case_item_list rs_case_item { match $1 with TLIST lst -> TLIST ($2 :: lst) | _ -> TLIST [$2; $1] }
+	|	rs_case_item { TLIST [$1] }
 
 rs_case_item: case_item_expression_list COLON production_item SEMICOLON { TUPLE5(STRING("rs_case_item1"),$1,COLON,$3,SEMICOLON) }
 	|	Default COLON production_item SEMICOLON { TUPLE5(STRING("rs_case_item2"),Default,COLON,$3,SEMICOLON) }
 	|	Default production_item SEMICOLON { TUPLE4(STRING("rs_case_item3"),Default,$2,SEMICOLON) }
 
-case_item_expression_list: case_item_expression_list COMMA case_item_expression { CONS3($1,COMMA,$3) }
-	|	case_item_expression { CONS1 ($1) }
+case_item_expression_list: case_item_expression_list COMMA case_item_expression { match $1 with TLIST lst -> TLIST ($3 :: lst) | _ -> TLIST [$3; $1] }
+	|	case_item_expression { TLIST [$1] }
 
 case_item_expression: expression { ($1) }
 

@@ -196,6 +196,27 @@ let rec ir_op_to_z3 ir node =
       end else
         Z3.BitVector.mk_numeral ctx "0" width
 
+  | Pmux { width; num_cases } ->
+      (* Pmux inputs: [default; sel0; sel1; ...; selN; data0; data1; ...; dataN] *)
+      if List.length inputs_z3 >= (1 + num_cases * 2) then begin
+        let default_val = List.nth inputs_z3 0 in
+        let selectors = List.init num_cases (fun i -> List.nth inputs_z3 (1 + i)) in
+        let data_values = List.init num_cases (fun i -> List.nth inputs_z3 (1 + num_cases + i)) in
+
+        (* Build nested ITE: if sel[0] then data[0] else (if sel[1] then data[1] else ...) *)
+        let rec build_pmux_ite sels datas default =
+          match sels, datas with
+          | [], [] -> default
+          | sel::rest_sels, data::rest_datas ->
+              let sel_bool = Z3.Boolean.mk_eq ctx sel (Z3.BitVector.mk_numeral ctx "1" 1) in
+              let else_part = build_pmux_ite rest_sels rest_datas default in
+              Z3.Boolean.mk_ite ctx sel_bool data else_part
+          | _, _ -> default
+        in
+        build_pmux_ite selectors data_values default_val
+      end else
+        Z3.BitVector.mk_numeral ctx "0" width
+
   | Shift { width; direction; arithmetic; amount } ->
       if List.length inputs_z3 >= 1 then begin
         let value = List.nth inputs_z3 0 in
@@ -259,24 +280,50 @@ let rec ir_op_to_z3 ir node =
 
 (* Build Z3 expressions for all IR outputs *)
 let build_ir_z3_outputs ir =
+  Printf.printf "DEBUG build_ir_z3_outputs: IR has %d outputs in hashtable\n" (Hashtbl.length ir.ir_outputs);
+  Hashtbl.iter (fun name out ->
+    match out with
+    | Output { id; width; _ } ->
+        Printf.printf "  Output '%s': id=%d, width=%d\n" name id width;
+        Printf.printf "    Checking ir_nodes for id=%d: %s\n" id
+          (if Hashtbl.mem ir.ir_nodes id then "FOUND" else "NOT FOUND");
+        Printf.printf "    Checking ir_value_to_node for id=%d: %s\n" id
+          (match Hashtbl.find_opt ir.ir_value_to_node id with
+           | Some nid -> Printf.sprintf "FOUND (maps to node %d)" nid
+           | None -> "NOT FOUND")
+    | _ -> ()
+  ) ir.ir_outputs;
   let outputs = Hashtbl.fold (fun name out acc ->
     match out with
     | Output { id; name; width } ->
-        (* Find the node that drives this output *)
-        (match Hashtbl.find_opt ir.ir_value_to_node id with
-         | Some node_id ->
-             (match Hashtbl.find_opt ir.ir_nodes node_id with
-              | Some node ->
-                  let z3_expr = ir_op_to_z3 ir node in
-                  (name, z3_expr, width) :: acc
-              | None -> acc)
+        (* Try to find the node directly by ID first (works for both Yosys and Verilator) *)
+        (match Hashtbl.find_opt ir.ir_nodes id with
+         | Some node ->
+             (* Found node directly - this is the common case *)
+             let z3_expr = ir_op_to_z3 ir node in
+             (name, z3_expr, width) :: acc
          | None ->
-             (* Output directly connected to input *)
-             (match Hashtbl.find_opt ir.ir_inputs name with
-              | Some (Input { id; name; width }) ->
-                  let z3_var = get_z3_var ir id width in
-                  (name, z3_var, width) :: acc
-              | Some _ | None -> acc))
+             (* Try the value_to_node mapping (Yosys-style) *)
+             match Hashtbl.find_opt ir.ir_value_to_node id with
+             | Some node_id ->
+                 (match Hashtbl.find_opt ir.ir_nodes node_id with
+                  | Some node ->
+                      let z3_expr = ir_op_to_z3 ir node in
+                      (name, z3_expr, width) :: acc
+                  | None ->
+                      (* Last resort: output directly connected to input *)
+                      (match Hashtbl.find_opt ir.ir_inputs name with
+                       | Some (Input { id; name; width }) ->
+                           let z3_var = get_z3_var ir id width in
+                           (name, z3_var, width) :: acc
+                       | Some _ | None -> acc))
+             | None ->
+                 (* Output directly connected to input *)
+                 (match Hashtbl.find_opt ir.ir_inputs name with
+                  | Some (Input { id; name; width }) ->
+                      let z3_var = get_z3_var ir id width in
+                      (name, z3_var, width) :: acc
+                  | Some _ | None -> acc))
     | _ -> acc
   ) ir.ir_outputs [] in
   List.rev outputs
@@ -292,20 +339,31 @@ let verify_ir_equivalence ir1 ir2 =
   let outputs2 = build_ir_z3_outputs ir2 in
   Printf.printf "  Found %d outputs\n" (List.length outputs2);
 
+  (* Debug: print output names with lengths *)
+  if !Sys.interactive then begin
+    Printf.printf "  IR1 outputs: [%s]\n"
+      (String.concat ", " (List.map (fun (name, _, _) ->
+        Printf.sprintf "%s(len=%d)" name (String.length name)) outputs1));
+    Printf.printf "  IR2 outputs: [%s]\n"
+      (String.concat ", " (List.map (fun (name, _, _) ->
+        Printf.sprintf "%s(len=%d)" name (String.length name)) outputs2))
+  end;
+
   (* Match outputs by name and create equivalence constraints *)
   let matched = ref 0 in
   let constraints = List.fold_left (fun acc (name1, expr1, width1) ->
     match List.find_opt (fun (name2, _, _) -> name1 = name2) outputs2 with
-    | Some (_, expr2, width2) ->
-        if width1 = width2 then begin
+    | Some (name2, expr2, width2) ->
+        (try
+          (* Normalize widths by extending the narrower expression *)
+          let (expr1_norm, expr2_norm) = extend_to_match_width ctx false expr1 expr2 in
+          let eq = Z3.Boolean.mk_eq ctx expr1_norm expr2_norm in
           matched := !matched + 1;
-          let eq = Z3.Boolean.mk_eq ctx expr1 expr2 in
           eq :: acc
-        end else begin
-          Printf.eprintf "Warning: Output %s has different widths: %d vs %d\n"
-            name1 width1 width2;
-          acc
-        end
+        with e ->
+          Printf.eprintf "Warning: Failed to compare output %s (widths %d vs %d): %s\n"
+            name1 width1 width2 (Printexc.to_string e);
+          acc)
     | None ->
         Printf.eprintf "Warning: Output %s not found in second IR\n" name1;
         acc
@@ -365,6 +423,7 @@ let print_ir_stats ir =
       | Not _ -> "Not"
       | Compare _ -> "Compare"
       | Mux _ -> "Mux"
+      | Pmux _ -> "Pmux"
       | Shift _ -> "Shift"
       | Concat _ -> "Concat"
       | Extract _ -> "Extract"

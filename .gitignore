@@ -21,3 +21,4 @@ results/
 slpp_all/
 sysver_tests/*.v
 testcase2.sv
+test_results/

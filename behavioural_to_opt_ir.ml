@@ -201,6 +201,21 @@ let rec convert_expr ctx expr =
       if !debug then Printf.eprintf "  Warning: Unsupported expression type\n";
       get_or_create_constant ctx.ir 0 32
 
+(* Extract clock signal from Always sensitivity list *)
+let extract_clock ctx senses =
+  (* Look for edge-sensitive signals (posedge/negedge) *)
+  let rec find_clock sens_list =
+    match sens_list with
+    | [] -> None
+    | VarRef { name; _ } :: _ ->
+        (* Found a clock signal *)
+        (match Hashtbl.find_opt ctx.var_to_id name with
+         | Some id -> Some id
+         | None -> None)
+    | _ :: rest -> find_clock rest
+  in
+  find_clock senses
+
 (* Convert statement *)
 let rec convert_stmt ctx stmt =
   match stmt with
@@ -208,23 +223,70 @@ let rec convert_stmt ctx stmt =
       let rhs_id = convert_expr ctx rhs in
       Hashtbl.replace ctx.var_to_id name rhs_id;
       if !debug then Printf.eprintf "  Assign: %s <- id=%d\n" name rhs_id
-  
+
+  | Assign { lhs = VarRef { name; dtype_ref; _ }; rhs; is_blocking = false } ->
+      (* Non-blocking assignment - create Register node *)
+      let rhs_id = convert_expr ctx rhs in
+      let width = get_width_from_dtype dtype_ref in
+      (* Use the current_clock from context if available *)
+      let clock_id = match ctx.current_clock with
+        | Some clk -> clk
+        | None ->
+            (* If no clock in context, try to find one or use a dummy *)
+            if !debug then Printf.eprintf "  Warning: No clock for sequential assignment to %s\n" name;
+            rhs_id (* Fallback - use input as clock *)
+      in
+      let operation = Register {
+        width;
+        clock = clock_id;
+        reset = None;
+        enable = None;
+        reset_value = 0
+      } in
+      let node_id = add_node ctx.ir operation [rhs_id] in
+      Hashtbl.replace ctx.var_to_id name node_id;
+      if !debug then Printf.eprintf "  AssignDly: %s <- Register node_id=%d (input=%d, clock=%d)\n"
+        name node_id rhs_id clock_id
+
   | AssignW { lhs = VarRef { name; _ }; rhs } ->
       let rhs_id = convert_expr ctx rhs in
       Hashtbl.replace ctx.var_to_id name rhs_id;
       if !debug then Printf.eprintf "  AssignW: %s <- id=%d\n" name rhs_id
-  
-  | Always { stmts; _ } ->
-      List.iter (convert_stmt ctx) stmts
-  
+
+  | Always { always; senses; stmts } ->
+      (* Extract clock from sensitivity list *)
+      let old_clock = ctx.current_clock in
+      let old_sequential = ctx.in_sequential in
+      (match extract_clock ctx senses with
+       | Some clock_id ->
+           ctx.current_clock <- Some clock_id;
+           ctx.in_sequential <- true;
+           if !debug then Printf.eprintf "  Always %s with clock id=%d\n" always clock_id
+       | None ->
+           if !debug then Printf.eprintf "  Always %s (no clock found)\n" always
+      );
+      List.iter (convert_stmt ctx) stmts;
+      (* Restore context *)
+      ctx.current_clock <- old_clock;
+      ctx.in_sequential <- old_sequential
+
   | Begin { stmts; _ } ->
       List.iter (convert_stmt ctx) stmts
-  
+
+  | If { condition; then_stmt; else_stmt } ->
+      (* For now, process both branches to extract assignments *)
+      (* TODO: Create Mux nodes based on condition *)
+      if !debug then Printf.eprintf "  If statement (processing branches)\n";
+      convert_stmt ctx then_stmt;
+      (match else_stmt with
+       | Some stmt -> convert_stmt ctx stmt
+       | None -> ())
+
   | Var { name; dtype_ref; var_type = "VAR"; _ } ->
       let id = get_new_id ctx.ir in
       Hashtbl.add ctx.var_to_id name id;
       if !debug then Printf.eprintf "  Var: %s (id=%d)\n" name id
-  
+
   | _ -> ()
 
 (* Main conversion function *)

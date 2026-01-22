@@ -31,6 +31,13 @@ let () =
 
       (* Convert to IR (stub) *)
       Printf.printf "Step 4: Converting to IR...\n";
-      let module_name = Filename.chop_extension (Filename.basename filename) in
+      (* Use the actual module name from elaboration, not the filename *)
+      let module_name = match elab_ctx.module_name with
+        | Some name -> name
+        | None ->
+            (* Fallback to filename if no module found *)
+            Printf.eprintf "Warning: No module name found in elaboration, using filename\n";
+            Filename.chop_extension (Filename.basename filename)
+      in
       let _ir = Sv_verible_to_ir.verible_to_ir ast module_name in
       Printf.printf "✓ IR created (stub)\n"

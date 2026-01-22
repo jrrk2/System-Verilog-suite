@@ -155,86 +155,11 @@ let rec print_token indent token =
       print_token (indent + 1) l;
       Printf.printf "%s)\n" spaces
 
-  | CONS1 a ->
-      Printf.printf "%sCONS1 (\n" spaces;
-      print_token (indent + 1) a;
-      Printf.printf "%s)\n" spaces
-
-  | CONS2 (a, b) ->
-      Printf.printf "%sCONS2 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      Printf.printf "%s)\n" spaces
-
-  | CONS3 (a, b, c) ->
-      Printf.printf "%sCONS3 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      print_token (indent + 1) c;
-      Printf.printf "%s)\n" spaces
-
-  | CONS4 (a, b, c, d) ->
-      Printf.printf "%sCONS4 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      print_token (indent + 1) c;
-      print_token (indent + 1) d;
-      Printf.printf "%s)\n" spaces
-
-  | CONS5 (a, b, c, d, e) ->
-      Printf.printf "%sCONS5 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      print_token (indent + 1) c;
-      print_token (indent + 1) d;
-      print_token (indent + 1) e;
-      Printf.printf "%s)\n" spaces
-
-  | CONS6 (a, b, c, d, e, f) ->
-      Printf.printf "%sCONS6 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      print_token (indent + 1) c;
-      print_token (indent + 1) d;
-      print_token (indent + 1) e;
-      print_token (indent + 1) f;
-      Printf.printf "%s)\n" spaces
-
-  | CONS7 (a, b, c, d, e, f, g) ->
-      Printf.printf "%sCONS7 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      print_token (indent + 1) c;
-      print_token (indent + 1) d;
-      print_token (indent + 1) e;
-      print_token (indent + 1) f;
-      print_token (indent + 1) g;
-      Printf.printf "%s)\n" spaces
-
-  | CONS8 (a, b, c, d, e, f, g, h) ->
-      Printf.printf "%sCONS8 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      print_token (indent + 1) c;
-      print_token (indent + 1) d;
-      print_token (indent + 1) e;
-      print_token (indent + 1) f;
-      print_token (indent + 1) g;
-      print_token (indent + 1) h;
-      Printf.printf "%s)\n" spaces
-
-  | CONS9 (a, b, c, d, e, f, g, h, i) ->
-      Printf.printf "%sCONS9 (\n" spaces;
-      print_token (indent + 1) a;
-      print_token (indent + 1) b;
-      print_token (indent + 1) c;
-      print_token (indent + 1) d;
-      print_token (indent + 1) e;
-      print_token (indent + 1) f;
-      print_token (indent + 1) g;
-      print_token (indent + 1) h;
-      print_token (indent + 1) i;
-      Printf.printf "%s)\n" spaces
+  | TLIST lst ->
+      Printf.printf "%sTLIST [%d items]\n" spaces (List.length lst);
+      List.iter (fun item ->
+        print_token (indent + 1) item
+      ) lst
 
   | End_of_file -> Printf.printf "%sEnd_of_file\n" spaces
   | EMPTY_TOKEN -> Printf.printf "%sEMPTY_TOKEN\n" spaces

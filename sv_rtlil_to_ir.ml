@@ -155,6 +155,27 @@ let cell_to_ir_operation cell =
       (* TODO: Extract clock from connections *)
       Some (Register { width; clock = 0; reset = None; enable = None; reset_value = 0 })
 
+  | "$dffe" ->
+      (* D flip-flop with enable *)
+      let width = get_param cell "WIDTH" in
+      Some (Register { width; clock = 0; reset = None; enable = Some 0; reset_value = 0 })
+
+  | "$adff" ->
+      (* D flip-flop with async reset *)
+      let width = get_param cell "WIDTH" in
+      let arst_value = get_param cell "ARST_VALUE" in
+      Some (Register { width; clock = 0; reset = Some 0; enable = None; reset_value = arst_value })
+
+  | "$logic_not" ->
+      (* Logical NOT (reduction to 1-bit) *)
+      let width = get_param cell "Y_WIDTH" in
+      Some (Not { width })
+
+  | "$pmux" ->
+      (* Priority multiplexer - treat as regular mux for now *)
+      let width = get_param cell "WIDTH" in
+      Some (Mux { width })
+
   (* Unsupported or unknown cell types *)
   | _ -> None
 
@@ -265,8 +286,19 @@ let rtlil_module_to_ir rtlil_module =
                     | _ -> [])
                | _ -> [])
 
-          (* Flip-flops *)
+          (* Flip-flops - single-bit *)
           | ct when String.length ct >= 4 && String.sub ct 0 4 = "$_DF" ->
+              let d_sig = find_connection cell "D" in
+              (match d_sig with
+               | Some d ->
+                   let d_name = sigspec_to_node_name d in
+                   (match Hashtbl.find_opt wire_to_id d_name with
+                    | Some did -> [did]
+                    | None -> [])
+               | None -> [])
+
+          (* Flip-flops - multi-bit *)
+          | "$dff" | "$dffe" | "$adff" | "$sdff" ->
               let d_sig = find_connection cell "D" in
               (match d_sig with
                | Some d ->
@@ -282,21 +314,28 @@ let rtlil_module_to_ir rtlil_module =
         (* Add node to IR if we have valid inputs *)
         if input_ids <> [] then begin
           let node_id = Sv_opt_ir.add_node ir op input_ids in
+          Printf.eprintf "DEBUG: Processing cell %s, created node_id=%d\n" cell.cell_type node_id;
 
           (* Map output signal to this node *)
           let out_sig = match cell.cell_type with
-            | "$_DFF_P_" | "$_DFF_N_" -> find_connection cell "Q"
+            (* All DFF variants have Q output *)
+            | ct when String.length ct >= 4 && String.sub ct 0 4 = "$_DF" -> find_connection cell "Q"
+            | "$dff" | "$dffe" | "$adff" | "$sdff" -> find_connection cell "Q"
+            (* Everything else has Y output *)
             | _ -> find_connection cell "Y"
           in
           (match out_sig with
            | Some signal_spec ->
                let out_name = sigspec_to_node_name signal_spec in
+               Printf.printf "DEBUG: Cell %s output signal -> wire '%s', node %d\n" cell.cell_type out_name node_id;
                Hashtbl.add wire_to_id out_name node_id;
                (* If this is an output wire, map output ID to node ID *)
                (match Hashtbl.find_opt ir.ir_outputs out_name with
                 | Some (Output { id; _ }) ->
+                    Printf.printf "DEBUG: Mapping output '%s' id=%d to node=%d\n" out_name id node_id;
                     Hashtbl.add ir.ir_value_to_node id node_id
-                | _ -> ())
+                | _ ->
+                    Printf.printf "DEBUG: Wire '%s' is not an output\n" out_name)
            | None -> ())
         end else begin
           (* Inputs not ready, defer to next pass *)
