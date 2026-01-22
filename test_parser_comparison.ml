@@ -43,29 +43,13 @@ let run_verible_path input_file output_file =
   Printf.printf "\n=== Verible Path ===\n";
 
   try
-    (* Parse with Verible *)
-    match Sv_verible_to_ir.parse_verible_file input_file with
+    (* Parse with Verible and convert to IR *)
+    match Sv_verible_to_ir.file_to_ir input_file with
     | None ->
-        Printf.eprintf "Verible parsing failed\n";
+        Printf.eprintf "Verible parsing/conversion failed\n";
         None
-    | Some ast ->
-        Printf.printf "✓ Parsed with Verible\n";
-
-        (* Elaborate *)
-        let elab_ctx = Sv_elaborate.elaborate ast in
-        Printf.printf "✓ Elaboration complete\n";
-
-        (* Get module name *)
-        let module_name = match elab_ctx.Sv_elaborate.module_name with
-          | Some name -> name
-          | None -> Filename.chop_extension (Filename.basename input_file)
-        in
-
-        Printf.printf "  Module: %s\n" module_name;
-
-        (* Convert to IR *)
-        let ir = Sv_verible_to_ir.verible_to_ir ast module_name in
-        Printf.printf "✓ IR conversion complete\n";
+    | Some ir ->
+        Printf.printf "✓ Parsed with Verible and converted to IR\n";
         Printf.printf "  Inputs: %d, Outputs: %d, Nodes: %d\n"
           (Hashtbl.length ir.Sv_ast.ir_inputs)
           (Hashtbl.length ir.Sv_ast.ir_outputs)
@@ -93,17 +77,30 @@ let run_verible_path input_file output_file =
 let run_yosys_rtlil_path input_file output_file =
   Printf.printf "\n=== Yosys RTLIL Path ===\n";
 
-  (* Run Yosys to generate RTLIL *)
-  let rtlil_file = Filename.temp_file "yosys_" ".il" in
-  let cmd = Printf.sprintf "yosys -p 'read_verilog -sv %s; hierarchy -check; proc; write_rtlil %s' 2>&1"
-    input_file rtlil_file in
-  Printf.printf "Running: %s\n" cmd;
-  let status = Sys.command cmd in
+  (* Check if pre-generated RTLIL file exists *)
+  let module_name = Filename.chop_extension (Filename.basename input_file) in
+  let prebuilt_rtlil = Printf.sprintf "sysver_tests/obj_dir/%s.il" module_name in
 
-  if status <> 0 then begin
-    Printf.eprintf "Yosys failed with status %d\n" status;
-    None
-  end else begin
+  let rtlil_file, should_cleanup =
+    if Sys.file_exists prebuilt_rtlil then begin
+      Printf.printf "Using pre-generated RTLIL: %s\n" prebuilt_rtlil;
+      (prebuilt_rtlil, false)
+    end else begin
+      (* Run Yosys to generate RTLIL *)
+      let temp_file = Filename.temp_file "yosys_" ".il" in
+      let cmd = Printf.sprintf "yosys -p 'read_verilog -sv %s; hierarchy -check; proc; write_rtlil %s' 2>&1"
+        input_file temp_file in
+      Printf.printf "Running: %s\n" cmd;
+      let status = Sys.command cmd in
+      if status <> 0 then begin
+        Printf.eprintf "Yosys failed with status %d\n" status;
+        ("", false)
+      end else
+        (temp_file, true)
+    end
+  in
+
+  if rtlil_file = "" then None else begin
     try
       (* Parse RTLIL and convert to IR *)
       let design = Sv_rtlil_reader.parse_rtlil_file rtlil_file in
@@ -138,7 +135,7 @@ let run_yosys_rtlil_path input_file output_file =
 
         Printf.printf "✓ RTLIL path complete: %s\n" output_file;
         Printf.printf "  Output size: %d bytes\n" (String.length output);
-        Sys.remove rtlil_file;
+        if should_cleanup then Sys.remove rtlil_file;
         Some output
       end
     with e ->
@@ -221,8 +218,7 @@ let () =
   (* Run all three paths *)
   let verilator_output = run_verilator_path input_file (base_name ^ "_verilator.v") in
   let verible_output = run_verible_path input_file (base_name ^ "_verible.v") in
-  (* RTLIL path disabled temporarily - needs new parser integration *)
-  let rtlil_output = None in
+  let rtlil_output = run_yosys_rtlil_path input_file (base_name ^ "_rtlil.v") in
 
   (* Compare *)
   compare_outputs original verilator_output verible_output rtlil_output;
