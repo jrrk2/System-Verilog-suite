@@ -632,30 +632,77 @@ let extract_always_ff ctx event_ctrl stmt =
 (* Analyze if/else structure for async reset/set pattern *)
 (* Returns: (reset_signal, reset_polarity, reset_assigns, normal_assigns) *)
 let rec analyze_async_reset_structure reset_signal stmt =
-  Printf.printf "      analyze_async_reset_structure: reset_signal=%s\n" reset_signal;
-  (match stmt with
-   | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      Statement: TUPLE4(%s, ...)\n" s
-   | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      Statement: TUPLE6(%s, ...)\n" s
-   | _ -> Printf.printf "      Statement: Other\n");
   match stmt with
+  (* TUPLE7 conditional statement - handle this pattern *)
+  | TUPLE7 (STRING "conditional_statement2", elem1, elem2, elem3, elem4, elem5, elem6) ->
+      let _label = elem1 in
+      let _if_kw = elem2 in
+      let cond_expr = elem3 in
+      let then_stmt = elem4 in
+      let _else_kw = elem5 in
+      let else_stmt = elem6 in
+      (* Check if condition references the reset signal *)
+      let cond_str = match cond_expr with
+        | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
+        | SymbolIdentifier id -> Some id
+        | TUPLE4 (STRING "expression_in_parens1", _lparen, inner_expr, _rparen) ->
+            (* Unwrap expression_in_parens1 *)
+            (match inner_expr with
+             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
+             | SymbolIdentifier id -> Some id
+             | TUPLE3 (STRING "unary_prefix_expr2", PLING, negated) ->
+                 (* Negated condition: if (!rst) *)
+                 (match negated with
+                  | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
+                  | SymbolIdentifier id -> Some id
+                  | _ -> None)
+             | _ -> None)
+        | TUPLE3 (STRING "unary_prefix_expr2", PLING, inner) ->
+            (* Negated condition: if (!rst) *)
+            (match inner with
+             | TUPLE3 (STRING "unqualified_id1", SymbolIdentifier id, _) -> Some id
+             | SymbolIdentifier id -> Some id
+             | _ -> None)
+        | _ -> None
+      in
+
+      (match cond_str with
+       | Some cond_id when cond_id = reset_signal ->
+           (* Condition is "if (reset)" - positive polarity *)
+           let reset_assigns = extract_assigns_from_if_branch then_stmt in
+           let normal_assigns = extract_assigns_from_if_branch else_stmt in
+           Some (`Posedge, reset_assigns, normal_assigns)
+       | Some _cond_id ->
+           (* Condition might be negated reset or different signal *)
+           let then_assigns = extract_assigns_from_if_branch then_stmt in
+           let else_assigns = extract_assigns_from_if_branch else_stmt in
+           Some (`Posedge, then_assigns, else_assigns)
+       | None -> None)
+
+  (* Unwrap nested TLIST *)
+  | TLIST lst ->
+      (match lst with
+       | [single] -> analyze_async_reset_structure reset_signal single
+       | _ ->
+           (* Look for conditional in list *)
+           (match List.find_opt (fun s ->
+              match s with
+              | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _) -> true
+              | TUPLE3 (STRING "statement_item6", TUPLE6 (STRING "conditional_statement2", _, _, _, _, _), _) -> true
+              | _ -> false) lst with
+            | Some if_stmt -> analyze_async_reset_structure reset_signal if_stmt
+            | None -> None))
+
   (* Unwrap statement_item wrapper *)
   | TUPLE3 (STRING "statement_item6", inner_stmt, _) ->
-      Printf.printf "      Unwrapping statement_item6\n";
       analyze_async_reset_structure reset_signal inner_stmt
 
   (* Unwrap seq_block (begin...end) *)
   | TUPLE4 (STRING "seq_block1", _begin, inner_stmts, _end) ->
-      Printf.printf "      Unwrapping seq_block1\n";
       (match inner_stmts with
        | TLIST [single] ->
-           (match single with
-            | TUPLE3 (STRING s, _, _) -> Printf.printf "      TLIST single: TUPLE3(%s)\n" s
-            | TUPLE4 (STRING s, _, _, _) -> Printf.printf "      TLIST single: TUPLE4(%s)\n" s
-            | TUPLE6 (STRING s, _, _, _, _, _) -> Printf.printf "      TLIST single: TUPLE6(%s)\n" s
-            | _ -> Printf.printf "      TLIST single: Other\n");
            analyze_async_reset_structure reset_signal single
        | TLIST lst ->
-           Printf.printf "      TLIST with %d elements\n" (List.length lst);
            (* Multiple statements in block - look for the if/else *)
            (match List.find_opt (fun s ->
               match s with
@@ -721,15 +768,25 @@ and extract_assigns_from_if_branch stmt =
            (* Check if inner_stmt is a conditional *)
            (match inner_stmt with
             | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _)
-            | TUPLE4 (STRING "conditional_statement1", _, _, _) ->
+            | TUPLE4 (STRING "conditional_statement1", _, _, _)
+            | TUPLE5 (STRING "conditional_statement1", _, _, _, _) ->
                 extract_if_else_assigns inner_stmt
             | _ -> []))
   | TUPLE4 (STRING "seq_block1", _begin, stmts, _end) ->
       extract_assigns_from_seq_block stmts
   | TUPLE6 (STRING "conditional_statement2", _, _, _, _, _) ->
       extract_if_else_assigns stmt
+  | TUPLE7 (STRING "conditional_statement2", _, _, _, _, _, _) ->
+      extract_if_else_assigns stmt
   | TUPLE4 (STRING "conditional_statement1", _, _, _) ->
       extract_if_else_assigns stmt
+  | TUPLE5 (STRING "conditional_statement1", _, _, _, _) ->
+      extract_if_else_assigns stmt
+  | TUPLE6 (STRING "nonblocking_assignment1", _, _, _, _, _) ->
+      (* Direct nonblocking assignment *)
+      (match extract_assignment_from_stmt stmt with
+       | Some assign -> [assign]
+       | None -> [])
   | _ ->
       (match extract_assignment_from_stmt stmt with
        | Some assign -> [assign]
@@ -745,8 +802,16 @@ and extract_if_else_assigns stmt =
   (* if (cond) stmt *)
   | TUPLE4 (STRING "conditional_statement1", _if_kw, _cond, then_stmt) ->
       extract_assigns_from_if_branch then_stmt
+  | TUPLE5 (STRING "conditional_statement1", _label, _if_kw, _cond, then_stmt) ->
+      (* if (cond) stmt with label *)
+      extract_assigns_from_if_branch then_stmt
   (* if (cond) stmt1 else stmt2 *)
   | TUPLE6 (STRING "conditional_statement2", _if_kw, _cond, then_stmt, _else_kw, else_stmt) ->
+      let then_assigns = extract_assigns_from_if_branch then_stmt in
+      let else_assigns = extract_assigns_from_if_branch else_stmt in
+      then_assigns @ else_assigns
+  | TUPLE7 (STRING "conditional_statement2", _label, _if_kw, _cond, then_stmt, _else_kw, else_stmt) ->
+      (* if (cond) stmt1 else stmt2 with label *)
       let then_assigns = extract_assigns_from_if_branch then_stmt in
       let else_assigns = extract_assigns_from_if_branch else_stmt in
       then_assigns @ else_assigns
