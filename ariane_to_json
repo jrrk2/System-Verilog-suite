@@ -1,0 +1,237 @@
+#!/bin/bash
+# Generate Verilator JSON for Ariane using the official flow
+
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Generating Verilator JSON for Ariane RISC-V Processor"
+echo "  Using official ./ariane flow with all 164 files"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+
+# Clean up and prepare
+rm -rf obj_dir
+mkdir -p obj_dir
+
+# All files in the exact order from ./ariane script
+FILES=(
+  "../ariane/include/riscv_pkg.sv"
+  "../ariane/src/debug/dm_pkg.sv"
+  "../ariane/include/ariane_pkg.sv"
+  "../ariane/include/std_cache_pkg.sv"
+  "../ariane/include/serpent_cache_pkg.sv"
+  "../ariane/src/axi/src/axi_pkg.sv"
+  "../ariane/src/register_interface/src/reg_intf.sv"
+  "../ariane/include/axi_intf.sv"
+  "../ariane/tb/ariane_soc_pkg.sv"
+  "../ariane/include/ariane_axi_pkg.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/defs_div_sqrt_mvp.sv"
+  "../ariane/src/alu.sv"
+  "../ariane/src/amo_buffer.sv"
+  "../ariane/src/ariane_regfile_ff.sv"
+  "../ariane/src/ariane.sv"
+  "../ariane/src/axi_adapter.sv"
+  "../ariane/src/axi_adapter2.sv"
+  "../ariane/src/branch_unit.sv"
+  "../ariane/src/commit_stage.sv"
+  "../ariane/src/compressed_decoder.sv"
+  "../ariane/src/controller.sv"
+  "../ariane/src/csr_buffer.sv"
+  "../ariane/src/csr_regfile.sv"
+  "../ariane/src/decoder.sv"
+  "../ariane/src/ex_stage.sv"
+  "../ariane/src/fpu_wrap.sv"
+  "../ariane/src/id_stage.sv"
+  "../ariane/src/instr_realigner.sv"
+  "../ariane/src/issue_read_operands.sv"
+  "../ariane/src/issue_stage.sv"
+  "../ariane/src/load_store_unit.sv"
+  "../ariane/src/load_unit.sv"
+  "../ariane/src/mmu.sv"
+  "../ariane/src/mult.sv"
+  "../ariane/src/multiplier.sv"
+  "../ariane/src/perf_counters.sv"
+  "../ariane/src/ptw.sv"
+  "../ariane/src/re_name.sv"
+  "../ariane/src/scoreboard.sv"
+  "../ariane/src/serdiv.sv"
+  "../ariane/src/store_buffer.sv"
+  "../ariane/src/store_unit.sv"
+  "../ariane/src/tlb.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/control_mvp.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_mvp_wrapper.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/fpu_ff.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/iteration_div_sqrt_mvp.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/norm_div_sqrt_mvp.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/nrbd_nrsc_mvp.sv"
+  "../ariane/src/fpu_div_sqrt_mvp/hdl/preprocess_mvp.sv"
+  "../ariane/src/frontend/bht.sv"
+  "../ariane/src/frontend/btb.sv"
+  "../ariane/src/frontend/frontend.sv"
+  "../ariane/src/frontend/instr_scan.sv"
+  "../ariane/src/frontend/ras.sv"
+  "../ariane/src/cache_subsystem/amo_alu.sv"
+  "../ariane/src/cache_subsystem/cache_ctrl.sv"
+  "../ariane/src/cache_subsystem/miss_handler.sv"
+  "../ariane/src/cache_subsystem/serpent_cache_subsystem.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_ctrl.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_mem.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_missunit.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_wbuffer.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache.sv"
+  "../ariane/src/cache_subsystem/serpent_icache.sv"
+  "../ariane/src/cache_subsystem/serpent_l15_adapter.sv"
+  "../ariane/src/cache_subsystem/std_cache_subsystem.sv"
+  "../ariane/src/cache_subsystem/std_icache.sv"
+  "../ariane/src/cache_subsystem/std_nbdcache.sv"
+  "../ariane/src/cache_subsystem/tag_cmp.sv"
+  "../ariane/bootrom/bootrom.sv"
+  "../ariane/src/clint/axi_lite_interface.sv"
+  "../ariane/src/clint/clint.sv"
+  "../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv"
+  "../ariane/fpga/src/axi2apb/src/axi2apb_wrap.sv"
+  "../ariane/fpga/src/axi2apb/src/axi2apb.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_ar_buffer.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_r_buffer.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_single_slice.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_slice_wrap.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_slice.sv"
+  "../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv"
+  "../ariane/src/plic/plic_claim_complete_tracker.sv"
+  "../ariane/src/plic/plic_comparator.sv"
+  "../ariane/src/plic/plic_find_max.sv"
+  "../ariane/src/plic/plic_gateway.sv"
+  "../ariane/src/plic/plic_interface.sv"
+  "../ariane/src/plic/plic_target_slice.sv"
+  "../ariane/src/plic/plic.sv"
+  "../ariane/src/axi_node/src/apb_regs_top.sv"
+  "../ariane/src/axi_node/src/axi_address_decoder_AR.sv"
+  "../ariane/src/axi_node/src/axi_address_decoder_AW.sv"
+  "../ariane/src/axi_node/src/axi_address_decoder_BR.sv"
+  "../ariane/src/axi_node/src/axi_address_decoder_BW.sv"
+  "../ariane/src/axi_node/src/axi_address_decoder_DW.sv"
+  "../ariane/src/axi_node/src/axi_AR_allocator.sv"
+  "../ariane/src/axi_node/src/axi_ArbitrationTree.sv"
+  "../ariane/src/axi_node/src/axi_AW_allocator.sv"
+  "../ariane/src/axi_node/src/axi_BR_allocator.sv"
+  "../ariane/src/axi_node/src/axi_BW_allocator.sv"
+  "../ariane/src/axi_node/src/axi_DW_allocator.sv"
+  "../ariane/src/axi_node/src/axi_FanInPrimitive_Req.sv"
+  "../ariane/src/axi_node/src/axi_multiplexer.sv"
+  "../ariane/src/axi_node/src/axi_node_intf_wrap.sv"
+  "../ariane/src/axi_node/src/axi_node_wrap_with_slices.sv"
+  "../ariane/src/axi_node/src/axi_node.sv"
+  "../ariane/src/axi_node/src/axi_regs_top.sv"
+  "../ariane/src/axi_node/src/axi_request_block.sv"
+  "../ariane/src/axi_node/src/axi_response_block.sv"
+  "../ariane/src/axi_node/src/axi_RR_Flag_Req.sv"
+  "../ariane/src/axi_mem_if/src/axi2mem.sv"
+  "../ariane/src/debug/dm_csrs.sv"
+  "../ariane/src/debug/dm_mem.sv"
+  "../ariane/src/debug/dm_sba.sv"
+  "../ariane/src/debug/dm_top.sv"
+  "../ariane/src/debug/dmi_cdc.sv"
+  "../ariane/src/debug/dmi_jtag_tap.sv"
+  "../ariane/src/debug/dmi_jtag.sv"
+  "../ariane/src/debug/debug_rom/debug_rom.sv"
+  "../ariane/src/register_interface/src/apb_to_reg.sv"
+  "../ariane/src/axi/src/axi_multicut.sv"
+  "../ariane/src/common_cells/src/deprecated/generic_fifo.sv"
+  "../ariane/src/common_cells/src/deprecated/pulp_sync.sv"
+  "../ariane/src/common_cells/src/deprecated/find_first_one.sv"
+  "../ariane/src/common_cells/src/rstgen_bypass.sv"
+  "../ariane/src/common_cells/src/rstgen.sv"
+  "../ariane/src/common_cells/src/stream_mux.sv"
+  "../ariane/src/common_cells/src/stream_demux.sv"
+  "../ariane/src/common_cells/src/stream_arbiter.sv"
+  "../ariane/src/util/axi_master_connect.sv"
+  "../ariane/src/util/axi_slave_connect.sv"
+  "../ariane/src/util/axi_master_connect_rev.sv"
+  "../ariane/src/util/axi_slave_connect_rev.sv"
+  "../ariane/src/axi/src/axi_cut.sv"
+  "../ariane/src/axi/src/axi_join.sv"
+  "../ariane/src/axi/src/axi_delayer.sv"
+  "../ariane/src/axi/src/axi_to_axi_lite.sv"
+  "../ariane/src/fpga-support/rtl/SyncSpRamBeNx64.sv"
+  "../ariane/src/common_cells/src/sync.sv"
+  "../ariane/src/common_cells/src/cdc_2phase.sv"
+  "../ariane/src/common_cells/src/spill_register.sv"
+  "../ariane/src/common_cells/src/sync_wedge.sv"
+  "../ariane/src/common_cells/src/edge_detect.sv"
+  "../ariane/src/common_cells/src/fifo_v3.sv"
+  "../ariane/src/common_cells/src/fifo_v2.sv"
+  "../ariane/src/common_cells/src/fifo_v1.sv"
+  "../ariane/src/common_cells/src/lzc.sv"
+  "../ariane/src/common_cells/src/rrarbiter.sv"
+  "../ariane/src/common_cells/src/ready_valid_delay.sv"
+  "../ariane/src/common_cells/src/lfsr_8bit.sv"
+  "../ariane/src/common_cells/src/lfsr_16bit.sv"
+  "../ariane/src/common_cells/src/counter.sv"
+  "../ariane/src/common_cells/src/pipe_reg_simple.sv"
+  "../ariane/src/tech_cells_generic/src/cluster_clock_inverter.sv"
+  "../ariane/src/tech_cells_generic/src/pulp_clock_mux2.sv"
+  "../ariane/tb/ariane_testharness.sv"
+  "../ariane/tb/ariane_peripherals.sv"
+  "../ariane/tb/common/uart.sv"
+  "../ariane/tb/common/SimDTM.sv"
+  "../ariane/tb/common/SimJTAG.sv"
+  "../ariane/src/util/sram.sv"
+)
+
+echo "Running Verilator on ${#FILES[@]} files..."
+echo ""
+
+# Run Verilator with JSON output
+# Note: Using --json-only generates obj_dir/Variane.tree.json
+verilator \
+  "${FILES[@]}" \
+  +incdir+src/axi_node \
+  --unroll-count 256 \
+  -Werror-PINMISSING \
+  -Werror-IMPLICIT \
+  -Wno-fatal \
+  -Wno-PINCONNECTEMPTY \
+  -Wno-ASSIGNDLY \
+  -Wno-DECLFILENAME \
+  -Wno-UNOPTFLAT \
+  -Wno-UNUSED \
+  -Wno-WIDTHEXPAND \
+  -Wno-WIDTHTRUNC \
+  -Wno-ASCRANGE \
+  -Wno-ENUMVALUE \
+  -Wno-UNSIGNED \
+  --json-only \
+  --top-module ariane \
+  2>&1 | tee verilator_output.log
+
+EXIT_CODE=${PIPESTATUS[0]}
+
+echo ""
+echo "─────────────────────────────────────────────────────────────"
+
+if [ $EXIT_CODE -eq 0 ]; then
+  echo "✅ Verilator completed successfully"
+
+  # Check for generated JSON
+  if [ -f "obj_dir/Variane.tree.json" ]; then
+    JSON_SIZE=$(ls -lh obj_dir/Variane.tree.json | awk '{print $5}')
+    echo "✓ JSON generated: obj_dir/Variane.tree.json ($JSON_SIZE)"
+    echo ""
+    echo "You can now convert to Behavioral IR:"
+    echo "  dune exec ./test_verilator_behavioral.exe obj_dir/Variane.tree.json"
+  else
+    echo "⚠  Warning: Expected JSON file not found"
+    echo "Available files in obj_dir:"
+    ls -lh obj_dir/
+  fi
+else
+  echo "✗ Verilator failed with exit code $EXIT_CODE"
+  echo ""
+  echo "Check verilator_output.log for details"
+fi
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+
+exit $EXIT_CODE
