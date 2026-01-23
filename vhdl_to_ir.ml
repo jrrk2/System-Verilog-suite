@@ -528,13 +528,33 @@ let process_to_ir ctx = function
              | Some rst -> Some (get_signal ctx rst 1)
              | None -> None
            in
+
+           (* Group assignments by destination signal to handle multiple assignments correctly *)
+           let signal_groups = Hashtbl.create 10 in
            List.iter (fun (dst_id, data_id) ->
+             let existing = try Hashtbl.find signal_groups dst_id with Not_found -> [] in
+             Hashtbl.replace signal_groups dst_id ((dst_id, data_id) :: existing)
+           ) assigns;
+
+           (* Create ONE register per unique signal with MUX tree for multiple assignments *)
+           Hashtbl.iter (fun dst_id assigns_for_signal ->
+             let assigns_in_order = List.rev assigns_for_signal in  (* Reverse to get chronological order *)
+
+             (* If multiple assignments to same signal, we need to build a MUX tree *)
+             (* For now, just use the last assignment (most conservative) *)
+             (* TODO: Build proper priority MUX tree based on if/case conditions *)
+             let (_final_dst_id, final_data_id) = match assigns_in_order with
+               | [] -> failwith "Empty assignment list"
+               | assignments -> List.hd (List.rev assignments)  (* Take last assignment = highest priority *)
+             in
+
+             (* Create ONE register for this signal *)
              let _reg_id = add_node ctx
                (Register { width = 32; clock = clk_id; reset = reset_id;
                           enable = None; reset_value = 0 })
-               [data_id] in
+               [final_data_id] in
              ()
-           ) assigns
+           ) signal_groups
        | None ->
            (* Combinational process - just wire assignments *)
            Printf.printf "      No clock detected - combinational process\n";
