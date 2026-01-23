@@ -308,6 +308,36 @@ let extract_port_decl ctx token =
   match token with
   | TUPLE5 (STRING "port_declaration_noattr1", dir, _, data_type, _) ->
       (match data_type with
+       (* Simple wire/reg without explicit type - defaults to 1-bit *)
+       | TUPLE3 (STRING "type_identifier_or_implicit_basic_followed_by_id_and_dimensions_opt4",
+                 id_token, _) ->
+           let name = extract_identifier id_token in
+           let direction = (match dir with
+             | Input -> "input"
+             | Output -> "output"
+             | _ -> "unknown") in
+           (match name with
+            | Some n ->
+                Printf.printf "  Port: %s %s (width=1)\n" direction n;
+                (* Add to current module's ports *)
+                (match get_current_module_data ctx with
+                 | Some data -> data.mod_ports <- {port_name = n; port_direction = direction; port_width = 1} :: data.mod_ports
+                 | None -> ());
+                (* Also add to deprecated global list for compatibility *)
+                ctx.ports <- {port_name = n; port_direction = direction; port_width = 1} :: ctx.ports;
+                (* Add to current module's symbol table *)
+                let kind = if direction = "input" then PortInput else PortOutput in
+                (match get_current_symbol_table ctx with
+                 | Some tbl -> Hashtbl.replace tbl n { signal_name = n; signal_kind = kind; signal_width = 1 }
+                 | None -> ());
+                Some (direction, n, 1)
+            | None -> None)
+
+       (* Explicit data type with identifier *)
+       | TUPLE3 (STRING "data_type_or_implicit_basic_followed_by_id_and_dimensions_opt1",
+                 data_type_primitive, id_token)
+       | TUPLE3 (STRING "data_type_or_implicit_basic_followed_by_id_and_dimensions_opt4",
+                 data_type_primitive, id_token)
        | TUPLE4 (STRING "data_type_or_implicit_basic_followed_by_id_and_dimensions_opt1",
                  data_type_primitive, id_token, _)
        | TUPLE4 (STRING "data_type_or_implicit_basic_followed_by_id_and_dimensions_opt4",
@@ -376,7 +406,8 @@ let extract_port_ref ctx direction width token =
 (* Extract ports from list, tracking last port declaration for shared ports *)
 let rec extract_ports_from_list_items ctx last_dir last_width = function
   | [] -> ()
-  | COMMA :: rest -> extract_ports_from_list_items ctx last_dir last_width rest
+  | COMMA :: rest ->
+      extract_ports_from_list_items ctx last_dir last_width rest
   | TUPLE5 (STRING "port_declaration_noattr1", dir, _, data_type, _) as port :: rest ->
       (match extract_port_decl ctx port with
        | Some (direction, _, width) ->

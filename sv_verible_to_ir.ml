@@ -781,6 +781,75 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
           let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
           Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Ne; signed = false }) [left_id; right_id]
 
+      (* Comparison: < operator *)
+      | TUPLE4 (STRING "comp_expr2", left, LESS, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Lt; signed = false }) [left_id; right_id]
+
+      (* Comparison: > operator *)
+      | TUPLE4 (STRING "comp_expr3", left, GREATER, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Gt; signed = false }) [left_id; right_id]
+
+      (* Comparison: <= operator *)
+      | TUPLE4 (STRING "comp_expr4", left, LT_EQ, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Le; signed = false }) [left_id; right_id]
+
+      (* Comparison: >= operator *)
+      | TUPLE4 (STRING "comp_expr5", left, GT_EQ, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = max (get_value_width ir left_id) (get_value_width ir right_id) in
+          Sv_opt_ir.add_node ir (Compare { width; cmp_op = `Ge; signed = false }) [left_id; right_id]
+
+      (* Shift left: << operator *)
+      | TUPLE4 (STRING "shift_expr2", left, LT_LT, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = get_value_width ir left_id in
+          Sv_opt_ir.add_node ir (Shift { width; direction = `Left; arithmetic = false; amount = None }) [left_id; right_id]
+
+      (* Shift right: >> operator *)
+      | TUPLE4 (STRING "shift_expr3", left, GT_GT, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = get_value_width ir left_id in
+          Sv_opt_ir.add_node ir (Shift { width; direction = `Right; arithmetic = false; amount = None }) [left_id; right_id]
+
+      (* Arithmetic shift right: >>> operator *)
+      | TUPLE4 (STRING "shift_expr4", left, GT_GT_GT, right) ->
+          let left_id = expr_to_ir ir expr_cache symbol_table functions left in
+          let right_id = expr_to_ir ir expr_cache symbol_table functions right in
+          let width = get_value_width ir left_id in
+          Sv_opt_ir.add_node ir (Shift { width; direction = `Right; arithmetic = true; amount = None }) [left_id; right_id]
+
+      (* Unary prefix: ~ (bitwise NOT) *)
+      | TUPLE3 (STRING "unary_prefix_expr2", TILDE, operand) ->
+          let operand_id = expr_to_ir ir expr_cache symbol_table functions operand in
+          let width = get_value_width ir operand_id in
+          Sv_opt_ir.add_node ir (Not { width }) [operand_id]
+
+      (* Unary prefix: ! (logical NOT) *)
+      | TUPLE3 (STRING "unary_prefix_expr3", PLING, operand) ->
+          let operand_id = expr_to_ir ir expr_cache symbol_table functions operand in
+          (* Logical NOT returns 1-bit result *)
+          Sv_opt_ir.add_node ir (Not { width = 1 }) [operand_id]
+
+      (* Unary prefix: - (negation) *)
+      | TUPLE3 (STRING "unary_prefix_expr5", HYPHEN, operand) ->
+          let operand_id = expr_to_ir ir expr_cache symbol_table functions operand in
+          let width = get_value_width ir operand_id in
+          (* Negation is 0 - operand *)
+          let zero_id = Sv_opt_ir.get_or_create_constant ir 0 width in
+          Sv_opt_ir.add_node ir (Sub { width; signed = false }) [zero_id; operand_id]
+
       (* Logical AND: && operator *)
       | TUPLE4 (STRING "logand_expr2", left, AMPERSAND_AMPERSAND, right) ->
           let left_id = expr_to_ir ir expr_cache symbol_table functions left in
@@ -802,6 +871,10 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
 
       (* Expression or dist - unwrap to get the actual expression *)
       | TUPLE3 (STRING "expression_or_dist1", expr, EMPTY_TOKEN) ->
+          expr_to_ir ir expr_cache symbol_table functions expr
+
+      (* Parenthesized expression - unwrap *)
+      | TUPLE4 (STRING "expression_in_parens1", _lparen, expr, _rparen) ->
           expr_to_ir ir expr_cache symbol_table functions expr
 
       | _ ->
