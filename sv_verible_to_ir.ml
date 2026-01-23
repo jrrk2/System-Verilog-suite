@@ -1215,6 +1215,17 @@ let verible_to_ir verible_ast module_name =
     (Hashtbl.length ir.ir_outputs)
     (Hashtbl.length ir.ir_nodes);
 
+  (* Report any unhandled patterns encountered during conversion *)
+  if Sys.file_exists "unhandled_sv" && Sys.is_directory "unhandled_sv" then begin
+    let files = Sys.readdir "unhandled_sv" |> Array.to_list in
+    let json_files = List.filter (fun f -> Filename.check_suffix f ".json") files in
+    if List.length json_files > 0 then begin
+      Printf.printf "\n⚠ Warning: Encountered %d unhandled pattern(s) - see unhandled_sv/\n"
+        (List.length json_files);
+      Printf.printf "  Run: Sv_dump_json.create_summary() for details\n"
+    end
+  end;
+
   ir
 
 (* Main entry point: parse Verilog file and convert to IR *)

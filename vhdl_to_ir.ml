@@ -769,6 +769,18 @@ let convert_vhdl_file_to_ir filename =
 
       (* Convert to opt_ir format *)
       let ir = context_to_opt_ir ctx ctx.module_name in
+
+      (* Report any unhandled patterns encountered during conversion *)
+      if Sys.file_exists "unhandled_vhdl" && Sys.is_directory "unhandled_vhdl" then begin
+        let files = Sys.readdir "unhandled_vhdl" |> Array.to_list in
+        let json_files = List.filter (fun f -> Filename.check_suffix f ".json") files in
+        if List.length json_files > 0 then begin
+          Printf.printf "\n⚠ Warning: Encountered %d unhandled pattern(s) - see unhandled_vhdl/\n"
+            (List.length json_files);
+          Printf.printf "  Run: Vhdl_dump_json.create_summary() for details\n"
+        end
+      end;
+
       Some ir
     end
   with e ->
