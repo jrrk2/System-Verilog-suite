@@ -592,7 +592,8 @@ module Interactive = struct
     Printf.printf "  test-miter <vhdl> <sv>        Formal Z3 miter verification (VHDL ≡ SV)\n";
     Printf.printf "  test-z3-simple <vhdl> <sv>    Structural Z3 verification\n\n";
     Printf.printf "Synthesis:\n";
-    Printf.printf "  synth-yosys <file.v> [out.il] Synthesize with Yosys, output RTLIL/ILANG\n\n";
+    Printf.printf "  synth-yosys <file.v> [out.il] Synthesize with Yosys, output RTLIL/ILANG\n";
+    Printf.printf "  verilator-json <file.v> [out.json] Parse with Verilator, output JSON AST\n\n";
     Printf.printf "Verification:\n";
     Printf.printf "  verify <orig.json> <hc.json>  Verify equivalence between files\n\n";
     Printf.printf "Shell Operations:\n";
@@ -887,6 +888,56 @@ module Interactive = struct
     | "synth-yosys" :: _ ->
         Printf.printf "✗ Usage: synth-yosys <file.v> [output.il]\n";
         Printf.printf "  If output file is omitted, RTLIL is written to stdout\n"
+    | "verilator-json" :: sv_file :: output_file :: _ ->
+        if not (Sys.file_exists sv_file) then
+          Printf.printf "✗ Error: File not found: %s\n" sv_file
+        else begin
+          Printf.printf "Parsing %s with Verilator...\n" sv_file;
+          let verilator_cmd = Printf.sprintf "verilator --json-only --json-only-output %s -Wno-fatal %s 2>&1"
+            output_file sv_file in
+          let exit_code = Sys.command verilator_cmd in
+          if exit_code = 0 then
+            Printf.printf "✓ JSON output complete: %s\n" output_file
+          else
+            Printf.printf "✗ Verilator failed with exit code %d\n" exit_code
+        end
+    | "verilator-json" :: sv_file :: [] ->
+        if not (Sys.file_exists sv_file) then
+          Printf.printf "✗ Error: File not found: %s\n" sv_file
+        else begin
+          Printf.printf "Parsing %s with Verilator (output to stdout)...\n" sv_file;
+          Printf.printf "─────────────────────────────────────────────────────\n";
+          let verilator_cmd = Printf.sprintf "verilator --json-only --json-only-output /dev/stdout -Wno-fatal %s 2>&1"
+            sv_file in
+          (* Use popen to capture output and filter *)
+          let ic = Unix.open_process_in verilator_cmd in
+          let rec skip_until_brace () =
+            try
+              let line = input_line ic in
+              if String.length line > 0 && line.[0] = '{' then begin
+                (* Found the start of JSON, print this line and all remaining *)
+                Printf.printf "%s\n" line;
+                try
+                  while true do
+                    Printf.printf "%s\n" (input_line ic)
+                  done
+                with End_of_file -> ()
+              end else
+                skip_until_brace ()
+            with End_of_file -> ()
+          in
+          skip_until_brace ();
+          let status = Unix.close_process_in ic in
+          Printf.printf "─────────────────────────────────────────────────────\n";
+          match status with
+          | Unix.WEXITED 0 -> Printf.printf "✓ JSON output complete\n"
+          | Unix.WEXITED n -> Printf.printf "✗ Verilator failed with exit code %d\n" n
+          | _ -> Printf.printf "✗ Verilator terminated abnormally\n"
+        end
+    | "verilator-json" :: _ ->
+        Printf.printf "✗ Usage: verilator-json <file.v> [output.json]\n";
+        Printf.printf "  If output file is omitted, JSON is written to stdout\n";
+        Printf.printf "  Note: Messages before '{' are automatically filtered\n"
     | "cd" :: dir :: _ -> change_directory state dir
     | "pwd" :: _ -> print_working_directory state
     | "ls" :: rest ->
