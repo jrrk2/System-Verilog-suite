@@ -48,14 +48,70 @@ let rec width_of_btype = function
   | BArray { element; size } -> size * (width_of_btype element)
   | BStruct _ -> 32
 
+(* Strip SSA suffix from variable name (RST_0 → RST) *)
+let strip_ssa_suffix name =
+  try
+    let last_underscore = String.rindex name '_' in
+    let suffix = String.sub name (last_underscore + 1)
+                            (String.length name - last_underscore - 1) in
+    (* Check if suffix is a number *)
+    if String.length suffix > 0 &&
+       String.for_all (fun c -> c >= '0' && c <= '9') suffix then
+      String.sub name 0 last_underscore
+    else
+      name
+  with Not_found -> name
+
+(* Get width from behavioral IR type - USE THE TYPE INFO THAT'S ALREADY THERE! *)
+(* Now takes widths hashtable for variable lookup *)
+let rec width_of_expr_ctx widths = function
+  | BVar name ->
+      (* Look up variable width, try SSA-stripped name *)
+      (match Hashtbl.find_opt widths name with
+       | Some w -> Some w
+       | None ->
+           let stripped = strip_ssa_suffix name in
+           Hashtbl.find_opt widths stripped)
+  | BConst { width; _ } -> Some width
+  | BBinOp { result_type; _ } -> Some (width_of_btype result_type)
+  | BUnOp { result_type; _ } -> Some (width_of_btype result_type)
+  | BCond { then_val; _ } -> width_of_expr_ctx widths then_val  (* Width of branches *)
+  | BSlice { msb; lsb; _ } -> Some (msb - lsb + 1)
+  | BConcat exprs ->
+      let widths_list = List.filter_map (width_of_expr_ctx widths) exprs in
+      Some (List.fold_left (+) 0 widths_list)
+  | BReplicate { count; value } ->
+      Option.map (fun w -> count * w) (width_of_expr_ctx widths value)
+  | BSelect _ | BCall _ -> None  (* Need more info *)
+
+(* Simple version without context for backward compatibility *)
+let rec width_of_expr = function
+  | BVar _ -> None
+  | BConst { width; _ } -> Some width
+  | BBinOp { result_type; _ } -> Some (width_of_btype result_type)
+  | BUnOp { result_type; _ } -> Some (width_of_btype result_type)
+  | BCond { then_val; _ } -> width_of_expr then_val
+  | BSlice { msb; lsb; _ } -> Some (msb - lsb + 1)
+  | BConcat exprs ->
+      let widths = List.filter_map width_of_expr exprs in
+      Some (List.fold_left (+) 0 widths)
+  | BReplicate { count; value } ->
+      Option.map (fun w -> count * w) (width_of_expr value)
+  | BSelect _ | BCall _ -> None
+
 (* Convert behavioral IR expression to Z3 *)
 let rec expr_to_z3 suffix ctx_sigs = function
   | BVar name ->
-      (* Look up width from context *)
+      (* Look up width from context, trying SSA-stripped name if not found *)
       let width =
         match List.assoc_opt name ctx_sigs with
         | Some w -> w
-        | None -> 32  (* Default *)
+        | None ->
+            (* Try stripped name (RST_0 → RST) *)
+            let stripped = strip_ssa_suffix name in
+            match List.assoc_opt stripped ctx_sigs with
+            | Some w -> w
+            | None -> 32  (* Last resort fallback *)
       in
       bv_var name width suffix
 
@@ -136,15 +192,28 @@ let rec expr_to_z3 suffix ctx_sigs = function
 (* Encode statement as Z3 constraint *)
 let rec encode_stmt suffix ctx_sigs solver = function
   | BAssign { lhs; rhs } ->
+      (* Get width from RHS expression directly! *)
       let width =
-        match List.assoc_opt lhs ctx_sigs with
+        match width_of_expr rhs with
         | Some w -> w
-        | None -> 32
+        | None ->
+            (* Fallback to context lookup *)
+            match List.assoc_opt lhs ctx_sigs with
+            | Some w -> w
+            | None -> 32  (* Last resort *)
       in
-      let z3_lhs = bv_var lhs width suffix in
-      let z3_rhs = expr_to_z3 suffix ctx_sigs rhs in
-      let eq = Z3.Boolean.mk_eq ctx z3_lhs z3_rhs in
-      Z3.Solver.add solver [eq]
+      (try
+        let z3_lhs = bv_var lhs width suffix in
+        let z3_rhs = expr_to_z3 suffix ctx_sigs rhs in
+        (* Just trust that widths match - expr_to_z3 should handle it *)
+        let eq = Z3.Boolean.mk_eq ctx z3_lhs z3_rhs in
+        Z3.Solver.add solver [eq]
+       with Z3.Error msg ->
+        Printf.eprintf "Error encoding assignment: %s := <rhs>\n" lhs;
+        Printf.eprintf "  LHS width: %d\n" width;
+        Printf.eprintf "  Z3 error: %s\n" msg;
+        raise (Z3.Error msg)
+      )
 
   | BIf { condition; then_stmts; else_stmts } ->
       (* Simplified: encode all branches *)
@@ -170,16 +239,64 @@ let encode_process suffix ctx_sigs solver = function
   | BCombinational { body; _ } | BSequential { body; _ } ->
       List.iter (encode_stmt suffix ctx_sigs solver) body
 
+(* Infer widths from assignments - walk all statements to find actual widths *)
+let rec infer_widths_from_stmt widths = function
+  | BAssign { lhs; rhs } ->
+      (* Get width from RHS expression using context *)
+      let width =
+        match width_of_expr_ctx widths rhs with
+        | Some w -> w
+        | None -> 32  (* Default if we can't infer *)
+      in
+      Hashtbl.replace widths lhs width
+
+  | BIf { then_stmts; else_stmts; _ } ->
+      List.iter (infer_widths_from_stmt widths) then_stmts;
+      List.iter (infer_widths_from_stmt widths) else_stmts
+
+  | BCase { cases; default; _ } ->
+      List.iter (fun (_, stmts) ->
+        List.iter (infer_widths_from_stmt widths) stmts
+      ) cases;
+      List.iter (infer_widths_from_stmt widths) default
+
+  | BWhile { body; _ } | BFor { body; _ } | BBlock body ->
+      List.iter (infer_widths_from_stmt widths) body
+
+  | BCallStmt _ | BReturn _ -> ()
+
+let infer_widths_from_process widths = function
+  | BCombinational { body; _ } | BSequential { body; _ } ->
+      List.iter (infer_widths_from_stmt widths) body
+
+let infer_widths_from_module bmod =
+  let widths = Hashtbl.create 256 in
+
+  (* Add signal widths *)
+  List.iter (fun (signal : bsignal) ->
+    Hashtbl.add widths signal.name (width_of_btype signal.stype)
+  ) bmod.signals;
+
+  (* Infer widths from all assignments in all processes *)
+  List.iter (infer_widths_from_process widths) bmod.processes;
+
+  widths
+
 (* Build signal width context from module *)
 let build_signal_context bmod =
-  List.map (fun (signal : bsignal) ->
-    (signal.name, width_of_btype signal.stype)
-  ) bmod.signals
+  let widths = infer_widths_from_module bmod in
+  Hashtbl.fold (fun name width acc -> (name, width) :: acc) widths []
 
 (* Encode module as Z3 constraints with suffix *)
 let encode_module bmod suffix =
   let solver = Z3.Solver.mk_simple_solver ctx in
   let ctx_sigs = build_signal_context bmod in
+
+  (* Debug: print inferred widths *)
+  Printf.printf "  Inferred widths for %s (%d signals):\n" bmod.name (List.length ctx_sigs);
+  List.iter (fun (name, width) ->
+    Printf.printf "    %s: %d bits\n" name width
+  ) (List.sort (fun (a,_) (b,_) -> String.compare a b) ctx_sigs);
 
   (* Encode all processes *)
   List.iter (encode_process suffix ctx_sigs solver) bmod.processes;
