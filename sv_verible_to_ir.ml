@@ -806,13 +806,8 @@ let rec expr_to_ir ir expr_cache symbol_table functions expr =
 
       | _ ->
           Printf.eprintf "\n=== Warning: Unhandled expression type ===\n";
-          (* Write full token to file for inspection *)
-          let oc = open_out_gen [Open_wronly; Open_append; Open_creat] 0o644 "unhandled_tokens.txt" in
-          Printf.fprintf oc "\n=== Unhandled Expression ===\n";
-          Printf.fprintf oc "%s\n" (token_to_json_string ~max_depth:5 0 expr);
-          Printf.fprintf oc "============================\n\n";
-          close_out oc;
-          Printf.eprintf "Token structure dumped to unhandled_tokens.txt\n";
+          (* Dump to JSON for detailed inspection *)
+          Sv_dump_json.dump_unhandled "expression" "expr" expr;
           Printf.eprintf "==========================================\n\n";
           Sv_opt_ir.get_new_id ir
     in
