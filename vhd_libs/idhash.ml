@@ -1,0 +1,1 @@
+type idhash = {id:string}

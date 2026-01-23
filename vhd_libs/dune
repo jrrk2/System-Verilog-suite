@@ -1,0 +1,20 @@
+; VHDL and Verilog parser libraries
+
+(ocamllex VhdlLexer vlexer)
+
+(menhir
+ (modules VhdlParser))
+
+; Verilog frontend library
+(library
+ (name ver_front)
+ (modules ord globals idhash vparser vlexer vparse setup const dump check semantics)
+ (libraries str unix num menhirLib)
+ (flags (:standard -w -33-35-38)))
+
+; VHDL frontend library
+(library
+ (name vhd_front)
+ (modules VhdlTypes asctoken VhdlTree vabstraction VhdlParser VhdlLexer VhdlSettings VhdlMain rewrite)
+ (libraries str unix num menhirLib ver_front)
+ (flags (:standard -open Ver_front -w -33-35-38)))

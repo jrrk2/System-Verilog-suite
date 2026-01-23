@@ -5,7 +5,7 @@ let parse_vhdl_file filename =
   let chan = open_in filename in
   let lexbuf = Lexing.from_channel chan in
   try
-    let ast = VhdlParser.top_level_file VhdlLexer.lexer lexbuf in
+    let ast = Vhd_front.VhdlParser.top_level_file Vhd_front.VhdlLexer.lexer lexbuf in
     close_in chan;
     Some ast
   with

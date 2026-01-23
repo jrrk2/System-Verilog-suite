@@ -1,0 +1,6 @@
+module Sv_ast = Dune__exe__Sv_ast
+module Sv_elaborate = Dune__exe__Sv_elaborate
+module Behavioural_to_opt_ir = Dune__exe__Behavioural_to_opt_ir
+module Sv_verible_to_ir = Dune__exe__Sv_verible_to_ir
+module Source_text_verible_types = Dune__exe__Source_text_verible_types
+module Source_text_verible_tokens = Dune__exe__Source_text_verible_tokens

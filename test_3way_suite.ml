@@ -114,6 +114,18 @@ let () =
     ("sysver_tests/test_15_priority_encoder.sv", "test_priority");
     ("sysver_tests/signed_mult.sv", "signed_mult");
     ("sysver_tests/enable_test.sv", "enable_test");
+    (* APB UART modules - formally verified *)
+    ("sysver_tests/slib_clock_div.sv", "slib_clock_div");
+    ("sysver_tests/slib_counter.sv", "slib_counter");
+    ("sysver_tests/slib_edge_detect.sv", "slib_edge_detect");
+    ("sysver_tests/slib_fifo.sv", "slib_fifo");
+    ("sysver_tests/slib_input_filter.sv", "slib_input_filter");
+    ("sysver_tests/slib_input_sync.sv", "slib_input_sync");
+    ("sysver_tests/slib_mv_filter.sv", "slib_mv_filter");
+    ("sysver_tests/uart_baudgen.sv", "uart_baudgen");
+    ("sysver_tests/uart_interrupt.sv", "uart_interrupt");
+    ("sysver_tests/uart_receiver.sv", "uart_receiver");
+    ("sysver_tests/uart_transmitter.sv", "uart_transmitter");
   ] in
 
   Printf.printf "========================================\n";

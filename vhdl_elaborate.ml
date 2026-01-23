@@ -1,6 +1,6 @@
 (* VHDL Elaborator - Extract processes and assignments from VHDL AST *)
 
-open VhdlTypes
+open Vhd_front.VhdlTypes
 
 (* Extract architecture body from design units *)
 let get_architecture_body design_file =
