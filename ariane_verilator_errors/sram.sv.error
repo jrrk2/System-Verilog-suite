@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/src/util/sram.sv:57:9: Cannot find file containing module: 'SyncSpRamBeNx64'
+   57 |         SyncSpRamBeNx64 #(
+      |         ^~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        SyncSpRamBeNx64
+                        SyncSpRamBeNx64.v
+                        SyncSpRamBeNx64.sv
+                        obj_dir/SyncSpRamBeNx64
+                        obj_dir/SyncSpRamBeNx64.v
+                        obj_dir/SyncSpRamBeNx64.sv
+%Error: Exiting due to 1 error(s)

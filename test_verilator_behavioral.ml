@@ -30,10 +30,101 @@ let test_verilator_file json_file =
         Printf.printf "⚠️  No modules found in Verilator JSON\n";
         false
       end else begin
+        (* Print ALL modules first *)
+        Printf.printf "═══════════════════════════════════════════════════════════════\n";
+        Printf.printf "  All Converted Modules\n";
+        Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
+
+        Printf.printf "%-35s %8s %10s %10s\n" "Module Name" "Signals" "Processes" "Instances";
+        Printf.printf "%s\n" (String.make 70 '-');
+
+        let empty_count = ref 0 in
+        List.iteri (fun i (m : Behavioral_ir.bmodule) ->
+          let sig_count = List.length m.signals in
+          let proc_count = List.length m.processes in
+          let inst_count = List.length m.instances in
+
+          let flag = if sig_count = 0 && proc_count = 0 then begin
+            incr empty_count;
+            " ⚠️"
+          end else "" in
+
+          Printf.printf "%-35s %8d %10d %10d%s\n"
+            m.name sig_count proc_count inst_count flag
+        ) bprog.modules;
+
+        Printf.printf "\n";
+        if !empty_count > 0 then
+          Printf.printf "⚠️  %d modules have 0 signals and 0 processes\n\n" !empty_count;
+
+        (* Check for std_icache specifically *)
+        Printf.printf "═══════════════════════════════════════════════════════════════\n";
+        Printf.printf "  std_icache Analysis\n";
+        Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
+
+        let std_icache_opt = List.find_opt (fun m -> m.name = "std_icache") bprog.modules in
+        (match std_icache_opt with
+        | Some icache ->
+            Printf.printf "✓ std_icache found in converted modules\n\n";
+            Printf.printf "  Signals: %d\n" (List.length icache.signals);
+            Printf.printf "  Processes: %d\n" (List.length icache.processes);
+            Printf.printf "  Instances: %d\n\n" (List.length icache.instances);
+
+            if List.length icache.signals > 0 then begin
+              Printf.printf "  First 20 signals:\n";
+              List.iteri (fun i s ->
+                if i < 20 then
+                  Printf.printf "    [%2d] %s\n" (i+1) s.name
+              ) icache.signals;
+
+              (* Count _q signals *)
+              let q_signals = List.filter (fun s ->
+                String.length s.name >= 2 &&
+                String.sub s.name (String.length s.name - 2) 2 = "_q"
+              ) icache.signals in
+
+              Printf.printf "\n  Signals ending in _q: %d\n" (List.length q_signals);
+              List.iter (fun s ->
+                Printf.printf "    - %s\n" s.name
+              ) q_signals;
+            end;
+
+            if List.length icache.processes > 0 then begin
+              Printf.printf "\n  Processes:\n";
+              List.iteri (fun i proc ->
+                match proc with
+                | Behavioral_ir.BSequential { name; clock; clock_edge; body; _ } ->
+                    Printf.printf "    [%d] Sequential: %s\n" (i+1) name;
+                    Printf.printf "        Clock: %s (%s)\n" clock
+                      (match clock_edge with `Pos -> "posedge" | `Neg -> "negedge");
+                    Printf.printf "        Body statements: %d\n" (List.length body)
+                | Behavioral_ir.BCombinational { name; body; _ } ->
+                    Printf.printf "    [%d] Combinational: %s\n" (i+1) name;
+                    Printf.printf "        Body statements: %d\n" (List.length body)
+              ) icache.processes
+            end;
+
+            if List.length icache.signals = 0 then
+              Printf.printf "\n  ❌ PROBLEM: std_icache has 0 signals (expected ~47 from JSON)\n";
+            if List.length icache.processes = 0 then
+              Printf.printf "  ❌ PROBLEM: std_icache has 0 processes (expected 3 from JSON)\n"
+
+        | None ->
+            Printf.printf "❌ std_icache NOT FOUND in converted modules\n";
+            Printf.printf "\nModules containing 'cache':\n";
+            List.iter (fun m ->
+              if String.contains (String.lowercase_ascii m.name) 'c' &&
+                 String.contains (String.lowercase_ascii m.name) 'a' then
+                Printf.printf "  - %s\n" m.name
+            ) bprog.modules);
+
+        Printf.printf "\n";
+
+        (* Now proceed with optimization on the first module *)
         let bmod = List.hd bprog.modules in
-        Printf.printf "Module: %s\n" bmod.name;
-        Printf.printf "  Signals: %d\n" (List.length bmod.signals);
-        Printf.printf "  Processes: %d\n\n" (List.length bmod.processes);
+        Printf.printf "═══════════════════════════════════════════════════════════════\n";
+        Printf.printf "  Optimization Test (on first module: %s)\n" bmod.name;
+        Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
 
         (* Step 2: Run optimization pipeline *)
         Printf.printf "[2/3] Running Optimization Pipeline...\n";
@@ -94,14 +185,56 @@ let test_verilator_file json_file =
         Printf.printf "  ✅ Can compare Verilator vs Verible frontends\n\n";
 
         Printf.printf "═══════════════════════════════════════════════════════════════\n";
-        Printf.printf "  ✅ SUCCESS\n";
+        Printf.printf "  Register Inference on ALL Modules\n";
         Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
 
-        Printf.printf "Verilator JSON successfully processed through behavioral IR!\n";
-        Printf.printf "Module %s: %d registers, %d wires\n\n"
-          opt_mod.name
-          (List.length ctx.registers)
-          (List.length ctx.wires);
+        (* Run register inference on ALL optimized modules *)
+        Printf.printf "%-35s %10s %10s\n" "Module Name" "Registers" "Wires";
+        Printf.printf "%s\n" (String.make 60 '-');
+
+        let total_registers = ref 0 in
+        let total_wires = ref 0 in
+
+        List.iter (fun (opt_m : Behavioral_ir.bmodule) ->
+          let ctx = Behavioral_registers.analyze_module opt_m in
+          let reg_count = List.length ctx.registers in
+          let wire_count = List.length ctx.wires in
+
+          total_registers := !total_registers + reg_count;
+          total_wires := !total_wires + wire_count;
+
+          Printf.printf "%-35s %10d %10d\n"
+            opt_m.name reg_count wire_count
+        ) optimized.modules;
+
+        Printf.printf "%s\n" (String.make 60 '-');
+        Printf.printf "%-35s %10d %10d\n" "TOTAL" !total_registers !total_wires;
+
+        Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
+        Printf.printf "  Summary\n";
+        Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
+
+        Printf.printf "Modules converted:        %d\n" (List.length bprog.modules);
+        Printf.printf "Total registers found:    %d\n" !total_registers;
+        Printf.printf "Total wires found:        %d\n" !total_wires;
+        Printf.printf "Empty modules (0/0):      %d\n\n" !empty_count;
+
+        (* Check std_icache register count *)
+        let std_icache_opt = List.find_opt (fun m -> m.name = "std_icache") optimized.modules in
+        (match std_icache_opt with
+        | Some icache ->
+            let ctx = Behavioral_registers.analyze_module icache in
+            Printf.printf "std_icache register count: %d\n" (List.length ctx.registers);
+            if List.length ctx.registers = 0 then
+              Printf.printf "  ❌ Expected 7 registers from JSON, got 0\n"
+            else
+              Printf.printf "  ✓ Found registers\n"
+        | None ->
+            Printf.printf "std_icache: NOT FOUND\n");
+
+        Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
+        Printf.printf "  ✅ ANALYSIS COMPLETE\n";
+        Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
 
         true
       end

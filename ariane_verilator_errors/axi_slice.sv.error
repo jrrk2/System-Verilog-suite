@@ -1,0 +1,25 @@
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_slice.sv:141:4: Cannot find file containing module: 'axi_aw_buffer'
+  141 |    axi_aw_buffer
+      |    ^~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_aw_buffer
+                        axi_aw_buffer.v
+                        axi_aw_buffer.sv
+                        obj_dir/axi_aw_buffer
+                        obj_dir/axi_aw_buffer.v
+                        obj_dir/axi_aw_buffer.sv
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_slice.sv:184:4: Cannot find file containing module: 'axi_ar_buffer'
+  184 |    axi_ar_buffer
+      |    ^~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_slice.sv:227:4: Cannot find file containing module: 'axi_w_buffer'
+  227 |    axi_w_buffer
+      |    ^~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_slice.sv:255:4: Cannot find file containing module: 'axi_r_buffer'
+  255 |    axi_r_buffer
+      |    ^~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_slice.sv:286:4: Cannot find file containing module: 'axi_b_buffer'
+  286 |    axi_b_buffer
+      |    ^~~~~~~~~~~~
+%Error: Exiting due to 5 error(s)

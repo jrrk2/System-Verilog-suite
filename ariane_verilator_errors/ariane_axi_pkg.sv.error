@@ -1,0 +1,104 @@
+%Error: ../ariane/include/ariane_axi_pkg.sv:40:9: Package/class for ':: reference' not found: 'axi_pkg'
+   40 |         axi_pkg::len_t    len;
+      |         ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/include/ariane_axi_pkg.sv:40:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   40 |         axi_pkg::len_t    len;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:41:9: Package/class for ':: reference' not found: 'axi_pkg'
+   41 |         axi_pkg::size_t   size;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:41:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   41 |         axi_pkg::size_t   size;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:42:9: Package/class for ':: reference' not found: 'axi_pkg'
+   42 |         axi_pkg::burst_t  burst;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:42:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   42 |         axi_pkg::burst_t  burst;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:44:9: Package/class for ':: reference' not found: 'axi_pkg'
+   44 |         axi_pkg::cache_t  cache;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:44:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   44 |         axi_pkg::cache_t  cache;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:45:9: Package/class for ':: reference' not found: 'axi_pkg'
+   45 |         axi_pkg::prot_t   prot;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:45:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   45 |         axi_pkg::prot_t   prot;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:46:9: Package/class for ':: reference' not found: 'axi_pkg'
+   46 |         axi_pkg::qos_t    qos;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:46:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   46 |         axi_pkg::qos_t    qos;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:47:9: Package/class for ':: reference' not found: 'axi_pkg'
+   47 |         axi_pkg::region_t region;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:47:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   47 |         axi_pkg::region_t region;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:48:9: Package/class for ':: reference' not found: 'axi_pkg'
+   48 |         axi_pkg::atop_t   atop;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:48:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   48 |         axi_pkg::atop_t   atop;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:61:9: Package/class for ':: reference' not found: 'axi_pkg'
+   61 |         axi_pkg::resp_t resp;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:61:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   61 |         axi_pkg::resp_t resp;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:68:9: Package/class for ':: reference' not found: 'axi_pkg'
+   68 |         axi_pkg::len_t    len;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:68:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   68 |         axi_pkg::len_t    len;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:69:9: Package/class for ':: reference' not found: 'axi_pkg'
+   69 |         axi_pkg::size_t   size;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:69:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   69 |         axi_pkg::size_t   size;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:70:9: Package/class for ':: reference' not found: 'axi_pkg'
+   70 |         axi_pkg::burst_t  burst;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:70:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   70 |         axi_pkg::burst_t  burst;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:72:9: Package/class for ':: reference' not found: 'axi_pkg'
+   72 |         axi_pkg::cache_t  cache;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:72:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   72 |         axi_pkg::cache_t  cache;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:73:9: Package/class for ':: reference' not found: 'axi_pkg'
+   73 |         axi_pkg::prot_t   prot;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:73:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   73 |         axi_pkg::prot_t   prot;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:74:9: Package/class for ':: reference' not found: 'axi_pkg'
+   74 |         axi_pkg::qos_t    qos;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:74:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   74 |         axi_pkg::qos_t    qos;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:75:9: Package/class for ':: reference' not found: 'axi_pkg'
+   75 |         axi_pkg::region_t region;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:75:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   75 |         axi_pkg::region_t region;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:82:9: Package/class for ':: reference' not found: 'axi_pkg'
+   82 |         axi_pkg::resp_t resp;
+      |         ^~~~~~~
+%Error: ../ariane/include/ariane_axi_pkg.sv:82:9: Package/class for 'class/package reference' not found: 'axi_pkg'
+   82 |         axi_pkg::resp_t resp;
+      |         ^~~~~~~
+%Error: Exiting due to 34 error(s)

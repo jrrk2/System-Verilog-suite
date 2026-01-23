@@ -1,0 +1,5 @@
+%Error: ../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_mvp_wrapper.sv:39:8: Import package not found: 'defs_div_sqrt_mvp'
+   39 | import defs_div_sqrt_mvp::*;
+      |        ^~~~~~~~~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: Exiting due to 1 error(s)

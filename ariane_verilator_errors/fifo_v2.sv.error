@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/src/common_cells/src/fifo_v2.sv:51:5: Cannot find file containing module: 'fifo_v3'
+   51 |     fifo_v3 #(
+      |     ^~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        fifo_v3
+                        fifo_v3.v
+                        fifo_v3.sv
+                        obj_dir/fifo_v3
+                        obj_dir/fifo_v3.v
+                        obj_dir/fifo_v3.sv
+%Error: Exiting due to 1 error(s)

@@ -1,0 +1,5 @@
+%Error: ../ariane/src/cache_subsystem/serpent_icache.sv:27:8: Import package not found: 'ariane_pkg'
+   27 | import ariane_pkg::*;
+      |        ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: Exiting due to 1 error(s)

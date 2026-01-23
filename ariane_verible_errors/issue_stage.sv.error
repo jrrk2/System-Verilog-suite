@@ -1,0 +1,12 @@
+File "vhd_libs/globals.ml", line 1:
+Error: The implementation "vhd_libs/globals.ml"
+       does not match the interface "vhd_libs/globals.ml": 
+       The value "tmpnam" is required but not provided
+       File "vhd_libs/globals.mli", line 86, characters 0-19:
+         Expected declaration
+       The value "logfile" is required but not provided
+       File "vhd_libs/globals.mli", line 99, characters 0-28:
+         Expected declaration
+       The value "log_open" is required but not provided
+       File "vhd_libs/globals.mli", line 114, characters 0-27:
+         Expected declaration

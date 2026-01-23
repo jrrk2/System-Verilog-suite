@@ -1,0 +1,26 @@
+%Error: ../ariane/src/amo_buffer.sv:24:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   24 |     input  ariane_pkg::amo_t amo_op_i,            
+      |            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/amo_buffer.sv:24:12: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   24 |     input  ariane_pkg::amo_t amo_op_i,            
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/amo_buffer.sv:29:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   29 |     output ariane_pkg::amo_req_t  amo_req_o,           
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/amo_buffer.sv:29:12: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   29 |     output ariane_pkg::amo_req_t  amo_req_o,           
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/amo_buffer.sv:30:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   30 |     input  ariane_pkg::amo_resp_t amo_resp_i,          
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/amo_buffer.sv:30:12: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   30 |     input  ariane_pkg::amo_resp_t amo_resp_i,          
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/amo_buffer.sv:39:9: Package/class for ':: reference' not found: 'ariane_pkg'
+   39 |         ariane_pkg::amo_t        op;
+      |         ^~~~~~~~~~
+%Error: ../ariane/src/amo_buffer.sv:39:9: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   39 |         ariane_pkg::amo_t        op;
+      |         ^~~~~~~~~~
+%Error: Exiting due to 8 error(s)

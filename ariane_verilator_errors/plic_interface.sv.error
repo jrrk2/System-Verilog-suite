@@ -1,0 +1,8 @@
+%Error: ../ariane/src/plic/plic_interface.sv:48:5: Cannot find file containing interface: 'REG_BUS'
+   48 |     REG_BUS.in                           external_bus_io                             
+      |     ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: Internal Error: ../ariane/src/plic/plic_interface.sv:48:5: ../V3LinkDot.cpp:3241: Unlinked interface
+   48 |     REG_BUS.in                           external_bus_io                             
+      |     ^~~~~~~
+                        ... This fatal error may be caused by the earlier error(s); resolve those first.

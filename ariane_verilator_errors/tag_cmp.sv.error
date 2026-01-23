@@ -1,0 +1,20 @@
+%Error: ../ariane/src/cache_subsystem/tag_cmp.sv:21:48: Package/class for ':: reference' not found: 'std_cache_pkg'
+   21 |     parameter type l_data_t                  = std_cache_pkg::cache_line_t,
+      |                                                ^~~~~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/cache_subsystem/tag_cmp.sv:21:48: Package/class for 'class/package reference' not found: 'std_cache_pkg'
+   21 |     parameter type l_data_t                  = std_cache_pkg::cache_line_t,
+      |                                                ^~~~~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/tag_cmp.sv:22:48: Package/class for ':: reference' not found: 'std_cache_pkg'
+   22 |     parameter type l_be_t                    = std_cache_pkg::cl_be_t,
+      |                                                ^~~~~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/tag_cmp.sv:22:48: Package/class for 'class/package reference' not found: 'std_cache_pkg'
+   22 |     parameter type l_be_t                    = std_cache_pkg::cl_be_t,
+      |                                                ^~~~~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/tag_cmp.sv:35:36: Package/class for ':: reference' not found: 'ariane_pkg'
+   35 |     input  logic    [NR_PORTS-1:0][ariane_pkg::DCACHE_TAG_WIDTH-1:0] tag_i,  
+      |                                    ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/tag_cmp.sv:50:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   50 |     logic [ariane_pkg::DCACHE_TAG_WIDTH-1:0] sel_tag;
+      |            ^~~~~~~~~~
+%Error: Exiting due to 6 error(s)

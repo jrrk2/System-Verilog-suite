@@ -1,0 +1,25 @@
+%Error-MODMISSING: ../ariane/src/axi/src/axi_delayer.sv:70:5: Cannot find file containing module: 'ready_valid_delay'
+   70 |     ready_valid_delay #(
+      |     ^~~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        ready_valid_delay
+                        ready_valid_delay.v
+                        ready_valid_delay.sv
+                        obj_dir/ready_valid_delay
+                        obj_dir/ready_valid_delay.v
+                        obj_dir/ready_valid_delay.sv
+%Error-MODMISSING: ../ariane/src/axi/src/axi_delayer.sv:86:5: Cannot find file containing module: 'ready_valid_delay'
+   86 |     ready_valid_delay #(
+      |     ^~~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi/src/axi_delayer.sv:102:5: Cannot find file containing module: 'ready_valid_delay'
+  102 |     ready_valid_delay #(
+      |     ^~~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi/src/axi_delayer.sv:118:5: Cannot find file containing module: 'ready_valid_delay'
+  118 |     ready_valid_delay #(
+      |     ^~~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi/src/axi_delayer.sv:134:6: Cannot find file containing module: 'ready_valid_delay'
+  134 |      ready_valid_delay #(
+      |      ^~~~~~~~~~~~~~~~~
+%Error: Exiting due to 5 error(s)

@@ -1,0 +1,44 @@
+%Error: ../ariane/src/axi_adapter.sv:29:12: Package/class for ':: reference' not found: 'ariane_axi'
+   29 |     input  ariane_axi::ad_req_t                         type_i,
+      |            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/axi_adapter.sv:29:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   29 |     input  ariane_axi::ad_req_t                         type_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:46:12: Package/class for ':: reference' not found: 'ariane_axi'
+   46 |     output ariane_axi::req_t                            axi_req_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:46:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   46 |     output ariane_axi::req_t                            axi_req_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:47:12: Package/class for ':: reference' not found: 'ariane_axi'
+   47 |     input  ariane_axi::resp_t                           axi_resp_i
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:47:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   47 |     input  ariane_axi::resp_t                           axi_resp_i
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:73:42: Package/class for ':: reference' not found: 'ariane_axi'
+   73 |         axi_req_o.aw.burst  = (type_i == ariane_axi::SINGLE_REQ) ? 2'b00 :  2'b01;   
+      |                                          ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:83:65: Package/class for ':: reference' not found: 'ariane_axi'
+   83 |         axi_req_o.ar.addr   = (CRITICAL_WORD_FIRST || type_i == ariane_axi::SINGLE_REQ) ? addr_i : { addr_i[63:CACHELINE_BYTE_OFFSET], {{CACHELINE_BYTE_OFFSET}{1'b0}}};
+      |                                                                 ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:88:42: Package/class for ':: reference' not found: 'ariane_axi'
+   88 |         axi_req_o.ar.burst  = (type_i == ariane_axi::SINGLE_REQ) ? 2'b00 : (CRITICAL_WORD_FIRST ? 2'b10 : 2'b01);   
+      |                                          ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:131:39: Package/class for ':: reference' not found: 'ariane_axi'
+  131 |                         if (type_i == ariane_axi::SINGLE_REQ) begin
+      |                                       ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:166:39: Package/class for ':: reference' not found: 'ariane_axi'
+  166 |                         if (type_i != ariane_axi::SINGLE_REQ) begin
+      |                                       ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:172:50: Package/class for ':: reference' not found: 'ariane_axi'
+  172 |                             state_d = (type_i == ariane_axi::SINGLE_REQ) ? WAIT_R_VALID : WAIT_R_VALID_MULTIPLE;
+      |                                                  ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:193:31: Package/class for ':: reference' not found: 'ariane_axi'
+  193 |                 if (type_i == ariane_axi::SINGLE_REQ) begin
+      |                               ^~~~~~~~~~
+%Error: ../ariane/src/axi_adapter.sv:245:31: Package/class for ':: reference' not found: 'ariane_axi'
+  245 |                 if (type_i != ariane_axi::SINGLE_REQ) begin
+      |                               ^~~~~~~~~~
+%Error: Exiting due to 14 error(s)

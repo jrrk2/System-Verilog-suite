@@ -1,0 +1,25 @@
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_request_block.sv:182:1: Cannot find file containing module: 'axi_AR_allocator'
+  182 | axi_AR_allocator
+      | ^~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_AR_allocator
+                        axi_AR_allocator.v
+                        axi_AR_allocator.sv
+                        obj_dir/axi_AR_allocator
+                        obj_dir/axi_AR_allocator.v
+                        obj_dir/axi_AR_allocator.sv
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_request_block.sv:229:1: Cannot find file containing module: 'axi_AW_allocator'
+  229 | axi_AW_allocator
+      | ^~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_request_block.sv:284:1: Cannot find file containing module: 'axi_DW_allocator'
+  284 | axi_DW_allocator
+      | ^~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_request_block.sv:325:1: Cannot find file containing module: 'axi_address_decoder_BW'
+  325 | axi_address_decoder_BW
+      | ^~~~~~~~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_request_block.sv:342:1: Cannot find file containing module: 'axi_address_decoder_BR'
+  342 | axi_address_decoder_BR
+      | ^~~~~~~~~~~~~~~~~~~~~~
+%Error: Exiting due to 5 error(s)

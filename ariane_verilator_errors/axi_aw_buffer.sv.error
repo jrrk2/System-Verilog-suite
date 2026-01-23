@@ -1,0 +1,51 @@
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:25:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                          : ... note: In instance 'axi_aw_buffer'
+   25 |     input  logic [ADDR_WIDTH-1:0] slave_addr_i,
+      |                  ^
+                   ... For warning description see https://verilator.org/warn/ASCRANGE?v=5.038
+                   ... Use "/* verilator lint_off ASCRANGE */" and lint_on around source to disable this message.
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:34:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                          : ... note: In instance 'axi_aw_buffer'
+   34 |     input  logic [ID_WIDTH-1:0]   slave_id_i,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:35:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                          : ... note: In instance 'axi_aw_buffer'
+   35 |     input  logic [USER_WIDTH-1:0] slave_user_i,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:39:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                          : ... note: In instance 'axi_aw_buffer'
+   39 |     output logic [ADDR_WIDTH-1:0] master_addr_o,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:48:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                          : ... note: In instance 'axi_aw_buffer'
+   48 |     output logic [ID_WIDTH-1:0]   master_id_o,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:49:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                          : ... note: In instance 'axi_aw_buffer'
+   49 |     output logic [USER_WIDTH-1:0] master_user_o,
+      |                  ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:58:21: Operator ASSIGNW expects 26 bits on the Assign RHS, but Assign RHS's REPLICATE generates 38 bits.
+                                                                            : ... note: In instance 'axi_aw_buffer'
+   58 |    assign s_data_in = {slave_cache_i,  slave_prot_i,  slave_lock_i,  slave_burst_i,  slave_size_i,  slave_len_i,  slave_qos_i,  slave_region_i,  slave_addr_i,  slave_user_i,  slave_id_i};
+      |                     ^
+                     ... For warning description see https://verilator.org/warn/WIDTHTRUNC?v=5.038
+                     ... Use "/* verilator lint_off WIDTHTRUNC */" and lint_on around source to disable this message.
+%Warning-WIDTHEXPAND: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:59:189: Operator ASSIGNW expects 38 bits on the Assign RHS, but Assign RHS's VARREF 's_data_out' generates 26 bits.
+                                                                              : ... note: In instance 'axi_aw_buffer'
+   59 |    assign             {master_cache_o, master_prot_o, master_lock_o, master_burst_o, master_size_o, master_len_o, master_qos_o, master_region_o, master_addr_o, master_user_o, master_id_o} = s_data_out;
+      |                                                                                                                                                                                             ^
+                      ... For warning description see https://verilator.org/warn/WIDTHEXPAND?v=5.038
+                      ... Use "/* verilator lint_off WIDTHEXPAND */" and lint_on around source to disable this message.
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_aw_buffer.sv:62:5: Cannot find file containing module: 'axi_single_slice'
+   62 |     axi_single_slice #(.BUFFER_DEPTH(BUFFER_DEPTH), .DATA_WIDTH(29+ADDR_WIDTH+USER_WIDTH+ID_WIDTH)) i_axi_single_slice (
+      |     ^~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_single_slice
+                        axi_single_slice.v
+                        axi_single_slice.sv
+                        obj_dir/axi_single_slice
+                        obj_dir/axi_single_slice.v
+                        obj_dir/axi_single_slice.sv
+%Error: Exiting due to 1 error(s)

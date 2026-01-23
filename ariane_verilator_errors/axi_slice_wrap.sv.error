@@ -1,0 +1,8 @@
+%Error: ../ariane/fpga/src/axi_slice/src/axi_slice_wrap.sv:12:5: Cannot find file containing interface: 'AXI_BUS'
+   12 |     AXI_BUS.Slave  axi_slave,
+      |     ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/fpga/src/axi_slice/src/axi_slice_wrap.sv:13:5: Cannot find file containing interface: 'AXI_BUS'
+   13 |     AXI_BUS.Master axi_master
+      |     ^~~~~~~
+%Error: Exiting due to 2 error(s)

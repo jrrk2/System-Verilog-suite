@@ -1,0 +1,22 @@
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_ArbitrationTree.sv:204:27: Cannot find file containing module: 'axi_FanInPrimitive_Req'
+  204 |                           axi_FanInPrimitive_Req #( .AUX_WIDTH(AUX_WIDTH), .ID_WIDTH(ID_WIDTH) ) FAN_IN_REQ
+      |                           ^~~~~~~~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_FanInPrimitive_Req
+                        axi_FanInPrimitive_Req.v
+                        axi_FanInPrimitive_Req.sv
+                        obj_dir/axi_FanInPrimitive_Req
+                        obj_dir/axi_FanInPrimitive_Req.v
+                        obj_dir/axi_FanInPrimitive_Req.sv
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_ArbitrationTree.sv:230:35: Cannot find file containing module: 'axi_FanInPrimitive_Req'
+  230 |                                   axi_FanInPrimitive_Req #( .AUX_WIDTH(AUX_WIDTH), .ID_WIDTH(ID_WIDTH) ) FAN_IN_REQ
+      |                                   ^~~~~~~~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_ArbitrationTree.sv:257:35: Cannot find file containing module: 'axi_FanInPrimitive_Req'
+  257 |                                   axi_FanInPrimitive_Req #( .AUX_WIDTH(AUX_WIDTH), .ID_WIDTH(ID_WIDTH) ) FAN_IN_REQ
+      |                                   ^~~~~~~~~~~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_ArbitrationTree.sv:290:5: Cannot find file containing module: 'axi_RR_Flag_Req'
+  290 |     axi_RR_Flag_Req #( .WIDTH(LOG_MASTER), .MAX_COUNT(N_MASTER) )  RR_REQ
+      |     ^~~~~~~~~~~~~~~
+%Error: Exiting due to 4 error(s)

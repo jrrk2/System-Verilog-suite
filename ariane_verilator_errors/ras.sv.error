@@ -1,0 +1,14 @@
+%Error: ../ariane/src/frontend/ras.sv:25:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   25 |     output ariane_pkg::ras_t data_o
+      |            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/frontend/ras.sv:25:12: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   25 |     output ariane_pkg::ras_t data_o
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/frontend/ras.sv:28:5: Package/class for ':: reference' not found: 'ariane_pkg'
+   28 |     ariane_pkg::ras_t [DEPTH-1:0] stack_d, stack_q;
+      |     ^~~~~~~~~~
+%Error: ../ariane/src/frontend/ras.sv:28:5: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   28 |     ariane_pkg::ras_t [DEPTH-1:0] stack_d, stack_q;
+      |     ^~~~~~~~~~
+%Error: Exiting due to 4 error(s)

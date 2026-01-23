@@ -1,0 +1,16 @@
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_DW_allocator.sv:120:1: Cannot find file containing module: 'fifo_v2'
+  120 | fifo_v2 #(
+      | ^~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        fifo_v2
+                        fifo_v2.v
+                        fifo_v2.sv
+                        obj_dir/fifo_v2
+                        obj_dir/fifo_v2.v
+                        obj_dir/fifo_v2.sv
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_DW_allocator.sv:259:3: Cannot find file containing module: 'axi_multiplexer'
+  259 |   axi_multiplexer
+      |   ^~~~~~~~~~~~~~~
+%Error: Exiting due to 2 error(s)

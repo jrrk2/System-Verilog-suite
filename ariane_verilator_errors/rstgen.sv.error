@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/src/common_cells/src/rstgen.sv:21:5: Cannot find file containing module: 'rstgen_bypass'
+   21 |     rstgen_bypass i_rstgen_bypass (
+      |     ^~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        rstgen_bypass
+                        rstgen_bypass.v
+                        rstgen_bypass.sv
+                        obj_dir/rstgen_bypass
+                        obj_dir/rstgen_bypass.v
+                        obj_dir/rstgen_bypass.sv
+%Error: Exiting due to 1 error(s)

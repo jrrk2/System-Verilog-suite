@@ -1,0 +1,71 @@
+%Error: ../ariane/include/serpent_cache_pkg.sv:47:40: Package/class for ':: reference' not found: 'ariane_pkg'
+   47 |   localparam L15_SET_ASSOC           = ariane_pkg::DCACHE_SET_ASSOC; 
+      |                                        ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/include/serpent_cache_pkg.sv:52:47: Package/class for ':: reference' not found: 'ariane_pkg'
+   52 |   localparam L1I_WAY_WIDTH           = $clog2(ariane_pkg::ICACHE_SET_ASSOC);
+      |                                               ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:53:47: Package/class for ':: reference' not found: 'ariane_pkg'
+   53 |   localparam L1D_WAY_WIDTH           = $clog2(ariane_pkg::DCACHE_SET_ASSOC);
+      |                                               ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:61:47: Package/class for ':: reference' not found: 'ariane_pkg'
+   61 |   localparam ICACHE_OFFSET_WIDTH     = $clog2(ariane_pkg::ICACHE_LINE_WIDTH/8);
+      |                                               ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:62:44: Package/class for ':: reference' not found: 'ariane_pkg'
+   62 |   localparam ICACHE_NUM_WORDS        = 2**(ariane_pkg::ICACHE_INDEX_WIDTH-ICACHE_OFFSET_WIDTH);
+      |                                            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:65:47: Package/class for ':: reference' not found: 'ariane_pkg'
+   65 |   localparam DCACHE_OFFSET_WIDTH     = $clog2(ariane_pkg::DCACHE_LINE_WIDTH/8);
+      |                                               ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:66:44: Package/class for ':: reference' not found: 'ariane_pkg'
+   66 |   localparam DCACHE_NUM_WORDS        = 2**(ariane_pkg::DCACHE_INDEX_WIDTH-DCACHE_OFFSET_WIDTH);
+      |                                            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:69:40: Package/class for ':: reference' not found: 'ariane_pkg'
+   69 |   localparam DCACHE_NUM_BANKS        = ariane_pkg::DCACHE_LINE_WIDTH/64;
+      |                                        ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:78:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   78 |     logic [ariane_pkg::DCACHE_INDEX_WIDTH+ariane_pkg::DCACHE_TAG_WIDTH-1:0] wtag;
+      |            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:78:43: Package/class for ':: reference' not found: 'ariane_pkg'
+   78 |     logic [ariane_pkg::DCACHE_INDEX_WIDTH+ariane_pkg::DCACHE_TAG_WIDTH-1:0] wtag;
+      |                                           ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:84:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   84 |     logic [ariane_pkg::DCACHE_SET_ASSOC-1:0]                                hit_oh;   
+      |            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:120:12: Package/class for ':: reference' not found: 'ariane_pkg'
+  120 |     logic [ariane_pkg::ICACHE_INDEX_WIDTH-1:0]       idx;          
+      |            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:126:19: Package/class for ':: reference' not found: 'ariane_pkg'
+  126 |     logic [$clog2(ariane_pkg::ICACHE_SET_ASSOC)-1:0] way;          
+      |                   ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:134:12: Package/class for ':: reference' not found: 'ariane_pkg'
+  134 |     logic [ariane_pkg::ICACHE_LINE_WIDTH-1:0]        data;         
+      |            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:150:5: Package/class for ':: reference' not found: 'ariane_pkg'
+  150 |     ariane_pkg::amo_t                                amo_op;       
+      |     ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:150:5: Package/class for 'class/package reference' not found: 'ariane_pkg'
+  150 |     ariane_pkg::amo_t                                amo_op;       
+      |     ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:155:12: Package/class for ':: reference' not found: 'ariane_pkg'
+  155 |     logic [ariane_pkg::DCACHE_LINE_WIDTH-1:0]        data;         
+      |            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:257:29: Package/class for ':: reference' not found: 'ariane_pkg'
+  257 |   function automatic logic [ariane_pkg::ICACHE_SET_ASSOC-1:0] icache_way_bin2oh (
+      |                             ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:258:25: Package/class for ':: reference' not found: 'ariane_pkg'
+  258 |     input logic [$clog2(ariane_pkg::ICACHE_SET_ASSOC)-1:0] in
+      |                         ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:260:12: Package/class for ':: reference' not found: 'ariane_pkg'
+  260 |     logic [ariane_pkg::ICACHE_SET_ASSOC-1:0] out;
+      |            ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:266:29: Package/class for ':: reference' not found: 'ariane_pkg'
+  266 |   function automatic logic [ariane_pkg::DCACHE_SET_ASSOC-1:0] dcache_way_bin2oh (
+      |                             ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:267:25: Package/class for ':: reference' not found: 'ariane_pkg'
+  267 |     input logic [$clog2(ariane_pkg::DCACHE_SET_ASSOC)-1:0] in
+      |                         ^~~~~~~~~~
+%Error: ../ariane/include/serpent_cache_pkg.sv:269:12: Package/class for ':: reference' not found: 'ariane_pkg'
+  269 |     logic [ariane_pkg::DCACHE_SET_ASSOC-1:0] out;
+      |            ^~~~~~~~~~
+%Error: Exiting due to 23 error(s)

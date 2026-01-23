@@ -1,0 +1,11 @@
+%Error: ../ariane/src/axi/src/axi_to_axi_lite.sv:30:3: Cannot find file containing interface: 'AXI_BUS'
+   30 |   AXI_BUS.in   in,
+      |   ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/axi/src/axi_to_axi_lite.sv:31:3: Cannot find file containing interface: 'AXI_LITE'
+   31 |   AXI_LITE.out out
+      |   ^~~~~~~~
+%Error: Internal Error: ../ariane/src/axi/src/axi_to_axi_lite.sv:30:3: ../V3LinkDot.cpp:3241: Unlinked interface
+   30 |   AXI_BUS.in   in,
+      |   ^~~~~~~
+                        ... This fatal error may be caused by the earlier error(s); resolve those first.

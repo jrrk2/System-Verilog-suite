@@ -1,0 +1,152 @@
+%Error: ../ariane/src/debug/dm_mem.sv:35:19: Package/class for ':: reference' not found: 'dm'
+   35 |     input  logic [dm::ProgBufSize-1:0][31:0] progbuf_i,     
+      |                   ^~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/debug/dm_mem.sv:37:19: Package/class for ':: reference' not found: 'dm'
+   37 |     input  logic [dm::DataCount-1:0][31:0]   data_i,        
+      |                   ^~
+%Error: ../ariane/src/debug/dm_mem.sv:38:19: Package/class for ':: reference' not found: 'dm'
+   38 |     output logic [dm::DataCount-1:0][31:0]   data_o,        
+      |                   ^~
+%Error: ../ariane/src/debug/dm_mem.sv:42:12: Package/class for ':: reference' not found: 'dm'
+   42 |     input  dm::command_t                     cmd_i,
+      |            ^~
+%Error: ../ariane/src/debug/dm_mem.sv:42:12: Package/class for 'class/package reference' not found: 'dm'
+   42 |     input  dm::command_t                     cmd_i,
+      |            ^~
+%Error: ../ariane/src/debug/dm_mem.sv:44:12: Package/class for ':: reference' not found: 'dm'
+   44 |     output dm::cmderr_t                      cmderror_o,
+      |            ^~
+%Error: ../ariane/src/debug/dm_mem.sv:44:12: Package/class for 'class/package reference' not found: 'dm'
+   44 |     output dm::cmderr_t                      cmderror_o,
+      |            ^~
+%Error: ../ariane/src/debug/dm_mem.sv:59:55: Package/class for ':: reference' not found: 'dm'
+   59 |     localparam logic [DbgAddressBits-1:0] DataBase = (dm::DataAddr);
+      |                                                       ^~
+%Error: ../ariane/src/debug/dm_mem.sv:60:54: Package/class for ':: reference' not found: 'dm'
+   60 |     localparam logic [DbgAddressBits-1:0] DataEnd = (dm::DataAddr + 4*dm::DataCount);
+      |                                                      ^~
+%Error: ../ariane/src/debug/dm_mem.sv:60:71: Package/class for ':: reference' not found: 'dm'
+   60 |     localparam logic [DbgAddressBits-1:0] DataEnd = (dm::DataAddr + 4*dm::DataCount);
+      |                                                                       ^~
+%Error: ../ariane/src/debug/dm_mem.sv:61:58: Package/class for ':: reference' not found: 'dm'
+   61 |     localparam logic [DbgAddressBits-1:0] ProgBufBase = (dm::DataAddr - 4*dm::ProgBufSize);
+      |                                                          ^~
+%Error: ../ariane/src/debug/dm_mem.sv:61:75: Package/class for ':: reference' not found: 'dm'
+   61 |     localparam logic [DbgAddressBits-1:0] ProgBufBase = (dm::DataAddr - 4*dm::ProgBufSize);
+      |                                                                           ^~
+%Error: ../ariane/src/debug/dm_mem.sv:62:57: Package/class for ':: reference' not found: 'dm'
+   62 |     localparam logic [DbgAddressBits-1:0] ProgBufEnd = (dm::DataAddr - 1);
+      |                                                         ^~
+%Error: ../ariane/src/debug/dm_mem.sv:75:12: Package/class for ':: reference' not found: 'dm'
+   75 |     logic [dm::ProgBufSize/2-1:0][63:0]   progbuf;
+      |            ^~
+%Error: ../ariane/src/debug/dm_mem.sv:90:5: Package/class for ':: reference' not found: 'dm'
+   90 |     dm::ac_ar_cmd_t ac_ar;
+      |     ^~
+%Error: ../ariane/src/debug/dm_mem.sv:90:5: Package/class for 'class/package reference' not found: 'dm'
+   90 |     dm::ac_ar_cmd_t ac_ar;
+      |     ^~
+%Error: ../ariane/src/debug/dm_mem.sv:93:26: Package/class for ':: reference' not found: 'dm'
+   93 |     assign ac_ar       = dm::ac_ar_cmd_t'(cmd_i.control);
+      |                          ^~
+%Error: ../ariane/src/debug/dm_mem.sv:107:28: Package/class for ':: reference' not found: 'dm'
+  107 |         cmderror_o       = dm::CmdErrNone;
+      |                            ^~
+%Error: ../ariane/src/debug/dm_mem.sv:122:34: Package/class for ':: reference' not found: 'dm'
+  122 |                     cmderror_o = dm::CmdErrorHaltResume;
+      |                                  ^~
+%Error: ../ariane/src/debug/dm_mem.sv:159:26: Package/class for ':: reference' not found: 'dm'
+  159 |             cmderror_o = dm::CmdErrorException;
+      |                          ^~
+%Error: ../ariane/src/debug/dm_mem.sv:164:26: Package/class for ':: reference' not found: 'dm'
+  164 |             cmderror_o = dm::CmdErrNotSupported;
+      |                          ^~
+%Error: ../ariane/src/debug/dm_mem.sv:208:23: Package/class for ':: reference' not found: 'dm'
+  208 |                     [(dm::DataAddr):DataEnd]: begin
+      |                       ^~
+%Error: ../ariane/src/debug/dm_mem.sv:225:47: Package/class for ':: reference' not found: 'riscv'
+  225 |                             rdata_d = {32'b0, riscv::jal(0, dm::ResumeAddress[11:0]-WhereTo)};
+      |                                               ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:225:61: Package/class for ':: reference' not found: 'dm'
+  225 |                             rdata_d = {32'b0, riscv::jal(0, dm::ResumeAddress[11:0]-WhereTo)};
+      |                                                             ^~
+%Error: ../ariane/src/debug/dm_mem.sv:232:51: Package/class for ':: reference' not found: 'riscv'
+  232 |                                 rdata_d = {32'b0, riscv::jal(0, ProgBufBase-WhereTo)};
+      |                                                   ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:235:51: Package/class for ':: reference' not found: 'riscv'
+  235 |                                 rdata_d = {32'b0, riscv::jal(0, AbstractCmdBase-WhereTo)};
+      |                                                   ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:277:34: Package/class for ':: reference' not found: 'riscv'
+  277 |         abstract_cmd[0][31:0]  = riscv::illegal();
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:279:34: Package/class for ':: reference' not found: 'riscv'
+  279 |         abstract_cmd[0][63:32] = riscv::auipc(10, 0);
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:280:34: Package/class for ':: reference' not found: 'riscv'
+  280 |         abstract_cmd[1][31:0]  = riscv::srli(10, 10, 12);  
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:281:34: Package/class for ':: reference' not found: 'riscv'
+  281 |         abstract_cmd[1][63:32] = riscv::slli(10, 10, 12);
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:282:34: Package/class for ':: reference' not found: 'riscv'
+  282 |         abstract_cmd[2][31:0]  = riscv::nop();
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:283:34: Package/class for ':: reference' not found: 'riscv'
+  283 |         abstract_cmd[2][63:32] = riscv::nop();
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:284:34: Package/class for ':: reference' not found: 'riscv'
+  284 |         abstract_cmd[3][31:0]  = riscv::nop();
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:285:34: Package/class for ':: reference' not found: 'riscv'
+  285 |         abstract_cmd[3][63:32] = riscv::nop();
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:286:34: Package/class for ':: reference' not found: 'riscv'
+  286 |         abstract_cmd[4][31:0]  = riscv::csrr(riscv::CSR_DSCRATCH1, 10);
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:286:46: Package/class for ':: reference' not found: 'riscv'
+  286 |         abstract_cmd[4][31:0]  = riscv::csrr(riscv::CSR_DSCRATCH1, 10);
+      |                                              ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:287:34: Package/class for ':: reference' not found: 'riscv'
+  287 |         abstract_cmd[4][63:32] = riscv::ebreak();
+      |                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:294:13: Package/class for ':: reference' not found: 'dm'
+  294 |             dm::AccessRegister: begin
+      |             ^~
+%Error: ../ariane/src/debug/dm_mem.sv:297:45: Package/class for ':: reference' not found: 'riscv'
+  297 |                     abstract_cmd[0][31:0] = riscv::csrw(riscv::CSR_DSCRATCH1, 10);
+      |                                             ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:297:57: Package/class for ':: reference' not found: 'riscv'
+  297 |                     abstract_cmd[0][31:0] = riscv::csrw(riscv::CSR_DSCRATCH1, 10);
+      |                                                         ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:300:49: Package/class for ':: reference' not found: 'riscv'
+  300 |                         abstract_cmd[0][31:0] = riscv::illegal();
+      |                                                 ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:305:53: Package/class for ':: reference' not found: 'riscv'
+  305 |                             abstract_cmd[2][31:0] = riscv::float_load(ac_ar.aarsize, ac_ar.regno[4:0], 10, dm::DataAddr);
+      |                                                     ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:305:108: Package/class for ':: reference' not found: 'dm'
+  305 |                             abstract_cmd[2][31:0] = riscv::float_load(ac_ar.aarsize, ac_ar.regno[4:0], 10, dm::DataAddr);
+      |                                                                                                            ^~
+%Error: ../ariane/src/debug/dm_mem.sv:307:53: Package/class for ':: reference' not found: 'riscv'
+  307 |                             abstract_cmd[2][31:0] = riscv::load(ac_ar.aarsize, ac_ar.regno[4:0], 10, dm::DataAddr);
+      |                                                     ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:307:102: Package/class for ':: reference' not found: 'dm'
+  307 |                             abstract_cmd[2][31:0] = riscv::load(ac_ar.aarsize, ac_ar.regno[4:0], 10, dm::DataAddr);
+      |                                                                                                      ^~
+%Error: ../ariane/src/debug/dm_mem.sv:313:50: Package/class for ':: reference' not found: 'riscv'
+  313 |                         abstract_cmd[2][31:0]  = riscv::csrw(riscv::CSR_DSCRATCH0, 8);
+      |                                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:313:62: Package/class for ':: reference' not found: 'riscv'
+  313 |                         abstract_cmd[2][31:0]  = riscv::csrw(riscv::CSR_DSCRATCH0, 8);
+      |                                                              ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:315:50: Package/class for ':: reference' not found: 'riscv'
+  315 |                         abstract_cmd[2][63:32] = riscv::load(ac_ar.aarsize, 8, 10, dm::DataAddr);
+      |                                                  ^~~~~
+%Error: ../ariane/src/debug/dm_mem.sv:315:84: Package/class for ':: reference' not found: 'dm'
+  315 |                         abstract_cmd[2][63:32] = riscv::load(ac_ar.aarsize, 8, 10, dm::DataAddr);
+      |                                                                                    ^~
+%Error: ../ariane/src/debug/dm_mem.sv:317:50: Package/class for ':: reference' not found: 'riscv'
+  317 |                         abstract_cmd[3][31:0]  = riscv::csrw(riscv::csr_reg_t'(ac_ar.regno[11:0]), 8);
+      |                                                  ^~~~~
+%Error: Exiting due to too many errors encountered; --error-limit=50

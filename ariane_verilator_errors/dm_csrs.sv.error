@@ -1,0 +1,152 @@
+%Error: ../ariane/src/debug/dm_csrs.sv:27:12: Package/class for ':: reference' not found: 'dm'
+   27 |     input  dm::dmi_req_t                      dmi_req_i,
+      |            ^~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/debug/dm_csrs.sv:27:12: Package/class for 'class/package reference' not found: 'dm'
+   27 |     input  dm::dmi_req_t                      dmi_req_i,
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:31:12: Package/class for ':: reference' not found: 'dm'
+   31 |     output dm::dmi_resp_t                     dmi_resp_o,
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:31:12: Package/class for 'class/package reference' not found: 'dm'
+   31 |     output dm::dmi_resp_t                     dmi_resp_o,
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:36:12: Package/class for ':: reference' not found: 'dm'
+   36 |     input  dm::hartinfo_t [NrHarts-1:0]       hartinfo_i,       
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:36:12: Package/class for 'class/package reference' not found: 'dm'
+   36 |     input  dm::hartinfo_t [NrHarts-1:0]       hartinfo_i,       
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:46:12: Package/class for ':: reference' not found: 'dm'
+   46 |     output dm::command_t                      cmd_o,              
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:46:12: Package/class for 'class/package reference' not found: 'dm'
+   46 |     output dm::command_t                      cmd_o,              
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:48:12: Package/class for ':: reference' not found: 'dm'
+   48 |     input  dm::cmderr_t                       cmderror_i,         
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:48:12: Package/class for 'class/package reference' not found: 'dm'
+   48 |     input  dm::cmderr_t                       cmderror_i,         
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:51:19: Package/class for ':: reference' not found: 'dm'
+   51 |     output logic [dm::ProgBufSize-1:0][31:0]  progbuf_o,  
+      |                   ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:52:19: Package/class for ':: reference' not found: 'dm'
+   52 |     output logic [dm::DataCount-1:0][31:0]    data_o,
+      |                   ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:54:19: Package/class for ':: reference' not found: 'dm'
+   54 |     input  logic [dm::DataCount-1:0][31:0]    data_i,
+      |                   ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:79:5: Package/class for ':: reference' not found: 'dm'
+   79 |     dm::dtm_op_t dtm_op;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:79:5: Package/class for 'class/package reference' not found: 'dm'
+   79 |     dm::dtm_op_t dtm_op;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:80:21: Package/class for ':: reference' not found: 'dm'
+   80 |     assign dtm_op = dm::dtm_op_t'(dmi_req_i.op);
+      |                     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:88:16: Package/class for ':: reference' not found: 'dm'
+   88 |     localparam dm::dm_csr_t DataEnd = dm::dm_csr_t'((dm::Data0 + {4'b0, dm::DataCount}));
+      |                ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:88:16: Package/class for 'class/package reference' not found: 'dm'
+   88 |     localparam dm::dm_csr_t DataEnd = dm::dm_csr_t'((dm::Data0 + {4'b0, dm::DataCount}));
+      |                ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:88:54: Package/class for ':: reference' not found: 'dm'
+   88 |     localparam dm::dm_csr_t DataEnd = dm::dm_csr_t'((dm::Data0 + {4'b0, dm::DataCount}));
+      |                                                      ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:88:73: Package/class for ':: reference' not found: 'dm'
+   88 |     localparam dm::dm_csr_t DataEnd = dm::dm_csr_t'((dm::Data0 + {4'b0, dm::DataCount}));
+      |                                                                         ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:88:39: Package/class for ':: reference' not found: 'dm'
+   88 |     localparam dm::dm_csr_t DataEnd = dm::dm_csr_t'((dm::Data0 + {4'b0, dm::DataCount}));
+      |                                       ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:89:16: Package/class for ':: reference' not found: 'dm'
+   89 |     localparam dm::dm_csr_t ProgBufEnd = dm::dm_csr_t'((dm::ProgBuf0 + {4'b0, dm::ProgBufSize}));
+      |                ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:89:16: Package/class for 'class/package reference' not found: 'dm'
+   89 |     localparam dm::dm_csr_t ProgBufEnd = dm::dm_csr_t'((dm::ProgBuf0 + {4'b0, dm::ProgBufSize}));
+      |                ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:89:57: Package/class for ':: reference' not found: 'dm'
+   89 |     localparam dm::dm_csr_t ProgBufEnd = dm::dm_csr_t'((dm::ProgBuf0 + {4'b0, dm::ProgBufSize}));
+      |                                                         ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:89:79: Package/class for ':: reference' not found: 'dm'
+   89 |     localparam dm::dm_csr_t ProgBufEnd = dm::dm_csr_t'((dm::ProgBuf0 + {4'b0, dm::ProgBufSize}));
+      |                                                                               ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:89:42: Package/class for ':: reference' not found: 'dm'
+   89 |     localparam dm::dm_csr_t ProgBufEnd = dm::dm_csr_t'((dm::ProgBuf0 + {4'b0, dm::ProgBufSize}));
+      |                                          ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:130:5: Package/class for ':: reference' not found: 'dm'
+  130 |     dm::dmstatus_t      dmstatus;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:130:5: Package/class for 'class/package reference' not found: 'dm'
+  130 |     dm::dmstatus_t      dmstatus;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:131:5: Package/class for ':: reference' not found: 'dm'
+  131 |     dm::dmcontrol_t     dmcontrol_d, dmcontrol_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:131:5: Package/class for 'class/package reference' not found: 'dm'
+  131 |     dm::dmcontrol_t     dmcontrol_d, dmcontrol_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:132:5: Package/class for ':: reference' not found: 'dm'
+  132 |     dm::abstractcs_t    abstractcs;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:132:5: Package/class for 'class/package reference' not found: 'dm'
+  132 |     dm::abstractcs_t    abstractcs;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:133:5: Package/class for ':: reference' not found: 'dm'
+  133 |     dm::cmderr_t        cmderr_d, cmderr_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:133:5: Package/class for 'class/package reference' not found: 'dm'
+  133 |     dm::cmderr_t        cmderr_d, cmderr_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:134:5: Package/class for ':: reference' not found: 'dm'
+  134 |     dm::command_t       command_d, command_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:134:5: Package/class for 'class/package reference' not found: 'dm'
+  134 |     dm::command_t       command_d, command_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:135:5: Package/class for ':: reference' not found: 'dm'
+  135 |     dm::abstractauto_t  abstractauto_d, abstractauto_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:135:5: Package/class for 'class/package reference' not found: 'dm'
+  135 |     dm::abstractauto_t  abstractauto_d, abstractauto_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:136:5: Package/class for ':: reference' not found: 'dm'
+  136 |     dm::sbcs_t          sbcs_d, sbcs_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:136:5: Package/class for 'class/package reference' not found: 'dm'
+  136 |     dm::sbcs_t          sbcs_d, sbcs_q;
+      |     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:142:12: Package/class for ':: reference' not found: 'dm'
+  142 |     logic [dm::ProgBufSize-1:0][31:0] progbuf_d, progbuf_q;
+      |            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:144:20: Package/class for ':: reference' not found: 'dm'
+  144 |     logic [({3'b0, dm::DataCount} + dm::Data0 - 1):(dm::Data0)][31:0] data_d, data_q;
+      |                    ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:144:37: Package/class for ':: reference' not found: 'dm'
+  144 |     logic [({3'b0, dm::DataCount} + dm::Data0 - 1):(dm::Data0)][31:0] data_d, data_q;
+      |                                     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:144:53: Package/class for ':: reference' not found: 'dm'
+  144 |     logic [({3'b0, dm::DataCount} + dm::Data0 - 1):(dm::Data0)][31:0] data_d, data_q;
+      |                                                     ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:149:30: Package/class for ':: reference' not found: 'dm'
+  149 |     assign dmi_resp_o.resp = dm::DTM_SUCCESS;
+      |                              ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:169:28: Package/class for ':: reference' not found: 'dm'
+  169 |         dmstatus.version = dm::DbgVersion013;
+      |                            ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:197:32: Package/class for ':: reference' not found: 'dm'
+  197 |         abstractcs.datacount = dm::DataCount;
+      |                                ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:198:34: Package/class for ':: reference' not found: 'dm'
+  198 |         abstractcs.progbufsize = dm::ProgBufSize;
+      |                                  ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:224:61: Package/class for ':: reference' not found: 'dm'
+  224 |         if (dmi_req_ready_o && dmi_req_valid_i && dtm_op == dm::DTM_READ) begin
+      |                                                             ^~
+%Error: ../ariane/src/debug/dm_csrs.sv:226:19: Package/class for ':: reference' not found: 'dm'
+  226 |                 [(dm::Data0):DataEnd]: begin
+      |                   ^~
+%Error: Exiting due to too many errors encountered; --error-limit=50

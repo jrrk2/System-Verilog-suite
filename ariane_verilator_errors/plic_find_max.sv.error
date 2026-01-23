@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/src/plic/plic_find_max.sv:62:13: Cannot find file containing module: 'plic_comparator'
+   62 |             plic_comparator #(
+      |             ^~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        plic_comparator
+                        plic_comparator.v
+                        plic_comparator.sv
+                        obj_dir/plic_comparator
+                        obj_dir/plic_comparator.v
+                        obj_dir/plic_comparator.sv
+%Error: Exiting due to 1 error(s)

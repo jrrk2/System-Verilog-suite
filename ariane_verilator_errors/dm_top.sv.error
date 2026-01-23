@@ -1,0 +1,68 @@
+%Error: ../ariane/src/debug/dm_top.sv:36:12: Package/class for ':: reference' not found: 'ariane_axi'
+   36 |     input  ariane_axi::req_t   axi_s_req_i,
+      |            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/debug/dm_top.sv:36:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   36 |     input  ariane_axi::req_t   axi_s_req_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_top.sv:37:12: Package/class for ':: reference' not found: 'ariane_axi'
+   37 |     output ariane_axi::resp_t  axi_s_resp_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_top.sv:37:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   37 |     output ariane_axi::resp_t  axi_s_resp_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_top.sv:40:12: Package/class for ':: reference' not found: 'ariane_axi'
+   40 |     output ariane_axi::req_t   axi_m_req_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_top.sv:40:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   40 |     output ariane_axi::req_t   axi_m_req_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_top.sv:41:12: Package/class for ':: reference' not found: 'ariane_axi'
+   41 |     input  ariane_axi::resp_t  axi_m_resp_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_top.sv:41:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   41 |     input  ariane_axi::resp_t  axi_m_resp_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_top.sv:47:12: Package/class for ':: reference' not found: 'dm'
+   47 |     input  dm::dmi_req_t       dmi_req_i,
+      |            ^~
+%Error: ../ariane/src/debug/dm_top.sv:47:12: Package/class for 'class/package reference' not found: 'dm'
+   47 |     input  dm::dmi_req_t       dmi_req_i,
+      |            ^~
+%Error: ../ariane/src/debug/dm_top.sv:51:12: Package/class for ':: reference' not found: 'dm'
+   51 |     output dm::dmi_resp_t      dmi_resp_o
+      |            ^~
+%Error: ../ariane/src/debug/dm_top.sv:51:12: Package/class for 'class/package reference' not found: 'dm'
+   51 |     output dm::dmi_resp_t      dmi_resp_o
+      |            ^~
+%Error: ../ariane/src/debug/dm_top.sv:55:5: Package/class for ':: reference' not found: 'dm'
+   55 |     dm::hartinfo_t [NrHarts-1:0]      hartinfo;
+      |     ^~
+%Error: ../ariane/src/debug/dm_top.sv:55:5: Package/class for 'class/package reference' not found: 'dm'
+   55 |     dm::hartinfo_t [NrHarts-1:0]      hartinfo;
+      |     ^~
+%Error: ../ariane/src/debug/dm_top.sv:62:5: Package/class for ':: reference' not found: 'dm'
+   62 |     dm::command_t                     cmd;
+      |     ^~
+%Error: ../ariane/src/debug/dm_top.sv:62:5: Package/class for 'class/package reference' not found: 'dm'
+   62 |     dm::command_t                     cmd;
+      |     ^~
+%Error: ../ariane/src/debug/dm_top.sv:72:5: Package/class for ':: reference' not found: 'dm'
+   72 |     dm::cmderr_t                      cmderror;
+      |     ^~
+%Error: ../ariane/src/debug/dm_top.sv:72:5: Package/class for 'class/package reference' not found: 'dm'
+   72 |     dm::cmderr_t                      cmderror;
+      |     ^~
+%Error: ../ariane/src/debug/dm_top.sv:74:12: Package/class for ':: reference' not found: 'dm'
+   74 |     logic [dm::ProgBufSize-1:0][31:0] progbuf;
+      |            ^~
+%Error: ../ariane/src/debug/dm_top.sv:75:12: Package/class for ':: reference' not found: 'dm'
+   75 |     logic [dm::DataCount-1:0][31:0]   data_csrs_mem;
+      |            ^~
+%Error: ../ariane/src/debug/dm_top.sv:76:12: Package/class for ':: reference' not found: 'dm'
+   76 |     logic [dm::DataCount-1:0][31:0]   data_mem_csrs;
+      |            ^~
+%Error: ../ariane/src/debug/dm_top.sv:99:30: Package/class for ':: reference' not found: 'ariane_pkg'
+   99 |         assign hartinfo[i] = ariane_pkg::DebugHartInfo;
+      |                              ^~~~~~~~~~
+%Error: Exiting due to 22 error(s)

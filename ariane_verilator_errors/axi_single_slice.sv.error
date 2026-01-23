@@ -1,0 +1,23 @@
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_single_slice.sv:21:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                             : ... note: In instance 'axi_single_slice'
+   21 |     input  logic [DATA_WIDTH-1:0] data_i,
+      |                  ^
+                   ... For warning description see https://verilator.org/warn/ASCRANGE?v=5.038
+                   ... Use "/* verilator lint_off ASCRANGE */" and lint_on around source to disable this message.
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_single_slice.sv:25:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                             : ... note: In instance 'axi_single_slice'
+   25 |     output logic [DATA_WIDTH-1:0] data_o
+      |                  ^
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_single_slice.sv:33:5: Cannot find file containing module: 'fifo'
+   33 |     fifo #(
+      |     ^~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        fifo
+                        fifo.v
+                        fifo.sv
+                        obj_dir/fifo
+                        obj_dir/fifo.v
+                        obj_dir/fifo.sv
+%Error: Exiting due to 1 error(s)

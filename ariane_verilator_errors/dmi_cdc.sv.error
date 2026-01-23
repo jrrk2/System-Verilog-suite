@@ -1,0 +1,26 @@
+%Error: ../ariane/src/debug/dmi_cdc.sv:24:12: Package/class for ':: reference' not found: 'dm'
+   24 |     input  dm::dmi_req_t     jtag_dmi_req_i,
+      |            ^~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/debug/dmi_cdc.sv:24:12: Package/class for 'class/package reference' not found: 'dm'
+   24 |     input  dm::dmi_req_t     jtag_dmi_req_i,
+      |            ^~
+%Error: ../ariane/src/debug/dmi_cdc.sv:28:12: Package/class for ':: reference' not found: 'dm'
+   28 |     output dm::dmi_resp_t    jtag_dmi_resp_o,
+      |            ^~
+%Error: ../ariane/src/debug/dmi_cdc.sv:28:12: Package/class for 'class/package reference' not found: 'dm'
+   28 |     output dm::dmi_resp_t    jtag_dmi_resp_o,
+      |            ^~
+%Error: ../ariane/src/debug/dmi_cdc.sv:36:12: Package/class for ':: reference' not found: 'dm'
+   36 |     output dm::dmi_req_t     core_dmi_req_o,
+      |            ^~
+%Error: ../ariane/src/debug/dmi_cdc.sv:36:12: Package/class for 'class/package reference' not found: 'dm'
+   36 |     output dm::dmi_req_t     core_dmi_req_o,
+      |            ^~
+%Error: ../ariane/src/debug/dmi_cdc.sv:40:11: Package/class for ':: reference' not found: 'dm'
+   40 |     input dm::dmi_resp_t     core_dmi_resp_i,
+      |           ^~
+%Error: ../ariane/src/debug/dmi_cdc.sv:40:11: Package/class for 'class/package reference' not found: 'dm'
+   40 |     input dm::dmi_resp_t     core_dmi_resp_i,
+      |           ^~
+%Error: Exiting due to 8 error(s)

@@ -1,0 +1,8 @@
+%Error: ../ariane/src/axi_node/src/axi_node_wrap_with_slices.sv:35:5: Cannot find file containing interface: 'AXI_BUS'
+   35 |     AXI_BUS.Slave    slave  [NB_SLAVE-1:0],
+      |     ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/axi_node/src/axi_node_wrap_with_slices.sv:36:5: Cannot find file containing interface: 'AXI_BUS'
+   36 |     AXI_BUS.Master   master [NB_MASTER-1:0],
+      |     ^~~~~~~
+%Error: Exiting due to 2 error(s)

@@ -1,0 +1,16 @@
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_node.sv:285:4: Cannot find file containing module: 'axi_request_block'
+  285 |    axi_request_block
+      |    ^~~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_request_block
+                        axi_request_block.v
+                        axi_request_block.sv
+                        obj_dir/axi_request_block
+                        obj_dir/axi_request_block.v
+                        obj_dir/axi_request_block.sv
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_node.sv:395:1: Cannot find file containing module: 'axi_response_block'
+  395 | axi_response_block
+      | ^~~~~~~~~~~~~~~~~~
+%Error: Exiting due to 2 error(s)

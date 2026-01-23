@@ -1,0 +1,74 @@
+%Error: ../ariane/include/ariane_pkg.sv:125:16: Package/class for ':: reference' not found: 'dm'
+  125 |     localparam dm::hartinfo_t DebugHartInfo = '{
+      |                ^~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/include/ariane_pkg.sv:125:16: Package/class for 'class/package reference' not found: 'dm'
+  125 |     localparam dm::hartinfo_t DebugHartInfo = '{
+      |                ^~
+%Error: ../ariane/include/ariane_pkg.sv:130:59: Package/class for ':: reference' not found: 'dm'
+  130 |                                                 datasize: dm::DataCount,
+      |                                                           ^~
+%Error: ../ariane/include/ariane_pkg.sv:131:59: Package/class for ':: reference' not found: 'dm'
+  131 |                                                 dataaddr: dm::DataAddr
+      |                                                           ^~
+%Error: ../ariane/include/ariane_pkg.sv:151:54: Package/class for ':: reference' not found: 'riscv'
+  151 |     localparam logic [63:0] SMODE_STATUS_READ_MASK = riscv::SSTATUS_UIE
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:152:54: Package/class for ':: reference' not found: 'riscv'
+  152 |                                                    | riscv::SSTATUS_SIE
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:153:54: Package/class for ':: reference' not found: 'riscv'
+  153 |                                                    | riscv::SSTATUS_SPIE
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:154:54: Package/class for ':: reference' not found: 'riscv'
+  154 |                                                    | riscv::SSTATUS_SPP
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:155:54: Package/class for ':: reference' not found: 'riscv'
+  155 |                                                    | riscv::SSTATUS_FS
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:156:54: Package/class for ':: reference' not found: 'riscv'
+  156 |                                                    | riscv::SSTATUS_XS
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:157:54: Package/class for ':: reference' not found: 'riscv'
+  157 |                                                    | riscv::SSTATUS_SUM
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:158:54: Package/class for ':: reference' not found: 'riscv'
+  158 |                                                    | riscv::SSTATUS_MXR
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:159:54: Package/class for ':: reference' not found: 'riscv'
+  159 |                                                    | riscv::SSTATUS_UPIE
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:160:54: Package/class for ':: reference' not found: 'riscv'
+  160 |                                                    | riscv::SSTATUS_SPIE
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:161:54: Package/class for ':: reference' not found: 'riscv'
+  161 |                                                    | riscv::SSTATUS_UXL
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:162:54: Package/class for ':: reference' not found: 'riscv'
+  162 |                                                    | riscv::SSTATUS64_SD;
+      |                                                      ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:164:55: Package/class for ':: reference' not found: 'riscv'
+  164 |     localparam logic [63:0] SMODE_STATUS_WRITE_MASK = riscv::SSTATUS_SIE
+      |                                                       ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:165:55: Package/class for ':: reference' not found: 'riscv'
+  165 |                                                     | riscv::SSTATUS_SPIE
+      |                                                       ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:166:55: Package/class for ':: reference' not found: 'riscv'
+  166 |                                                     | riscv::SSTATUS_SPP
+      |                                                       ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:167:55: Package/class for ':: reference' not found: 'riscv'
+  167 |                                                     | riscv::SSTATUS_FS
+      |                                                       ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:168:55: Package/class for ':: reference' not found: 'riscv'
+  168 |                                                     | riscv::SSTATUS_SUM
+      |                                                       ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:169:55: Package/class for ':: reference' not found: 'riscv'
+  169 |                                                     | riscv::SSTATUS_MXR;
+      |                                                       ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:523:9: Package/class for ':: reference' not found: 'riscv'
+  523 |         riscv::pte_t           content;
+      |         ^~~~~
+%Error: ../ariane/include/ariane_pkg.sv:523:9: Package/class for 'class/package reference' not found: 'riscv'
+  523 |         riscv::pte_t           content;
+      |         ^~~~~
+%Error: Exiting due to 24 error(s)

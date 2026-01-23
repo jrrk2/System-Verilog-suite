@@ -1,0 +1,20 @@
+%Error: ../ariane/src/frontend/btb.sv:30:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   30 |     input  ariane_pkg::btb_update_t     btb_update_i,     
+      |            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/frontend/btb.sv:30:12: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   30 |     input  ariane_pkg::btb_update_t     btb_update_i,     
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/frontend/btb.sv:31:12: Package/class for ':: reference' not found: 'ariane_pkg'
+   31 |     output ariane_pkg::btb_prediction_t btb_prediction_o  
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/frontend/btb.sv:31:12: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   31 |     output ariane_pkg::btb_prediction_t btb_prediction_o  
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/frontend/btb.sv:40:5: Package/class for ':: reference' not found: 'ariane_pkg'
+   40 |     ariane_pkg::btb_prediction_t btb_d [NR_ENTRIES-1:0], btb_q [NR_ENTRIES-1:0];
+      |     ^~~~~~~~~~
+%Error: ../ariane/src/frontend/btb.sv:40:5: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   40 |     ariane_pkg::btb_prediction_t btb_d [NR_ENTRIES-1:0], btb_q [NR_ENTRIES-1:0];
+      |     ^~~~~~~~~~
+%Error: Exiting due to 6 error(s)

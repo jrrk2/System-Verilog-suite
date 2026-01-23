@@ -1,0 +1,20 @@
+%Error: ../ariane/src/util/axi_master_connect.sv:17:5: Cannot find file containing interface: 'AXI_BUS'
+   17 |     AXI_BUS.out master
+      |     ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/util/axi_master_connect.sv:15:12: Package/class for ':: reference' not found: 'ariane_axi'
+   15 |     input  ariane_axi::req_t    axi_req_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/util/axi_master_connect.sv:15:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   15 |     input  ariane_axi::req_t    axi_req_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/util/axi_master_connect.sv:16:12: Package/class for ':: reference' not found: 'ariane_axi'
+   16 |     output ariane_axi::resp_t   axi_resp_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/util/axi_master_connect.sv:16:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   16 |     output ariane_axi::resp_t   axi_resp_o,
+      |            ^~~~~~~~~~
+%Error: Internal Error: ../ariane/src/util/axi_master_connect.sv:17:5: ../V3LinkDot.cpp:3241: Unlinked interface
+   17 |     AXI_BUS.out master
+      |     ^~~~~~~
+                        ... This fatal error may be caused by the earlier error(s); resolve those first.

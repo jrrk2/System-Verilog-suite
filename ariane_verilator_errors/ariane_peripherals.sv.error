@@ -1,0 +1,20 @@
+%Error: ../ariane/tb/ariane_peripherals.sv:24:5: Cannot find file containing interface: 'AXI_BUS'
+   24 |     AXI_BUS.in         plic            ,
+      |     ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/tb/ariane_peripherals.sv:25:5: Cannot find file containing interface: 'AXI_BUS'
+   25 |     AXI_BUS.in         uart            ,
+      |     ^~~~~~~
+%Error: ../ariane/tb/ariane_peripherals.sv:26:5: Cannot find file containing interface: 'AXI_BUS'
+   26 |     AXI_BUS.in         spi             ,
+      |     ^~~~~~~
+%Error: ../ariane/tb/ariane_peripherals.sv:27:5: Cannot find file containing interface: 'AXI_BUS'
+   27 |     AXI_BUS.in         ethernet        ,
+      |     ^~~~~~~
+%Error: ../ariane/tb/ariane_peripherals.sv:55:12: Package/class for ':: reference' not found: 'ariane_soc'
+   55 |     logic [ariane_soc::NumSources-1:0] irq_sources;
+      |            ^~~~~~~~~~
+%Error: Internal Error: ../ariane/tb/ariane_peripherals.sv:26:5: ../V3LinkDot.cpp:3241: Unlinked interface
+   26 |     AXI_BUS.in         spi             ,
+      |     ^~~~~~~
+                        ... This fatal error may be caused by the earlier error(s); resolve those first.

@@ -1,0 +1,41 @@
+%Error: ../ariane/src/frontend/instr_scan.sv:40:42: Package/class for ':: reference' not found: 'ariane_pkg'
+   40 |     assign rvi_imm_o    = (instr_i[3]) ? ariane_pkg::uj_imm(instr_i) : ariane_pkg::sb_imm(instr_i);
+      |                                          ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/frontend/instr_scan.sv:40:72: Package/class for ':: reference' not found: 'ariane_pkg'
+   40 |     assign rvi_imm_o    = (instr_i[3]) ? ariane_pkg::uj_imm(instr_i) : ariane_pkg::sb_imm(instr_i);
+      |                                                                        ^~~~~~~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:41:44: Package/class for ':: reference' not found: 'riscv'
+   41 |     assign rvi_branch_o = (instr_i[6:0] == riscv::OpcodeBranch) ? 1'b1 : 1'b0;
+      |                                            ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:42:44: Package/class for ':: reference' not found: 'riscv'
+   42 |     assign rvi_jalr_o   = (instr_i[6:0] == riscv::OpcodeJalr)   ? 1'b1 : 1'b0;
+      |                                            ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:43:44: Package/class for ':: reference' not found: 'riscv'
+   43 |     assign rvi_jump_o   = (instr_i[6:0] == riscv::OpcodeJal)    ? 1'b1 : 1'b0;
+      |                                            ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:45:46: Package/class for ':: reference' not found: 'riscv'
+   45 |     assign rvc_jump_o   = (instr_i[15:13] == riscv::OpcodeC1J) & is_rvc_o & (instr_i[1:0] == riscv::OpcodeC1);
+      |                                              ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:45:94: Package/class for ':: reference' not found: 'riscv'
+   45 |     assign rvc_jump_o   = (instr_i[15:13] == riscv::OpcodeC1J) & is_rvc_o & (instr_i[1:0] == riscv::OpcodeC1);
+      |                                                                                              ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:47:46: Package/class for ':: reference' not found: 'riscv'
+   47 |     assign rvc_jr_o     = (instr_i[15:13] == riscv::OpcodeC2JalrMvAdd)
+      |                                              ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:50:44: Package/class for ':: reference' not found: 'riscv'
+   50 |                         & (instr_i[1:0] == riscv::OpcodeC2)
+      |                                            ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:52:47: Package/class for ':: reference' not found: 'riscv'
+   52 |     assign rvc_branch_o = ((instr_i[15:13] == riscv::OpcodeC1Beqz) | (instr_i[15:13] == riscv::OpcodeC1Bnez))
+      |                                               ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:52:89: Package/class for ':: reference' not found: 'riscv'
+   52 |     assign rvc_branch_o = ((instr_i[15:13] == riscv::OpcodeC1Beqz) | (instr_i[15:13] == riscv::OpcodeC1Bnez))
+      |                                                                                         ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:53:44: Package/class for ':: reference' not found: 'riscv'
+   53 |                         & (instr_i[1:0] == riscv::OpcodeC1)
+      |                                            ^~~~~
+%Error: ../ariane/src/frontend/instr_scan.sv:58:46: Package/class for ':: reference' not found: 'riscv'
+   58 |     assign rvc_jalr_o   = (instr_i[15:13] == riscv::OpcodeC2JalrMvAdd)
+      |                                              ^~~~~
+%Error: Exiting due to 13 error(s)

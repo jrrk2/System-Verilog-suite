@@ -1,0 +1,6 @@
+%Error: ../ariane/src/common_cells/src/deprecated/find_first_one.sv:55:13: Loop unrolling took too long; probably this is an infinite loop,  or use /*verilator unroll_full*/, or set --unroll-count above 3075
+                                                                         : ... note: In instance 'find_first_one'
+   55 |             for (genvar l = 0; l < 2**level; l++) begin
+      |             ^~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: Exiting due to 1 error(s)

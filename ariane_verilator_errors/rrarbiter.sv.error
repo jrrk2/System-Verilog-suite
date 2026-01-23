@@ -1,0 +1,48 @@
+%Warning-WIDTHTRUNC: ../ariane/src/common_cells/src/rrarbiter.sv:84:23: Logical operator LOGNOT expects 1 bit on the LHS, but LHS's VARREF 'LOCK_IN' generates 32 bits.
+                                                                      : ... note: In instance 'rrarbiter'
+   84 |   if (NUM_REQ == 2 && !LOCK_IN) begin : g_rrlogic
+      |                       ^
+                     ... For warning description see https://verilator.org/warn/WIDTHTRUNC?v=5.038
+                     ... Use "/* verilator lint_off WIDTHTRUNC */" and lint_on around source to disable this message.
+%Warning-WIDTHTRUNC: ../ariane/src/common_cells/src/rrarbiter.sv:121:50: Logical operator LOGOR expects 1 bit on the RHS, but RHS's VARREF 'LOCK_IN' generates 32 bits.
+                                                                       : ... note: In instance 'rrarbiter'
+  121 |   for (genvar k=0; (k < NUM_REQ) && (NUM_REQ > 2 || LOCK_IN); k++) begin : g_mask
+      |                                                  ^~
+%Error-MODMISSING: ../ariane/src/common_cells/src/rrarbiter.sv:97:5: Cannot find file containing module: 'lzc'
+   97 |     lzc #(
+      |     ^~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        lzc
+                        lzc.v
+                        lzc.sv
+                        obj_dir/lzc
+                        obj_dir/lzc.v
+                        obj_dir/lzc.sv
+%Error-MODMISSING: ../ariane/src/common_cells/src/rrarbiter.sv:105:5: Cannot find file containing module: 'lzc'
+  105 |     lzc #(
+      |     ^~~
+%Warning-WIDTHEXPAND: ../ariane/src/common_cells/src/rrarbiter.sv:117:35: Operator LT expects 32 bits on the LHS, but LHS's VARREF 'next_idx' generates 4 bits.
+                                                                        : ... note: In instance 'rrarbiter'
+  117 |                         (next_idx < NUM_REQ) ? next_idx       :
+      |                                   ^
+                      ... For warning description see https://verilator.org/warn/WIDTHEXPAND?v=5.038
+                      ... Use "/* verilator lint_off WIDTHEXPAND */" and lint_on around source to disable this message.
+%Warning-WIDTHEXPAND: ../ariane/src/common_cells/src/rrarbiter.sv:116:46: Operator COND expects 32 bits on the Conditional True, but Conditional True's VARREF 'arb_sel_lock_q' generates 4 bits.
+                                                                        : ... note: In instance 'rrarbiter'
+  116 |     assign arb_sel_d  = (lock_q)             ? arb_sel_lock_q :
+      |                                              ^
+%Warning-WIDTHEXPAND: ../ariane/src/common_cells/src/rrarbiter.sv:117:46: Operator COND expects 32 bits on the Conditional True, but Conditional True's VARREF 'next_idx' generates 4 bits.
+                                                                        : ... note: In instance 'rrarbiter'
+  117 |                         (next_idx < NUM_REQ) ? next_idx       :
+      |                                              ^
+%Warning-WIDTHTRUNC: ../ariane/src/common_cells/src/rrarbiter.sv:116:23: Operator ASSIGNW expects 4 bits on the Assign RHS, but Assign RHS's COND generates 32 bits.
+                                                                       : ... note: In instance 'rrarbiter'
+  116 |     assign arb_sel_d  = (lock_q)             ? arb_sel_lock_q :
+      |                       ^
+%Warning-WIDTHTRUNC: ../ariane/src/common_cells/src/rrarbiter.sv:122:28: Operator ASSIGNW expects 13 bits on the Assign RHS, but Assign RHS's UNSIGNED generates 32 bits.
+                                                                       : ... note: In instance 'rrarbiter'
+  122 |     assign mask_lut[k]     = unsigned'(2**(k+1)-1);
+      |                            ^
+%Error: Exiting due to 2 error(s)

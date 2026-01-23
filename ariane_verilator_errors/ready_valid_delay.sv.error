@@ -1,0 +1,19 @@
+%Warning-WIDTHTRUNC: ../ariane/src/common_cells/src/ready_valid_delay.sv:106:33: Operator ASSIGNW expects 4 bits on the Assign RHS, but Assign RHS's VARREF 'FixedDelay' generates 32 bits.
+                                                                               : ... note: In instance 'ready_valid_delay'
+  106 |             assign counter_load = FixedDelay;
+      |                                 ^
+                     ... For warning description see https://verilator.org/warn/WIDTHTRUNC?v=5.038
+                     ... Use "/* verilator lint_off WIDTHTRUNC */" and lint_on around source to disable this message.
+%Error-MODMISSING: ../ariane/src/common_cells/src/ready_valid_delay.sv:109:9: Cannot find file containing module: 'counter'
+  109 |         counter #(
+      |         ^~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        counter
+                        counter.v
+                        counter.sv
+                        obj_dir/counter
+                        obj_dir/counter.v
+                        obj_dir/counter.sv
+%Error: Exiting due to 1 error(s)

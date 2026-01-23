@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/src/axi_node/src/axi_AW_allocator.sv:136:7: Cannot find file containing module: 'axi_ArbitrationTree'
+  136 |       axi_ArbitrationTree
+      |       ^~~~~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_ArbitrationTree
+                        axi_ArbitrationTree.v
+                        axi_ArbitrationTree.sv
+                        obj_dir/axi_ArbitrationTree
+                        obj_dir/axi_ArbitrationTree.v
+                        obj_dir/axi_ArbitrationTree.sv
+%Error: Exiting due to 1 error(s)

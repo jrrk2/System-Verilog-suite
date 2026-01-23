@@ -1,0 +1,71 @@
+%Error-MODMISSING: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:210:5: Cannot find file containing module: 'axi_aw_buffer'
+  210 |     axi_aw_buffer #(
+      |     ^~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_aw_buffer
+                        axi_aw_buffer.v
+                        axi_aw_buffer.sv
+                        obj_dir/axi_aw_buffer
+                        obj_dir/axi_aw_buffer.v
+                        obj_dir/axi_aw_buffer.sv
+%Error-MODMISSING: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:247:5: Cannot find file containing module: 'axi_ar_buffer'
+  247 |     axi_ar_buffer #(
+      |     ^~~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:283:5: Cannot find file containing module: 'axi_w_buffer'
+  283 |     axi_w_buffer #(
+      |     ^~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:304:5: Cannot find file containing module: 'axi_r_buffer'
+  304 |     axi_r_buffer #(
+      |     ^~~~~~~~~~~~
+%Error-MODMISSING: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:329:5: Cannot find file containing module: 'axi_b_buffer'
+  329 |     axi_b_buffer #(
+      |     ^~~~~~~~~~~~
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:388:27: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'ARADDR' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  388 |                 address   = ARADDR;
+      |                           ^
+                     ... For warning description see https://verilator.org/warn/WIDTHTRUNC?v=5.038
+                     ... Use "/* verilator lint_off WIDTHTRUNC */" and lint_on around source to disable this message.
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:420:27: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'AWADDR' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  420 |                 address   = AWADDR;
+      |                           ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:448:31: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'ARADDR' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  448 |                     address   = ARADDR;
+      |                               ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:479:39: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'AWADDR' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  479 |                             address   = AWADDR;
+      |                                       ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:517:28: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's ADD generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  517 |                 address    = AWADDR + 4;
+      |                            ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:545:28: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'AWADDR_Q' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  545 |                 address    = AWADDR_Q;  
+      |                            ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:569:25: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'AWADDR_Q' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  569 |                 address = AWADDR_Q;  
+      |                         ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:595:25: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'ARADDR_Q' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  595 |                address  = ARADDR_Q;
+      |                         ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:622:26: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'ARADDR_Q' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  622 |                 address  = ARADDR_Q;
+      |                          ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:646:26: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's VARREF 'ARADDR_Q' generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  646 |                 address  = ARADDR_Q;
+      |                          ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv:675:32: Operator ASSIGN expects 12 bits on the Assign RHS, but Assign RHS's ADD generates 32 bits.
+                                                                           : ... note: In instance 'axi2apb_64_32'
+  675 |                 address        = ARADDR + 4;
+      |                                ^
+%Error: Exiting due to 5 error(s)

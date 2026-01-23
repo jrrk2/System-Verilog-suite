@@ -1,0 +1,6 @@
+%Error: ../ariane/src/common_cells/src/stream_arbiter.sv:18:25: Parameter without default value is never given value (IEEE 1800-2023 6.20.1): 'N_INP'
+                                                              : ... note: In instance 'stream_arbiter'
+   18 |     parameter integer   N_INP
+      |                         ^~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: Exiting due to 1 error(s)

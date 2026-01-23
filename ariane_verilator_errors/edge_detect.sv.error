@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/src/common_cells/src/edge_detect.sv:22:5: Cannot find file containing module: 'sync_wedge'
+   22 |     sync_wedge i_sync_wedge (
+      |     ^~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        sync_wedge
+                        sync_wedge.v
+                        sync_wedge.sv
+                        obj_dir/sync_wedge
+                        obj_dir/sync_wedge.v
+                        obj_dir/sync_wedge.sv
+%Error: Exiting due to 1 error(s)

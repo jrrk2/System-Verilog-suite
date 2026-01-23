@@ -1,0 +1,59 @@
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:24:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   24 |     input logic  [DATA_WIDTH-1:0] slave_data_i,
+      |                  ^
+                   ... For warning description see https://verilator.org/warn/ASCRANGE?v=5.038
+                   ... Use "/* verilator lint_off ASCRANGE */" and lint_on around source to disable this message.
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:25:18: Ascending bit range vector: left < right of bit range: [-1:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   25 |     input logic  [STRB_WIDTH-1:0] slave_strb_i,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:26:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   26 |     input logic  [USER_WIDTH-1:0] slave_user_i,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:31:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   31 |     output logic [DATA_WIDTH-1:0] master_data_o,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:32:18: Ascending bit range vector: left < right of bit range: [-1:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   32 |     output logic [STRB_WIDTH-1:0] master_strb_o,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:33:18: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   33 |     output logic [USER_WIDTH-1:0] master_user_o,
+      |                  ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:38:11: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   38 |     logic [DATA_WIDTH+STRB_WIDTH+USER_WIDTH:0] s_data_in;
+      |           ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:39:11: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_w_buffer'
+   39 |     logic [DATA_WIDTH+STRB_WIDTH+USER_WIDTH:0] s_data_out;
+      |           ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:41:22: Operator ASSIGNW expects 3 bits on the Assign RHS, but Assign RHS's REPLICATE generates 9 bits.
+                                                                           : ... note: In instance 'axi_w_buffer'
+   41 |     assign s_data_in = { slave_user_i,  slave_strb_i,  slave_data_i,  slave_last_i  };
+      |                      ^
+                     ... For warning description see https://verilator.org/warn/WIDTHTRUNC?v=5.038
+                     ... Use "/* verilator lint_off WIDTHTRUNC */" and lint_on around source to disable this message.
+%Warning-WIDTHEXPAND: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:42:87: Operator ASSIGNW expects 9 bits on the Assign RHS, but Assign RHS's VARREF 's_data_out' generates 3 bits.
+                                                                            : ... note: In instance 'axi_w_buffer'
+   42 |     assign             { master_user_o, master_strb_o, master_data_o, master_last_o } = s_data_out;
+      |                                                                                       ^
+                      ... For warning description see https://verilator.org/warn/WIDTHEXPAND?v=5.038
+                      ... Use "/* verilator lint_off WIDTHEXPAND */" and lint_on around source to disable this message.
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_w_buffer.sv:44:5: Cannot find file containing module: 'axi_single_slice'
+   44 |     axi_single_slice #(.BUFFER_DEPTH(BUFFER_DEPTH), .DATA_WIDTH(1+DATA_WIDTH+STRB_WIDTH+USER_WIDTH)) i_axi_single_slice (
+      |     ^~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_single_slice
+                        axi_single_slice.v
+                        axi_single_slice.sv
+                        obj_dir/axi_single_slice
+                        obj_dir/axi_single_slice.v
+                        obj_dir/axi_single_slice.sv
+%Error: Exiting due to 1 error(s)

@@ -1,0 +1,14 @@
+%Error: ../ariane/src/clint/clint.sv:28:12: Package/class for ':: reference' not found: 'ariane_axi'
+   28 |     input  ariane_axi::req_t    axi_req_i,
+      |            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/clint/clint.sv:28:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   28 |     input  ariane_axi::req_t    axi_req_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/clint/clint.sv:29:12: Package/class for ':: reference' not found: 'ariane_axi'
+   29 |     output ariane_axi::resp_t   axi_resp_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/clint/clint.sv:29:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   29 |     output ariane_axi::resp_t   axi_resp_o,
+      |            ^~~~~~~~~~
+%Error: Exiting due to 4 error(s)

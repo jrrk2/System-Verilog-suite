@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/src/plic/plic_target_slice.sv:55:5: Cannot find file containing module: 'plic_find_max'
+   55 |     plic_find_max #(
+      |     ^~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        plic_find_max
+                        plic_find_max.v
+                        plic_find_max.sv
+                        obj_dir/plic_find_max
+                        obj_dir/plic_find_max.v
+                        obj_dir/plic_find_max.sv
+%Error: Exiting due to 1 error(s)

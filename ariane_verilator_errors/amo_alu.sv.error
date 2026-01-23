@@ -1,0 +1,38 @@
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:16:16: Package/class for ':: reference' not found: 'ariane_pkg'
+   16 |         input  ariane_pkg::amo_t  amo_op_i,
+      |                ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:16:16: Package/class for 'class/package reference' not found: 'ariane_pkg'
+   16 |         input  ariane_pkg::amo_t  amo_op_i,
+      |                ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:36:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   36 |             ariane_pkg::AMO_SC:;
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:37:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   37 |             ariane_pkg::AMO_SWAP:;
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:38:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   38 |             ariane_pkg::AMO_ADD: amo_result_o = adder_sum[63:0];
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:39:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   39 |             ariane_pkg::AMO_AND: amo_result_o = amo_operand_a_i & amo_operand_b_i;
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:40:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   40 |             ariane_pkg::AMO_OR:  amo_result_o = amo_operand_a_i | amo_operand_b_i;
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:41:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   41 |             ariane_pkg::AMO_XOR: amo_result_o = amo_operand_a_i ^ amo_operand_b_i;
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:42:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   42 |             ariane_pkg::AMO_MAX: begin
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:46:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   46 |             ariane_pkg::AMO_MIN: begin
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:50:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   50 |             ariane_pkg::AMO_MAXU: begin
+      |             ^~~~~~~~~~
+%Error: ../ariane/src/cache_subsystem/amo_alu.sv:55:13: Package/class for ':: reference' not found: 'ariane_pkg'
+   55 |             ariane_pkg::AMO_MINU: begin
+      |             ^~~~~~~~~~
+%Error: Exiting due to 12 error(s)

@@ -1,0 +1,30 @@
+%Error-NEEDTIMINGOPT: ../ariane/tb/common/SimJTAG.sv:43:17: Use --timing or --no-timing to specify how timing controls should be handled
+                                                          : ... note: In instance 'SimJTAG'
+   43 |    wire         #0.1 __jtag_TDO = jtag_TDO_driven ?
+      |                 ^
+                      ... For error description see https://verilator.org/warn/NEEDTIMINGOPT?v=5.038
+%Error-NEEDTIMINGOPT: ../ariane/tb/common/SimJTAG.sv:43:17: Use --timing or --no-timing to specify how delays should be handled
+                                                          : ... note: In instance 'SimJTAG'
+   43 |    wire         #0.1 __jtag_TDO = jtag_TDO_driven ?
+      |                 ^
+%Error-NEEDTIMINGOPT: ../ariane/tb/common/SimJTAG.sv:54:11: Use --timing or --no-timing to specify how timing controls should be handled
+                                                          : ... note: In instance 'SimJTAG'
+   54 |    assign #0.1 jtag_TCK   = __jtag_TCK;
+      |           ^
+%Error-NEEDTIMINGOPT: ../ariane/tb/common/SimJTAG.sv:55:11: Use --timing or --no-timing to specify how timing controls should be handled
+                                                          : ... note: In instance 'SimJTAG'
+   55 |    assign #0.1 jtag_TMS   = __jtag_TMS;
+      |           ^
+%Error-NEEDTIMINGOPT: ../ariane/tb/common/SimJTAG.sv:56:11: Use --timing or --no-timing to specify how timing controls should be handled
+                                                          : ... note: In instance 'SimJTAG'
+   56 |    assign #0.1 jtag_TDI   = __jtag_TDI;
+      |           ^
+%Error-NEEDTIMINGOPT: ../ariane/tb/common/SimJTAG.sv:57:11: Use --timing or --no-timing to specify how timing controls should be handled
+                                                          : ... note: In instance 'SimJTAG'
+   57 |    assign #0.1 jtag_TRSTn = __jtag_TRSTn;
+      |           ^
+%Error-NEEDTIMINGOPT: ../ariane/tb/common/SimJTAG.sv:59:11: Use --timing or --no-timing to specify how timing controls should be handled
+                                                          : ... note: In instance 'SimJTAG'
+   59 |    assign #0.1 exit = __exit;
+      |           ^
+%Error: Exiting due to 7 error(s)

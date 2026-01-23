@@ -1,0 +1,47 @@
+%Error: ../ariane/include/std_cache_pkg.sv:21:44: Package/class for ':: reference' not found: 'ariane_pkg'
+   21 |     localparam DCACHE_BYTE_OFFSET = $clog2(ariane_pkg::DCACHE_LINE_WIDTH/8);
+      |                                            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/include/std_cache_pkg.sv:22:41: Package/class for ':: reference' not found: 'ariane_pkg'
+   22 |     localparam DCACHE_NUM_WORDS   = 2**(ariane_pkg::DCACHE_INDEX_WIDTH-DCACHE_BYTE_OFFSET);
+      |                                         ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:23:37: Package/class for ':: reference' not found: 'ariane_pkg'
+   23 |     localparam DCACHE_DIRTY_WIDTH = ariane_pkg::DCACHE_SET_ASSOC*2;
+      |                                     ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:46:16: Package/class for ':: reference' not found: 'ariane_pkg'
+   46 |         logic [ariane_pkg::DCACHE_TAG_WIDTH-1:0]  tag;     
+      |                ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:47:16: Package/class for ':: reference' not found: 'ariane_pkg'
+   47 |         logic [ariane_pkg::DCACHE_LINE_WIDTH-1:0] data;    
+      |                ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:54:17: Package/class for ':: reference' not found: 'ariane_pkg'
+   54 |         logic [(ariane_pkg::DCACHE_TAG_WIDTH+7)/8-1:0]  tag;     
+      |                 ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:55:17: Package/class for ':: reference' not found: 'ariane_pkg'
+   55 |         logic [(ariane_pkg::DCACHE_LINE_WIDTH+7)/8-1:0] data;    
+      |                 ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:56:16: Package/class for ':: reference' not found: 'ariane_pkg'
+   56 |         logic [ariane_pkg::DCACHE_SET_ASSOC-1:0]        vldrty;  
+      |                ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:60:38: Package/class for ':: reference' not found: 'ariane_pkg'
+   60 |     function automatic logic [$clog2(ariane_pkg::DCACHE_SET_ASSOC)-1:0] one_hot_to_bin (
+      |                                      ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:61:22: Package/class for ':: reference' not found: 'ariane_pkg'
+   61 |         input logic [ariane_pkg::DCACHE_SET_ASSOC-1:0] in
+      |                      ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:63:38: Package/class for ':: reference' not found: 'ariane_pkg'
+   63 |         for (int unsigned i = 0; i < ariane_pkg::DCACHE_SET_ASSOC; i++) begin
+      |                                      ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:69:31: Package/class for ':: reference' not found: 'ariane_pkg'
+   69 |     function automatic logic [ariane_pkg::DCACHE_SET_ASSOC-1:0] get_victim_cl (
+      |                               ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:70:22: Package/class for ':: reference' not found: 'ariane_pkg'
+   70 |         input logic [ariane_pkg::DCACHE_SET_ASSOC-1:0] valid_dirty
+      |                      ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:73:16: Package/class for ':: reference' not found: 'ariane_pkg'
+   73 |         logic [ariane_pkg::DCACHE_SET_ASSOC-1:0] oh = '0;
+      |                ^~~~~~~~~~
+%Error: ../ariane/include/std_cache_pkg.sv:74:38: Package/class for ':: reference' not found: 'ariane_pkg'
+   74 |         for (int unsigned i = 0; i < ariane_pkg::DCACHE_SET_ASSOC; i++) begin
+      |                                      ^~~~~~~~~~
+%Error: Exiting due to 15 error(s)

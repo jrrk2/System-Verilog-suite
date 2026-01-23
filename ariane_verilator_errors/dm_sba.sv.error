@@ -1,0 +1,14 @@
+%Error: ../ariane/src/debug/dm_sba.sv:24:12: Package/class for ':: reference' not found: 'ariane_axi'
+   24 |     output ariane_axi::req_t  axi_req_o,
+      |            ^~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: ../ariane/src/debug/dm_sba.sv:24:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   24 |     output ariane_axi::req_t  axi_req_o,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_sba.sv:25:12: Package/class for ':: reference' not found: 'ariane_axi'
+   25 |     input  ariane_axi::resp_t axi_resp_i,
+      |            ^~~~~~~~~~
+%Error: ../ariane/src/debug/dm_sba.sv:25:12: Package/class for 'class/package reference' not found: 'ariane_axi'
+   25 |     input  ariane_axi::resp_t axi_resp_i,
+      |            ^~~~~~~~~~
+%Error: Exiting due to 4 error(s)

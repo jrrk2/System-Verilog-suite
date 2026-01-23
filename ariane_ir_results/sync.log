@@ -1,0 +1,104 @@
+═══════════════════════════════════════════════════════════════
+  Verilator JSON → Behavioral IR → Optimization
+═══════════════════════════════════════════════════════════════
+
+Input: ariane_verilator_json/sync.json
+
+[1/3] Converting Verilator JSON to Behavioral IR...
+✓ Conversion successful (1 modules)
+
+Module: sync
+  Signals: 6
+  Processes: 1
+
+[2/3] Running Optimization Pipeline...
+Constant propagation iteration 1: 0 changes
+Dead code elimination: 0 statements removed (1 → 1)
+Common subexpression elimination: 0 expressions reused
+Register Inference Results:
+  Registers: 1
+  Wires: 3
+
+Registers (original signals only):
+  - r_reg: 2 bits, clock=clk_i
+      data = _cse_temp2
+
+Combinational wires (CSE temps and intermediate values):
+  - _cse_temp0 = r_reg_0[0:0]
+  - _cse_temp1 = {_cse_temp0, serial_i_0}
+  - _cse_temp2 = (rst_ni_0 ? _cse_temp1 : 2'0)
+
+═══════════════════════════════════════════════════════════════
+Comparison: New Register Inference vs Old VHDL Bug
+═══════════════════════════════════════════════════════════════
+
+Module: sync
+
+OLD VHDL APPROACH (BUGGY):
+  - Created register for EVERY assignment
+  - Result: 6 registers for slib_clock_div
+    • Register(iCounter) - initial
+    • Register(iQ) - initial
+    • Register(iQ_next1) - default assignment ❌
+    • Register(iQ_next2) - pulse assignment ❌
+    • Register(iCounter_n1) - max assignment ❌
+    • Register(iCounter_n2) - increment ❌
+
+NEW SHARED APPROACH (CORRECT):
+  - Groups assignments by ORIGINAL signal name
+  - Strips SSA suffixes (iCounter_7 → iCounter)
+  - Filters out CSE temps (_cse_tempN)
+  - Builds MUX tree for multiple assignments
+  - Creates ONE register per ORIGINAL signal
+  - Result: 1 registers
+    • Register(r_reg) ✅
+
+  - CSE temps and SSA versions: 3 wires (not registers!)
+
+✅ Bug fixed! Correct number of registers.
+✅ This logic is shared by VHDL and SystemVerilog.
+✅ No more language-specific register inference!
+
+✓ Optimization complete
+
+[3/3] Register Inference...
+
+Register Inference Results:
+  Registers: 1
+  Wires: 3
+
+Registers (original signals only):
+  - r_reg: 2 bits, clock=clk_i
+
+═══════════════════════════════════════════════════════════════
+Comparison: Old opt_ir vs New Behavioral IR
+═══════════════════════════════════════════════════════════════
+
+OLD APPROACH (behavioural_to_opt_ir.ml):
+  • Converted Verilator JSON → opt_ir (dataflow graph)
+  • No high-level optimization passes
+  • No SSA, no DCE, no CSE
+  • Register inference at opt_ir level
+
+NEW APPROACH (verilator_to_behavioral.ml):
+  • Converts Verilator JSON → Behavioral IR
+  • ✅ SSA construction
+  • ✅ Constant propagation
+  • ✅ Dead code elimination
+  • ✅ Common subexpression elimination
+  • ✅ Register inference: 1 registers
+
+Benefits:
+  ✅ Language-neutral IR (same as VHDL/SV)
+  ✅ Shared optimization infrastructure
+  ✅ Module-level DCE with cross-process analysis
+  ✅ Can use Z3 miter verification
+  ✅ Can compare Verilator vs Verible frontends
+
+═══════════════════════════════════════════════════════════════
+  ✅ SUCCESS
+═══════════════════════════════════════════════════════════════
+
+Verilator JSON successfully processed through behavioral IR!
+Module sync: 1 registers, 3 wires
+

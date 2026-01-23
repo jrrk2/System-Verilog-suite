@@ -1,0 +1,13 @@
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_r_buffer.sv:48:4: Cannot find file containing module: 'axi_single_slice'
+   48 |    axi_single_slice #(.BUFFER_DEPTH(BUFFER_DEPTH), .DATA_WIDTH(3+DATA_WIDTH+USER_WIDTH+ID_WIDTH)) i_axi_single_slice (
+      |    ^~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_single_slice
+                        axi_single_slice.v
+                        axi_single_slice.sv
+                        obj_dir/axi_single_slice
+                        obj_dir/axi_single_slice.v
+                        obj_dir/axi_single_slice.sv
+%Error: Exiting due to 1 error(s)

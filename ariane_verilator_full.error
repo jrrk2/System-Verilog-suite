@@ -1,0 +1,77 @@
+%Warning-MULTITOP: ../ariane/src/cache_subsystem/serpent_cache_subsystem.sv:24:8: Multiple top level modules
+                                                                                : ... Suggest see manual; fix the duplicates, or use --top-module to select top.
+                   ... For warning description see https://verilator.org/warn/MULTITOP?v=5.038
+                   ... Use "/* verilator lint_off MULTITOP */" and lint_on around source to disable this message.
+                                                                                : ... Top module 'div_sqrt_mvp_wrapper'
+   41 | module div_sqrt_mvp_wrapper
+      |        ^~~~~~~~~~~~~~~~~~~~
+                                                                                : ... Top module 'serpent_cache_subsystem'
+   24 | module serpent_cache_subsystem #(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~
+                                                                                : ... Top module 'axi2apb_wrap'
+   11 | module axi2apb_wrap #(
+      |        ^~~~~~~~~~~~
+                                                                                : ... Top module 'axi_slice_wrap'
+    1 | module axi_slice_wrap #(
+      |        ^~~~~~~~~~~~~~
+                                                                                : ... Top module 'apb_regs_top'
+   72 | module apb_regs_top
+      |        ^~~~~~~~~~~~
+                                                                                : ... Top module 'axi_node_wrap_with_slices'
+   22 | module axi_node_wrap_with_slices #(
+      |        ^~~~~~~~~~~~~~~~~~~~~~~~~
+                                                                                : ... Top module 'axi_regs_top'
+   92 | module axi_regs_top
+      |        ^~~~~~~~~~~~
+                                                                                : ... Top module 'generic_fifo'
+   12 | module generic_fifo #(
+      |        ^~~~~~~~~~~~
+                                                                                : ... Top module 'pulp_sync'
+   13 | module pulp_sync
+      |        ^~~~~~~~~
+                                                                                : ... Top module 'find_first_one'
+   20 | module find_first_one #(
+      |        ^~~~~~~~~~~~~~
+                                                                                : ... Top module 'axi_master_connect_rev'
+   14 | module axi_master_connect_rev (
+      |        ^~~~~~~~~~~~~~~~~~~~~~
+                                                                                : ... Top module 'axi_to_axi_lite'
+   21 | module axi_to_axi_lite #(
+      |        ^~~~~~~~~~~~~~~
+                                                                                : ... Top module 'sync'
+   13 | module sync #(
+      |        ^~~~
+                                                                                : ... Top module 'edge_detect'
+   14 | module edge_detect (
+      |        ^~~~~~~~~~~
+                                                                                : ... Top module 'ariane_testharness'
+   16 | module ariane_testharness #(
+      |        ^~~~~~~~~~~~~~~~~~
+%Error: ../ariane/fpga/src/axi2apb/src/axi2apb_wrap.sv:24:5: Cannot find file containing interface: 'APB_BUS'
+   24 |     APB_BUS.Master  apb_master
+      |     ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Warning-IMPLICIT: ../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv:138:28: Signal definition not found, creating implicitly: 'Full_precision_S'
+  138 |    .Full_precision_SO     (Full_precision_S   ),
+      |                            ^~~~~~~~~~~~~~~~
+                   ... For warning description see https://verilator.org/warn/IMPLICIT?v=5.038
+                   ... Use "/* verilator lint_off IMPLICIT */" and lint_on around source to disable this message.
+%Warning-IMPLICIT: ../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv:139:28: Signal definition not found, creating implicitly: 'FP32_S'
+  139 |    .FP32_SO               (FP32_S             ),
+      |                            ^~~~~~
+%Warning-IMPLICIT: ../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv:140:28: Signal definition not found, creating implicitly: 'FP64_S'
+                                                                                : ... Suggested alternative: 'FP32_S'
+  140 |    .FP64_SO               (FP64_S             ),
+      |                            ^~~~~~
+%Warning-IMPLICIT: ../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv:141:28: Signal definition not found, creating implicitly: 'FP16_S'
+                                                                                : ... Suggested alternative: 'FP32_S'
+  141 |    .FP16_SO               (FP16_S             ),
+      |                            ^~~~~~
+%Warning-IMPLICIT: ../ariane/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv:142:28: Signal definition not found, creating implicitly: 'FP16ALT_S'
+                                                                                : ... Suggested alternative: 'FP16_S'
+  142 |    .FP16ALT_SO            (FP16ALT_S          ),
+      |                            ^~~~~~~~~
+%Error: Internal Error: ../ariane/fpga/src/axi2apb/src/axi2apb_wrap.sv:24:5: ../V3LinkDot.cpp:3241: Unlinked interface
+   24 |     APB_BUS.Master  apb_master
+      |     ^~~~~~~
+                        ... This fatal error may be caused by the earlier error(s); resolve those first.

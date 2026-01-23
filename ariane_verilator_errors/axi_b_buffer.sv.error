@@ -1,0 +1,51 @@
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:24:17: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_b_buffer'
+   24 |    input logic  [ID_WIDTH-1:0]   slave_id_i,
+      |                 ^
+                   ... For warning description see https://verilator.org/warn/ASCRANGE?v=5.038
+                   ... Use "/* verilator lint_off ASCRANGE */" and lint_on around source to disable this message.
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:25:17: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_b_buffer'
+   25 |    input logic  [USER_WIDTH-1:0] slave_user_i,
+      |                 ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:30:17: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_b_buffer'
+   30 |    output logic [ID_WIDTH-1:0]   master_id_o,
+      |                 ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:31:17: Ascending bit range vector: left < right of bit range: [-2:0]
+                                                                         : ... note: In instance 'axi_b_buffer'
+   31 |    output logic [USER_WIDTH-1:0] master_user_o,
+      |                 ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:35:11: Ascending bit range vector: left < right of bit range: [-1:0]
+                                                                         : ... note: In instance 'axi_b_buffer'
+   35 |     logic [2+USER_WIDTH+ID_WIDTH-1:0] s_data_in;
+      |           ^
+%Warning-ASCRANGE: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:36:11: Ascending bit range vector: left < right of bit range: [-1:0]
+                                                                         : ... note: In instance 'axi_b_buffer'
+   36 |     logic [2+USER_WIDTH+ID_WIDTH-1:0] s_data_out;
+      |           ^
+%Warning-WIDTHTRUNC: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:38:22: Operator ASSIGNW expects 2 bits on the Assign RHS, but Assign RHS's REPLICATE generates 8 bits.
+                                                                           : ... note: In instance 'axi_b_buffer'
+   38 |     assign s_data_in = {slave_id_i,  slave_user_i,  slave_resp_i};
+      |                      ^
+                     ... For warning description see https://verilator.org/warn/WIDTHTRUNC?v=5.038
+                     ... Use "/* verilator lint_off WIDTHTRUNC */" and lint_on around source to disable this message.
+%Warning-WIDTHEXPAND: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:39:68: Operator ASSIGNW expects 8 bits on the Assign RHS, but Assign RHS's VARREF 's_data_out' generates 2 bits.
+                                                                            : ... note: In instance 'axi_b_buffer'
+   39 |     assign             {master_id_o, master_user_o, master_resp_o} = s_data_out;
+      |                                                                    ^
+                      ... For warning description see https://verilator.org/warn/WIDTHEXPAND?v=5.038
+                      ... Use "/* verilator lint_off WIDTHEXPAND */" and lint_on around source to disable this message.
+%Error-MODMISSING: ../ariane/fpga/src/axi_slice/src/axi_b_buffer.sv:42:5: Cannot find file containing module: 'axi_single_slice'
+   42 |     axi_single_slice #(.BUFFER_DEPTH(BUFFER_DEPTH), .DATA_WIDTH(2+USER_WIDTH+ID_WIDTH)) i_axi_single_slice (
+      |     ^~~~~~~~~~~~~~~~
+                   ... For error description see https://verilator.org/warn/MODMISSING?v=5.038
+                   ... This may be because there's no search path specified with -I<dir>.
+                   ... Looked in:
+                        axi_single_slice
+                        axi_single_slice.v
+                        axi_single_slice.sv
+                        obj_dir/axi_single_slice
+                        obj_dir/axi_single_slice.v
+                        obj_dir/axi_single_slice.sv
+%Error: Exiting due to 1 error(s)

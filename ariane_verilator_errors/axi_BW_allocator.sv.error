@@ -1,0 +1,5 @@
+%Error: ../ariane/src/axi_node/src/axi_BW_allocator.sv:222:23: Package/class for ':: reference' not found: 'axi_pkg'
+  222 |         bresp_o     = axi_pkg::RESP_DECERR;
+      |                       ^~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=5.038 for more assistance.
+%Error: Exiting due to 1 error(s)
