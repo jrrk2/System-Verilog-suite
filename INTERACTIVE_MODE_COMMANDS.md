@@ -2,9 +2,49 @@
 
 ## Summary
 
-Added five new commands to the unified interactive console (`sv_main_unified.exe interactive`) for testing the behavioral IR infrastructure and Yosys synthesis.
+Added six new commands to the unified interactive console (`sv_main_unified.exe interactive`) for testing the behavioral IR infrastructure, Yosys synthesis, and Verilator parsing.
 
 ## New Commands
+
+### verilator-json
+Parse SystemVerilog with Verilator and output JSON AST.
+
+**Usage:**
+```
+sv> verilator-json <file.v> [output.json]
+```
+
+**Examples:**
+```
+# Output to file
+sv> verilator-json sysver_tests/slib_clock_div.sv /tmp/output.json
+
+# Output to stdout (with automatic filtering)
+sv> verilator-json sysver_tests/slib_clock_div.sv
+```
+
+**What it does:**
+1. Reads SystemVerilog file with Verilator
+2. Generates JSON AST representation
+3. Writes JSON to file or stdout
+4. **Automatically filters** Verilator warnings/messages from stdout
+
+**Verilator Command:**
+```bash
+verilator --json-only --json-only-output <output> -Wno-fatal <input>
+```
+
+**Output Filtering (stdout mode):**
+- Uses `popen` to capture Verilator output
+- Reads line by line until finding first line starting with `{`
+- Discards all lines before `{` (warnings, reports, etc.)
+- Outputs clean JSON starting from `{`
+
+**Use Cases:**
+- Generate JSON AST for behavioral IR conversion
+- Quick parsing without dealing with warning messages
+- Feed directly to test_verilator_behavioral.exe
+- Compare Verilator AST with Yosys RTLIL
 
 ### synth-yosys
 Synthesize SystemVerilog with Yosys and output RTLIL format.
@@ -149,11 +189,15 @@ sv> help
 ## Example Session
 
 ```
+sv> verilator-json sysver_tests/slib_clock_div.sv /tmp/clock_div.json
+Parsing sysver_tests/slib_clock_div.sv with Verilator...
+✓ JSON output complete: /tmp/clock_div.json
+
 sv> synth-yosys sysver_tests/slib_clock_div.sv /tmp/clock_div.il
 Synthesizing sysver_tests/slib_clock_div.sv with Yosys...
 ✓ Synthesis complete: /tmp/clock_div.il
 
-sv> test-verilator test/obj_dir/Vcounter.tree.json
+sv> test-verilator /tmp/clock_div.json
 ═══════════════════════════════════════════════════════════════
   Verilator JSON → Behavioral IR → Optimization
 ═══════════════════════════════════════════════════════════════
@@ -216,6 +260,7 @@ Goodbye!
 
 The commands are implemented in `sv_main_unified.ml` in the `Interactive` module:
 
+### Test Commands
 ```ocaml
 | "test-verilator" :: json_file :: _ ->
     let cmd = Printf.sprintf "dune exec ./test_verilator_behavioral.exe %s" json_file in
@@ -226,14 +271,41 @@ The commands are implemented in `sv_main_unified.ml` in the `Interactive` module
     execute_shell_command cmd
 ```
 
+### Synthesis Commands
+```ocaml
+| "verilator-json" :: sv_file :: [] ->
+    (* Use popen to capture and filter output *)
+    let ic = Unix.open_process_in verilator_cmd in
+    let rec skip_until_brace () =
+      try
+        let line = input_line ic in
+        if String.length line > 0 && line.[0] = '{' then begin
+          (* Found JSON start, output this and remaining lines *)
+          Printf.printf "%s\n" line;
+          ...
+        end else
+          skip_until_brace ()  (* Skip non-JSON lines *)
+      with End_of_file -> ()
+    in
+    skip_until_brace ();
+    let status = Unix.close_process_in ic in
+    ...
+
+| "synth-yosys" :: sv_file :: [] ->
+    let yosys_cmd = "yosys -q -q -p 'read_verilog -sv ...; synth; write_rtlil'" in
+    execute_shell_command yosys_cmd
+```
+
 Each command:
 1. Validates arguments (shows usage if missing)
-2. Builds `dune exec` command string
-3. Executes via `execute_shell_command`
+2. Builds command string or uses popen for filtering
+3. Executes via `execute_shell_command` or `Unix.open_process_in`
 4. Returns exit code and output to user
 
 ## Status
 
-✅ **All four commands working and tested**
+✅ **All six commands working and tested**
 
-The interactive mode now provides convenient access to the complete behavioral IR test suite.
+The interactive mode now provides convenient access to:
+- Behavioral IR test suite (4 commands)
+- Synthesis tools (2 commands: Yosys + Verilator)
