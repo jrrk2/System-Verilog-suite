@@ -1,0 +1,162 @@
+#!/bin/bash
+# Test Verilator JSON → Behavioral IR conversion on Ariane files (v2)
+
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Testing Verilator JSON → Behavioral IR on Ariane Modules"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+
+# Create output directory
+mkdir -p ariane_verilator_json
+mkdir -p ariane_ir_results
+
+# Check if executable exists
+EXEC="_build/default/test_verilator_behavioral.exe"
+if [ ! -f "$EXEC" ]; then
+  echo "✗ Error: Executable not found: $EXEC"
+  echo "Please build first: dune build ./test_verilator_behavioral.exe"
+  exit 1
+fi
+
+# Select representative modules from different categories
+TEST_MODULES=(
+  # Simple utility modules
+  "counter:../ariane/src/common_cells/src/counter.sv"
+  "lzc:../ariane/src/common_cells/src/lzc.sv"
+  "sync:../ariane/src/common_cells/src/sync.sv"
+  "lfsr_8bit:../ariane/src/common_cells/src/lfsr_8bit.sv"
+  "lfsr_16bit:../ariane/src/common_cells/src/lfsr_16bit.sv"
+  "spill_register:../ariane/src/common_cells/src/spill_register.sv"
+  "edge_detect:../ariane/src/common_cells/src/edge_detect.sv"
+
+  # More complex modules (will likely fail without packages)
+  "serdiv:../ariane/src/serdiv.sv"
+  "multiplier:../ariane/src/multiplier.sv"
+
+  # FPU components
+  "fpu_ff:../ariane/src/fpu_div_sqrt_mvp/hdl/fpu_ff.sv"
+  "iteration_div_sqrt_mvp:../ariane/src/fpu_div_sqrt_mvp/hdl/iteration_div_sqrt_mvp.sv"
+)
+
+# Counters
+TOTAL=0
+JSON_SUCCESS=0
+JSON_FAILED=0
+IR_SUCCESS=0
+IR_FAILED=0
+
+echo "Phase 1: Generating Verilator JSON"
+echo "─────────────────────────────────────────────────────────────"
+echo ""
+
+for MODULE_ENTRY in "${TEST_MODULES[@]}"; do
+  IFS=':' read -r MODULE_NAME MODULE_FILE <<< "$MODULE_ENTRY"
+
+  TOTAL=$((TOTAL + 1))
+
+  if [ ! -f "$MODULE_FILE" ]; then
+    echo "⚠  File not found: $MODULE_FILE"
+    continue
+  fi
+
+  JSON_FILE="ariane_verilator_json/${MODULE_NAME}.json"
+
+  # Generate Verilator JSON
+  echo -n "[$TOTAL] Generating JSON for $MODULE_NAME... "
+
+  if verilator --json-only --json-only-output "$JSON_FILE" \
+      -Wno-fatal "$MODULE_FILE" > /dev/null 2>&1; then
+    echo "✓"
+    JSON_SUCCESS=$((JSON_SUCCESS + 1))
+  else
+    echo "✗ (Verilator failed)"
+    JSON_FAILED=$((JSON_FAILED + 1))
+  fi
+done
+
+echo ""
+echo "JSON Generation Summary:"
+echo "  Total:      $TOTAL"
+echo "  Successful: $JSON_SUCCESS"
+echo "  Failed:     $JSON_FAILED"
+echo ""
+
+if [ $JSON_SUCCESS -eq 0 ]; then
+  echo "✗ No JSON files generated, cannot proceed to IR conversion"
+  exit 1
+fi
+
+echo ""
+echo "Phase 2: Converting JSON → Behavioral IR"
+echo "─────────────────────────────────────────────────────────────"
+echo ""
+
+for MODULE_ENTRY in "${TEST_MODULES[@]}"; do
+  IFS=':' read -r MODULE_NAME MODULE_FILE <<< "$MODULE_ENTRY"
+
+  JSON_FILE="ariane_verilator_json/${MODULE_NAME}.json"
+
+  if [ ! -f "$JSON_FILE" ]; then
+    continue
+  fi
+
+  echo ""
+  echo "Testing: $MODULE_NAME"
+  echo "─────────────────────────────────────────────────────────"
+
+  # Test conversion to Behavioral IR (use pre-built executable)
+  if "$EXEC" "$JSON_FILE" > "ariane_ir_results/${MODULE_NAME}.log" 2>&1; then
+    echo "✅ SUCCESS: $MODULE_NAME"
+    IR_SUCCESS=$((IR_SUCCESS + 1))
+
+    # Extract key metrics
+    REGS=$(grep "Registers:" "ariane_ir_results/${MODULE_NAME}.log" | tail -1 | awk '{print $2}')
+    WIRES=$(grep "Wires:" "ariane_ir_results/${MODULE_NAME}.log" | tail -1 | awk '{print $2}')
+
+    echo "   Registers: $REGS, Wires: $WIRES"
+  else
+    echo "✗ FAILED: $MODULE_NAME"
+    IR_FAILED=$((IR_FAILED + 1))
+
+    # Show error snippet
+    tail -10 "ariane_ir_results/${MODULE_NAME}.log" | head -5
+  fi
+done
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Final Summary"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Verilator JSON Generation:"
+echo "  Total:      $TOTAL"
+echo "  Successful: $JSON_SUCCESS"
+echo "  Failed:     $JSON_FAILED"
+echo ""
+echo "Behavioral IR Conversion:"
+echo "  Tested:     $JSON_SUCCESS"
+echo "  Successful: $IR_SUCCESS"
+echo "  Failed:     $IR_FAILED"
+echo ""
+
+if [ $IR_SUCCESS -gt 0 ]; then
+  PERCENT=$((IR_SUCCESS * 100 / JSON_SUCCESS))
+  echo "IR Conversion Success Rate: ${PERCENT}%"
+  echo ""
+  echo "Detailed logs saved in: ariane_ir_results/"
+fi
+
+echo ""
+echo "Files generated:"
+echo "  - Verilator JSON: ariane_verilator_json/"
+echo "  - IR logs:        ariane_ir_results/"
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+
+if [ $IR_SUCCESS -eq $JSON_SUCCESS ]; then
+  echo "✅ All JSON files successfully converted to Behavioral IR!"
+  exit 0
+else
+  echo "⚠  Some conversions failed"
+  exit 1
+fi

@@ -1,0 +1,154 @@
+#!/bin/bash
+# Test Verilator JSON → Behavioral IR conversion on Ariane files
+
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Testing Verilator JSON → Behavioral IR on Ariane Modules"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+
+# Create output directory
+mkdir -p ariane_verilator_json
+mkdir -p ariane_ir_results
+
+# Select representative modules from different categories
+# These are standalone modules that can be tested individually
+
+TEST_MODULES=(
+  # Simple utility modules
+  "counter:../ariane/src/common_cells/src/counter.sv"
+  "lzc:../ariane/src/common_cells/src/lzc.sv"
+  "sync:../ariane/src/common_cells/src/sync.sv"
+  "lfsr_8bit:../ariane/src/common_cells/src/lfsr_8bit.sv"
+  "lfsr_16bit:../ariane/src/common_cells/src/lfsr_16bit.sv"
+
+  # More complex modules
+  "serdiv:../ariane/src/serdiv.sv"
+  "multiplier:../ariane/src/multiplier.sv"
+
+  # FPU components
+  "fpu_ff:../ariane/src/fpu_div_sqrt_mvp/hdl/fpu_ff.sv"
+  "iteration_div_sqrt_mvp:../ariane/src/fpu_div_sqrt_mvp/hdl/iteration_div_sqrt_mvp.sv"
+
+  # Frontend components
+  "ras:../ariane/src/frontend/ras.sv"
+)
+
+# Counters
+TOTAL=0
+JSON_SUCCESS=0
+JSON_FAILED=0
+IR_SUCCESS=0
+IR_FAILED=0
+
+echo "Phase 1: Generating Verilator JSON"
+echo "─────────────────────────────────────────────────────────────"
+echo ""
+
+for MODULE_ENTRY in "${TEST_MODULES[@]}"; do
+  IFS=':' read -r MODULE_NAME MODULE_FILE <<< "$MODULE_ENTRY"
+
+  TOTAL=$((TOTAL + 1))
+
+  if [ ! -f "$MODULE_FILE" ]; then
+    echo "⚠  File not found: $MODULE_FILE"
+    continue
+  fi
+
+  JSON_FILE="ariane_verilator_json/${MODULE_NAME}.json"
+
+  # Generate Verilator JSON
+  echo -n "[$TOTAL] Generating JSON for $MODULE_NAME... "
+
+  if verilator --json-only --json-only-output "$JSON_FILE" \
+      -Wno-fatal "$MODULE_FILE" > /dev/null 2>&1; then
+    echo "✓"
+    JSON_SUCCESS=$((JSON_SUCCESS + 1))
+  else
+    echo "✗ (Verilator failed)"
+    JSON_FAILED=$((JSON_FAILED + 1))
+  fi
+done
+
+echo ""
+echo "JSON Generation Summary:"
+echo "  Total:      $TOTAL"
+echo "  Successful: $JSON_SUCCESS"
+echo "  Failed:     $JSON_FAILED"
+echo ""
+
+if [ $JSON_SUCCESS -eq 0 ]; then
+  echo "✗ No JSON files generated, cannot proceed to IR conversion"
+  exit 1
+fi
+
+echo ""
+echo "Phase 2: Converting JSON → Behavioral IR"
+echo "─────────────────────────────────────────────────────────────"
+echo ""
+
+for MODULE_ENTRY in "${TEST_MODULES[@]}"; do
+  IFS=':' read -r MODULE_NAME MODULE_FILE <<< "$MODULE_ENTRY"
+
+  JSON_FILE="ariane_verilator_json/${MODULE_NAME}.json"
+
+  if [ ! -f "$JSON_FILE" ]; then
+    continue
+  fi
+
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  Testing: $MODULE_NAME"
+  echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+
+  # Test conversion to Behavioral IR
+  if dune exec ./test_verilator_behavioral.exe "$JSON_FILE" \
+      > "ariane_ir_results/${MODULE_NAME}.log" 2>&1; then
+    echo "✅ SUCCESS: $MODULE_NAME converted to Behavioral IR"
+    IR_SUCCESS=$((IR_SUCCESS + 1))
+
+    # Show summary
+    grep -A 5 "Module:" "ariane_ir_results/${MODULE_NAME}.log" | head -6
+  else
+    echo "✗ FAILED: $MODULE_NAME IR conversion failed"
+    IR_FAILED=$((IR_FAILED + 1))
+
+    # Show error
+    echo "Error details:"
+    tail -20 "ariane_ir_results/${MODULE_NAME}.log"
+  fi
+done
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Final Summary"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Verilator JSON Generation:"
+echo "  Total:      $TOTAL"
+echo "  Successful: $JSON_SUCCESS"
+echo "  Failed:     $JSON_FAILED"
+echo ""
+echo "Behavioral IR Conversion:"
+echo "  Tested:     $JSON_SUCCESS"
+echo "  Successful: $IR_SUCCESS"
+echo "  Failed:     $IR_FAILED"
+echo ""
+
+if [ $IR_SUCCESS -gt 0 ]; then
+  PERCENT=$((IR_SUCCESS * 100 / JSON_SUCCESS))
+  echo "IR Conversion Success Rate: ${PERCENT}%"
+  echo ""
+  echo "Detailed logs saved in: ariane_ir_results/"
+fi
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+
+if [ $IR_SUCCESS -eq $JSON_SUCCESS ]; then
+  echo "✅ All JSON files successfully converted to Behavioral IR!"
+  exit 0
+else
+  echo "⚠  Some conversions failed"
+  exit 1
+fi
