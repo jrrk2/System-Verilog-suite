@@ -586,6 +586,11 @@ module Interactive = struct
     Printf.printf "  backends                      List available backends\n";
     Printf.printf "  generate <ast> <output>       Generate output for loaded AST\n";
     Printf.printf "  scan <backend> <dir>          Process all files in obj_dir/\n\n";
+    Printf.printf "Behavioral IR Commands:\n";
+    Printf.printf "  test-verilator <json>         Test Verilator → Behavioral IR pipeline\n";
+    Printf.printf "  test-equiv <vhdl> <sv>        Test VHDL vs SV behavioral equivalence\n";
+    Printf.printf "  test-miter <vhdl> <sv>        Formal Z3 miter verification (VHDL ≡ SV)\n";
+    Printf.printf "  test-z3-simple <vhdl> <sv>    Structural Z3 verification\n\n";
     Printf.printf "Verification:\n";
     Printf.printf "  verify <orig.json> <hc.json>  Verify equivalence between files\n\n";
     Printf.printf "Shell Operations:\n";
@@ -825,6 +830,30 @@ module Interactive = struct
           Printf.printf "✗ %s\n" msg)
     | "verify" :: orig :: hc :: _ ->
         verify_files orig hc
+    | "test-verilator" :: json_file :: _ ->
+        Printf.printf "Running: dune exec ./test_verilator_behavioral.exe %s\n" json_file;
+        let cmd = Printf.sprintf "dune exec ./test_verilator_behavioral.exe %s" json_file in
+        execute_shell_command cmd
+    | "test-verilator" :: _ ->
+        Printf.printf "✗ Usage: test-verilator <verilator.json>\n"
+    | "test-equiv" :: vhdl :: sv :: _ ->
+        Printf.printf "Running: dune exec ./test_behavioral_equivalence.exe %s %s\n" vhdl sv;
+        let cmd = Printf.sprintf "dune exec ./test_behavioral_equivalence.exe %s %s" vhdl sv in
+        execute_shell_command cmd
+    | "test-equiv" :: _ ->
+        Printf.printf "✗ Usage: test-equiv <file.vhd> <file.sv>\n"
+    | "test-miter" :: vhdl :: sv :: _ ->
+        Printf.printf "Running: dune exec ./test_miter_equivalence.exe %s %s\n" vhdl sv;
+        let cmd = Printf.sprintf "dune exec ./test_miter_equivalence.exe %s %s" vhdl sv in
+        execute_shell_command cmd
+    | "test-miter" :: _ ->
+        Printf.printf "✗ Usage: test-miter <file.vhd> <file.sv>\n"
+    | "test-z3-simple" :: vhdl :: sv :: _ ->
+        Printf.printf "Running: dune exec ./test_behavioral_z3_simple.exe %s %s\n" vhdl sv;
+        let cmd = Printf.sprintf "dune exec ./test_behavioral_z3_simple.exe %s %s" vhdl sv in
+        execute_shell_command cmd
+    | "test-z3-simple" :: _ ->
+        Printf.printf "✗ Usage: test-z3-simple <file.vhd> <file.sv>\n"
     | "cd" :: dir :: _ -> change_directory state dir
     | "pwd" :: _ -> print_working_directory state
     | "ls" :: rest ->
