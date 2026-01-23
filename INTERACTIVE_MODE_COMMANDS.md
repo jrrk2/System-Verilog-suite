@@ -2,9 +2,42 @@
 
 ## Summary
 
-Added four new commands to the unified interactive console (`sv_main_unified.exe interactive`) for testing the behavioral IR infrastructure.
+Added five new commands to the unified interactive console (`sv_main_unified.exe interactive`) for testing the behavioral IR infrastructure and Yosys synthesis.
 
 ## New Commands
+
+### synth-yosys
+Synthesize SystemVerilog with Yosys and output RTLIL format.
+
+**Usage:**
+```
+sv> synth-yosys <file.v> [output.il]
+```
+
+**Examples:**
+```
+# Output to file
+sv> synth-yosys sysver_tests/slib_clock_div.sv /tmp/output.il
+
+# Output to stdout
+sv> synth-yosys sysver_tests/slib_clock_div.sv
+```
+
+**What it does:**
+1. Reads SystemVerilog file with Yosys
+2. Runs synthesis pass
+3. Writes RTLIL/ILANG format to file or stdout
+
+**Yosys Command:**
+```bash
+yosys -q -q -p 'read_verilog -sv <file>; synth; write_rtlil [output]'
+```
+
+**Use Cases:**
+- Generate RTLIL for analysis
+- Compare Yosys synthesis with Verilator
+- Prepare input for RTLIL → IR conversion
+- Debug synthesis issues
 
 ### test-verilator
 Test Verilator JSON → Behavioral IR pipeline with full optimization.
@@ -116,6 +149,10 @@ sv> help
 ## Example Session
 
 ```
+sv> synth-yosys sysver_tests/slib_clock_div.sv /tmp/clock_div.il
+Synthesizing sysver_tests/slib_clock_div.sv with Yosys...
+✓ Synthesis complete: /tmp/clock_div.il
+
 sv> test-verilator test/obj_dir/Vcounter.tree.json
 ═══════════════════════════════════════════════════════════════
   Verilator JSON → Behavioral IR → Optimization
