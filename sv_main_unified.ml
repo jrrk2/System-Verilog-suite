@@ -591,6 +591,8 @@ module Interactive = struct
     Printf.printf "  test-equiv <vhdl> <sv>        Test VHDL vs SV behavioral equivalence\n";
     Printf.printf "  test-miter <vhdl> <sv>        Formal Z3 miter verification (VHDL ≡ SV)\n";
     Printf.printf "  test-z3-simple <vhdl> <sv>    Structural Z3 verification\n\n";
+    Printf.printf "Synthesis:\n";
+    Printf.printf "  synth-yosys <file.v> [out.il] Synthesize with Yosys, output RTLIL/ILANG\n\n";
     Printf.printf "Verification:\n";
     Printf.printf "  verify <orig.json> <hc.json>  Verify equivalence between files\n\n";
     Printf.printf "Shell Operations:\n";
@@ -854,6 +856,37 @@ module Interactive = struct
         execute_shell_command cmd
     | "test-z3-simple" :: _ ->
         Printf.printf "✗ Usage: test-z3-simple <file.vhd> <file.sv>\n"
+    | "synth-yosys" :: sv_file :: output_file :: _ ->
+        if not (Sys.file_exists sv_file) then
+          Printf.printf "✗ Error: File not found: %s\n" sv_file
+        else begin
+          Printf.printf "Synthesizing %s with Yosys...\n" sv_file;
+          let yosys_cmd = Printf.sprintf "yosys -q -q -p 'read_verilog -sv %s; synth; write_rtlil %s'"
+            sv_file output_file in
+          let exit_code = Sys.command yosys_cmd in
+          if exit_code = 0 then
+            Printf.printf "✓ Synthesis complete: %s\n" output_file
+          else
+            Printf.printf "✗ Yosys failed with exit code %d\n" exit_code
+        end
+    | "synth-yosys" :: sv_file :: [] ->
+        if not (Sys.file_exists sv_file) then
+          Printf.printf "✗ Error: File not found: %s\n" sv_file
+        else begin
+          Printf.printf "Synthesizing %s with Yosys (output to stdout)...\n" sv_file;
+          Printf.printf "─────────────────────────────────────────────────────\n";
+          let yosys_cmd = Printf.sprintf "yosys -q -q -p 'read_verilog -sv %s; synth; write_rtlil'"
+            sv_file in
+          let exit_code = Sys.command yosys_cmd in
+          Printf.printf "─────────────────────────────────────────────────────\n";
+          if exit_code = 0 then
+            Printf.printf "✓ Synthesis complete\n"
+          else
+            Printf.printf "✗ Yosys failed with exit code %d\n" exit_code
+        end
+    | "synth-yosys" :: _ ->
+        Printf.printf "✗ Usage: synth-yosys <file.v> [output.il]\n";
+        Printf.printf "  If output file is omitted, RTLIL is written to stdout\n"
     | "cd" :: dir :: _ -> change_directory state dir
     | "pwd" :: _ -> print_working_directory state
     | "ls" :: rest ->
