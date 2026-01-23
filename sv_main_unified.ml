@@ -555,6 +555,7 @@ module Interactive = struct
     mutable current_dir: string;
     mutable running: bool;
     mutable history: string list;
+    file_registry: File_registry.registry;
   }
 
   let create_state () = {
@@ -563,6 +564,7 @@ module Interactive = struct
     current_dir = Sys.getcwd ();
     running = true;
     history = [];
+    file_registry = File_registry.create_registry ();
   }
 
   let print_banner () =
@@ -596,6 +598,11 @@ module Interactive = struct
     Printf.printf "  verilator-json <file.v> [out.json] Parse with Verilator, output JSON AST\n\n";
     Printf.printf "Verification:\n";
     Printf.printf "  verify <orig.json> <hc.json>  Verify equivalence between files\n\n";
+    Printf.printf "File Registry (Type-Safe):\n";
+    Printf.printf "  register <file>               Register file with type inference\n";
+    Printf.printf "  list-files                    List all registered files with types\n";
+    Printf.printf "  file-info <file>              Show file type and valid transformations\n";
+    Printf.printf "  convert <file> <type>         Explicitly convert file to target type\n\n";
     Printf.printf "Shell Operations:\n";
     Printf.printf "  !<command>                    Execute shell command\n";
     Printf.printf "  shell <command>               Execute shell command\n";
@@ -605,7 +612,8 @@ module Interactive = struct
     Printf.printf "Interactive:\n";
     Printf.printf "  help                          Show this help\n";
     Printf.printf "  history                       Show command history\n";
-    Printf.printf "  quit, exit                    Exit interactive mode\n\n"
+    Printf.printf "  quit, exit                    Exit interactive mode\n\n";
+    Printf.printf "Note: Many commands auto-convert files as needed (e.g., .sv → .json)\n\n"
 
   let print_backends () =
     Printf.printf "\nAvailable Backends:\n";
@@ -833,12 +841,19 @@ module Interactive = struct
           Printf.printf "✗ %s\n" msg)
     | "verify" :: orig :: hc :: _ ->
         verify_files orig hc
-    | "test-verilator" :: json_file :: _ ->
-        Printf.printf "Running: dune exec ./test_verilator_behavioral.exe %s\n" json_file;
-        let cmd = Printf.sprintf "dune exec ./test_verilator_behavioral.exe %s" json_file in
-        execute_shell_command cmd
+    | "test-verilator" :: input_file :: _ ->
+        (* Auto-convert to Verilator JSON if needed *)
+        (match File_registry.auto_convert state.file_registry input_file File_registry.VerilatorJSON with
+         | Some json_file ->
+             Printf.printf "Running: dune exec ./test_verilator_behavioral.exe %s\n" json_file;
+             let cmd = Printf.sprintf "dune exec ./test_verilator_behavioral.exe %s" json_file in
+             execute_shell_command cmd
+         | None ->
+             Printf.printf "✗ Cannot convert %s to Verilator JSON\n" input_file)
     | "test-verilator" :: _ ->
-        Printf.printf "✗ Usage: test-verilator <verilator.json>\n"
+        Printf.printf "✗ Usage: test-verilator <file.v|file.json>\n";
+        Printf.printf "  Accepts: SystemVerilog (.sv) or Verilator JSON (.json)\n";
+        Printf.printf "  Auto-converts .sv to .json if needed\n"
     | "test-equiv" :: vhdl :: sv :: _ ->
         Printf.printf "Running: dune exec ./test_behavioral_equivalence.exe %s %s\n" vhdl sv;
         let cmd = Printf.sprintf "dune exec ./test_behavioral_equivalence.exe %s %s" vhdl sv in
@@ -938,6 +953,33 @@ module Interactive = struct
         Printf.printf "✗ Usage: verilator-json <file.v> [output.json]\n";
         Printf.printf "  If output file is omitted, JSON is written to stdout\n";
         Printf.printf "  Note: Messages before '{' are automatically filtered\n"
+    | "register" :: file :: _ ->
+        let _ = File_registry.register_file state.file_registry file in ()
+    | "register" :: _ ->
+        Printf.printf "✗ Usage: register <file>\n"
+    | "list-files" :: _ ->
+        File_registry.list_files state.file_registry
+    | "file-info" :: file :: _ ->
+        File_registry.show_transformations state.file_registry file
+    | "file-info" :: _ ->
+        Printf.printf "✗ Usage: file-info <file>\n"
+    | "convert" :: file :: target_type_str :: _ ->
+        let target_type = match String.lowercase_ascii target_type_str with
+          | "json" | "verilator-json" -> Some File_registry.VerilatorJSON
+          | "il" | "rtlil" | "yosys-rtlil" -> Some File_registry.YosysRTLIL
+          | "behavioral-ir" | "bir" -> Some File_registry.BehavioralIR
+          | "optimized-ir" | "oir" -> Some File_registry.OptimizedIR
+          | _ -> None
+        in
+        (match target_type with
+         | Some tt ->
+             let _ = File_registry.auto_convert state.file_registry file tt in ()
+         | None ->
+             Printf.printf "✗ Unknown target type: %s\n" target_type_str;
+             Printf.printf "  Valid types: json, il, behavioral-ir, optimized-ir\n")
+    | "convert" :: _ ->
+        Printf.printf "✗ Usage: convert <file> <type>\n";
+        Printf.printf "  Types: json, il, behavioral-ir, optimized-ir\n"
     | "cd" :: dir :: _ -> change_directory state dir
     | "pwd" :: _ -> print_working_directory state
     | "ls" :: rest ->

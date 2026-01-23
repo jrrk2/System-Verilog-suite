@@ -23,6 +23,7 @@
           behavioral_ir vhdl_to_behavioral sv_to_behavioral verilator_to_behavioral
           behavioral_ssa behavioral_registers behavioral_const behavioral_dce behavioral_cse behavioral_optimize
           behavioral_to_z3 behavioral_to_hardcaml z3_miter
+          file_registry
           test_gate_mapping example_round_trip test_rtlil_reader
           test_verify_yosys_verilator test_verible_elab test_verible_parse
           test_3way_verify test_3way_suite test_parser_comparison test_apb_uart_z3 test_simple_z3 test_uart_modules_z3 test_assignment_ordering test_token_dumper test_debug_ir vhdl_semantic_checker
