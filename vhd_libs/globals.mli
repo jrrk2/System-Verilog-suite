@@ -83,7 +83,6 @@ type mybuft =
 
 val implicit_params : Idhash.idhash list ref
 val implicit_wires : Idhash.idhash list ref
-val tmpnam : string
 
 val modprims: (string, modtree) Hashtbl.t
 val pending: (string, modtree) Hashtbl.t
@@ -96,8 +95,6 @@ val get_table : Idhash.idhash -> modtree
 val unresolved_list : string list ref
 
 val stk : (int * Vparser.token) Stack.t
-val logfile : Setup.logt ref
-val trace_file : Setup.logt ref
 val mygetenv : string -> string
 val mygetenv_int : string -> int
 val verbose : int
@@ -111,4 +108,3 @@ val unique_open : string -> out_channel
 (*
 val unresolved_check : Vparser.token -> unit
 *)
-val log_open : unit -> unit

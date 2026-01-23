@@ -1,0 +1,65 @@
+#!/bin/bash
+# Test only the failed files with detailed error capture
+
+FAILED_FILES=(
+  "../ariane/include/ariane_pkg.sv"
+  "../ariane/include/serpent_cache_pkg.sv"
+  "../ariane/src/ariane.sv"
+  "../ariane/src/issue_read_operands.sv"
+  "../ariane/src/load_unit.sv"
+  "../ariane/src/scoreboard.sv"
+  "../ariane/src/store_buffer.sv"
+  "../ariane/src/cache_subsystem/cache_ctrl.sv"
+  "../ariane/src/cache_subsystem/miss_handler.sv"
+  "../ariane/src/cache_subsystem/serpent_cache_subsystem.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_ctrl.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_mem.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_missunit.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache_wbuffer.sv"
+  "../ariane/src/cache_subsystem/serpent_dcache.sv"
+  "../ariane/src/cache_subsystem/serpent_icache.sv"
+  "../ariane/src/cache_subsystem/serpent_l15_adapter.sv"
+  "../ariane/src/cache_subsystem/std_cache_subsystem.sv"
+  "../ariane/src/clint/axi_lite_interface.sv"
+  "../ariane/fpga/src/axi2apb/src/axi2apb_64_32.sv"
+  "../ariane/fpga/src/axi2apb/src/axi2apb.sv"
+  "../ariane/src/debug/dm_csrs.sv"
+  "../ariane/src/debug/dm_sba.sv"
+  "../ariane/src/common_cells/src/fifo_v3.sv"
+  "../ariane/src/common_cells/src/rrarbiter.sv"
+  "../ariane/tb/common/uart.sv"
+)
+
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Testing Failed Files with Error Details"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+
+# Use pre-built executable to avoid build stderr
+PARSER="_build/default/test_verible_parse.exe"
+
+if [ ! -f "$PARSER" ]; then
+  echo "Error: Parser executable not found at $PARSER"
+  echo "Run: dune build ./test_verible_parse.exe"
+  exit 1
+fi
+
+for FILE in "${FAILED_FILES[@]}"; do
+  BASENAME=$(basename "$FILE")
+
+  if [ ! -f "$FILE" ]; then
+    echo "⚠ File not found: $BASENAME"
+    continue
+  fi
+
+  echo "───────────────────────────────────────────────────────────────"
+  echo "Testing: $BASENAME"
+  echo "───────────────────────────────────────────────────────────────"
+
+  # Run parser and capture full output
+  "$PARSER" "$FILE" 2>&1
+
+  echo ""
+done
+
+echo "═══════════════════════════════════════════════════════════════"
