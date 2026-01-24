@@ -38,7 +38,7 @@ let test_all_modules json_file =
         (* Show first 10 signals *)
         if List.length bmod.signals > 0 then begin
           Printf.printf "\n  First few signals:\n";
-          List.iteri (fun i (signal_info : signal) ->
+          List.iteri (fun i (signal_info : bsignal) ->
             if i < 10 then
               Printf.printf "    [%d] %s (%s, %s)\n"
                 i
@@ -53,7 +53,7 @@ let test_all_modules json_file =
           ) bmod.signals;
 
           (* Count _q signals *)
-          let q_count = List.fold_left (fun acc signal_info ->
+          let q_count = List.fold_left (fun acc (signal_info : bsignal) ->
             if String.contains signal_info.name 'q' &&
                (String.ends_with ~suffix:"_q" signal_info.name ||
                 String.ends_with ~suffix:"_Q" signal_info.name) then
@@ -132,7 +132,7 @@ let test_all_modules json_file =
 
       (* Check if std_icache exists *)
       let std_icache = List.find_opt (fun m -> m.name = "std_icache") bprog.modules in
-      match std_icache with
+      (match std_icache with
       | Some m ->
           Printf.printf "✓ std_icache found in extracted modules\n";
           Printf.printf "  Signals: %d\n" (List.length m.signals);
@@ -145,7 +145,7 @@ let test_all_modules json_file =
           List.iter (fun m ->
             if String.contains m.name 'c' && String.contains m.name 'a' then
               Printf.printf "     - %s\n" m.name
-          ) bprog.modules;
+          ) bprog.modules);
 
       Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
       true

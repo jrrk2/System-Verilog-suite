@@ -62,7 +62,7 @@ let test_verilator_file json_file =
         Printf.printf "  std_icache Analysis\n";
         Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
 
-        let std_icache_opt = List.find_opt (fun m -> m.name = "std_icache") bprog.modules in
+        let std_icache_opt = List.find_opt (fun (m : Behavioral_ir.bmodule) -> m.name = "std_icache") bprog.modules in
         (match std_icache_opt with
         | Some icache ->
             Printf.printf "✓ std_icache found in converted modules\n\n";
@@ -72,19 +72,19 @@ let test_verilator_file json_file =
 
             if List.length icache.signals > 0 then begin
               Printf.printf "  First 20 signals:\n";
-              List.iteri (fun i s ->
+              List.iteri (fun i (s : Behavioral_ir.bsignal) ->
                 if i < 20 then
                   Printf.printf "    [%2d] %s\n" (i+1) s.name
               ) icache.signals;
 
               (* Count _q signals *)
-              let q_signals = List.filter (fun s ->
+              let q_signals = List.filter (fun (s : Behavioral_ir.bsignal) ->
                 String.length s.name >= 2 &&
                 String.sub s.name (String.length s.name - 2) 2 = "_q"
               ) icache.signals in
 
               Printf.printf "\n  Signals ending in _q: %d\n" (List.length q_signals);
-              List.iter (fun s ->
+              List.iter (fun (s : Behavioral_ir.bsignal) ->
                 Printf.printf "    - %s\n" s.name
               ) q_signals;
             end;
@@ -112,7 +112,7 @@ let test_verilator_file json_file =
         | None ->
             Printf.printf "❌ std_icache NOT FOUND in converted modules\n";
             Printf.printf "\nModules containing 'cache':\n";
-            List.iter (fun m ->
+            List.iter (fun (m : Behavioral_ir.bmodule) ->
               if String.contains (String.lowercase_ascii m.name) 'c' &&
                  String.contains (String.lowercase_ascii m.name) 'a' then
                 Printf.printf "  - %s\n" m.name
@@ -220,7 +220,7 @@ let test_verilator_file json_file =
         Printf.printf "Empty modules (0/0):      %d\n\n" !empty_count;
 
         (* Check std_icache register count *)
-        let std_icache_opt = List.find_opt (fun m -> m.name = "std_icache") optimized.modules in
+        let std_icache_opt = List.find_opt (fun (m : Behavioral_ir.bmodule) -> m.name = "std_icache") optimized.modules in
         (match std_icache_opt with
         | Some icache ->
             let ctx = Behavioral_registers.analyze_module icache in

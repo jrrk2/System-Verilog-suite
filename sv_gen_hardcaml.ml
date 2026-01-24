@@ -512,51 +512,211 @@ let process_assign decls lhs rhs =
    | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
        Printf.eprintf "          Assigning to variable: %s\n%!" name
    | _ -> ());
-  match expr_to_remap decls lhs with
-  | Var v ->
-      let rhs_sig = sig' (expr_to_remap decls rhs) in
-      let wlhs = width v.value in
-      let wrhs = width rhs_sig in
-      Printf.eprintf "        Assignment: lhs_width=%d rhs_width=%d\n%!" wlhs wrhs;
-      if wlhs <= 0 then begin
-        Printf.eprintf "        ERROR: LHS width is %d, skipping assignment\n%!" wlhs;
-        None
-      end else if wrhs <= 0 then begin
-        Printf.eprintf "        ERROR: RHS width is %d, skipping assignment\n%!" wrhs;
-        None
-      end else
-        let rhs_resized = if wlhs = wrhs then rhs_sig
-                          else if wlhs > wrhs then begin
-                            Printf.eprintf "        Upsizing RHS from %d to %d\n%!" wrhs wlhs;
-                            uresize rhs_sig wlhs
-                          end else begin
-                            Printf.eprintf "        Downsizing RHS from %d to %d (select bits 0 to %d)\n%!" wrhs wlhs (wlhs-1);
-                            (* select expects: signal lsb width, NOT signal lsb msb *)
-                            (* Actually, looking at error, it seems to use lsb and width correctly *)
-                            (* The issue is we're passing wlhs as the third arg *)
-                            (* Let's use sel_bottom instead which takes width *)
-                            sel_bottom rhs_sig wlhs
-                          end in
-        Some (v <-- rhs_resized)
-  | Invalid ->
-      Printf.eprintf "        ERROR: LHS expression is Invalid (type: %s)\n%!" (show_ast_node lhs);
-      (match lhs with
+
+  (* Special handling for bit/array selections on LHS *)
+  match lhs with
+  | Sv_ast.Sel { expr; lsb = sel_lsb; width = sel_width; range; _ } ->
+      Printf.eprintf "          Sel detected: lsb=%s width=%s range=%s\n%!"
+        (match sel_lsb with Some _ -> "Some" | None -> "None")
+        (match sel_width with Some _ -> "Some" | None -> "None")
+        range;
+      (match (sel_lsb, sel_width) with
+      | (Some lsb_node, Some width_node) ->
+      (* Bit selection on LHS: need read-modify-write *)
+      (match expr with
        | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
-           Printf.eprintf "          Variable '%s' not found in decls\n%!" name;
-           Printf.eprintf "          Available vars: ";
-           Hashtbl.iter (fun k _ -> Printf.eprintf "%s " k) decls;
-           Printf.eprintf "\n%!"
-       | Sv_ast.Sel { expr; lsb; width; range; _ } ->
-           Printf.eprintf "          Sel assignment: range=%s\n%!" range;
-           (match expr with
-            | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
-                Printf.eprintf "            Base variable: %s\n%!" name
-            | _ -> Printf.eprintf "            Base: complex expression\n%!")
-       | _ -> ());
-      None
+           (* Extract the base variable *)
+           (match Hashtbl.find_opt decls name with
+            | Some (Var v) ->
+                (try
+                  (* Get the bit range *)
+                  match (expr_to_remap decls lsb_node, expr_to_remap decls width_node) with
+                  | (Con lsb_const, Con width_const) ->
+                      let lsb = Constant.to_int lsb_const in
+                      let sel_width = Constant.to_int width_const in
+                      let base_width = width v.value in
+                      let rhs_sig = sig' (expr_to_remap decls rhs) in
+
+                      Printf.eprintf "        Bit selection assignment: %s[%d +: %d] (base width=%d)\n%!"
+                        name lsb sel_width base_width;
+
+                      (* Resize RHS to match selection width *)
+                      let rhs_resized = if width rhs_sig = sel_width then rhs_sig
+                                       else if width rhs_sig < sel_width then uresize rhs_sig sel_width
+                                       else sel_bottom rhs_sig sel_width in
+
+                      (* Read-modify-write: construct new value *)
+                      let new_val =
+                        if lsb = 0 && sel_width = base_width then
+                          (* Full width assignment - just use RHS *)
+                          rhs_resized
+                        else if lsb = 0 then
+                          (* Lower bits: {old[base_width-1 : sel_width], new[sel_width-1:0]} *)
+                          let upper = sel_top v.value (base_width - sel_width) in
+                          concat_msb [upper; rhs_resized]
+                        else if lsb + sel_width = base_width then
+                          (* Upper bits: {new[sel_width-1:0], old[lsb-1:0]} *)
+                          let lower = sel_bottom v.value lsb in
+                          concat_msb [rhs_resized; lower]
+                        else
+                          (* Middle bits: {old[base_width-1:lsb+sel_width], new[sel_width-1:0], old[lsb-1:0]} *)
+                          let upper = sel_top v.value (base_width - lsb - sel_width) in
+                          let lower = sel_bottom v.value lsb in
+                          concat_msb [upper; rhs_resized; lower]
+                      in
+                      Some (v <-- new_val)
+                  | _ ->
+                      Printf.eprintf "        ERROR: Dynamic bit selection not supported\n%!";
+                      None
+                 with e ->
+                   Printf.eprintf "        ERROR in bit selection: %s\n%!" (Printexc.to_string e);
+                   None)
+            | _ ->
+                Printf.eprintf "        ERROR: Base variable '%s' not found or not a Variable\n%!" name;
+                None)
+       | _ ->
+           Printf.eprintf "        ERROR: Bit selection on complex expression not supported\n%!";
+           None)
+      | (None, _) | (_, None) ->
+          (* Try to parse the range string like "[1:0]" or "[7:0]" *)
+          Printf.eprintf "        Attempting to parse range string: %s\n%!" range;
+          let range_clean = String.trim range in
+          if range_clean = "" then begin
+            (* Empty range - this is likely a single-bit or full-width selection *)
+            (* Treat as regular assignment to the base variable *)
+            Printf.eprintf "        Empty range - treating as full variable assignment\n%!";
+            (match expr with
+             | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+                 (match Hashtbl.find_opt decls name with
+                  | Some (Var v) ->
+                      let rhs_sig = sig' (expr_to_remap decls rhs) in
+                      let wlhs = width v.value in
+                      let wrhs = width rhs_sig in
+                      let rhs_resized = if wlhs = wrhs then rhs_sig
+                                       else if wlhs > wrhs then uresize rhs_sig wlhs
+                                       else sel_bottom rhs_sig wlhs in
+                      Some (v <-- rhs_resized)
+                  | _ ->
+                      Printf.eprintf "        ERROR: Variable '%s' not found\n%!" name;
+                      None)
+             | _ ->
+                 Printf.eprintf "        ERROR: Non-variable Sel with empty range\n%!";
+                 None)
+          end else
+          (try
+            let range_clean = if String.length range_clean > 0 && range_clean.[0] = '[' then
+              String.sub range_clean 1 (String.length range_clean - 2)
+            else range_clean in
+            match String.split_on_char ':' range_clean with
+            | [msb_str; lsb_str] ->
+                let msb = int_of_string (String.trim msb_str) in
+                let lsb = int_of_string (String.trim lsb_str) in
+                let sel_width = msb - lsb + 1 in
+                Printf.eprintf "        Parsed range: msb=%d lsb=%d width=%d\n%!" msb lsb sel_width;
+                (* Now handle the assignment with parsed values *)
+                (match expr with
+                 | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+                     (match Hashtbl.find_opt decls name with
+                      | Some (Var v) ->
+                          let base_width = width v.value in
+                          let rhs_sig = sig' (expr_to_remap decls rhs) in
+                          Printf.eprintf "        Bit selection assignment (from range): %s[%d:%d] (base width=%d)\n%!"
+                            name msb lsb base_width;
+                          (* Resize RHS to match selection width *)
+                          let rhs_resized = if width rhs_sig = sel_width then rhs_sig
+                                           else if width rhs_sig < sel_width then uresize rhs_sig sel_width
+                                           else sel_bottom rhs_sig sel_width in
+                          (* Read-modify-write *)
+                          let new_val =
+                            if lsb = 0 && sel_width = base_width then
+                              rhs_resized
+                            else if lsb = 0 then
+                              let upper = sel_top v.value (base_width - sel_width) in
+                              concat_msb [upper; rhs_resized]
+                            else if lsb + sel_width = base_width then
+                              let lower = sel_bottom v.value lsb in
+                              concat_msb [rhs_resized; lower]
+                            else
+                              let upper = sel_top v.value (base_width - lsb - sel_width) in
+                              let lower = sel_bottom v.value lsb in
+                              concat_msb [upper; rhs_resized; lower]
+                          in
+                          Some (v <-- new_val)
+                      | _ ->
+                          Printf.eprintf "        ERROR: Base variable '%s' not found\n%!" name;
+                          None)
+                 | _ ->
+                     Printf.eprintf "        ERROR: Bit selection on complex expression not supported\n%!";
+                     None)
+            | _ ->
+                Printf.eprintf "        ERROR: Could not parse range string\n%!";
+                None
+           with e ->
+             Printf.eprintf "        ERROR parsing range: %s\n%!" (Printexc.to_string e);
+             None))
+
+  | Sv_ast.ArraySel { expr; index } ->
+      (* Array selection on LHS *)
+      (match expr with
+       | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+           Printf.eprintf "        Array selection assignment: %s[<index>]\n%!" name;
+           (* For now, treat as variable assignment if we can find it *)
+           (match Hashtbl.find_opt decls name with
+            | Some (Var v) ->
+                (* Simplified: assign RHS to the whole variable *)
+                (* TODO: Proper array indexing requires memory modeling *)
+                let rhs_sig = sig' (expr_to_remap decls rhs) in
+                let wlhs = width v.value in
+                let wrhs = width rhs_sig in
+                let rhs_resized = if wlhs = wrhs then rhs_sig
+                                 else if wlhs > wrhs then uresize rhs_sig wlhs
+                                 else sel_bottom rhs_sig wlhs in
+                Printf.eprintf "        WARNING: Array indexing simplified to whole variable assignment\n%!";
+                Some (v <-- rhs_resized)
+            | _ ->
+                Printf.eprintf "        ERROR: Array base '%s' not found\n%!" name;
+                None)
+       | _ ->
+           Printf.eprintf "        ERROR: Array selection on complex expression not supported\n%!";
+           None)
+
   | _ ->
-      Printf.eprintf "        ERROR: LHS is not a Variable (type: %s)\n%!" (show_ast_node lhs);
-      None
+      (* Normal variable assignment *)
+      match expr_to_remap decls lhs with
+      | Var v ->
+          let rhs_sig = sig' (expr_to_remap decls rhs) in
+          let wlhs = width v.value in
+          let wrhs = width rhs_sig in
+          Printf.eprintf "        Assignment: lhs_width=%d rhs_width=%d\n%!" wlhs wrhs;
+          if wlhs <= 0 then begin
+            Printf.eprintf "        ERROR: LHS width is %d, skipping assignment\n%!" wlhs;
+            None
+          end else if wrhs <= 0 then begin
+            Printf.eprintf "        ERROR: RHS width is %d, skipping assignment\n%!" wrhs;
+            None
+          end else
+            let rhs_resized = if wlhs = wrhs then rhs_sig
+                              else if wlhs > wrhs then begin
+                                Printf.eprintf "        Upsizing RHS from %d to %d\n%!" wrhs wlhs;
+                                uresize rhs_sig wlhs
+                              end else begin
+                                Printf.eprintf "        Downsizing RHS from %d to %d (select bits 0 to %d)\n%!" wrhs wlhs (wlhs-1);
+                                sel_bottom rhs_sig wlhs
+                              end in
+            Some (v <-- rhs_resized)
+      | Invalid ->
+          Printf.eprintf "        ERROR: LHS expression is Invalid (type: %s)\n%!" (show_ast_node lhs);
+          (match lhs with
+           | Sv_ast.VarRef { name; _ } | Sv_ast.VarRef' { name; _ } ->
+               Printf.eprintf "          Variable '%s' not found in decls\n%!" name;
+               Printf.eprintf "          Available vars: ";
+               Hashtbl.iter (fun k _ -> Printf.eprintf "%s " k) decls;
+               Printf.eprintf "\n%!"
+           | _ -> ());
+          None
+      | _ ->
+          Printf.eprintf "        ERROR: LHS is not a Variable (type: %s)\n%!" (show_ast_node lhs);
+          None
 
 (* Process statement to Always.t *)
 let rec process_stmt decls intermediate_set = function
