@@ -91,8 +91,11 @@ let libhash = Hashtbl.create 256
 
 let env_cache = Hashtbl.create 256
 
+let tmpnam = "report."^(string_of_int(Unix.getpid()))^"."^Unix.gethostname()^".report"
 let (unresolved_list: string list ref) = ref []
 let (stk: (int * Vparser.token) Stack.t) = Stack.create()
+let logfile = ref Setup.Closed
+let trace_file = ref Setup.Closed
 
 let (implicit_params:Idhash.idhash list ref) = ref []
 let (implicit_wires:Idhash.idhash list ref) = ref []
@@ -142,3 +145,8 @@ let unresolved_check = function
   end
   | _ -> failwith "unexpected argument to unresolved_check"
 *)
+
+let log_open () = 
+  if (!logfile == Setup.Closed) then
+      let fd = open_out tmpnam in
+          logfile := Setup.Open (fd) (*,Format.formatter_of_out_channel fd*)
