@@ -6,15 +6,14 @@
 
 open Behavioral_ir
 open Hardcaml
-open Signal
 
 (* Context for tracking signals during conversion *)
 type conv_context = {
   mutable signals: (string * Signal.t) list;
   mutable variables: (string * Always.Variable.t) list;
   scope: Scope.t;
-  clock: Signal.t option;
-  reset: Signal.t option;
+  mutable clock: Signal.t option;
+  mutable reset: Signal.t option;
 }
 
 (* Get width from behavioral IR type *)
@@ -73,8 +72,14 @@ let rec expr_to_signal ctx = function
        | BAdd -> Signal.(s_lhs +: s_rhs)
        | BSub -> Signal.(s_lhs -: s_rhs)
        | BMul -> Signal.(s_lhs *: s_rhs)
-       | BDiv -> Signal.(s_lhs /: s_rhs)
-       | BMod -> Signal.(s_lhs %: s_rhs)
+       | BDiv ->
+           (* Division not synthesizable in HardCaml - use placeholder *)
+           Printf.eprintf "Warning: Division not synthesizable, using zero\n";
+           Signal.zero result_width
+       | BMod ->
+           (* Modulo not synthesizable in HardCaml - use placeholder *)
+           Printf.eprintf "Warning: Modulo not synthesizable, using zero\n";
+           Signal.zero result_width
        | BAnd -> Signal.(s_lhs &: s_rhs)
        | BOr -> Signal.(s_lhs |: s_rhs)
        | BXor -> Signal.(s_lhs ^: s_rhs)
@@ -93,9 +98,21 @@ let rec expr_to_signal ctx = function
       (match op with
        | BNot -> Signal.(~: s_operand)
        | BNeg -> Signal.(~: s_operand +: (Signal.of_int ~width:(Signal.width s_operand) 1))
-       | BRedAnd -> Signal.reduce ~f:(Signal.(&:)) s_operand
-       | BRedOr -> Signal.reduce ~f:(Signal.(|:)) s_operand
-       | BRedXor -> Signal.reduce ~f:(Signal.(^:)) s_operand)
+       | BRedAnd ->
+           (* Reduce AND: split into bits and AND them all *)
+           let bits = List.init (Signal.width s_operand) (fun i ->
+             Signal.bit s_operand i) in
+           Signal.reduce ~f:(Signal.(&:)) bits
+       | BRedOr ->
+           (* Reduce OR: split into bits and OR them all *)
+           let bits = List.init (Signal.width s_operand) (fun i ->
+             Signal.bit s_operand i) in
+           Signal.reduce ~f:(Signal.(|:)) bits
+       | BRedXor ->
+           (* Reduce XOR: split into bits and XOR them all *)
+           let bits = List.init (Signal.width s_operand) (fun i ->
+             Signal.bit s_operand i) in
+           Signal.reduce ~f:(Signal.(^:)) bits)
 
   | BCond { condition; then_val; else_val } ->
       let s_cond = expr_to_signal ctx condition in
@@ -174,31 +191,31 @@ let process_to_always ctx = function
       let alw = List.fold_left (stmt_to_always ctx) [] body in
       Some (Always.compile alw)
 
-  | BSequential { clock_signal; body; _ } ->
+  | BSequential { clock; body; _ } ->
       (* Update context with clock *)
-      let clk_sig = get_signal ctx clock_signal in
+      let clk_sig = get_signal ctx clock in
       let updated_ctx = { ctx with clock = Some clk_sig } in
       let alw = List.fold_left (stmt_to_always updated_ctx) [] body in
       Some (Always.compile alw)
 
 (* Build input interface from behavioral IR module *)
-let build_input_ports bmod =
-  List.filter_map (fun signal ->
+let build_input_ports (bmod : Behavioral_ir.bmodule) =
+  List.filter_map (fun (signal : Behavioral_ir.bsignal) ->
     match signal.direction with
     | `Input -> Some (signal.name, width_of_btype signal.stype)
     | _ -> None
   ) bmod.signals
 
 (* Build output interface from behavioral IR module *)
-let build_output_ports bmod =
-  List.filter_map (fun signal ->
+let build_output_ports (bmod : Behavioral_ir.bmodule) =
+  List.filter_map (fun (signal : Behavioral_ir.bsignal) ->
     match signal.direction with
     | `Output -> Some (signal.name, width_of_btype signal.stype)
     | _ -> None
   ) bmod.signals
 
 (* Convert behavioral IR module to HardCaml create function *)
-let module_to_create bmod inputs =
+let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
   let scope = Scope.create () in
 
   (* Initialize context with input signals *)
@@ -213,7 +230,7 @@ let module_to_create bmod inputs =
   } in
 
   (* Look for clock and reset signals *)
-  List.iter (fun signal ->
+  List.iter (fun (signal : Behavioral_ir.bsignal) ->
     match signal.name with
     | "clock" | "clk" | "CLK" ->
         ctx.clock <- Some (get_signal ctx signal.name)
@@ -240,7 +257,7 @@ let module_to_create bmod inputs =
   outputs
 
 (* Create a HardCaml circuit from behavioral IR module *)
-let create_circuit bmod =
+let create_circuit (bmod : Behavioral_ir.bmodule) =
   let input_ports = build_input_ports bmod in
   let output_ports = build_output_ports bmod in
 
@@ -253,7 +270,7 @@ let create_circuit bmod =
   (input_ports, output_ports)
 
 (* High-level conversion function *)
-let convert_to_hardcaml bprog =
+let convert_to_hardcaml (bprog : Behavioral_ir.bprogram) =
   match bprog.modules with
   | [] ->
       Printf.eprintf "No modules to convert\n";
