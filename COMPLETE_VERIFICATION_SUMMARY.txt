@@ -114,10 +114,11 @@ demonstrating production-ready compiler infrastructure and language-neutral Beha
 - **uart_receiver**: Minor optimization differences (VHDL 6 vs SV 5 regs)
 - **uart_transmitter**: Minor optimization differences (VHDL 4 vs SV 3 regs)
 
-### Needs Investigation (SAT Counterexamples)
-- **slib_edge_detect**: Structural match but SAT found differences
-- **slib_input_sync**: Structural match but SAT found differences
-- *Note*: Likely encoding artifacts, but manual review recommended
+### Investigated: SAT Counterexamples (FALSE POSITIVES) ✓
+- **slib_edge_detect**: FALSE POSITIVE - Missing when-else expression support in VHDL frontend
+- **slib_input_sync**: FALSE POSITIVES - Width inference bug (32 bits instead of 2) in VHDL frontend
+- *Note*: Manual investigation completed (see results/sat_counterexample_investigation.md)
+- *Conclusion*: Encoding bugs in compiler, NOT semantic differences between VHDL/SV
 
 ---
 
