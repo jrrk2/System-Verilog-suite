@@ -110,14 +110,19 @@ The client uses lua-ml (Lua 2.5 in OCaml) instead of external Lua. This provides
 - **No external dependencies**: Everything runs in OCaml
 - **Direct access**: OCaml functions are directly callable from Lua
 
-### Limitations
+### Full Lua 2.5 Syntax Support
 
-The current implementation uses a simplified Lua parser that only supports:
-- Function calls: `function_name(arg1, arg2, ...)`
-- String arguments: `"quoted strings"` or `'quoted strings'`
-- Simple commands: `help()`, `exit`
+The client now uses the proper lua-ml integration pattern (from ../hardcaml-lua) and supports full Lua 2.5 syntax:
 
-Full Lua syntax (variables, loops, conditionals, tables) is not yet supported but could be added by integrating the full lua-ml parser.
+✅ **Variables**: `vhdl = "sysver_tests/slib_clock_div.vhd"`
+✅ **Tables**: `modules = {"slib_clock_div", "uart_baudgen"}`
+✅ **Loops**: `while modules[i] do ... i = i + 1 end`
+✅ **Conditionals**: `if result then print("Success") end`
+✅ **String concatenation**: `"sysver_tests/" .. module_name .. ".vhd"`
+✅ **Module namespacing**: `verify.hardcaml_sat(vhdl, sv)`
+✅ **Functions**: `function test(m) return verify.hardcaml_sat(m..".vhd", m..".sv") end`
+
+**Note**: lua-ml implements Lua 2.5, not Lua 5.x, so some modern Lua features like `#table` (use `getn()` instead), `ipairs()` (use `while` loops), and `local` variables in some contexts may not be available.
 
 ## Comparison with verify_interactive.lua
 
@@ -132,14 +137,13 @@ Full Lua syntax (variables, loops, conditionals, tables) is not yet supported bu
 
 ## Examples
 
-### Example 1: Quick Validation
+### Example 1: Quick Validation (Module Syntax)
 
 ```bash
 ./_build/default/interactive_client.exe << 'EOF'
-vhdl_regression("sysver_tests/slib_clock_div.vhd")
-sv_regression("sysver_tests/slib_clock_div.sv")
-hardcaml_equiv("sysver_tests/slib_clock_div.vhd", "sysver_tests/slib_clock_div.sv")
-exit
+verify.vhdl_regression("sysver_tests/slib_clock_div.vhd")
+verify.sv_regression("sysver_tests/slib_clock_div.sv")
+verify.hardcaml_equiv("sysver_tests/slib_clock_div.vhd", "sysver_tests/slib_clock_div.sv")
 EOF
 ```
 
@@ -147,47 +151,85 @@ EOF
 
 ```bash
 ./_build/default/interactive_client.exe << 'EOF'
-verify_all("sysver_tests/slib_clock_div.vhd", "sysver_tests/slib_clock_div.sv")
-exit
+verify.verify_all("sysver_tests/slib_clock_div.vhd", "sysver_tests/slib_clock_div.sv")
 EOF
 ```
 
-### Example 3: Interactive Exploration
+### Example 3: Batch Processing with Lua Variables and Loops
+
+```bash
+./_build/default/interactive_client.exe << 'EOF'
+-- Define modules to test
+modules = {"slib_clock_div", "slib_input_sync", "uart_baudgen"}
+
+-- Test each module
+i = 1
+while modules[i] do
+    m = modules[i]
+    print("Testing module: " .. m)
+
+    vhdl = "sysver_tests/" .. m .. ".vhd"
+    sv = "sysver_tests/" .. m .. ".sv"
+
+    result = verify.hardcaml_sat(vhdl, sv)
+
+    if result then
+        print("  ✓ Passed")
+    else
+        print("  ✗ Failed")
+    end
+
+    i = i + 1
+end
+
+print("All tests complete!")
+EOF
+```
+
+### Example 4: Interactive Exploration
 
 ```bash
 # Start interactive mode
 ./_build/default/interactive_client.exe
 
-# Then try different modules interactively:
-lua> hardcaml_sat("sysver_tests/uart_baudgen.vhd", "sysver_tests/uart_baudgen.sv")
-lua> structural_equiv("sysver_tests/slib_edge_detect.vhd", "sysver_tests/slib_edge_detect.sv")
-lua> exit
+# Try different modules interactively:
+lua> verify.hardcaml_sat("sysver_tests/uart_baudgen.vhd", "sysver_tests/uart_baudgen.sv")
+lua> verify.structural_equiv("sysver_tests/slib_edge_detect.vhd", "sysver_tests/slib_edge_detect.sv")
+lua> help()
 ```
 
 ## Future Enhancements
 
 Potential improvements to the interactive client:
 
-1. **Full Lua Parser**: Integrate lua-ml's complete parser for full Lua 2.5 syntax support (variables, loops, functions, tables)
+1. **Script File Loading**: Support loading and executing Lua script files as command-line arguments (currently reads from stdin or interactive)
 
-2. **Batch Processing**: Add support for processing lists of modules:
+2. **Result Collection**: Accumulate results in Lua tables and generate summary reports:
    ```lua
-   modules = {"slib_clock_div", "uart_baudgen", "slib_edge_detect"}
-   for i, m in ipairs(modules) do
-     verify_all("sysver_tests/"..m..".vhd", "sysver_tests/"..m..".sv")
+   results = {}
+   i = 1
+   while modules[i] do
+     results[i] = verify.hardcaml_sat(modules[i]..".vhd", modules[i]..".sv")
+     i = i + 1
    end
    ```
 
-3. **Script Files**: Support loading and executing Lua script files:
-   ```bash
-   ./_build/default/interactive_client.exe verify_suite.lua
+3. **Synthesis Integration**: Add Liberty library mapping and gate-level synthesis commands to the `verify` module
+
+4. **Additional Lua Libraries**: Add more lua-ml standard libraries (Luacamllib for OCaml interop, custom libraries for file I/O)
+
+5. **MCP Server**: Integrate with Model Context Protocol for IDE integration
+
+6. **Lua 5.x Compatibility Layer**: Add helper functions to emulate common Lua 5.x patterns:
+   ```lua
+   function ipairs(t)
+     local i = 0
+     return function()
+       i = i + 1
+       if t[i] then return i, t[i] end
+     end
+   end
    ```
-
-4. **Result Collection**: Accumulate results in Lua tables and generate summary reports
-
-5. **Synthesis Integration**: Add Liberty library mapping and gate-level synthesis commands
-
-6. **MCP Server**: Integrate with Model Context Protocol for IDE integration
 
 ## Files
 
@@ -211,6 +253,49 @@ Potential improvements to the interactive client:
 2. **Type safety**: Lua values are OCaml types, preventing runtime errors
 3. **Direct integration**: OCaml functions callable without FFI overhead
 4. **User requirement**: Explicitly requested "lua-ml 2.5 interpreter in OCaml"
+
+### Architecture: Following hardcaml-lua Pattern
+
+The implementation follows the established pattern from `../hardcaml-lua/myluaclient.ml`:
+
+**Type Combination**:
+```ocaml
+module T = Lua.Lib.Combine.T2
+    (LuaChar)      -- Custom char type
+    (Luaiolib.T)   -- I/O library type
+```
+
+**USERCODE Functor**:
+```ocaml
+module MakeVerificationLib
+    (CharV: Lua.Lib.TYPEVIEW with type 'a t = 'a LuaChar.t)
+    : Lua.Lib.USERCODE with type 'a userdata' = 'a CharV.combined
+```
+
+**Module Registration**:
+```ocaml
+C.register_module "verify" [
+    "vhdl_regression", V.efunc (V.string **->> V.bool) (wrap1 vhdl_regression);
+    "hardcaml_sat", V.efunc (V.string **-> V.string **->> V.bool) (wrap2 hardcaml_sat);
+    ...
+]
+```
+
+**Library Combination**:
+```ocaml
+module C = Lua.Lib.Combine.C4
+    (Luaiolib.Make(LuaioT))
+    (W (Luastrlib.M))
+    (W (Luamathlib.M))
+    (MakeVerificationLib (LuaCharT))
+```
+
+This pattern provides:
+- ✅ Proper type integration with lua-ml
+- ✅ Clean namespace organization (verify.*)
+- ✅ Full Lua 2.5 syntax support
+- ✅ Standard library integration (string, math, I/O)
+- ✅ Extensibility for adding new modules
 
 ### Implementation Challenges Solved
 
