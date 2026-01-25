@@ -34,6 +34,19 @@ Run:
 ./_build/default/interactive_client_v2.exe
 ```
 
+## Interactive Features
+
+The client includes **linenoise** for enhanced line editing and command history:
+
+- **Command history**: Use Up/Down arrows to navigate previous commands
+- **Line editing**: Left/Right arrows, Home/End, Ctrl-A/E for cursor movement
+- **Persistent history**: Commands saved to `~/.hdl_history` (1000 commands)
+- **Multi-line support**: Edit longer Lua expressions with line wrapping
+- **Screen control**: Ctrl-L to clear screen
+- **Editing shortcuts**: Ctrl-K (kill to end), Ctrl-U (kill to start), Ctrl-W (delete word)
+
+See [LINENOISE_FEATURES.md](LINENOISE_FEATURES.md) for complete documentation.
+
 ## Module Reference
 
 ### convert.* - IR Conversions

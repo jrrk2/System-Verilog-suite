@@ -299,22 +299,43 @@ let main () =
     Printf.printf "Type 'help()' or 'verify.help()' for available commands\n";
     Printf.printf "Type Ctrl-D to quit\n\n";
 
+    (* Configure linenoise *)
+    let history_file = Filename.concat (Sys.getenv "HOME") ".hdl_history" in
+    let _ = LNoise.history_set ~max_length:1000 in
+    let _ = LNoise.history_load ~filename:history_file in
+    LNoise.set_multiline true;
+
     let state = I.mk () in
     let eval e = ignore (I.dostring state e) in
 
-    (* Interactive REPL loop *)
-    try
-        while true do
-            Printf.printf "lua> ";
-            flush stdout;
-            let line = read_line () in
-            try
+    (* REPL loop with linenoise *)
+    let rec loop () =
+        match LNoise.linenoise "lua> " with
+        | None ->
+            (* Ctrl-D pressed - exit *)
+            Printf.printf "\nGoodbye!\n\n"
+        | Some line ->
+            (* Add non-empty lines to history *)
+            if String.trim line <> "" then
+                ignore (LNoise.history_add line);
+
+            (* Evaluate the line *)
+            (try
                 eval line
             with e ->
                 Printf.eprintf "Error: %s\n" (Printexc.to_string e);
-                flush stderr
-        done
-    with End_of_file ->
-        Printf.printf "\nGoodbye!\n\n"
+                flush stderr);
+
+            (* Continue loop *)
+            loop ()
+    in
+
+    (* Run REPL and save history on exit *)
+    try
+        loop ();
+        ignore (LNoise.history_save ~filename:history_file)
+    with e ->
+        ignore (LNoise.history_save ~filename:history_file);
+        raise e
 
 let _ = main ()
