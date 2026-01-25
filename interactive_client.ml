@@ -250,7 +250,9 @@ module MakeVerificationLib
             Printf.printf "      verify.verify_all('sysver_tests/'..m..'.vhd',\n";
             Printf.printf "                         'sysver_tests/'..m..'.sv')\n";
             Printf.printf "    end\n\n";
-            Printf.printf "Type Ctrl-D to quit\n\n"
+            Printf.printf "Type Ctrl-D to quit\n\n";
+            flush stdout;
+            ()
 
         (* Initialize and register all functions *)
         let init g =

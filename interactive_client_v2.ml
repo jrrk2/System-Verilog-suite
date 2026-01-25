@@ -438,6 +438,7 @@ module MakeHDLLib
             Printf.printf "  > optimize.quick('test.vhd')\n";
             Printf.printf "  > lib = liberty.load('sky130.lib')\n";
             Printf.printf "  > verify.verify_all('test.vhd', 'test.sv')\n\n";
+            flush stdout;
             ()
 
         (* ============================================================ *)
