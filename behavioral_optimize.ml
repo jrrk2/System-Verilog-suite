@@ -100,9 +100,6 @@ let optimize_program ?(config=default_config) prog =
       let ctx = Behavioral_registers.analyze_module bmod in
       Behavioral_registers.print_register_stats ctx;
       log "";
-
-      (* Show comparison with old buggy approach *)
-      Behavioral_registers.compare_with_vhdl_bug bmod.name ctx;
     ) prog4.modules;
 
     log "✅ Register inference complete";

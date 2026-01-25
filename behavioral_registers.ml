@@ -347,38 +347,3 @@ let print_register_stats ctx =
       Printf.printf "  ... and %d more wires\n" (List.length ctx.wires - 5)
   end
 
-(* Compare with original approach *)
-let compare_with_vhdl_bug module_name ctx =
-  Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
-  Printf.printf "Comparison: New Register Inference vs Old VHDL Bug\n";
-  Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
-
-  Printf.printf "Module: %s\n\n" module_name;
-
-  Printf.printf "OLD VHDL APPROACH (BUGGY):\n";
-  Printf.printf "  - Created register for EVERY assignment\n";
-  Printf.printf "  - Result: 6 registers for slib_clock_div\n";
-  Printf.printf "    • Register(iCounter) - initial\n";
-  Printf.printf "    • Register(iQ) - initial\n";
-  Printf.printf "    • Register(iQ_next1) - default assignment ❌\n";
-  Printf.printf "    • Register(iQ_next2) - pulse assignment ❌\n";
-  Printf.printf "    • Register(iCounter_n1) - max assignment ❌\n";
-  Printf.printf "    • Register(iCounter_n2) - increment ❌\n\n";
-
-  Printf.printf "NEW SHARED APPROACH (CORRECT):\n";
-  Printf.printf "  - Groups assignments by ORIGINAL signal name\n";
-  Printf.printf "  - Strips SSA suffixes (iCounter_7 → iCounter)\n";
-  Printf.printf "  - Filters out CSE temps (_cse_tempN)\n";
-  Printf.printf "  - Builds MUX tree for multiple assignments\n";
-  Printf.printf "  - Creates ONE register per ORIGINAL signal\n";
-  Printf.printf "  - Result: %d registers\n" (List.length ctx.registers);
-  List.iter (fun reg ->
-    Printf.printf "    • Register(%s) ✅\n" reg.reg_name
-  ) (List.rev ctx.registers);
-
-  Printf.printf "\n";
-  Printf.printf "  - CSE temps and SSA versions: %d wires (not registers!)\n" (List.length ctx.wires);
-  Printf.printf "\n";
-  Printf.printf "✅ Bug fixed! Correct number of registers.\n";
-  Printf.printf "✅ This logic is shared by VHDL and SystemVerilog.\n";
-  Printf.printf "✅ No more language-specific register inference!\n\n"
