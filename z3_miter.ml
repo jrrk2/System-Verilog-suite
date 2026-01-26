@@ -192,21 +192,37 @@ let rec expr_to_z3 suffix ctx_sigs = function
 (* Encode statement as Z3 constraint *)
 let rec encode_stmt suffix ctx_sigs solver = function
   | BAssign { lhs; rhs } ->
-      (* Get width from RHS expression directly! *)
+      (* Get LHS width from context - must use declared signal width *)
       let width =
-        match width_of_expr rhs with
+        match List.assoc_opt lhs ctx_sigs with
         | Some w -> w
         | None ->
-            (* Fallback to context lookup *)
-            match List.assoc_opt lhs ctx_sigs with
-            | Some w -> w
-            | None -> 32  (* Last resort *)
+            (* Try SSA-stripped name *)
+            let stripped = strip_ssa_suffix lhs in
+            (match List.assoc_opt stripped ctx_sigs with
+             | Some w -> w
+             | None ->
+                 (* Last resort: try to infer from RHS *)
+                 (match width_of_expr rhs with
+                  | Some w -> w
+                  | None -> 32))
       in
       (try
         let z3_lhs = bv_var lhs width suffix in
         let z3_rhs = expr_to_z3 suffix ctx_sigs rhs in
-        (* Just trust that widths match - expr_to_z3 should handle it *)
-        let eq = Z3.Boolean.mk_eq ctx z3_lhs z3_rhs in
+        (* Ensure RHS matches LHS width *)
+        let rhs_width = Z3.BitVector.get_size (Z3.Expr.get_sort z3_rhs) in
+        let z3_rhs_adjusted =
+          if rhs_width = width then
+            z3_rhs
+          else if rhs_width < width then
+            (* Zero-extend RHS to match LHS *)
+            Z3.BitVector.mk_zero_ext ctx (width - rhs_width) z3_rhs
+          else
+            (* Truncate RHS to match LHS *)
+            Z3.BitVector.mk_extract ctx (width - 1) 0 z3_rhs
+        in
+        let eq = Z3.Boolean.mk_eq ctx z3_lhs z3_rhs_adjusted in
         Z3.Solver.add solver [eq]
        with Z3.Error msg ->
         Printf.eprintf "Error encoding assignment: %s := <rhs>\n" lhs;
@@ -242,13 +258,19 @@ let encode_process suffix ctx_sigs solver = function
 (* Infer widths from assignments - walk all statements to find actual widths *)
 let rec infer_widths_from_stmt widths = function
   | BAssign { lhs; rhs } ->
-      (* Get width from RHS expression using context *)
-      let width =
-        match width_of_expr_ctx widths rhs with
-        | Some w -> w
-        | None -> 32  (* Default if we can't infer *)
-      in
-      Hashtbl.replace widths lhs width
+      (* Only infer width if we don't already have it from signal declaration *)
+      (match Hashtbl.find_opt widths lhs with
+       | Some _ ->
+           (* Signal already has declared width - don't overwrite it *)
+           ()
+       | None ->
+           (* Signal not declared, infer from RHS *)
+           let width =
+             match width_of_expr_ctx widths rhs with
+             | Some w -> w
+             | None -> 32  (* Default if we can't infer *)
+           in
+           Hashtbl.add widths lhs width)
 
   | BIf { then_stmts; else_stmts; _ } ->
       List.iter (infer_widths_from_stmt widths) then_stmts;
