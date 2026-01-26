@@ -114,9 +114,17 @@ type bmodule = {
   instances: binstance list;
 } [@@deriving yojson]
 
+(* Library cell port specification - simpler than full bsignal *)
+type library_port = {
+  port_name: string;
+  port_direction: [`Input | `Output];
+  port_width: int;
+} [@@deriving yojson]
+
 (* Top-level program *)
 type bprogram = {
   modules: bmodule list;
+  library_cells: (string * library_port list) list;  (* (cell_name, ports) *)
 } [@@deriving yojson]
 
 (* ========================================================================= *)
