@@ -228,7 +228,7 @@ let verilog_of_process proc =
       Printf.sprintf "%s\n%s\n%s\nend\n" comment always_header body_with_reset
 
 (* Generate instance *)
-let verilog_of_instance inst =
+let verilog_of_instance prog inst =
   let { inst_name; module_name; param_values; port_connections } = inst in
 
   (* Parameter instantiation *)
@@ -241,14 +241,34 @@ let verilog_of_instance inst =
     else ""
   in
 
-  (* Port connections *)
-  let ports_str =
-    if List.length port_connections > 0 then
-      String.concat ",\n    " (List.map (fun (port, expr) ->
-        Printf.sprintf ".%s(%s)" port (verilog_of_expr expr)
-      ) port_connections)
-    else ""
+  (* Look up expected ports for this module *)
+  let expected_ports =
+    (* First check library cells *)
+    match List.assoc_opt module_name prog.library_cells with
+    | Some lib_ports -> List.map (fun (p : library_port) -> p.port_name) lib_ports
+    | None ->
+        (* Then check user modules *)
+        match List.find_opt (fun (m : bmodule) -> m.name = module_name) prog.modules with
+        | Some m ->
+            List.filter_map (fun (s : bsignal) ->
+              if s.direction <> `Internal then Some (sanitize_name s.name) else None
+            ) m.signals
+        | None -> []
   in
+
+  (* Build port connections, adding empty connections for unconnected ports *)
+  let connected_ports = Hashtbl.create (List.length port_connections) in
+  List.iter (fun (port, _) -> Hashtbl.add connected_ports port true) port_connections;
+
+  let all_port_connections =
+    List.map (fun port_name ->
+      match List.assoc_opt port_name port_connections with
+      | Some expr -> Printf.sprintf ".%s(%s)" port_name (verilog_of_expr expr)
+      | None -> Printf.sprintf ".%s()" port_name  (* Empty connection *)
+    ) expected_ports
+  in
+
+  let ports_str = String.concat ",\n    " all_port_connections in
 
   if ports_str <> "" then
     Printf.sprintf "%s%s %s (\n    %s\n);"
@@ -283,7 +303,7 @@ let verilog_of_signal sig_ =
     Some decl
 
 (* Generate module *)
-let verilog_of_module bmod =
+let verilog_of_module prog bmod =
   let { name; params; signals; processes; instances } = bmod in
 
   (* Module header *)
@@ -334,7 +354,7 @@ let verilog_of_module bmod =
   let process_strs = String.concat "\n" (List.map verilog_of_process processes) in
 
   (* Instances *)
-  let instance_strs = String.concat "\n\n" (List.map verilog_of_instance instances) in
+  let instance_strs = String.concat "\n\n" (List.map (verilog_of_instance prog) instances) in
 
   (* Combine all *)
   let body_parts = [signal_decls; process_strs; instance_strs]
@@ -613,7 +633,7 @@ let generate_library_cells prog =
 (* Generate program *)
 let verilog_of_program prog =
   let lib_cells = generate_library_cells prog in
-  let modules = String.concat "\n\n" (List.map verilog_of_module prog.modules) in
+  let modules = String.concat "\n\n" (List.map (verilog_of_module prog) prog.modules) in
   lib_cells ^ modules
 
 (* Write to file *)
