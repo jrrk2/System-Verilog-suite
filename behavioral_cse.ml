@@ -344,7 +344,7 @@ let apply_cse_program prog =
     bmod'
   ) prog.modules in
 
-  ({ modules = modules' }, !total_elims)
+  ({ modules = modules'; library_cells = prog.library_cells }, !total_elims)
 
 let apply_cse_with_stats prog =
   let (prog', eliminations) = apply_cse_program prog in

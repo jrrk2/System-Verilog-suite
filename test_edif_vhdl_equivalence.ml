@@ -127,12 +127,26 @@ let () =
       else
         Printf.printf "  ⚠ Instance counts differ (expected - EDIF is post-synthesis)\n\n";
 
+      (* Step 4: Z3 Formal Equivalence Checking *)
+      Printf.printf "Step 4: Z3 Formal Equivalence Verification...\n\n";
+
+      let z3_result = Z3_miter.check_miter_equivalence edif_top vhdl_top in
+
       (* Summary *)
-      Printf.printf "═══════════════════════════════════════════════════════════════\n";
+      Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
       Printf.printf "  Equivalence Check Summary\n";
       Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
 
-      Printf.printf "Both EDIF and VHDL paths successfully converted to Behavioral IR.\n";
-      Printf.printf "EDIF represents post-synthesis netlist (flattened, optimized).\n";
-      Printf.printf "VHDL represents original RTL hierarchy.\n";
-      Printf.printf "\nFor full equivalence checking, use Z3 formal verification.\n\n"
+      Printf.printf "Structural Comparison:\n";
+      Printf.printf "  ✓ Port counts match (%d ports)\n" (List.length edif_ports);
+      Printf.printf "  ⚠ EDIF has %d instances (post-synthesis)\n" (List.length edif_top.instances);
+      Printf.printf "  ⚠ VHDL has %d instances (behavioral)\n\n" (List.length vhdl_top.instances);
+
+      Printf.printf "Formal Verification (Z3):\n";
+      if z3_result then
+        Printf.printf "  ✅ DESIGNS ARE FORMALLY EQUIVALENT\n\n"
+      else
+        Printf.printf "  ❌ DESIGNS DIFFER OR VERIFICATION INCOMPLETE\n\n";
+
+      if not z3_result then
+        exit 1

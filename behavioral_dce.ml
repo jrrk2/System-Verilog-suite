@@ -283,7 +283,7 @@ let eliminate_dead_module bmod =
 (* Eliminate dead code in program *)
 let eliminate_dead_program prog =
   let modules' = List.map eliminate_dead_module prog.modules in
-  { modules = modules' }
+  { modules = modules'; library_cells = prog.library_cells }
 
 (* Count eliminated statements *)
 let count_stmts_process = function

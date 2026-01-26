@@ -282,7 +282,7 @@ let module_data_to_bmodule module_name (mod_data : module_data) symbol_table =
 (* Main conversion function *)
 let convert_sv_to_behavioral module_name (mod_data : module_data) symbol_table =
   let bmodule = module_data_to_bmodule module_name mod_data symbol_table in
-  { modules = [bmodule] }
+  { modules = [bmodule]; library_cells = [] }
 
 (* Helper: Convert elaborated SV file to behavioral IR *)
 let convert_elaborated_sv_to_behavioral filename =

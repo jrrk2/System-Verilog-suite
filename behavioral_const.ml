@@ -318,7 +318,7 @@ let propagate_program prog =
     bmod'
   ) prog.modules in
 
-  ({ modules = modules' }, !total_changes)
+  ({ modules = modules'; library_cells = prog.library_cells }, !total_changes)
 
 (* Iteratively propagate until fixed point *)
 let propagate_to_fixpoint prog =

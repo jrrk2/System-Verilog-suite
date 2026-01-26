@@ -278,7 +278,7 @@ let module_to_ssa bmod =
 (* Convert program to SSA form *)
 let program_to_ssa prog =
   let modules' = List.map module_to_ssa prog.modules in
-  { modules = modules' }
+  { modules = modules'; library_cells = prog.library_cells }
 
 (* Pretty print SSA info *)
 let print_ssa_stats ctx =
