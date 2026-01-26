@@ -194,8 +194,57 @@ let convert filename =
   let inst_list = NetlistParser.get_instance_info filename in
   let nets = NetlistParser.get_nets filename in
 
+  (* Helper: parse signal name to extract base and bit index *)
+  let parse_signal_name name =
+    try
+      (* Look for pattern: name[index] *)
+      let bracket_pos = String.rindex name '[' in
+      let close_pos = String.rindex name ']' in
+      if close_pos = String.length name - 1 then
+        let base = String.sub name 0 bracket_pos in
+        let idx_str = String.sub name (bracket_pos + 1) (close_pos - bracket_pos - 1) in
+        let idx = int_of_string idx_str in
+        (base, Some idx)
+      else
+        (name, None)
+    with _ -> (name, None)
+  in
+
+  (* Helper: group signals into vectors *)
+  let group_into_vectors signal_list =
+    (* Group by base name *)
+    let groups : (string, (int * bsignal) list) Hashtbl.t = Hashtbl.create 256 in
+    List.iter (fun (sig_ : bsignal) ->
+      let (base, idx_opt) = parse_signal_name sig_.name in
+      match idx_opt with
+      | Some idx ->
+          let existing = try Hashtbl.find groups base with Not_found -> [] in
+          Hashtbl.replace groups base ((idx, sig_) :: existing)
+      | None ->
+          (* Non-indexed signal - add as-is *)
+          Hashtbl.replace groups sig_.name [(0, sig_)]
+    ) signal_list;
+
+    (* Convert groups to signals *)
+    Hashtbl.fold (fun base indices acc ->
+      let sorted = List.sort (fun (i1, _) (i2, _) -> compare i1 i2) indices in
+      match sorted with
+      | [(0, sig_)] when not (List.exists (fun (i, _) -> i > 0) sorted) ->
+          (* Single signal without index, keep as-is *)
+          sig_ :: acc
+      | indices ->
+          (* Vector - find max index and use first signal as template *)
+          let max_idx = List.fold_left (fun m (i, _) -> max m i) 0 indices in
+          let (_, template) = List.hd sorted in
+          { template with
+            name = base;
+            stype = BInt { width = max_idx + 1; signed = Unsigned };
+          } :: acc
+    ) groups []
+  in
+
   (* Create signals *)
-  let signals =
+  let ungrouped_signals =
     (* Ports *)
     List.map (fun p ->
       {
@@ -219,6 +268,9 @@ let convert filename =
     ) nets
   in
 
+  (* Group signals with indices into vectors *)
+  let signals = group_into_vectors ungrouped_signals in
+
   (* Build instance map for quick lookup *)
   let inst_map : (string, NetlistParser.instance_info) Hashtbl.t = Hashtbl.create 256 in
   List.iter (fun (i : NetlistParser.instance_info) -> Hashtbl.add inst_map i.NetlistParser.name i) inst_list;
@@ -231,13 +283,21 @@ let convert filename =
     ) net.connections
   ) nets;
 
+  (* Helper: convert net name to expression, handling indexed signals *)
+  let net_to_expr net_name =
+    let (base, idx_opt) = parse_signal_name net_name in
+    match idx_opt with
+    | Some idx -> BSelect { array = BVar base; index = BConst { value = idx; width = 32 } }
+    | None -> BVar base
+  in
+
   (* Helper: get input expressions for an instance *)
   let get_inputs inst_name =
     let pins = Hashtbl.find_all pin_to_net (inst_name, "I0") @
                Hashtbl.find_all pin_to_net (inst_name, "I1") @
                Hashtbl.find_all pin_to_net (inst_name, "I") @
                Hashtbl.find_all pin_to_net (inst_name, "D") in
-    List.map (fun net -> BVar net) pins
+    List.map net_to_expr pins
   in
 
   (* Helper: get output net for an instance *)
@@ -270,6 +330,46 @@ let convert filename =
     body = List.rev !assignments;
   } in
 
+  (* Helper: get all port connections for an instance *)
+  let get_port_connections inst_name =
+    (* Find all nets connected to this instance *)
+    let connections = ref [] in
+    List.iter (fun (net : NetlistParser.net_info) ->
+      List.iter (fun (pin : NetlistParser.net_pin) ->
+        if pin.NetlistParser.inst = inst_name then
+          connections := (pin.pin, net_to_expr net.NetlistParser.name) :: !connections
+      ) net.connections
+    ) nets;
+    List.rev !connections
+  in
+
+  (* Helper: parse parameterized module name *)
+  let parse_module_name cell_type =
+    (* Handle names like "slib_fifo__parameterized1" *)
+    try
+      let idx = String.index cell_type '_' in
+      let rec find_double_underscore pos =
+        try
+          let next_idx = String.index_from cell_type (pos + 1) '_' in
+          if next_idx = pos + 1 then
+            (* Found __ at position pos *)
+            let base_name = String.sub cell_type 0 pos in
+            let suffix = String.sub cell_type (pos + 2) (String.length cell_type - pos - 2) in
+            if String.starts_with ~prefix:"parameterized" suffix then
+              let param_num = try
+                int_of_string (String.sub suffix 13 (String.length suffix - 13))
+              with _ -> 1 in
+              (base_name, [("PARAM_SET", param_num)])
+            else
+              (cell_type, [])
+          else
+            find_double_underscore next_idx
+        with Not_found -> (cell_type, [])
+      in
+      find_double_underscore idx
+    with Not_found -> (cell_type, [])
+  in
+
   (* Identify hierarchical instances (non-RTL primitives) *)
   let hier_instances = List.filter_map (fun (inst : NetlistParser.instance_info) ->
     let is_primitive =
@@ -278,11 +378,12 @@ let convert filename =
       inst.cell_type = "BUF" || inst.cell_type = "OBUF"
     in
     if not is_primitive then
+      let (module_name, params) = parse_module_name inst.cell_type in
       Some {
         inst_name = inst.name;
-        module_name = inst.cell_type;
-        param_values = [];
-        port_connections = [];  (* Would need to extract from nets *)
+        module_name;
+        param_values = params;
+        port_connections = get_port_connections inst.name;
       }
     else None
   ) inst_list in
