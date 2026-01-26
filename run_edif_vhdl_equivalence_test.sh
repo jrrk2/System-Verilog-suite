@@ -6,6 +6,7 @@
 # 2. Converts EDIF to Behavioral Verilog
 # 3. Converts VHDL to Behavioral IR
 # 4. Compares the two representations
+# 5. Performs Z3 formal equivalence verification
 
 set -e  # Exit on error
 
@@ -88,23 +89,24 @@ echo ""
 echo "✓ Behavioral Verilog created: apb_uart_from_edif.v"
 echo ""
 
-# Step 3: Run equivalence checker
+# Step 3: Run equivalence checker with Z3 formal verification
 echo "═══════════════════════════════════════════════════════════════"
-echo "Step 3: Comparing EDIF and VHDL representations..."
+echo "Step 3: Running equivalence checker with Z3 verification..."
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-if [ ! -f "_build/default/test_edif_vhdl_equivalence.exe" ]; then
-    echo "Building equivalence checker..."
-    dune build test_edif_vhdl_equivalence.exe
-fi
+echo "Building equivalence checker..."
+dune build test_edif_vhdl_equivalence.exe
 
 echo "Running equivalence checker..."
 _build/default/test_edif_vhdl_equivalence.exe
 
+# Capture exit code
+TEST_RESULT=$?
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Test Complete"
+echo "  Test Flow Complete"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 echo "Generated files:"
@@ -113,8 +115,17 @@ echo "  - apb_uart_from_edif.v         : Behavioral Verilog from EDIF"
 echo "  - uart_post_synth.dcp          : Vivado checkpoint"
 echo "  - vivado_synth.log             : Vivado synthesis log"
 echo ""
-echo "Next steps:"
-echo "  - Verify apb_uart_from_edif.v with Verilator"
-echo "  - Compare with VHDL behavioral conversion"
-echo "  - Run Z3 formal equivalence checking"
+echo "Verification performed:"
+echo "  ✓ Structural comparison (ports, instances)"
+echo "  ✓ Z3 formal equivalence verification (miter circuit + SAT)"
 echo ""
+
+if [ $TEST_RESULT -eq 0 ]; then
+    echo "🎉 EQUIVALENCE VERIFIED - Designs are formally equivalent!"
+    echo ""
+    exit 0
+else
+    echo "❌ VERIFICATION FAILED - Designs differ or incomplete"
+    echo ""
+    exit 1
+fi
