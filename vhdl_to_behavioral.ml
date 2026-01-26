@@ -459,7 +459,15 @@ let convert_vhdl_to_behavioral vhdl_ast =
     instances = [];
   } in
 
-  { modules = [bmodule] }
+  { modules = [bmodule]; library_cells = [] }
+
+(* Convert multiple VHDL ASTs to behavioral IR *)
+let convert_multiple vhdl_asts =
+  let all_modules = List.concat_map (fun ast ->
+    let prog = convert_vhdl_to_behavioral ast in
+    prog.Behavioral_ir.modules
+  ) vhdl_asts in
+  { Behavioral_ir.modules = all_modules; library_cells = [] }
 
 (* Helper: Convert VHDL file to behavioral IR *)
 let convert_vhdl_file_to_behavioral filename =
