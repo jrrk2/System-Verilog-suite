@@ -104,7 +104,23 @@ let () =
     | Some flist, Some top ->
         let files = String.split_on_char ':' flist
                     |> List.filter (fun s -> s <> "") in
-        (try Some (Verible_to_behavioral.convert_files ~top files)
+        (try
+          let p = Verible_to_behavioral.convert_files ~top files in
+          (* Same pipeline test_cva6_bottom_up runs on its SV side:
+           * unroll genvar bodies, inline functions/tasks, lift if-
+           * conditioned blocks, recognise array→memory patterns. The
+           * Vivado side already comes from elaborated VHDL so doesn't
+           * need this. Without these the FF analysis sees BCalls and
+           * unexpanded loops on the Verible side that don't exist on
+           * Vivado, inflating the no-match count. *)
+          let p =
+            p
+            |> Behavioral_unroll.unroll_program
+            |> Behavioral_inline.inline_program
+            |> Behavioral_iflift.lift_program
+            |> Behavioral_meminfer.infer_program
+          in
+          Some p
          with e ->
            Printf.eprintf "  Verible failed: %s\n" (Printexc.to_string e);
            None)
