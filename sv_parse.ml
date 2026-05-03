@@ -6,6 +6,15 @@ let assoc_find_opt lst kw = List.assoc_opt kw !lst
 let assoc_find lst kw = List.assoc kw !lst
 let assoc_create _ = ref []
 
+(* Verilator 5.026+ sometimes emits `null` (not `[]`) for missing
+ * sub-tree fields like `lhsp`, `rhsp`, `pinsp`, `stmtsp`, …
+ * `Yojson.Safe.Util.to_list` then raises Type_error. Wrap so a
+ * missing/null member becomes an empty list. *)
+let to_list_safe j =
+  match j with
+  | `Null -> []
+  | _ -> to_list j
+
 (* Parse type table entries *)
 let rec parse_type attr json =
   let node_type = json |> member "type" |> to_string in
@@ -17,10 +26,10 @@ let rec parse_type attr json =
       
   | "ENUMDTYPE" ->
       let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
-      let items_json = json |> member "itemsp" |> to_list in
+      let items_json = json |> member "itemsp" |> to_list_safe in
       let items = List.map (fun item ->
         let item_name = item |> member "name" |> to_string in
-        let value = item |> member "valuep" |> to_list |> List.hd |> member "name" |> to_string in
+        let value = item |> member "valuep" |> to_list_safe |> List.hd |> member "name" |> to_string in
         (item_name, value)
       ) items_json in
       (* Verilator's ENUMDTYPE has a `refDTypep` pointing at the
@@ -51,11 +60,11 @@ let rec parse_type attr json =
               ""
         | _ ->
             (* Fall back to parsing rangep array *)
-            let range_json = json |> member "rangep" |> to_list in
+            let range_json = json |> member "rangep" |> to_list_safe in
             (match range_json with
             | r :: _ -> 
-                let left = r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
-                let right = r |> member "rightp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                let left = r |> member "leftp" |> to_list_safe |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                let right = r |> member "rightp" |> to_list_safe |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
                 Printf.sprintf "%s:%s" left right
             | _ -> "")
       in
@@ -73,11 +82,11 @@ let rec parse_type attr json =
               ""
         | _ ->
             (* Fall back to parsing rangep array *)
-            let range_json = json |> member "rangep" |> to_list in
+            let range_json = json |> member "rangep" |> to_list_safe in
             (match range_json with
             | r :: _ -> 
-                let left = r |> member "leftp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
-                let right = r |> member "rightp" |> to_list |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                let left = r |> member "leftp" |> to_list_safe |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
+                let right = r |> member "rightp" |> to_list_safe |> List.hd |> member "name" |> to_string_option |> Option.value ~default:"0" in
                 Printf.sprintf "%s:%s" left right
             | _ -> "")
       in
@@ -96,26 +105,26 @@ let rec parse_type attr json =
   | "STRUCTDTYPE" ->
       let name = json |> member "name" |> to_string in
       let packed = json |> member "packed" |> to_bool_option |> Option.value ~default:false in
-      let members = json |> member "membersp" |> to_list |> List.map (parse_type attr) in
+      let members = json |> member "membersp" |> to_list_safe |> List.map (parse_type attr) in
       StructType { name; packed; members }
 
   | "UNIONDTYPE" ->
       let name = json |> member "name" |> to_string in
       let packed = json |> member "packed" |> to_bool_option |> Option.value ~default:false in
-      let members = json |> member "membersp" |> to_list |> List.map (parse_type attr) in
+      let members = json |> member "membersp" |> to_list_safe |> List.map (parse_type attr) in
       UnionType { name; packed; members }
 
   | "MEMBERDTYPE" ->
       let name = json |> member "name" |> to_string in
       let dtype = json |> member "dtypep" |> to_string in
-      let child = json |> member "childDTypep" |> to_list |> List.map (parse_type attr) in
-      let value = json |> member "valuep" |> to_list |> List.map (parse_type attr) in
+      let child = json |> member "childDTypep" |> to_list_safe |> List.map (parse_type attr) in
+      let value = json |> member "valuep" |> to_list_safe |> List.map (parse_type attr) in
       MemberType' { name; dtype; child; value }
 
   | "CONSTDTYPE" ->
       let name = json |> member "name" |> to_string in
       let dtype = json |> member "dtypep" |> to_string in
-      let child = json |> member "childDTypep" |> to_list |> List.map (parse_type attr) in
+      let child = json |> member "childDTypep" |> to_list_safe |> List.map (parse_type attr) in
       ConstType' { name; dtype; child }
 
   | "PARAMTYPEDTYPE" ->
@@ -135,7 +144,7 @@ let rec extract_const_value = function
   
 (* Parse type table and populate global table *)
 let rec parse_type_table attr json =
-  let types_json = json |> member "typesp" |> to_list in
+  let types_json = json |> member "typesp" |> to_list_safe in
   List.iter (fun type_json ->
     let addr = type_json |> member "addr" |> to_string_option |> Option.value ~default:"" in
     let parsed_type = parse_type attr type_json in
@@ -156,30 +165,30 @@ let rec parse_json attr json =
   match node_type with
   | "NETLIST" ->
       (* Parse type table first *)
-      let misc_list = json |> member "miscsp" |> to_list in
+      let misc_list = json |> member "miscsp" |> to_list_safe in
       List.iter (fun misc ->
         if (misc |> member "type" |> to_string) = "TYPETABLE" then
           parse_type_table attr misc
       ) misc_list;
       
-      let modules = json |> member "modulesp" |> to_list |> List.map (parse' attr name) in
+      let modules = json |> member "modulesp" |> to_list_safe |> List.map (parse' attr name) in
       (* let type_list = assoc_fold (fun k v acc -> (k, v) :: acc) attr.type_table [] in *)
       netlist := modules;
       Netlist modules
       
   | "MODULE" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       let m = Module { name; stmts } in
       if addr <> "" then assoc_add attr.module_table addr m;
       m
       
   | "PACKAGE" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       Package { name; stmts }
 
   | "IFACE" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       let interface_node = Interface { name; params = []; stmts } in
       if addr <> "" then (
@@ -190,16 +199,16 @@ let rec parse_json attr json =
       interface_node
 
   | "CELL" ->
-      let pins = json |> member "pinsp" |> to_list |> List.map (parse' attr name) in
+      let pins = json |> member "pinsp" |> to_list_safe |> List.map (parse' attr name) in
       let modp_addr = json |> member "modp" |> to_string_option |> Option.value ~default:"" in
       Cell' { name; modp_addr; pins }
       
   | "PIN" ->
-      let expr = try Some (json |> member "exprp" |> to_list |> List.hd |> parse' attr name) with _ -> None in
+      let expr = try Some (json |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name) with _ -> None in
       Pin { name; expr }
       
   | "MODPORT" ->
-      let vars = json |> member "varsp" |> to_list |> List.map (parse' attr name) in
+      let vars = json |> member "varsp" |> to_list_safe |> List.map (parse' attr name) in
       let m = Modport { name; vars } in
       let addr = json |> member "addr" |> to_string_option |> Option.value ~default:"" in
       if addr <> "" then assoc_add attr.interface_table addr m;
@@ -221,7 +230,7 @@ let rec parse_json attr json =
       let is_param = json |> member "isParam" |> to_bool_option |> Option.value ~default:false in
       let value = 
 	try 
-	  let valuep = json |> member "valuep" |> to_list in
+	  let valuep = json |> member "valuep" |> to_list_safe in
 	  match valuep with
 	  | v :: _ -> 
 	      (* Try to extract constant value directly *)
@@ -238,7 +247,7 @@ let rec parse_json attr json =
       v            
 									    
   | "INITITEM" ->
-      let value = json |> member "valuep" |> to_list |> List.map (parse' attr name) in
+      let value = json |> member "valuep" |> to_list_safe |> List.map (parse' attr name) in
       InitItem { value }
 									    
   | "CONST" ->
@@ -255,75 +264,86 @@ let rec parse_json attr json =
       
   | "FUNC" ->
       let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
-      let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
+      let vars = json |> member "fvarp" |> to_list_safe |> List.map (parse' attr name) in
       Func' { name; dtype; stmts; vars }
       
   | "TASK" ->
       let dtype = json |> member "dtypep" |> to_string_option |> Option.value ~default:"" in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
-      let vars = json |> member "fvarp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
+      let vars = json |> member "fvarp" |> to_list_safe |> List.map (parse' attr name) in
       Task' { name; dtype; stmts; vars }
       
   | "ALWAYS" ->
       let always = json |> member "keyword" |> to_string_option |> Option.value ~default:"always" in
-      let senses = json |> member "sensesp" |> to_list |> List.map (parse' attr name) in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      (* Verilator 5.026+ moved the sensitivity list one level deeper:
+       * `sensesp: [SENITEM, ...]` became `sentreep: [SENTREE]` whose
+       * SENTREE has the original `sensesp`. Handle both shapes so we
+       * stay compatible with older builds too. *)
+      let senses =
+        let sentreep = try json |> member "sentreep" |> to_list_safe with _ -> [] in
+        match sentreep with
+        | sentree :: _ ->
+            sentree |> member "sensesp" |> to_list_safe |> List.map (parse' attr name)
+        | [] ->
+            json |> member "sensesp" |> to_list_safe |> List.map (parse' attr name)
+      in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       Always { always; senses; stmts }
       
   | "BEGIN" ->
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       let is_generate = json |> member "generate" |> to_bool_option |> Option.value ~default:false in
       Begin { name; stmts; is_generate }
       
   | "ASSIGN" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list_safe |> List.hd |> parse' attr name in
       Assign { lhs; rhs; is_blocking = true }
       
   | "INSIDERANGE" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list_safe |> List.hd |> parse' attr name in
       InsideRange { lhs; rhs }
       
   | "ASSIGNDLY" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list_safe |> List.hd |> parse' attr name in
       Assign { lhs; rhs; is_blocking = false }
       
   | "ASSIGNW" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list_safe |> List.hd |> parse' attr name in
       AssignW { lhs; rhs }
       
   | "IF" ->
-      let condition = json |> member "condp" |> to_list |> List.hd |> parse' attr name in
-      let then_stmt = json |> member "thensp" |> to_list |> List.hd |> parse' attr name in
+      let condition = json |> member "condp" |> to_list_safe |> List.hd |> parse' attr name in
+      let then_stmt = json |> member "thensp" |> to_list_safe |> List.hd |> parse' attr name in
       let else_stmt = 
-        try Some (json |> member "elsesp" |> to_list |> List.hd |> parse' attr name)
+        try Some (json |> member "elsesp" |> to_list_safe |> List.hd |> parse' attr name)
         with _ -> None
       in
       If { condition; then_stmt; else_stmt }
       
   | "CASE" ->
-      let expr = json |> member "exprp" |> to_list |> List.hd |> parse' attr name in
-      let items_json = json |> member "itemsp" |> to_list in
+      let expr = json |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name in
+      let items_json = json |> member "itemsp" |> to_list_safe in
       let items = List.map (fun item ->
-        let conditions = item |> member "condsp" |> to_list |> List.map (parse' attr name) in
-        let statements = item |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+        let conditions = item |> member "condsp" |> to_list_safe |> List.map (parse' attr name) in
+        let statements = item |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
         { conditions; statements }
       ) items_json in
       Case { expr; items }
       
   | "CASEITEM" ->
-      let conditions = json |> member "condsp" |> to_list |> List.map (parse' attr name) in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let conditions = json |> member "condsp" |> to_list_safe |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       CaseItem { conditions; stmts }
 
   | "WHILE" ->
-      let condition = json |> member "condp" |> to_list |> List.hd |> parse' attr name in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
-      let incs = json |> member "incsp" |> to_list |> List.map (parse' attr name) in
+      let condition = json |> member "condp" |> to_list_safe |> List.hd |> parse' attr name in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
+      let incs = json |> member "incsp" |> to_list_safe |> List.map (parse' attr name) in
       For' { condition; stmts; incs }
 
   | "VARREF" ->
@@ -337,49 +357,61 @@ let rec parse_json attr json =
       VarXRef { name; access; dotted }
       
   | "SEL" ->
-      let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
-      let lsb = try Some (json |> member "lsbp" |> to_list |> List.hd |> parse' attr name) with _ -> None in
-      let width = try Some (json |> member "widthp" |> to_list |> List.hd |> parse' attr name) with _ -> None in
+      let expr = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
+      let lsb = try Some (json |> member "lsbp" |> to_list_safe |> List.hd |> parse' attr name) with _ -> None in
+      let width = try Some (json |> member "widthp" |> to_list_safe |> List.hd |> parse' attr name) with _ -> None in
       let width_const = try Some (json |> member "widthConst" |> to_int) with _ -> None in
       let range = json |> member "declRange" |> to_string_option |> Option.value ~default:"" in
       Sel { expr; lsb; width; width_const; range }
       
   | "ARRAYSEL" ->
-      let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
-      let index = json |> member "bitp" |> to_list |> List.hd |> parse' attr name in
+      let expr = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
+      let index = json |> member "bitp" |> to_list_safe |> List.hd |> parse' attr name in
       ArraySel { expr; index }
+
+  (* `arr[hi:lo]` on an unpacked array — verilator emits SLICESEL
+   * with `fromp` + `rhsp` (msb / left) + `thsp` (lsb / right). For
+   * BIR purposes the same Sel(fromp, lsb=thsp, width=msb-lsb+1)
+   * shape works — downstream encoders handle it like any part-select. *)
+  | "SLICESEL" ->
+      let expr = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
+      let lsb = try Some (json |> member "thsp" |> to_list_safe |> List.hd |> parse' attr name) with _ -> None in
+      let width = None in
+      let width_const = None in
+      let range = json |> member "declRange" |> to_string_option |> Option.value ~default:"" in
+      Sel { expr; lsb; width; width_const; range }
 
   | "SELBIT" ->
       (* Single bit selection - treat as Sel with lsb only *)
-      let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
-      let lsb = json |> member "bitp" |> to_list |> List.hd |> parse' attr name in
+      let expr = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
+      let lsb = json |> member "bitp" |> to_list_safe |> List.hd |> parse' attr name in
       Sel { expr; lsb = Some lsb; width = None; width_const = Some 1; range = "" }
 
   | "SELEXTRACT" ->
       (* Bit range extraction [msb:lsb] *)
-      let expr = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
-      let msb = json |> member "leftp" |> to_list |> List.hd |> parse' attr name in
-      let lsb_expr = json |> member "rightp" |> to_list |> List.hd |> parse' attr name in
+      let expr = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
+      let msb = json |> member "leftp" |> to_list_safe |> List.hd |> parse' attr name in
+      let lsb_expr = json |> member "rightp" |> to_list_safe |> List.hd |> parse' attr name in
       (* Construct width from msb - lsb *)
       Sel { expr; lsb = Some lsb_expr; width = Some msb; width_const = None; range = "" }
 
   | "CASTPARSE" ->
       (* Type casting - just return the expression being casted *)
-      let expr = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
+      let expr = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
       expr
 
   | "FUNCREF" ->
-      let args = json |> member "pinsp" |> to_list |> 
+      let args = json |> member "pinsp" |> to_list_safe |> 
         List.filter_map (fun pin -> 
-          try Some (pin |> member "exprp" |> to_list |> List.hd |> parse' attr name)
+          try Some (pin |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name)
           with _ -> None
         ) in
       FuncRef { name; args }
       
   | "TASKREF" ->
-      let args = json |> member "pinsp" |> to_list |>
+      let args = json |> member "pinsp" |> to_list_safe |>
         List.filter_map (fun pin ->
-          try Some (pin |> member "exprp" |> to_list |> List.hd |> parse' attr name)
+          try Some (pin |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name)
           with _ -> None
         ) in
       TaskRef { name; args }
@@ -387,10 +419,10 @@ let rec parse_json attr json =
   | "METHODCALL" ->
       (* Method call on object: object.method(args) *)
       let method_name = json |> member "name" |> to_string in
-      let obj = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
-      let args = json |> member "pinsp" |> to_list |>
+      let obj = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
+      let args = json |> member "pinsp" |> to_list_safe |>
         List.filter_map (fun pin ->
-          try Some (pin |> member "exprp" |> to_list |> List.hd |> parse' attr name)
+          try Some (pin |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name)
           with _ -> None
         ) in
       (* For now, represent as FuncRef with object as first arg *)
@@ -398,27 +430,27 @@ let rec parse_json attr json =
 
   | "RAND" ->
       let name = json |> member "name" |> to_string in
-      let args = json |> member "seedp" |> to_list |> List.map (parse' attr name) in
+      let args = json |> member "seedp" |> to_list_safe |> List.map (parse' attr name) in
       FuncRef { name; args }
       
   | "COND" ->
-      let condition = json |> member "condp" |> to_list |> List.hd |> parse' attr name in
-      let then_val = json |> member "thenp" |> to_list |> List.hd |> parse' attr name in
-      let else_val = json |> member "elsep" |> to_list |> List.hd |> parse' attr name in
+      let condition = json |> member "condp" |> to_list_safe |> List.hd |> parse' attr name in
+      let then_val = json |> member "thenp" |> to_list_safe |> List.hd |> parse' attr name in
+      let else_val = json |> member "elsep" |> to_list_safe |> List.hd |> parse' attr name in
       Cond { condition; then_val; else_val }
       
   | "CONCAT" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list_safe |> List.hd |> parse' attr name in
       Concat { parts = [lhs; rhs] }
       
   | "SENTREE" ->
-      let senses = json |> member "sensesp" |> to_list |> List.map (parse' attr name) in
+      let senses = json |> member "sensesp" |> to_list_safe |> List.map (parse' attr name) in
       SenTree senses
       
   | "SENITEM" ->
       let edge = json |> member "edgeType" |> to_string_option |> Option.value ~default:"" in
-      let signal = json |> member "sensp" |> to_list |> List.hd |> parse' attr name in
+      let signal = json |> member "sensp" |> to_list_safe |> List.hd |> parse' attr name in
       let edge_str = String.lowercase_ascii edge ^ "edge" in
       SenItem { edge_str; signal }
       
@@ -426,44 +458,44 @@ let rec parse_json attr json =
   | "AND" | "OR" | "XOR"
   | "LOGAND" | "LOGOR"
   | "EQ" | "NEQ" | "LT" | "LTE" | "LTES" | "GT" | "GTE" | "GTES" | "LTS" | "GTS"
-  | "EQWILD" | "NEQWILD" | "NEQCASE"
+  | "EQWILD" | "NEQWILD" | "EQCASE" | "NEQCASE"
   | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "MOD" | "MODDIV" | "MODDIV" | "MODDIVS"
   | "POW" | "POWSS" | "POWSU" | "POWUS" | "SHIFTL" | "SHIFTR" | "SHIFTRS"
   | "STREAML" | "STREAMR" ->
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list_safe |> List.hd |> parse' attr name in
       let dtype = json |> member "dtypep" |> to_string in
       BinaryOp' { op = node_type; lhs; rhs; dtype }
       
   (* Unary operators *)
   | "NOT" | "REDAND" | "REDOR" | "REDXOR" | "EXTEND" | "LOGNOT" | "ONEHOT" | "ONEHOT0" | "NEGATE"
   | "EXTENDS" | "ISUNKNOWN" | "CLOG2" | "SIGNED" | "UNSIGNED" ->
-      let operand = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
+      let operand = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
       let dtype = json |> member "dtypep" |> to_string in
       UnaryOp' { op = node_type; operand; dtype }
   | "EVENTCONTROL" ->
-      let sense = json |> member "sensesp" |> to_list |> List.map (parse' attr name) in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let sense = json |> member "sensesp" |> to_list_safe |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       EventCtrl {sense; stmts}
   | "INITARRAY" ->
-      let inits = json |> member "initsp" |> to_list |> List.map (parse' attr name) in
+      let inits = json |> member "initsp" |> to_list_safe |> List.map (parse' attr name) in
       InitArray {inits}
 
   | "INITIAL" ->
       let suspend = json |> member "isSuspendable" |> to_bool_option |> Option.value ~default:false in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       Initial {suspend; stmts}
 
   | "INITIALSTATIC" ->
       let suspend = json |> member "isSuspendable" |> to_bool_option |> Option.value ~default:false in
       let process = json |> member "needProcess" |> to_bool_option |> Option.value ~default:false in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       InitialStatic {suspend; process; stmts}
 
   | "FINAL" ->
       let suspend = json |> member "isSuspendable" |> to_bool_option |> Option.value ~default:false in
       let process = json |> member "needProcess" |> to_bool_option |> Option.value ~default:false in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       Final {suspend; process; stmts}
 
   | "FINISH" ->
@@ -471,43 +503,43 @@ let rec parse_json attr json =
 
   | "DELAY" ->
       let cycle = json |> member "isCycleDelay" |> to_bool_option |> Option.value ~default:false in
-      let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
-      let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       Delay {cycle; lhs; stmts}
 
   | "ITORD" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let lhs = json |> member "lhsp" |> to_list |> List.map (parse' attr name) in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.map (parse' attr name) in
       Itord' {dtype; lhs}
 
   | "CVTPACKSTRING" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let lhs = json |> member "lhsp" |> to_list |> List.map (parse' attr name) in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.map (parse' attr name) in
       CvtPackString' {dtype; lhs}
 
   | "FOPEN" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let filename = json |> member "filenamep" |> to_list |> List.map (parse' attr name) in
-      let mode = json |> member "modep" |> to_list |> List.map (parse' attr name) in
+      let filename = json |> member "filenamep" |> to_list_safe |> List.map (parse' attr name) in
+      let mode = json |> member "modep" |> to_list_safe |> List.map (parse' attr name) in
       Fopen' {dtype; filename; mode}
 
   | "FCLOSE" ->
-      let file = json |> member "filep" |> to_list |> List.map (parse' attr name) in
+      let file = json |> member "filep" |> to_list_safe |> List.map (parse' attr name) in
       Fclose {file}
 
   | "DISPLAY" ->
-      let fmt = json |> member "fmtp" |> to_list |> List.map (parse' attr name) in
-      let file = json |> member "filep" |> to_list |> List.map (parse' attr name) in
+      let fmt = json |> member "fmtp" |> to_list_safe |> List.map (parse' attr name) in
+      let file = json |> member "filep" |> to_list_safe |> List.map (parse' attr name) in
       Display {fmt; file}
 
   | "SFORMAT" ->
-      let fmt = json |> member "fmtp" |> to_list |> List.map (parse' attr name) in
-      let lhs = json |> member "lhsp" |> to_list |> List.map (parse' attr name) in
+      let fmt = json |> member "fmtp" |> to_list_safe |> List.map (parse' attr name) in
+      let lhs = json |> member "lhsp" |> to_list_safe |> List.map (parse' attr name) in
       Sformat {fmt; lhs}
 
   | "SFORMATF" ->
-      let expr = json |> member "exprsp" |> to_list |> List.map (parse' attr name) in
-      let scope = json |> member "scopeNamep" |> to_list |> List.map (parse' attr name) in
+      let expr = json |> member "exprsp" |> to_list_safe |> List.map (parse' attr name) in
+      let scope = json |> member "scopeNamep" |> to_list_safe |> List.map (parse' attr name) in
       Sformatp {expr; scope}
 
   | "SCOPENAME" ->
@@ -524,47 +556,47 @@ let rec parse_json attr json =
 
   | "SAMPLED" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let expr = json |> member "exprp" |> to_list |> List.map (parse' attr name) in
+      let expr = json |> member "exprp" |> to_list_safe |> List.map (parse' attr name) in
       Sampled {dtype; expr}
 
   | "CEXPR" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let expr = json |> member "exprsp" |> to_list |> List.map (parse' attr name) in
+      let expr = json |> member "exprsp" |> to_list_safe |> List.map (parse' attr name) in
       Cexpr {dtype; expr}
 
   | "STMTEXPR" ->
-      let expr = json |> member "exprp" |> to_list |> List.hd |> parse' attr name in
+      let expr = json |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name in
      StmtExpr {expr}
 
   | "CONSPACKUORSTRUCT" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let members = json |> member "membersp" |> to_list |> List.map (parse' attr name) in
+      let members = json |> member "membersp" |> to_list_safe |> List.map (parse' attr name) in
      ConsPack' {dtype; members}
 
   | "CONSPACKMEMBER" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let rhs = json |> member "rhsp" |> to_list |> List.hd |> parse' attr name in
+      let rhs = json |> member "rhsp" |> to_list_safe |> List.hd |> parse' attr name in
      ConsPackMember' {dtype; rhs}
 
   | "VALUEPLUSARGS" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let search = json |> member "searchp" |> to_list |> List.map (parse' attr name) in
-      let out = json |> member "outp" |> to_list |> List.map (parse' attr name) in
+      let search = json |> member "searchp" |> to_list_safe |> List.map (parse' attr name) in
+      let out = json |> member "outp" |> to_list_safe |> List.map (parse' attr name) in
      ValuePlusArgs' {dtype; search; out}
 
   | "TESTPLUSARGS" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let search = json |> member "searchp" |> to_list |> List.map (parse' attr name) in
+      let search = json |> member "searchp" |> to_list_safe |> List.map (parse' attr name) in
      TestPlusArgs' {dtype; search}
 
   | "REPLICATE" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let src = json |> member "srcp" |> to_list |> List.hd |> parse' attr name in
-      let count = json |> member "countp" |> to_list |> List.hd |> parse' attr name in
+      let src = json |> member "srcp" |> to_list_safe |> List.hd |> parse' attr name in
+      let count = json |> member "countp" |> to_list_safe |> List.hd |> parse' attr name in
      Replicate' {dtype; src; count}
 
   | "JUMPBLOCK" ->
-      let stmt = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
+      let stmt = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
      JumpBlock { stmt }
 
   | "JUMPGO" ->
@@ -577,8 +609,8 @@ let rec parse_json attr json =
 
   | "CMETHODHARD" ->
       let dtype = json |> member "dtypep" |> to_string in
-      let from = json |> member "fromp" |> to_list |> List.hd |> parse' attr name in
-      let pins = json |> member "pinsp" |> to_list |> List.map (parse' attr name) in
+      let from = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
+      let pins = json |> member "pinsp" |> to_list_safe |> List.map (parse' attr name) in
       CMethodHard' { dtype; from; pins }
  
   | oth -> Unknown (node_type, json)
@@ -754,11 +786,59 @@ incs = rwlst attr incs;}
 | Var _ as skip -> skip
 | Unknown (tag, json) as oth ->
     othrw := Some oth;
-    Printf.eprintf "\n=== UNKNOWN AST NODE ===\n";
-    Printf.eprintf "Tag: %s\n" tag;
-    Printf.eprintf "JSON: %s\n" (Yojson.Safe.pretty_to_string json);
-    Printf.eprintf "=====================\n%!";
-    failwith "othrw"
+    (* Tags that come from non-synthesisable Verilog constructs:
+     * string methods (`.putc`, `.tolower`, `.compare`, …),
+     * dynamic-array / queue / associative-array operations
+     * (CONSDYNARRAY, ASSOCSEL, SLICESEL, LENN, …),
+     * file I/O ($fgetc, $readmem, $sscanf), and procedural
+     * release. These can't be lowered to BIR — but rather than
+     * crashing the whole conversion (which loses every other
+     * module in the file too), substitute a 1-bit zero literal so
+     * the surrounding expression tree can still be walked. The
+     * downstream miter will still notice if anything depended on
+     * the dropped value. *)
+    (* SLICESEL is `arr[hi:lo]` on an unpacked array — synthesisable
+     * (handled by route to the SEL path elsewhere).
+     * STRUCTSEL is `s.field` — synthesisable, handled in
+     * verible_to_behavioral.ml; the Verilator-side path TBD.
+     * EXPRSTMT might be a void function call — could be synth.
+     * Don't stub those; let them surface as proper failures. *)
+    let nonsynth_tags = [
+      "ASSOCSEL"; "CONSDYNARRAY"; "ATON";
+      "READMEM"; "LENN"; "FGETC"; "FGETS";
+      "FSCANF"; "FOPEN"; "FCLOSE"; "FFLUSH"; "FREAD";
+      "FWRITE"; "FERROR"; "FEOF"; "COMPARENN"; "COMPARENI";
+      "TOUPPERN"; "TOLOWERN"; "SUBSTRN"; "PUTCN"; "GETCN";
+      "ATOIN"; "ATOREALN"; "ATOHEXN"; "ATOOCTN"; "ATOBINN";
+      "SYSFUNCASTASK"; "RELEASE"; "DELAYEDARG"; "TIMEFORMAT";
+      "TIMEPRECISION"; "VALUEPLUSARGS"; "TESTPLUSARGS";
+      (* Random distributions ($dist_uniform/normal/poisson/...):
+       * testbench/randomization only, never synthesisable. *)
+      "DISTUNIFORM"; "DISTNORMAL"; "DISTPOISSON"; "DISTEXPONENTIAL";
+      "DISTERLANG"; "DISTCHISQUARE"; "DISTT"; "DISTGAMMA";
+      (* `a += 1` used as an expression — SV permits it but
+       * synthesisers reject; safer to stub than crash. *)
+      "EXPRSTMT";
+      (* `s.field` — proper handling needs a dtype map on the
+       * Verilator side. Stub for now so other modules in the same
+       * file still convert. TODO: add real STRUCTSEL handler. *)
+      "STRUCTSEL";
+      (* OOP / dynamic / force — never synthesisable: *)
+      "CLASS"; "CONSASSOC"; "ASSIGNFORCE";
+      (* $countbits / $countones / $isunknown / $onehot* — usually
+       * synthesisable but rarely used in this corpus; stub for now. *)
+      "COUNTBITS"; "COUNTONES"; "ISUNKNOWN"; "ONEHOT"; "ONEHOT0";
+    ] in
+    if List.mem tag nonsynth_tags then
+      (* Drop in a 1-bit zero literal stand-in. *)
+      Const' { name = "1'h0"; dtype = "" }
+    else begin
+      Printf.eprintf "\n=== UNKNOWN AST NODE ===\n";
+      Printf.eprintf "Tag: %s\n" tag;
+      Printf.eprintf "JSON: %s\n" (Yojson.Safe.pretty_to_string json);
+      Printf.eprintf "=====================\n%!";
+      failwith "othrw"
+    end
 
 and rwitm attr = function
 | { conditions; statements } -> {

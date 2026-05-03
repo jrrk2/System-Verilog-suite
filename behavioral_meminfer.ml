@@ -238,7 +238,10 @@ let rewrite_body_for_rom body =
                        addr_width = addr_w;
                        depth;
                        kind = BRom;
-                       init_values } :: !mems;
+                       init_values;
+                       n_write_ports = 0;
+                       n_read_ports = 1;
+                       read_is_sync = false } :: !mems;
              BAssign { lhs;
                        rhs = build_rom_lookup sel pairs def }
          | None ->
@@ -269,6 +272,146 @@ let rewrite_process_for_rom = function
   | BSequential s ->
       let (body', mems) = rewrite_body_for_rom s.body in
       (BSequential { s with body = body' }, mems)
+
+(* ─── Port-count + sync/async classification ─────────────────────────── *)
+
+(* Collect distinct read-address expressions for memory `m` across
+ * `processes`. Two reads count as the same port only if the index
+ * expressions are structurally identical AND the surrounding process
+ * is the same one — the conservative choice is to treat every distinct
+ * (process_name, index_expr) tuple as a separate port. *)
+let count_read_ports m_name processes =
+  let ports = ref [] in
+  let add proc_name idx =
+    let key = (proc_name, idx) in
+    if not (List.mem key !ports) then ports := key :: !ports
+  in
+  let rec walk_e proc_name = function
+    | BSelect { array = BVar n; index } when n = m_name ->
+        add proc_name index;
+        walk_e proc_name index
+    | BBinOp { lhs; rhs; _ } -> walk_e proc_name lhs; walk_e proc_name rhs
+    | BUnOp { operand; _ } -> walk_e proc_name operand
+    | BSlice { signal; _ } -> walk_e proc_name signal
+    | BSelect { array; index } -> walk_e proc_name array; walk_e proc_name index
+    | BConcat es -> List.iter (walk_e proc_name) es
+    | BReplicate { value; _ } -> walk_e proc_name value
+    | BCond { condition; then_val; else_val } ->
+        walk_e proc_name condition;
+        walk_e proc_name then_val;
+        walk_e proc_name else_val
+    | BCall { args; _ } -> List.iter (walk_e proc_name) args
+    | _ -> ()
+  in
+  let rec walk_s proc_name = function
+    | BAssign { rhs; _ } -> walk_e proc_name rhs
+    | BIf { condition; then_stmts; else_stmts } ->
+        walk_e proc_name condition;
+        List.iter (walk_s proc_name) then_stmts;
+        List.iter (walk_s proc_name) else_stmts
+    | BCase { selector; cases; default } ->
+        walk_e proc_name selector;
+        List.iter (fun (k, ss) ->
+          walk_e proc_name k; List.iter (walk_s proc_name) ss) cases;
+        List.iter (walk_s proc_name) default
+    | BBlock ss -> List.iter (walk_s proc_name) ss
+    | BWhile { condition; body } ->
+        walk_e proc_name condition; List.iter (walk_s proc_name) body
+    | BFor { condition; body; _ } ->
+        walk_e proc_name condition; List.iter (walk_s proc_name) body
+    | BCallStmt { args; _ } -> List.iter (walk_e proc_name) args
+    | _ -> ()
+  in
+  List.iter (function
+    | BCombinational c -> List.iter (walk_s c.name) c.body
+    | BSequential s -> List.iter (walk_s s.name) s.body
+  ) processes;
+  List.length !ports
+
+(* Distinct write addresses for memory `m`, counted across all
+ * BSequential bodies (the only place @mem_write should appear). *)
+let count_write_ports m_name processes =
+  let ports = ref [] in
+  let rec walk = function
+    | BCallStmt { func = "@mem_write"; args = [BVar n; addr; _] }
+      when n = m_name ->
+        if not (List.mem addr !ports) then ports := addr :: !ports
+    | BIf { then_stmts; else_stmts; _ } ->
+        List.iter walk then_stmts; List.iter walk else_stmts
+    | BCase { cases; default; _ } ->
+        List.iter (fun (_, ss) -> List.iter walk ss) cases;
+        List.iter walk default
+    | BBlock ss -> List.iter walk ss
+    | _ -> ()
+  in
+  List.iter (function
+    | BSequential s -> List.iter walk s.body
+    | _ -> ()
+  ) processes;
+  List.length !ports
+
+(* True if any read of `m_name` lives inside a BCombinational process —
+ * that's the distributed/async-RAM pattern (Vivado infers LUT RAM).
+ * False if every read is from a BSequential — block-RAM pattern. *)
+let read_is_async m_name processes =
+  let found_async = ref false in
+  let found_any = ref false in
+  let rec walk_e in_comb = function
+    | BSelect { array = BVar n; _ } when n = m_name ->
+        found_any := true;
+        if in_comb then found_async := true
+    | BBinOp { lhs; rhs; _ } -> walk_e in_comb lhs; walk_e in_comb rhs
+    | BUnOp { operand; _ } -> walk_e in_comb operand
+    | BSlice { signal; _ } -> walk_e in_comb signal
+    | BSelect { array; index } -> walk_e in_comb array; walk_e in_comb index
+    | BConcat es -> List.iter (walk_e in_comb) es
+    | BReplicate { value; _ } -> walk_e in_comb value
+    | BCond { condition; then_val; else_val } ->
+        walk_e in_comb condition;
+        walk_e in_comb then_val;
+        walk_e in_comb else_val
+    | BCall { args; _ } -> List.iter (walk_e in_comb) args
+    | _ -> ()
+  in
+  let rec walk_s in_comb = function
+    | BAssign { rhs; _ } -> walk_e in_comb rhs
+    | BIf { condition; then_stmts; else_stmts } ->
+        walk_e in_comb condition;
+        List.iter (walk_s in_comb) then_stmts;
+        List.iter (walk_s in_comb) else_stmts
+    | BCase { selector; cases; default } ->
+        walk_e in_comb selector;
+        List.iter (fun (k, ss) ->
+          walk_e in_comb k; List.iter (walk_s in_comb) ss) cases;
+        List.iter (walk_s in_comb) default
+    | BBlock ss -> List.iter (walk_s in_comb) ss
+    | BWhile { condition; body } ->
+        walk_e in_comb condition; List.iter (walk_s in_comb) body
+    | BFor { condition; body; _ } ->
+        walk_e in_comb condition; List.iter (walk_s in_comb) body
+    | BCallStmt { args; _ } -> List.iter (walk_e in_comb) args
+    | _ -> ()
+  in
+  List.iter (function
+    | BCombinational c -> List.iter (walk_s true) c.body
+    | BSequential s -> List.iter (walk_s false) s.body
+  ) processes;
+  if not !found_any then false  (* no reads at all — irrelevant *)
+  else !found_async
+
+(* Human-readable categorisation. *)
+let kind_label mm =
+  match mm.kind, mm.n_write_ports, mm.n_read_ports, mm.read_is_sync with
+  | BRom, _, _, _ -> "ROM"
+  | BRam, 0, _, _ -> "RAM (read-only — promote to ROM?)"
+  | BRam, 1, 1, true  -> "single_port_bram"
+  | BRam, 1, 2, true  -> "simple_dual_port_bram"
+  | BRam, 2, 2, true  -> "true_dual_port_bram"
+  | BRam, 1, 1, false -> "distributed_async_1w1r"
+  | BRam, 1, 2, false -> "distributed_async_1w2r"
+  | BRam, 1, n, false -> Printf.sprintf "distributed_async_1w%dr" n
+  | BRam, w, r, sync ->
+      Printf.sprintf "ram_%dw%dr_%s" w r (if sync then "sync" else "async")
 
 (* ─── Top-level pass ─────────────────────────────────────────────────── *)
 
@@ -316,7 +459,10 @@ let infer_module (m : bmodule) =
       addr_width = max 1 addr_w;
       depth;
       kind = BRam;
-      init_values = [] }
+      init_values = [];
+      n_write_ports = count_write_ports n processes;
+      n_read_ports = count_read_ports n processes;
+      read_is_sync = not (read_is_async n processes) }
   ) ram_writes in
 
   (* Step 3: read-only memory inference — names appearing in BSelect
@@ -354,7 +500,10 @@ let infer_module (m : bmodule) =
                  addr_width = addr_w;
                  depth;
                  kind = BRom;
-                 init_values = [] }
+                 init_values = [];
+                 n_write_ports = 0;
+                 n_read_ports = count_read_ports n processes;
+                 read_is_sync = not (read_is_async n processes) }
     end
   ) reads
   in

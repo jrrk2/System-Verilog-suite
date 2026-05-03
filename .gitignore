@@ -115,3 +115,8 @@ apb_uart.v
 apb_uart_from_edif.v
 uart.edf
 uart_synthesized.edf
+
+# previously checked in stuff that should be ignored:
+obj_dir_test/
+test_z3_mul
+

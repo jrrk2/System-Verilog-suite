@@ -164,8 +164,12 @@ let rec expr_to_bexpr = function
                               result_type = BInt { width; signed = signedness } }
        | "SHIFTRS" -> BBinOp { op = BAshr; lhs = lhs_expr; rhs = rhs_expr;
                                result_type = BInt { width; signed = Signed } }
-       | "EQ" -> BBinOp { op = BEq; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "NEQ" -> BBinOp { op = BNe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       (* Case-equality `===` and wildcard `==?` degrade to plain
+        * `==` once X/Z aren't modelled (synthesisable subset). *)
+       | "EQ" | "EQCASE" | "EQWILD"
+           -> BBinOp { op = BEq; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "NEQ" | "NEQCASE" | "NEQWILD"
+           -> BBinOp { op = BNe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "LT" | "LTS" -> BBinOp { op = BLt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "LTE" | "LTES" -> BBinOp { op = BLe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "GT" | "GTS" -> BBinOp { op = BGt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
@@ -203,8 +207,12 @@ let rec expr_to_bexpr = function
                               result_type = BInt { width; signed = signedness } }
        | "SHIFTRS" -> BBinOp { op = BAshr; lhs = lhs_expr; rhs = rhs_expr;
                                result_type = BInt { width; signed = Signed } }
-       | "EQ" -> BBinOp { op = BEq; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "NEQ" -> BBinOp { op = BNe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       (* Case-equality `===` and wildcard `==?` degrade to plain
+        * `==` once X/Z aren't modelled (synthesisable subset). *)
+       | "EQ" | "EQCASE" | "EQWILD"
+           -> BBinOp { op = BEq; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "NEQ" | "NEQCASE" | "NEQWILD"
+           -> BBinOp { op = BNe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "LT" | "LTS" -> BBinOp { op = BLt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "LTE" | "LTES" -> BBinOp { op = BLe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "GT" | "GTS" -> BBinOp { op = BGt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
@@ -227,6 +235,49 @@ let rec expr_to_bexpr = function
        | "REDAND" -> BUnOp { op = BRedAnd; operand = operand_expr; result_type = BBool }
        | "REDOR" -> BUnOp { op = BRedOr; operand = operand_expr; result_type = BBool }
        | "REDXOR" -> BUnOp { op = BRedXor; operand = operand_expr; result_type = BBool }
+       (* Width-changing operators: Verilator emits these when an
+        * implicit zero-extend (`{{N{1'b0}}, x}`) or sign-extend
+        * (`$signed(...)`) collapses during constant folding. The
+        * result must be `width` bits regardless of the operand's
+        * source width — emit a BConcat that pads the bit-vector. *)
+       | "EXTEND" | "EXTENDS" ->
+           (* Compute the operand's bit-width directly from the AST.
+            * Most expression nodes carry a dtype_ref; Concat /
+            * Replicate don't (sv_parse drops it), so we sum/multiply
+            * children widths recursively. *)
+           let rec width_of_ast = function
+             | VarRef { dtype_ref; _ } -> get_width_from_dtype dtype_ref
+             | Const { dtype_ref; _ } -> get_width_from_dtype dtype_ref
+             | BinaryOp { dtype_ref; _ } -> get_width_from_dtype dtype_ref
+             | UnaryOp { dtype_ref; _ } -> get_width_from_dtype dtype_ref
+             | Cond { then_val; _ } -> width_of_ast then_val
+             | Concat { parts } ->
+                 List.fold_left (+) 0 (List.map width_of_ast parts)
+             | Replicate { count; src; _ }
+             | Replicate' { count; src; _ } ->
+                 let n = match expr_to_bexpr count with
+                   | BConst { value; _ } -> value | _ -> 1
+                 in
+                 n * width_of_ast src
+             | _ -> width
+           in
+           let from_w = width_of_ast operand in
+           let pad = width - from_w in
+           if pad <= 0 then operand_expr
+           else begin
+             let pad_value =
+               if op = "EXTENDS" then
+                 (* Sign-extend: replicate the operand's MSB. *)
+                 BSlice { signal = operand_expr;
+                          msb = from_w - 1; lsb = from_w - 1 }
+               else
+                 BConst { value = 0; width = 1 }
+             in
+             BConcat [
+               BReplicate { count = pad; value = pad_value };
+               operand_expr
+             ]
+           end
        | _ ->
            if !debug then Printf.eprintf "Warning: Unknown unary op %s\n" op;
            operand_expr)
@@ -776,8 +827,119 @@ let module_to_bmodule_with_funcs extra_funcs = function
             lhs_base inner
         | _ -> None
       in
-      let assignw_processes = List.filter_map (function
+      (* Decompose an AssignW LHS into (base_name, optional bit
+       * position) so we can recognise per-bit unrolled writes from
+       * generate-for loops (`assign y[i] = expr;` → multiple AssignW
+       * with constant-index Sel LHSs). *)
+      let lhs_bit_pos = function
+        | Sel { expr = VarRef { name; _ }; lsb; width = _ } ->
+            (match lsb with
+             | Some (Const { name = lit; _ }) ->
+                 (try Some (name, Some (parse_const_value lit))
+                  with _ -> Some (name, None))
+             | _ -> Some (name, None))
+        | VarRef { name; _ } -> Some (name, None)
+        | other ->
+            (match lhs_base other with
+             | Some n -> Some (n, None)
+             | None -> None)
+      in
+      (* Group AssignWs by base name, collect per-bit RHS exprs. *)
+      let signal_width n =
+        match List.find_opt (fun (s : Behavioral_ir.bsignal) ->
+                s.name = n) signals with
+        | Some { stype = BInt { width; _ }; _ } -> Some width
+        | _ -> None
+      in
+      let aw_groups = Hashtbl.create 16 in
+      let aw_order = ref [] in
+      List.iter (function
         | AssignW { lhs; rhs } ->
+            (match lhs_bit_pos lhs with
+             | Some (n, idx) ->
+                 if not (Hashtbl.mem aw_groups n) then
+                   aw_order := n :: !aw_order;
+                 let lst =
+                   try Hashtbl.find aw_groups n with Not_found -> []
+                 in
+                 Hashtbl.replace aw_groups n ((idx, rhs) :: lst)
+             | None -> ())
+        | _ -> ()
+      ) flat_stmts;
+      let assignw_processes = List.filter_map (fun n ->
+        let entries = List.rev (Hashtbl.find aw_groups n) in
+        match entries with
+        | [] -> None
+        | [(None, rhs)] ->
+            (* Single whole-signal assign — the common case. *)
+            Some (BCombinational {
+              name = "assign_" ^ n;
+              sensitivity = [BAny];
+              body = [BAssign { lhs = n;
+                                rhs = expr_to_bexpr rhs }];
+            })
+        | _ ->
+            (* Multiple entries OR a single bit-select. Try to coalesce
+             * if all have constant indexes that cover [0..W-1] exactly
+             * once. Otherwise emit each as a lossy whole-signal assign
+             * (preserves prior behaviour). *)
+            let all_indexed =
+              List.for_all (fun (idx, _) -> idx <> None) entries
+            in
+            let w = signal_width n in
+            (match all_indexed, w with
+             | true, Some width ->
+                 let by_idx = List.filter_map (fun (idx, rhs) ->
+                   match idx with Some i -> Some (i, rhs) | None -> None
+                 ) entries in
+                 let positions = List.map fst by_idx |> List.sort compare in
+                 let expected = List.init width (fun i -> i) in
+                 if positions = expected then begin
+                   (* Cover the full width. Build a BConcat from MSB
+                    * (width-1) down to LSB (0). *)
+                   let bits = List.init width (fun i ->
+                     let rhs = List.assoc (width - 1 - i) by_idx in
+                     expr_to_bexpr rhs
+                   ) in
+                   let combined =
+                     match bits with
+                     | [single] -> single
+                     | _ -> BConcat bits
+                   in
+                   Some (BCombinational {
+                     name = "assign_" ^ n;
+                     sensitivity = [BAny];
+                     body = [BAssign { lhs = n; rhs = combined }];
+                   })
+                 end else
+                   (* Partial coverage: drop to lossy form to keep
+                    * the test running. *)
+                   Some (BCombinational {
+                     name = "assign_" ^ n;
+                     sensitivity = [BAny];
+                     body = List.map (fun (_, rhs) ->
+                              BAssign { lhs = n;
+                                        rhs = expr_to_bexpr rhs }
+                            ) entries;
+                   })
+             | _ ->
+                 Some (BCombinational {
+                   name = "assign_" ^ n;
+                   sensitivity = [BAny];
+                   body = List.map (fun (_, rhs) ->
+                            BAssign { lhs = n;
+                                      rhs = expr_to_bexpr rhs }
+                          ) entries;
+                 }))
+      ) (List.rev !aw_order) in
+      (* Verilator constant-folds `assign x = <constant_expr>;` into
+       * an INITIAL block whose body is `Assign(VarRef x, <const>)`.
+       * Recover those as combinational assigns so the module's
+       * outputs stay driven. Real (non-folded) initial blocks have
+       * other shapes — only the "single-assign-to-port" pattern is
+       * the constant-folded continuous assign. *)
+      let initial_processes = List.filter_map (function
+        | Initial { stmts = [Assign { lhs; rhs; _ }]; _ } ->
             (match lhs_base lhs with
              | Some n ->
                  let rhs_expr = expr_to_bexpr rhs in
@@ -790,7 +952,10 @@ let module_to_bmodule_with_funcs extra_funcs = function
         | _ -> None
       ) flat_stmts in
       let cell_processes = List.filter_map cell_to_bprocess flat_stmts in
-      let processes = always_processes @ assignw_processes @ cell_processes in
+      let processes =
+        always_processes @ assignw_processes @ initial_processes
+        @ cell_processes
+      in
 
       (* Functions/tasks defined inline in this module + imported from
        * any sibling Package nodes the caller pulled in. *)

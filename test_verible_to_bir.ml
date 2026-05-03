@@ -42,6 +42,24 @@ let () =
     ) m.signals
   ) prog.modules;
 
+  (* Exit non-zero when nothing came out — convert_files traps the
+   * Verible parse exception and returns an empty bprogram, so the
+   * only signal that parsing failed is the empty modules list.
+   * sv-tests' Decompiler_Verible_Parse runner relies on this rc to
+   * tell PASS from FAIL. *)
+  if prog.modules = [] then exit 1;
+
+  (* Brain-dead semantic checks that the parser doesn't catch:
+   * multi-driver, mixed proc/continuous, duplicate decls. Anything
+   * here means the SV is syntactically valid but semantically
+   * illegal — exit 1 so sv-tests' should_fail tests get the right
+   * verdict. Skip when MITER_NO_SANITY is set (for cases where the
+   * miter wants to compare a deliberately-broken design). *)
+  if Sys.getenv_opt "MITER_NO_SANITY" = None then begin
+    let n = Behavioral_sanity.report prog in
+    if n > 0 then exit 1
+  end;
+
   match miter_vhd with
   | None -> ()
   | Some vhd ->

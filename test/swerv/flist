@@ -1,0 +1,27 @@
+# Verilator include paths + prerequisite files for the SweRV regression.
+# Each `-I` is forwarded as `-I<dir>` to verilator; each `-f` is
+# prepended as a source file in argv order.
+#
+# Edit the SWERV_ROOT line if the synlig corpus moves; everything else
+# is relative to it.
+SWERV_ROOT=/home/jonathan/synlig/third_party/surelog/third_party/tests/CoresSweRV
+
+-I ${SWERV_ROOT}/design/include
+-I ${SWERV_ROOT}/design/lib
+-I ${SWERV_ROOT}/snapshots/default
+
+# Library search dirs (verilator -y) so cells can resolve sibling
+# modules without us listing each one.
+-y ${SWERV_ROOT}/design
+-y ${SWERV_ROOT}/design/lib
+-y ${SWERV_ROOT}/design/dec
+-y ${SWERV_ROOT}/design/exu
+-y ${SWERV_ROOT}/design/ifu
+-y ${SWERV_ROOT}/design/lsu
+-y ${SWERV_ROOT}/design/dbg
+-y ${SWERV_ROOT}/design/dmi
+
+-f ${SWERV_ROOT}/snapshots/default/common_defines.vh
+-f ${SWERV_ROOT}/design/include/swerv_types.sv
+-f ${SWERV_ROOT}/design/lib/beh_lib.sv
+-f ${SWERV_ROOT}/design/lib/mem_lib.sv

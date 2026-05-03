@@ -111,6 +111,11 @@ type binstance = {
  * benefit from a different representation). *)
 type bmem_kind = BRam | BRom [@@deriving yojson]
 
+(* Port-count + read-mode categorisation, used by downstream emitters
+ * to pick a primitive (Xilinx BRAM, distributed LUTRAM, ASIC SRAM
+ * macro, …). `read_is_sync` is false when the read appears in pure
+ * combinational/assign code (distributed RAM territory) and true when
+ * the read is registered (block-RAM territory). *)
 type bmem = {
   mname: string;
   data_width: int;
@@ -118,6 +123,9 @@ type bmem = {
   depth: int;
   kind: bmem_kind;
   init_values: int list;   (* indexed by address; empty for RAM *)
+  n_write_ports: int;      (* number of distinct sync write addresses *)
+  n_read_ports: int;       (* number of distinct read addresses *)
+  read_is_sync: bool;      (* true ⇒ block-RAM, false ⇒ async/distributed *)
 } [@@deriving yojson]
 
 (* Function / task definition. Functions return a value; tasks don't.

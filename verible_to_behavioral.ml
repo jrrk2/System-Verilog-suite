@@ -134,9 +134,59 @@ let extract_typedefs ~pkgs ~params tok =
   let nodes = collect_by (has_tag (prefix_is "type_declaration")) tok in
   List.filter_map (fun n -> match n with
     | TUPLE6 (_, _, data_type, SymbolIdentifier nm, _, _) ->
-        (match extract_range ~pkgs ~params data_type with
-         | Some (m, l) -> Some (nm, abs (m - l) + 1)
-         | None -> None)
+        (* Check struct first — extract_range would otherwise dive
+         * into the first field's packed dim and short-circuit. *)
+        let members = collect_by
+          (has_tag (prefix_is "struct_union_member")) data_type in
+        if members <> [] then
+          let total = List.fold_left (fun acc m ->
+            match extract_range ~pkgs ~params m with
+            | Some (mb, lb) -> acc + abs (mb - lb) + 1
+            | None -> acc + 1
+          ) 0 members in
+          if total > 0 then Some (nm, total) else None
+        else
+          (match extract_range ~pkgs ~params data_type with
+           | Some (m, l) -> Some (nm, abs (m - l) + 1)
+           | None -> None)
+    | _ -> None
+  ) nodes
+
+(* For each `typedef struct packed { ... } t;`, extract an ordered
+ * list of (field_name, width). Field declaration order is MSB →
+ * LSB per SV semantics: `'{f1: x, f2: y}` packs f1 in the high
+ * bits, f2 in the low bits. The struct_union_member nodes appear in
+ * source (= MSB-first) order in Verible's AST. *)
+let extract_struct_defs ~pkgs ~params tok
+    : (string * (string * int) list) list =
+  let nodes = collect_by (has_tag (prefix_is "type_declaration")) tok in
+  List.filter_map (fun n -> match n with
+    | TUPLE6 (_, _, data_type, SymbolIdentifier nm, _, _)
+      when (let ms = collect_by
+              (has_tag (prefix_is "struct_union_member")) data_type in
+            ms <> []) ->
+        (* The struct_union_member_list TLIST is left-recursive, so
+         * collect_by ends up walking it in reverse source order; the
+         * final List.rev in collect_by un-reverses *that* but leaves
+         * the original reversal in place. Reverse here to recover
+         * source (= MSB-first) order. *)
+        let members = List.rev (collect_by
+          (has_tag (prefix_is "struct_union_member")) data_type) in
+        let fields = List.filter_map (fun m ->
+          let w = match extract_range ~pkgs ~params m with
+            | Some (mb, lb) -> abs (mb - lb) + 1
+            | None -> 1
+          in
+          (* Field name is the SymbolIdentifier inside the member. *)
+          let fname = ref None in
+          walk (function
+            | SymbolIdentifier id when !fname = None -> fname := Some id
+            | _ -> ()) m;
+          match !fname with
+          | Some id -> Some (id, w)
+          | None -> None
+        ) members in
+        if fields <> [] then Some (nm, fields) else None
     | _ -> None
   ) nodes
 
@@ -239,6 +289,15 @@ let extract_enum_items ~pkgs ~params tok =
     ) items_in_source_order
   ) nodes
 
+(* ─── Module-scoped state for struct typedef lookup ──────────────── *)
+(* Set by convert_module before walking each module body.  Read by
+ * expr_to_bexpr's `'{f1: x, ...}` and `p.field` handlers and by the
+ * signal-table builder when it sees a struct-typed declaration. *)
+let cur_struct_defs : (string * (string * int) list) list ref = ref []
+(* Map of in-module signal names → their struct typedef name (for
+ * member-select on bare references like `p.field`). *)
+let cur_signal_struct : (string * string) list ref = ref []
+
 (* ─── Expression conversion ──────────────────────────────────────── *)
 
 let dummy_bool = BInt { width = 1; signed = Unsigned }
@@ -248,8 +307,8 @@ let dummy_bool = BInt { width = 1; signed = Unsigned }
  * 1-bit zero with a stderr note (when MITER_VERIBLE_DEBUG is set). *)
 let debug_expr = lazy (Sys.getenv_opt "MITER_VERIBLE_DEBUG" <> None)
 
-let rec expr_to_bexpr ~pkgs ~params tok =
-  let recurse = expr_to_bexpr ~pkgs ~params in
+let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
+  let recurse = expr_to_bexpr ~pkgs ~params ~arrays in
   let bin op a b =
     BBinOp { op; lhs = recurse a; rhs = recurse b;
              result_type = dummy_bool }
@@ -309,6 +368,69 @@ let rec expr_to_bexpr ~pkgs ~params tok =
            (try BConst { value = int_of_string v; width = 32 }
             with _ -> BVar id)
        | None -> BVar id)
+  (* Struct assignment pattern `'{f1: x, f2: y}`. The Verible parse
+   * is `assignment_pattern2` wrapping a TLIST of
+   * `structure_or_array_pattern_expression1` nodes — each carries a
+   * key (the field name) and a value expression. We emit a BConcat
+   * in the field's DECLARED order (MSB-first). The struct typedef
+   * is looked up via `cur_struct_defs`; if no typedef matches we
+   * fall back to source-order BConcat. *)
+  | TUPLE4 (STRING tag, _, body, _)
+    when prefix_is "assignment_pattern2" tag ->
+      let pairs = match body with
+        | TLIST xs ->
+            List.filter_map (fun e -> match e with
+              | TUPLE4 (STRING t, key, _, value)
+                when prefix_is "structure_or_array_pattern_expression" t ->
+                  let kname = ref None in
+                  walk (function
+                    | SymbolIdentifier id when !kname = None ->
+                        kname := Some id
+                    | _ -> ()) key;
+                  (match !kname with
+                   | Some k -> Some (k, recurse value)
+                   | None -> None)
+              | _ -> None) (List.rev xs)
+        | _ -> []
+      in
+      (* Pick a typedef whose field set EXACTLY matches the keys —
+       * this is how we link `'{hi: x, lo: y}` back to `pair_t`. *)
+      let key_set = List.map fst pairs |> List.sort compare in
+      let matching_def =
+        List.find_opt (fun (_, fields) ->
+          List.map fst fields |> List.sort compare = key_set
+        ) !cur_struct_defs
+      in
+      (match matching_def with
+       | Some (_, fields) ->
+           let in_order =
+             List.map (fun (fname, _w) ->
+               try List.assoc fname pairs
+               with Not_found -> BConst { value = 0; width = 1 }
+             ) fields
+           in
+           (match in_order with
+            | [single] -> single
+            | _ -> BConcat in_order)
+       | None ->
+           let exprs = List.map snd pairs in
+           (match exprs with
+            | [single] -> single
+            | _ -> BConcat exprs))
+  (* Replication `{N{value}}` — Verible parses as `expr_primary_braces2`:
+   *   TUPLE7(tag, LBRACE, value_range, LBRACE, expression_list_proper,
+   *          RBRACE, RBRACE)
+   * value_range is the count N (constant), and expression_list_proper
+   * is the inner value to be replicated. Both ride on the standard
+   * eval_int / recurse paths. *)
+  | TUPLE7 (STRING tag, _, count_node, _, value_node, _, _)
+    when prefix_is "expr_primary_braces2" tag ->
+      let n = match eval_int ~pkgs ~params count_node with
+        | Some n -> n
+        | None -> 1
+      in
+      let value = recurse value_node in
+      BReplicate { count = n; value }
   (* Concatenation `{a, b, c}` — Verible parses as
    * `range_list_in_braces1`: TUPLE4(tag, LBRACE, open_range_list, RBRACE).
    * The open_range_list is a TLIST of expressions (with COMMA separators
@@ -384,14 +506,61 @@ let rec expr_to_bexpr ~pkgs ~params tok =
            in
            BCall { func = fname; args = arg_exprs }
        | None -> BConst { value = 0; width = 1 })
+  (* Struct member-select `p.field` — Verible parses as `reference2`:
+   *   TUPLE3(tag, reference, hierarchy_extension)
+   * with `hierarchy_extension1: TUPLE3(tag, DOT, unqualified_id)`.
+   * The signal name (typically a BVar) must be a struct-typed signal
+   * in `cur_signal_struct`, and we look up the field's bit range in
+   * `cur_struct_defs` to emit a BSlice. *)
+  | TUPLE3 (STRING t, ref_node,
+            TUPLE3 (STRING ht, _, ext_id))
+    when prefix_is "reference2" t
+      && prefix_is "hierarchy_extension1" ht ->
+      let signal = recurse ref_node in
+      let field_name = ref None in
+      walk (function
+        | SymbolIdentifier id when !field_name = None ->
+            field_name := Some id
+        | _ -> ()) ext_id;
+      (match signal, !field_name with
+       | BVar sig_name, Some fname ->
+           (match List.assoc_opt sig_name !cur_signal_struct with
+            | Some struct_name ->
+                (match List.assoc_opt struct_name !cur_struct_defs with
+                 | Some fields ->
+                     (* Field declared first is in the MSBs.  Bit
+                      * range = [W - prefix_w - 1 : W - prefix_w - field_w]. *)
+                     let total_w = List.fold_left (fun a (_, w) -> a + w)
+                                     0 fields in
+                     let rec find_bit_range pos = function
+                       | [] -> None
+                       | (n, w) :: rest ->
+                           if n = fname then
+                             Some (total_w - pos - 1,
+                                   total_w - pos - w)
+                           else find_bit_range (pos + w) rest
+                     in
+                     (match find_bit_range 0 fields with
+                      | Some (msb, lsb) ->
+                          BSlice { signal; msb; lsb }
+                      | None -> signal)
+                 | None -> signal)
+            | None -> signal)
+       | _ -> signal)
   (* Bit-select / part-select on a reference: `reference3` is
    *   TUPLE3(tag, reference, select_variable_dimension).
    * The inner dimension is either select_variable_dimension2 (single
    * index `[N]`, TUPLE4) or select_variable_dimension1 (range `[M:N]`,
-   * TUPLE6). Emit BSlice — z3_miter handles BSlice but not BSelect. *)
+   * TUPLE6). For packed regs we emit BSlice; for memory arrays
+   * (signal name in `arrays`) the single-index case must emit
+   * BSelect so meminfer recognises the read. *)
   | TUPLE3 (STRING t, ref_node, dim_node) when prefix_is "reference" t
                                               && t <> "reference1" ->
       let signal = recurse ref_node in
+      let is_array_sig = match signal with
+        | BVar n -> List.mem n arrays
+        | _ -> false
+      in
       (match dim_node with
        | TUPLE6 (STRING dt, _, msb, _, lsb, _)
          when prefix_is "select_variable_dimension" dt ->
@@ -401,9 +570,12 @@ let rec expr_to_bexpr ~pkgs ~params tok =
             | _ -> signal)
        | TUPLE4 (STRING dt, _, idx, _)
          when prefix_is "select_variable_dimension" dt ->
-           (match eval_int ~pkgs ~params idx with
-            | Some i -> BSlice { signal; msb = i; lsb = i }
-            | None -> signal)
+           if is_array_sig then
+             BSelect { array = signal; index = recurse idx }
+           else
+             (match eval_int ~pkgs ~params idx with
+              | Some i -> BSlice { signal; msb = i; lsb = i }
+              | None -> signal)
        | _ -> signal)
   (* `unary_prefix_expr2`: TUPLE3(tag, unary_op_token, operand).
    * Must come before the generic TUPLE3 wrapper below — otherwise the
@@ -556,14 +728,43 @@ let lhs_name_of tok =
   ) tok;
   !n
 
-let extract_assign ~pkgs ~params tok =
+(* Same as lhs_name_of but ALSO returns the optional index token if
+ * the lhs is `name[idx]` (e.g. `regs[~waddr[4:0]] <= wdata`). The
+ * index lives inside a `select_variable_dimension2` (TUPLE4 with
+ * `LBRACK expr RBRACK`) sibling of the unqualified_id. *)
+let lhs_indexed_of tok =
+  let n = ref None and idx = ref None in
+  walk (function
+    | TUPLE3 (STRING t, SymbolIdentifier id, _)
+      when prefix_is "unqualified_id" t && !n = None -> n := Some id
+    | TUPLE4 (STRING dt, _, e, _)
+      when prefix_is "select_variable_dimension" dt && !idx = None ->
+        idx := Some e
+    | _ -> ()
+  ) tok;
+  match !n with
+  | Some name -> Some (name, !idx)
+  | None -> None
+
+let extract_assign ~pkgs ~params ~arrays tok =
   let assigns = collect_by (has_tag (prefix_is "cont_assign")) tok in
   List.filter_map (fun a ->
     match a with
     | TUPLE4 (STRING tag, lhs, _eq, rhs) when prefix_is "cont_assign" tag ->
-        (match lhs_name_of lhs with
-         | Some name ->
-             let rhs_e = expr_to_bexpr ~pkgs ~params rhs in
+        (match lhs_indexed_of lhs with
+         | Some (name, Some idx_node) when List.mem name arrays ->
+             let idx = expr_to_bexpr ~pkgs ~params ~arrays idx_node in
+             let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
+             Some (BCombinational {
+               name = "assign_" ^ name;
+               sensitivity = [BAny];
+               body = [BCallStmt {
+                 func = "@mem_write";
+                 args = [BVar name; idx; rhs_e];
+               }];
+             })
+         | Some (name, _) ->
+             let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
              Some (BCombinational {
                name = "assign_" ^ name;
                sensitivity = [BAny];
@@ -577,23 +778,30 @@ let extract_assign ~pkgs ~params tok =
 
 (* Recognised statement shapes inside an `always_*` body. Anything
  * else becomes BBlock []. *)
-let rec stmt_to_bstmt ~pkgs ~params tok =
-  let recurse_e = expr_to_bexpr ~pkgs ~params in
-  let recurse_s = stmt_to_bstmt ~pkgs ~params in
+let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
+  let recurse_e = expr_to_bexpr ~pkgs ~params ~arrays in
+  let recurse_s = stmt_to_bstmt ~pkgs ~params ~arrays in
+  let assign_to lhs rhs =
+    (* If lhs is `name[idx]` and `name` is a memory-array signal,
+     * emit `@mem_write(name, idx, rhs)` so meminfer can recognise
+     * the pattern. Otherwise plain BAssign. *)
+    match lhs_indexed_of lhs with
+    | Some (name, Some idx_node) when List.mem name arrays ->
+        BCallStmt {
+          func = "@mem_write";
+          args = [BVar name; recurse_e idx_node; recurse_e rhs];
+        }
+    | Some (name, _) -> BAssign { lhs = name; rhs = recurse_e rhs }
+    | None -> BBlock []
+  in
   match tok with
   (* Blocking assignment: lhs = rhs *)
   | TUPLE4 (STRING tag, lhs, _eq, rhs)
-    when prefix_is "assignment_statement_no_expr" tag ->
-      (match lhs_name_of lhs with
-       | Some name -> BAssign { lhs = name; rhs = recurse_e rhs }
-       | None -> BBlock [])
+    when prefix_is "assignment_statement_no_expr" tag -> assign_to lhs rhs
   (* Non-blocking: lhs <= rhs (Verible: nonblocking_assignment1
    *   TUPLE6(tag, lhs, _, _, rhs, _)) *)
   | TUPLE6 (STRING tag, lhs, _, _, rhs, _)
-    when prefix_is "nonblocking_assignment" tag ->
-      (match lhs_name_of lhs with
-       | Some name -> BAssign { lhs = name; rhs = recurse_e rhs }
-       | None -> BBlock [])
+    when prefix_is "nonblocking_assignment" tag -> assign_to lhs rhs
   (* Conditional statement. Match by direct tuple structure to pick
    * the immediate then/else slots (don't recurse — collect_by would
    * pull in statements from nested conditionals too). Arities seen:
@@ -676,7 +884,7 @@ let rec stmt_to_bstmt ~pkgs ~params tok =
  * the block followed by a case-branch with conditional refinement is
  * still combinational). Keeping the simple edge-based rule until we
  * have per-lhs path-coverage analysis. *)
-let extract_always ~pkgs ~params tok =
+let extract_always ~pkgs ~params ~arrays tok =
   let always_nodes = collect_by
     (has_tag (prefix_is "always_construct")) tok in
   List.map (fun an ->
@@ -708,7 +916,7 @@ let extract_always ~pkgs ~params tok =
           prefix_is "conditional_statement" t ||
           prefix_is "case_statement" t)) an in
         let body = match body_nodes with
-          | b :: _ -> [stmt_to_bstmt ~pkgs ~params b]
+          | b :: _ -> [stmt_to_bstmt ~pkgs ~params ~arrays b]
           | [] -> []
         in
         BSequential {
@@ -735,7 +943,7 @@ let extract_always ~pkgs ~params tok =
           prefix_is "conditional_statement" t ||
           prefix_is "case_statement" t)) an in
         let body = match body_nodes with
-          | b :: _ -> [stmt_to_bstmt ~pkgs ~params b]
+          | b :: _ -> [stmt_to_bstmt ~pkgs ~params ~arrays b]
           | [] -> []
         in
         BCombinational {
@@ -849,6 +1057,76 @@ let convert_module ~pkgs (mdecl : module_decl)
     params @ List.filter (fun (n, _) -> not (List.mem n known)) enum_items
   in
   let typedefs = extract_typedefs ~pkgs ~params mdecl.m_body in
+  if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
+    List.iter (fun (n, w) ->
+      Printf.eprintf "[%s] typedef %s width=%d\n" mdecl.m_name n w
+    ) typedefs;
+  (* Populate the module-scoped struct typedef table for the
+   * expression converter. Reset between modules so a typedef in one
+   * doesn't leak into another. *)
+  cur_struct_defs :=
+    extract_struct_defs ~pkgs ~params mdecl.m_body;
+  if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then begin
+    Printf.eprintf "[%s] struct_defs:\n" mdecl.m_name;
+    List.iter (fun (n, fs) ->
+      Printf.eprintf "  %s: %s\n" n
+        (String.concat ", "
+           (List.map (fun (f, w) -> Printf.sprintf "%s(%d)" f w) fs))
+    ) !cur_struct_defs
+  end;
+  (* Build signal_name → struct_typedef_name for every reg/net
+   * declared with a struct-typed instantiation_type. *)
+  let signal_struct_decls =
+    let acc = ref [] in
+    let bases = collect_by
+      (has_tag (prefix_is "instantiation_base")) mdecl.m_body in
+    List.iter (fun base ->
+      (* The type name is the first SymbolIdentifier under the
+       * `instantiation_type`; collect the var names that follow. *)
+      let type_name = ref None in
+      walk (function
+        | TUPLE3 (STRING t, SymbolIdentifier id, _)
+          when prefix_is "unqualified_id" t && !type_name = None ->
+            type_name := Some id
+        | _ -> ()) base;
+      if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
+        Printf.eprintf "  base type_name = %s\n"
+          (Option.value !type_name ~default:"<none>");
+      match !type_name with
+      | Some tn when List.mem_assoc tn !cur_struct_defs ->
+          (* Pick out variable names — register_variable nodes. *)
+          let vars = collect_by (has_tag (fun t ->
+            (let l = String.length "register_variable" in
+             String.length t >= l && String.sub t 0 l = "register_variable")
+            || prefix_is "non_anonymous_gate_instance" t
+            || prefix_is "gate_instance_or_register_variable" t)) base in
+          if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
+            Printf.eprintf "    %d var nodes\n" (List.length vars);
+          List.iter (fun v ->
+            let nm = ref None in
+            walk (function
+              | TUPLE3 (STRING t, SymbolIdentifier id, _)
+                when prefix_is "unqualified_id" t && !nm = None ->
+                  nm := Some id
+              | SymbolIdentifier id when !nm = None ->
+                  nm := Some id
+              | _ -> ()) v;
+            if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
+              Printf.eprintf "    var=%s\n"
+                (Option.value !nm ~default:"<none>");
+            match !nm with
+            | Some n when n <> tn -> acc := (n, tn) :: !acc
+            | _ -> ()
+          ) vars
+      | _ -> ()
+    ) bases;
+    !acc
+  in
+  cur_signal_struct := signal_struct_decls;
+  if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
+    List.iter (fun (n, t) ->
+      Printf.eprintf "  signal %s : %s\n" n t
+    ) !cur_signal_struct;
   (* Three port-list flavours we need to handle together:
    *   - module_port_declaration5  → K&R: `input clk;`
    *   - port_declaration_noattr1  → ANSI explicit: `input logic [W-1:0] x`
@@ -864,36 +1142,135 @@ let convert_module ~pkgs (mdecl : module_decl)
   in
   let explicit_names = List.map (fun (s : bsignal) -> s.name)
                          explicit_signals in
-  (* Pull every port_reference1 name from the module_port_list_opt.
-   * For names not already declared explicitly, default to Input
-   * (modules rarely have implicit-direction outputs in cva6). *)
+  (* Inherited ports (`output [3:0] sum1, sum2;` — sum2 is a bare
+   * port_reference1 sibling that inherits BOTH the direction AND the
+   * width from sum1's preceding port_declaration_noattr1).
+   *
+   * Strategy: walk the module_port_list_opt's children in source
+   * order, maintaining a "current direction + width" state. When we
+   * encounter an explicit port decl, update the state from it. When
+   * we encounter a port_reference1 not covered by an explicit decl,
+   * emit a signal using the current state. *)
   let port_list_node = collect_by
     (has_tag (prefix_is "module_port_list_opt")) mdecl.m_body in
-  let inherited_names =
-    List.concat_map (fun pl ->
-      let refs = collect_by (has_tag (prefix_is "port_reference")) pl in
-      List.filter_map (fun r ->
-        let n = ref None in
-        walk (function
-          | TUPLE3 (STRING t, SymbolIdentifier id, _)
-            when prefix_is "unqualified_id" t && !n = None -> n := Some id
-          | _ -> ()
-        ) r;
-        !n
-      ) refs
-    ) port_list_node
-    |> List.sort_uniq compare
-  in
   let inherited_signals =
-    List.filter_map (fun n ->
-      if List.mem n explicit_names then None
-      else Some {
-        name = n;
-        stype = BInt { width = 1; signed = Unsigned };
-        direction = `Input;
-        initial_value = None;
-      }
-    ) inherited_names
+    (* Verible visits port-related nodes in REVERSE of source order
+     * (the explicit decl comes after its bare-reference siblings in
+     * DFS). So: collect every port-related event in DFS order, then
+     * iterate the list in REVERSE to apply direction+width
+     * inheritance the way the source intended. *)
+    let cur_dir = ref `Input in
+    let cur_width = ref 1 in
+    let acc = ref [] in
+    let events = ref [] in (* (dir_opt, width_opt, name_opt) per port1 *)
+    (* Iterate each `port1` in the module_port_list_opt in order. Each
+     * `port1` is one comma-separated port — it either has its own
+     * direction+width (the first port in `output [3:0] a, b`) OR is a
+     * bare name that inherits from the previous port1 (b, in the same
+     * example). *)
+    (* Per-event collector — extract direction/width/name from a
+     * port-related node. The name walker must skip identifier-bearing
+     * dimension subtrees so `[$clog2(N)-1:0]` doesn't surface `$clog2`
+     * or `N` as a port name. *)
+    let process_port1 p1 =
+      let dir = ref None in
+      walk (function
+        | Input -> dir := Some `Input
+        | Output -> dir := Some `Output
+        | Inout -> dir := Some `Internal
+        | _ -> ()) p1;
+      let explicit_w = extract_range ~pkgs ~params p1 in
+      let w_opt =
+        match explicit_w with
+        | Some _ -> Some (width_of ~pkgs ~params p1)
+        | None ->
+            (* No packed dimension — but if this port has an explicit
+             * direction token, it's the start of a fresh comma group
+             * (e.g. `output logic a, b` after `input [3:0] d`) and
+             * the width defaults to 1, NOT inherited from the
+             * previous group. *)
+            (match !dir with
+             | Some _ -> Some 1
+             | None -> None)
+      in
+      let n = ref None in
+      let rec walk_skip t =
+        match t with
+        | TUPLE6 (STRING t', _, _, _, _, _)
+          when prefix_is "decl_variable_dimension" t'
+            || prefix_is "select_variable_dimension" t' -> ()
+        | TUPLE4 (STRING t', _, _, _)
+          when prefix_is "decl_variable_dimension" t'
+            || prefix_is "select_variable_dimension" t' -> ()
+        | TUPLE3 (STRING t', SymbolIdentifier id, _)
+          when prefix_is "unqualified_id" t' && !n = None ->
+            n := Some id
+        | TUPLE2 (a, b) -> walk_skip a; walk_skip b
+        | TUPLE3 (a, b, c) -> walk_skip a; walk_skip b; walk_skip c
+        | TUPLE4 (a, b, c, d) ->
+            walk_skip a; walk_skip b; walk_skip c; walk_skip d
+        | TUPLE5 (a, b, c, d, e) ->
+            List.iter walk_skip [a; b; c; d; e]
+        | TUPLE6 (a, b, c, d, e, f) ->
+            List.iter walk_skip [a; b; c; d; e; f]
+        | TUPLE7 (a, b, c, d, e, f, g) ->
+            List.iter walk_skip [a; b; c; d; e; f; g]
+        | TUPLE8 (a, b, c, d, e, f, g, h) ->
+            List.iter walk_skip [a; b; c; d; e; f; g; h]
+        | TLIST xs -> List.iter walk_skip xs
+        | _ -> ()
+      in
+      walk_skip p1;
+      events := (!dir, w_opt, !n) :: !events
+    in
+    (* Use the global walk (which handles all TUPLE arities up to
+     * TUPLE15) to visit every node in depth-first pre-order. The
+     * port1 / explicit-decl handler updates inheritance state and
+     * emits names. *)
+    let visit t =
+      let is_port_tag tag =
+        prefix_is "port1" tag
+        || prefix_is "module_port_declaration" tag
+        || prefix_is "port_declaration_noattr" tag
+      in
+      match t with
+      | TUPLE2 (STRING tag, _) when is_port_tag tag -> process_port1 t
+      | TUPLE3 (STRING tag, _, _) when is_port_tag tag -> process_port1 t
+      | TUPLE4 (STRING tag, _, _, _) when is_port_tag tag -> process_port1 t
+      | TUPLE5 (STRING tag, _, _, _, _) when is_port_tag tag -> process_port1 t
+      | _ -> ()
+    in
+    (* Walk the whole module body — explicit port decls and the
+     * module_port_list_opt's port1 entries are siblings in Verible's
+     * AST, so we need a global in-order walk to keep direction+width
+     * inheritance correct. *)
+    walk visit mdecl.m_body;
+    let _ = port_list_node in
+    (* Verible's DFS order is the REVERSE of source order for sibling
+     * port nodes (left-recursive grammar builds TLISTs back-to-front).
+     * Walk the events list as-is (it was prepended) which gives
+     * source order, applying inheritance as we go. *)
+    let source_order = !events in
+    List.iter (fun (dir_opt, w_opt, n_opt) ->
+      (match dir_opt with Some d when d <> `Internal -> cur_dir := d | _ -> ());
+      (match w_opt with Some w -> cur_width := w | None -> ());
+      match n_opt with
+      | Some name when not (List.mem name explicit_names) ->
+          acc := {
+            name;
+            stype = BInt { width = !cur_width; signed = Unsigned };
+            direction = !cur_dir;
+            initial_value = None;
+          } :: !acc
+      | _ -> ()
+    ) source_order;
+    (* Dedup by name, preserving first occurrence. *)
+    let rev = List.rev !acc in
+    List.fold_left (fun (seen, out) (s : bsignal) ->
+      if List.mem s.name seen then (seen, out)
+      else (s.name :: seen, s :: out)
+    ) ([], []) rev
+    |> snd |> List.rev
   in
   let port_signals = explicit_signals @ inherited_signals in
   (* Internal nets — `net_declaration1` (wires) plus
@@ -933,22 +1310,45 @@ let convert_module ~pkgs (mdecl : module_decl)
         | TUPLE3 (_, t, _) -> t
         | _ -> base
       in
-      let w = width_of ~typedefs ~pkgs ~params inst_type in
+      let elem_w = width_of ~typedefs ~pkgs ~params inst_type in
       List.filter_map (fun n ->
         let nm = ref None in
         walk (function
           | SymbolIdentifier id when !nm = None -> nm := Some id
           | _ -> ()) n;
+        (* Unpacked array: `reg [W-1:0] mem [0:N]` carries a
+         * `decl_variable_dimension1` *inside the var node* (slot 2 of
+         * `…_register_variable1`). When present, treat as BArray
+         * with depth = |msb − lsb| + 1. *)
+        let unpacked = extract_range ~pkgs ~params n in
+        let stype = match unpacked with
+          | Some (m, l) ->
+              BArray {
+                element = BInt { width = elem_w; signed = Unsigned };
+                size = abs (m - l) + 1;
+              }
+          | None -> BInt { width = elem_w; signed = Unsigned }
+        in
         match !nm with
         | Some id -> Some {
             name = id;
-            stype = BInt { width = w; signed = Unsigned };
+            stype;
             direction = `Internal;
             initial_value = None;
           }
         | None -> None
       ) var_nodes
   ) instbase_nodes in
+  (* Names of memory-array signals — used by the assign/always
+   * handlers below to switch indexed lhs to `@mem_write` and indexed
+   * rhs to BSelect. *)
+  let array_names =
+    List.filter_map (fun (s : bsignal) ->
+      match s.stype with
+      | BArray _ -> Some s.name
+      | _ -> None
+    ) reg_var_signals
+  in
   let internal_signals =
     (List.concat_map (extract_port_decl ~pkgs ~params) net_nodes
      |> List.map (fun s -> { s with direction = `Internal }))
@@ -962,9 +1362,9 @@ let convert_module ~pkgs (mdecl : module_decl)
     ) (port_signals @ internal_signals)
   in
   let assign_procs = List.concat_map (fun ca ->
-    extract_assign ~pkgs ~params ca
+    extract_assign ~pkgs ~params ~arrays:array_names ca
   ) (collect_by (has_tag (prefix_is "continuous_assign")) mdecl.m_body) in
-  let always_procs = extract_always ~pkgs ~params mdecl.m_body in
+  let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params mdecl.m_body in
   {
     name = mdecl.m_name;

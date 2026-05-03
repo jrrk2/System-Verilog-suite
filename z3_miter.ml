@@ -426,6 +426,13 @@ let check_miter_equivalence bmod1 bmod2 =
    * D-pin function. *)
   let bmod1 = Behavioral_ffrip.rip_module bmod1 in
   let bmod2 = Behavioral_ffrip.rip_module bmod2 in
+  (* Post-FF-rip register sharing: collapse pairs of FFs whose D-cones
+   * are structurally identical to a single canonical register. This
+   * mirrors yosys's `share` and Vivado's elaboration dedup, so the
+   * verilator/verible side (which has no synthesis pass) ends up
+   * with the same FF set as a synthesised reference. *)
+  let bmod1 = Behavioral_share.share_module bmod1 in
+  let bmod2 = Behavioral_share.share_module bmod2 in
 
   (* Get input/output ports *)
   let inputs1 = get_input_signals bmod1 in
