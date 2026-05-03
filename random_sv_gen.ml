@@ -399,6 +399,52 @@ let emit_mem2d ~name seed =
     (depth_log2-1) (cols_log2-1) (dw-1) (dw-1)
     (dw-1) ((1 lsl depth_log2)-1) ((1 lsl cols_log2)-1)
 
+(* Const-fn struct config — exercises the symbolic-execution path in
+ * Verible_elaborate.eval_function. A package defines a constant
+ * function returning a packed struct; the top module uses that as a
+ * parameter default and instantiates two child modules whose widths
+ * come from the struct's fields. The two child specialisations
+ * MUST get distinct concrete widths or the elaborator missed the
+ * field access. *)
+let emit_cfg_struct ~name seed =
+  Random.init seed;
+  let wa = gen_width () in
+  let wb = gen_width () in
+  Printf.sprintf
+    "// random_sv_gen seed=%d mode=cfg_struct\n\
+     package %s_pkg;\n\
+     \  typedef struct packed {\n\
+     \    int unsigned A;\n\
+     \    int unsigned B;\n\
+     \  } cfg_t;\n\
+     \  function automatic cfg_t mk_cfg();\n\
+     \    cfg_t cfg;\n\
+     \    cfg.A = %d;\n\
+     \    cfg.B = %d;\n\
+     \    return cfg;\n\
+     \  endfunction\n\
+     endpackage\n\
+     \n\
+     module %s_child #(parameter int unsigned WIDTH = 8) (\n\
+     \    input  logic [WIDTH-1:0] din,\n\
+     \    output logic [WIDTH-1:0] dout\n\
+     );\n\
+     \  assign dout = din;\n\
+     endmodule\n\
+     \n\
+     module %s\n\
+     \  #(parameter %s_pkg::cfg_t Cfg = %s_pkg::mk_cfg())\n\
+     (\n\
+     \    input  logic [Cfg.A-1:0] in_a,\n\
+     \    input  logic [Cfg.B-1:0] in_b,\n\
+     \    output logic [Cfg.A-1:0] out_a,\n\
+     \    output logic [Cfg.B-1:0] out_b\n\
+     );\n\
+     \  %s_child #(.WIDTH(Cfg.A)) u_a (.din(in_a), .dout(out_a));\n\
+     \  %s_child #(.WIDTH(Cfg.B)) u_b (.din(in_b), .dout(out_b));\n\
+     endmodule\n"
+    seed name wa wb name name name name name name
+
 (* ─── Mode dispatcher ────────────────────────────────────────────── *)
 
 let emit_for_mode ~name ~seed mode =
@@ -407,6 +453,7 @@ let emit_for_mode ~name ~seed mode =
   | "func"   -> emit_func ~name seed
   | "gen"    -> emit_gen ~name seed
   | "mem2d"  -> emit_mem2d ~name seed
+  | "cfg_struct" -> emit_cfg_struct ~name seed
   | "simple" | _ ->
       let include_clock = (let _ = Random.init seed in coin ()) in
       emit_module ~name ~include_clock seed
@@ -429,7 +476,7 @@ let pick_mode s =
   match active_modes with
   | [] -> "simple"
   | ["mixed"] ->
-      let modes = ["simple"; "struct"; "func"; "gen"; "mem2d"] in
+      let modes = ["simple"; "struct"; "func"; "gen"; "mem2d"; "cfg_struct"] in
       List.nth modes (s mod List.length modes)
   | _ ->
       List.nth active_modes (s mod List.length active_modes)

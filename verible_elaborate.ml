@@ -457,6 +457,182 @@ let resolve_pkg_ref (pkgs : package_decl list) ~pkg ~name =
   | None -> None
   | Some p -> List.assoc_opt name p.pkg_params
 
+(* ─── Symbolic-execution domain (Verilator V3Const-style) ────────── *)
+
+(* Lattice domain for constant function values. Mirrors Verilator's
+ * V3Number for ints + a structured tag for typed-config-parameter
+ * struct/array returns. SVUnknown = lattice top, no info. *)
+type sv_value =
+  | SVInt    of int
+  | SVStruct of (string * sv_value) list
+  | SVArray  of sv_value list
+  | SVUnknown
+
+let rec int_of_sv = function
+  | SVInt n -> Some n
+  | _ -> None
+let _ = int_of_sv
+
+(* SV functions discovered in the parse tree. Body kept as a token —
+ * we walk it when called. *)
+type sv_function = {
+  fn_name: string;
+  fn_args: string list;
+  fn_body: token;
+}
+
+(* Walk the parse tree for `function_declaration` nodes. Pulls the
+ * function name (first SymbolIdentifier inside the return-type-and-id
+ * subtree), the formal-parameter names from tf_port_list, and the
+ * body token (last child before `Endfunction`). Conservative: drops
+ * any function we can't extract cleanly. *)
+let extract_functions root : sv_function list =
+  let nodes = collect_by
+    (has_tag (prefix_is "function_declaration")) root in
+  (* Pull function name from the return-type-and-id subtree at
+   * TUPLE11 position 4 (function_declaration1's shape). The
+   * data_type form of function_return_type_and_id is a grammar
+   * passthrough with no tag, so we can't use prefix_is here —
+   * destructure directly and take the LAST identifier in the
+   * subtree (the name comes after the type). *)
+  let return_subtree n =
+    match n with
+    | TUPLE11 (_, _, _, ret, _, _, _, _, _, _, _) -> Some ret
+    | TUPLE9  (_, _, _, ret, _, _, _, _, _) -> Some ret
+    | TUPLE8  (_, _, _, ret, _, _, _, _) -> Some ret
+    | _ -> None
+  in
+  List.filter_map (fun n ->
+    let fname = match return_subtree n with
+      | None -> None
+      | Some r ->
+          let ids = ref [] in
+          walk (function
+            | SymbolIdentifier id -> ids := id :: !ids
+            | _ -> ()) r;
+          (* !ids is reverse-source-order, so the head is the LAST. *)
+          (match !ids with last :: _ -> Some last | [] -> None)
+    in
+    let arg_nodes = collect_by
+      (has_tag (prefix_is "tf_port_item")) n in
+    let args = List.filter_map (fun a ->
+      let ids = ref [] in
+      walk (function
+        | SymbolIdentifier id -> ids := id :: !ids
+        | _ -> ()) a;
+      match !ids with last :: _ -> Some last | _ -> None
+    ) arg_nodes in
+    match fname with
+    | None -> None
+    | Some name -> Some { fn_name = name; fn_args = args; fn_body = n }
+  ) nodes
+
+(* Evaluate a constant function call. Walks the body collecting
+ * `<local>.<field> = <expr>` assignments into an SVStruct, and
+ * `<local> = <expr>` assignments into a plain SVInt. Returns the
+ * value of the local matching the function name (the SV convention
+ * for return) or the value of the last `return` statement.
+ *
+ * This is intentionally narrow — handles the build_config-style
+ * pattern (sequential field assignments, no control flow). Anything
+ * with a conditional / loop / nested call we can't fold returns
+ * SVUnknown for that field, propagating up. *)
+let eval_function ~functions ~lookup_int (fn : sv_function)
+                  (args : sv_value list) : sv_value =
+  let _ = functions in
+  (* Local int-scope for the body's RHS expressions. Struct args
+   * don't yet flow into RHS (that needs structured pattern matching
+   * we don't have); int args do via name. *)
+  let scope : (string * int) list ref =
+    ref (List.filter_map (fun (n, v) ->
+           match v with SVInt i -> Some (n, i) | _ -> None
+         ) (try List.combine fn.fn_args args with _ -> [])) in
+  let eval_int_expr tok : sv_value =
+    let s = deep_string_of_token tok in
+    match lookup_int !scope s with
+    | Some n -> SVInt n
+    | None -> SVUnknown
+  in
+  (* Track the canonical struct-build local. *)
+  let struct_acc : (string * sv_value) list ref = ref [] in
+  let returned : sv_value option ref = ref None in
+  (* Recognise `<id>.<field> = <expr>` from an assignment_statement
+   * subtree. Returns Some (id, field, rhs_token) when matched. *)
+  let try_field_assign n =
+    match n with
+    | TUPLE4 (STRING tag, lp, _, rhs)
+      when prefix_is "assignment_statement_no_expr" tag ->
+        let ids = ref [] in
+        walk (function
+          | SymbolIdentifier id -> ids := id :: !ids
+          | _ -> ()) lp;
+        (match List.rev !ids with
+         | base :: field :: _ -> Some (base, field, rhs)
+         | _ -> None)
+    | _ -> None
+  in
+  let try_return n =
+    match n with
+    | TUPLE4 (STRING tag, _, e, _)
+      when prefix_is "jump_statement" tag -> Some e
+    | _ -> None
+  in
+  walk (fun stmt ->
+    if !returned <> None then () else
+    match try_field_assign stmt with
+    | Some (_base, field, rhs) ->
+        let v = eval_int_expr rhs in
+        struct_acc := (field, v) :: !struct_acc
+    | None ->
+        match try_return stmt with
+        | Some e ->
+            (* If the return references the struct local, hand it back. *)
+            let s = deep_string_of_token e in
+            let id_only = String.trim s in
+            if List.exists (fun (f, _) -> id_only = f) !struct_acc then ()
+            else (match lookup_int !scope s with
+                  | Some n -> returned := Some (SVInt n)
+                  | None -> ());
+            (* Fall through to also publish struct *)
+        | None -> ()
+  ) fn.fn_body;
+  let _ = scope in  (* suppress warn — used inside eval_int_expr *)
+  match !returned with
+  | Some v -> v
+  | None when !struct_acc <> [] ->
+      (* Later assignments overwrite earlier (List.assoc_opt's first-
+       * match semantics): reverse to first-assigned-first, then
+       * dedup keeping the LATEST. *)
+      let dedup =
+        List.fold_left (fun acc (k, v) ->
+          if List.mem_assoc k acc then acc else (k, v) :: acc
+        ) [] (List.rev !struct_acc) in
+      SVStruct (List.rev dedup)
+  | None -> SVUnknown
+
+(* Resolve a parameter default to an sv_value, evaluating function
+ * calls if recognised. Returns SVUnknown when we can't reduce. *)
+let resolve_param_default ~functions ~lookup_int ~tok : sv_value =
+  let s = deep_string_of_token tok in
+  let s = String.trim s in
+  match String.index_opt s '(' with
+  | None ->
+      (match lookup_int [] s with
+       | Some n -> SVInt n | None -> SVUnknown)
+  | Some lp ->
+      let prefix = String.trim (String.sub s 0 lp) in
+      let bare =
+        match String.rindex_opt prefix ':' with
+        | Some i -> String.trim (String.sub prefix (i + 1)
+                                  (String.length prefix - i - 1))
+        | None -> prefix
+      in
+      (match List.find_opt (fun f -> f.fn_name = bare) functions with
+       | Some fn -> eval_function ~functions ~lookup_int fn []
+       | None ->
+           (match lookup_int [] s with
+            | Some n -> SVInt n | None -> SVUnknown))
+
 (* Resolve an override expression to a printable string, folding
  * `pkg::name` references through the package table when possible.
  * Returns the deep stringification by default so the constant
@@ -533,12 +709,19 @@ let _ = int_of_pvalue
 module Eval = struct
   type tok =
     | TNum of int | TId of string
-    | TLP | TRP | TComma
+    | TLP | TRP | TComma | TDot
     | TPlus | TMinus | TStar | TSlash | TPercent
     | TShl | TShr
     | TEq | TNeq | TLt | TLe | TGt | TGe
     | TLAnd | TLOr | TBang
     | TDollar of string
+
+  (* Global table of resolved struct values, indexed by their
+   * top-level identifier (e.g. "CVA6Cfg" → SVStruct [...]).
+   * Populated by resolve_param_default during specialise_design's
+   * top-level visit; consulted by parse_atom for "X.Y" field
+   * lookups that don't resolve via plain scope. *)
+  let struct_table : (string, sv_value) Hashtbl.t = Hashtbl.create 16
 
   let tokenize s =
     let n = String.length s in
@@ -556,6 +739,7 @@ module Eval = struct
       | '(' -> push TLP; incr i
       | ')' -> push TRP; incr i
       | ',' -> push TComma; incr i
+      | '.' -> push TDot; incr i
       | '+' -> push TPlus; incr i
       | '-' -> push TMinus; incr i
       | '*' -> push TStar; incr i
@@ -704,6 +888,17 @@ module Eval = struct
     | toks -> parse_atom scope toks
   and parse_atom scope = function
     | TNum n :: rest -> (Some n, rest)
+    | TId base :: TDot :: TId field :: rest ->
+        (* Struct field access: try the global struct table first
+         * (populated by resolve_param_default for top-level
+         * struct-typed parameters like CVA6Cfg), then fall back to
+         * the int scope. *)
+        (match Hashtbl.find_opt struct_table base with
+         | Some (SVStruct fs) ->
+             (match List.assoc_opt field fs with
+              | Some (SVInt n) -> (Some n, rest)
+              | _ -> (None, rest))
+         | _ -> (List.assoc_opt (base ^ "." ^ field) scope, rest))
     | TId id :: rest -> (List.assoc_opt id scope, rest)
     | TDollar fname :: TLP :: rest ->
         let arg, t = parse_expr scope rest in
@@ -812,6 +1007,67 @@ type specialised = {
 let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
+  (* Build the function table once from every module + package body.
+   * Used by resolve_param_default to evaluate constant function calls
+   * appearing as parameter defaults (e.g. CVA6Cfg = build_config(...)).
+   * Mirrors Verilator's V3Inline + V3Const interaction: identify
+   * pure functions, evaluate them once, cache the result. *)
+  let functions =
+    List.concat_map (fun m -> extract_functions m.m_body) mods
+    @ List.concat_map (fun p -> extract_functions p.pkg_body) pkgs
+  in
+  Hashtbl.clear Eval.struct_table;
+  let debug = Sys.getenv_opt "ELAB_DEBUG" <> None in
+  if debug then
+    Printf.eprintf "[elab] %d modules, %d packages, %d const-functions\n%!"
+      (List.length mods) (List.length pkgs) (List.length functions);
+  (* Evaluate each top-level module's struct-typed parameter defaults
+   * once and stash in Eval.struct_table so override expressions like
+   * `CVA6Cfg.XLEN` in child instantiations can resolve via field
+   * lookup. Only the top module's defaults are needed — non-top
+   * modules pick up their CVA6Cfg through override propagation. *)
+  (match Hashtbl.find_opt by_name top_name with
+   | None -> ()
+   | Some top ->
+       let lookup_int sc s = Eval.eval_string sc s in
+       let param_decls = collect_by
+         (has_tag (prefix_is "module_parameter_port")) top.m_body in
+       List.iter (fun pn ->
+         (* The param name is the identifier in the
+          * `param_type_followed_by_id*` subtree (excludes both the
+          * type's pkg::type qualifier AND the default expression's
+          * identifiers). Without this restriction the walk drifts
+          * into either the type or default and picks up wrong ids. *)
+         let ids =
+           let acc = ref [] in
+           let id_subs = collect_by
+             (has_tag (prefix_is "param_type_followed_by_id")) pn in
+           List.iter (fun s ->
+             walk (function
+               | SymbolIdentifier id -> acc := id :: !acc
+               | _ -> ()) s) id_subs;
+           !acc
+         in
+         let pname = match ids with last :: _ -> Some last | _ -> None in
+         let default = match collect_by
+                          (has_tag (prefix_is "trailing_assign")) pn with
+           | a :: _ -> Some a | _ -> None in
+         match pname, default with
+         | Some name, Some d ->
+             let v = resolve_param_default ~functions ~lookup_int ~tok:d in
+             (match v with
+              | SVStruct fs ->
+                  if debug then
+                    Printf.eprintf
+                      "[elab] %s ← struct (%d known of %d fields)\n%!"
+                      name
+                      (List.length (List.filter
+                        (function (_, SVInt _) -> true | _ -> false) fs))
+                      (List.length fs);
+                  Hashtbl.replace Eval.struct_table name v
+              | _ -> ())
+         | _ -> ()
+       ) param_decls);
   (* Build the integer-valued scope for the current module: start with
    * each override that resolves to an int (via package + Eval), then
    * fold in localparams whose RHS Eval can reduce against that scope.
