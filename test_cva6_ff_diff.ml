@@ -118,6 +118,7 @@ let () =
             |> Behavioral_unroll.unroll_program
             |> Behavioral_inline.inline_program
             |> Behavioral_iflift.lift_program
+            |> Behavioral_blocking_subst.blocking_subst_program
             |> Behavioral_meminfer.infer_program
           in
           Some p
