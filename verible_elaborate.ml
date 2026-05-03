@@ -96,6 +96,39 @@ let rec value_of = function
   | TUPLE6 (_, _, _, _, v, _) -> value_of v   (* parameter_value_byname1 *)
   | other -> getstr other
 
+(* Render a token tree as one whitespace-joined string of all its
+ * meaningful leaves, in source order. Unlike `value_of`, which only
+ * walks the first child of each tuple node, this preserves the full
+ * expression — required for the constant evaluator to see e.g. the
+ * `/2` part of `PaddedWidth/2`. Operator/punctuation tokens are
+ * mapped back to their original text so the output re-tokenises
+ * cleanly. *)
+(* Strict allowlist — anything not listed (TUPLEn, TLIST, EMPTY_TOKEN,
+ * STRING tag-labels) returns None. Without this, walk emits "TUPLE3"
+ * etc. as literal text and the resulting expression is garbage. *)
+let leaf_text = function
+  | TK_DecNumber n | TK_UnBasedNumber n
+  | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n -> Some n
+  | SymbolIdentifier id -> Some id
+  | LT_LT -> Some "<<"  | GT_GT -> Some ">>"
+  | SLASH -> Some "/"   | STAR  -> Some "*"
+  | PERCENT -> Some "%" | PLUS  -> Some "+" | HYPHEN -> Some "-"
+  | LPAREN -> Some "("  | RPAREN -> Some ")"
+  | COMMA  -> Some ","  | DOT    -> Some "."
+  | COLON_COLON -> Some "::"
+  | _ -> None
+
+let deep_string_of_token tok =
+  let buf = Buffer.create 32 in
+  walk (fun t ->
+    match leaf_text t with
+    | Some s ->
+        if Buffer.length buf > 0 then Buffer.add_char buf ' ';
+        Buffer.add_string buf s
+    | None -> ()
+  ) tok;
+  Buffer.contents buf
+
 (* ─── Module parameter declarations ──────────────────────────────── *)
 
 (* `module_parameter_port1` shape:
@@ -333,7 +366,10 @@ let resolve_pkg_ref (pkgs : package_decl list) ~pkg ~name =
   | Some p -> List.assoc_opt name p.pkg_params
 
 (* Resolve an override expression to a printable string, folding
- * `pkg::name` references through the package table when possible. *)
+ * `pkg::name` references through the package table when possible.
+ * Returns the deep stringification by default so the constant
+ * evaluator sees the full expression text — falling back to the
+ * single-leaf value_of only for trivially-wrapped scalars. *)
 let rec resolve_value (pkgs : package_decl list) tok =
   let try_qualified t =
     match t with
@@ -350,18 +386,229 @@ let rec resolve_value (pkgs : package_decl list) tok =
   match try_qualified tok with
   | Some v -> v
   | None ->
+      (* Substitute every `pkg::name` reference inside the expression
+       * with its resolved string by string-replacement on the deep
+       * rendering. Non-resolvable refs survive as-is and the
+       * evaluator just returns None for them. *)
+      let raw = deep_string_of_token tok in
       let qrefs = collect_by (function
         | TUPLE4 (STRING tag, _, _, _) when prefix_is "qualified_id" tag -> true
         | _ -> false) tok in
-      match qrefs with
-      | qr :: _ ->
-          (match try_qualified qr with
-           | Some v -> v
-           | None -> value_of tok)
-      | [] -> value_of tok
+      List.fold_left (fun acc qr ->
+        match qr with
+        | TUPLE4 (_,
+                  TUPLE3 (_, SymbolIdentifier pkg, _),
+                  _,
+                  TUPLE3 (_, SymbolIdentifier name, _)) ->
+            (match resolve_pkg_ref pkgs ~pkg ~name with
+             | None -> acc
+             | Some pv ->
+                 let pat = pkg ^ " :: " ^ name in
+                 let r = string_of_pvalue pv in
+                 (* Naive substring replace; OK for these short tags. *)
+                 let rec rep s =
+                   match String.index_opt s pat.[0] with
+                   | None -> s
+                   | Some _ ->
+                       let lp = String.length pat and ls = String.length s in
+                       let rec scan i =
+                         if i + lp > ls then s
+                         else if String.sub s i lp = pat then
+                           String.sub s 0 i ^ r ^
+                           rep (String.sub s (i + lp) (ls - i - lp))
+                         else scan (i + 1)
+                       in scan 0
+                 in
+                 rep acc)
+        | _ -> acc
+      ) raw qrefs
 
 let _ = resolve_value
 let _ = int_of_pvalue
+
+(* ─── Constant expression evaluator ──────────────────────────────── *)
+
+(* Recursive-descent evaluator over the `value_of` / `resolve_value`
+ * string output. Substitutes identifiers from `scope`, folds the
+ * standard SV integer ops (`+ - * / % << >>`), and a few system
+ * functions (`$clog2`, `$bits`, `$signed`, `$unsigned`). Returns
+ * None on unknown identifiers / unsupported operators — callers fall
+ * back to the original string then. Required so that recursive
+ * instantiations like `popcount #(.INPUT_WIDTH(PaddedWidth/2))` (where
+ * PaddedWidth is a localparam computed from INPUT_WIDTH) get
+ * specialised through the recursion tower instead of bottoming out at
+ * the first level. *)
+module Eval = struct
+  type tok =
+    | TNum of int | TId of string
+    | TLP | TRP | TComma
+    | TPlus | TMinus | TStar | TSlash | TPercent
+    | TShl | TShr
+    | TDollar of string
+
+  let tokenize s =
+    let n = String.length s in
+    let i = ref 0 in
+    let out = ref [] in
+    let push t = out := t :: !out in
+    let is_id_start c =
+      (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_' in
+    let is_id c = is_id_start c || (c >= '0' && c <= '9') in
+    let is_dig c = c >= '0' && c <= '9' in
+    while !i < n do
+      let c = s.[!i] in
+      match c with
+      | ' ' | '\t' | '\n' | '\r' -> incr i
+      | '(' -> push TLP; incr i
+      | ')' -> push TRP; incr i
+      | ',' -> push TComma; incr i
+      | '+' -> push TPlus; incr i
+      | '-' -> push TMinus; incr i
+      | '*' -> push TStar; incr i
+      | '/' -> push TSlash; incr i
+      | '%' -> push TPercent; incr i
+      | '<' when !i + 1 < n && s.[!i + 1] = '<' -> push TShl; i := !i + 2
+      | '>' when !i + 1 < n && s.[!i + 1] = '>' -> push TShr; i := !i + 2
+      | '$' ->
+          let j = ref (!i + 1) in
+          while !j < n && is_id s.[!j] do incr j done;
+          push (TDollar (String.sub s (!i + 1) (!j - !i - 1)));
+          i := !j
+      | '\'' ->
+          (* `'0`, `'1`, `'x`, `'z` — bare unsized literals. *)
+          if !i + 1 < n then begin
+            let nc = s.[!i + 1] in
+            (match nc with
+             | '0' -> push (TNum 0)
+             | '1' -> push (TNum 1)
+             | _   -> push (TNum 0));
+            i := !i + 2
+          end else incr i
+      | _ when is_dig c ->
+          let j = ref !i in
+          while !j < n && is_dig s.[!j] do incr j done;
+          let lead = String.sub s !i (!j - !i) in
+          if !j < n && s.[!j] = '\'' && !j + 1 < n then begin
+            (* sized literal: <width>'<base><digits> *)
+            let base = Char.lowercase_ascii s.[!j + 1] in
+            let k = ref (!j + 2) in
+            while !k < n &&
+                  (let cc = s.[!k] in
+                   is_dig cc || (cc >= 'a' && cc <= 'f')
+                             || (cc >= 'A' && cc <= 'F') || cc = '_')
+            do incr k done;
+            let digits =
+              String.concat "" (String.split_on_char '_'
+                (String.sub s (!j + 2) (!k - !j - 2))) in
+            let v =
+              try
+                match base with
+                | 'h' -> int_of_string ("0x" ^ digits)
+                | 'b' -> int_of_string ("0b" ^ digits)
+                | 'o' -> int_of_string ("0o" ^ digits)
+                | _   -> int_of_string digits
+              with _ -> 0
+            in
+            push (TNum v); i := !k
+          end else begin
+            push (TNum (try int_of_string lead with _ -> 0));
+            i := !j
+          end
+      | _ when is_id_start c ->
+          let j = ref !i in
+          while !j < n && is_id s.[!j] do incr j done;
+          push (TId (String.sub s !i (!j - !i)));
+          i := !j
+      | _ -> incr i  (* skip unknown punctuation *)
+    done;
+    List.rev !out
+
+  let rec parse_expr scope toks = parse_add scope toks
+  and parse_add scope toks =
+    let l, t = parse_mul scope toks in
+    let rec loop l = function
+      | TPlus  :: rest -> binop scope (+)   l rest loop
+      | TMinus :: rest -> binop scope (-)   l rest loop
+      | TShl   :: rest -> binop scope (lsl) l rest loop
+      | TShr   :: rest -> binop scope (lsr) l rest loop
+      | rest -> (l, rest)
+    in loop l t
+  and parse_mul scope toks =
+    let l, t = parse_unary scope toks in
+    let rec loop l = function
+      | TStar    :: rest -> binop scope ( * ) l rest loop
+      | TSlash   :: rest -> safe_binop scope (/) l rest loop
+      | TPercent :: rest -> safe_binop scope (mod) l rest loop
+      | rest -> (l, rest)
+    in loop l t
+  and parse_unary scope = function
+    | TMinus :: rest ->
+        let v, t = parse_unary scope rest in
+        (Option.map (~-) v, t)
+    | TPlus :: rest -> parse_unary scope rest
+    | toks -> parse_atom scope toks
+  and parse_atom scope = function
+    | TNum n :: rest -> (Some n, rest)
+    | TId id :: rest -> (List.assoc_opt id scope, rest)
+    | TDollar fname :: TLP :: rest ->
+        let arg, t = parse_expr scope rest in
+        let rec drop_to_rp = function
+          | TRP :: r -> r | _ :: r -> drop_to_rp r | [] -> []
+        in
+        let r = drop_to_rp t in
+        let v = match fname, arg with
+          | "clog2", Some n when n > 1 ->
+              let rec lg n acc = if n <= 1 then acc else lg ((n + 1) / 2) (acc + 1) in
+              Some (lg n 0)
+          | "clog2", Some _ -> Some 0
+          | ("bits" | "size" | "unsigned" | "signed"), _ -> arg
+          | _ -> None
+        in
+        (v, r)
+    | TLP :: rest ->
+        let v, t = parse_expr scope rest in
+        (match t with TRP :: r -> (v, r) | _ -> (v, t))
+    | rest -> (None, rest)
+  and binop scope op l rest cont =
+    let r, t = parse_mul scope rest in
+    (match l, r with
+     | Some a, Some b -> cont (Some (op a b)) t
+     | _ -> cont None t)
+  and safe_binop scope op l rest cont =
+    let r, t = parse_unary scope rest in
+    (match l, r with
+     | Some a, Some b when b <> 0 -> cont (Some (op a b)) t
+     | _ -> cont None t)
+
+  let eval_string scope s =
+    try fst (parse_expr scope (tokenize s)) with _ -> None
+end
+
+(* Pull `localparam`/`parameter` declarations from a module body, as
+ * (name, rhs_token) pairs. The grammar tags both as
+ * `any_param_declaration<N>`; we trust that only ones inside the
+ * module body show up here. Walks the trailing_assign for the RHS. *)
+let extract_module_internal_params (body : token) : (string * token) list =
+  let nodes = collect_by
+    (has_tag (prefix_is "any_param_declaration")) body in
+  List.filter_map (fun n ->
+    let id_subs = collect_by
+      (has_tag (prefix_is "param_type_followed_by_id")) n in
+    let pname = match id_subs with
+      | s :: _ ->
+          let ids = ref [] in
+          walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) s;
+          (match List.rev !ids with last :: _ -> Some last | [] -> None)
+      | [] -> None
+    in
+    let rhs = match collect_by
+                (has_tag (prefix_is "trailing_assign")) n with
+      | a :: _ -> Some a | [] -> None
+    in
+    match pname, rhs with
+    | Some name, Some r -> Some (name, r)
+    | _ -> None
+  ) nodes
 
 (* ─── Specialisation ─────────────────────────────────────────────── *)
 
@@ -410,8 +657,35 @@ type specialised = {
 let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
-  let resolve_overrides ovs =
-    List.map (fun (name, tok) -> (name, resolve_value pkgs tok)) ovs
+  (* Build the integer-valued scope for the current module: start with
+   * each override that resolves to an int (via package + Eval), then
+   * fold in localparams whose RHS Eval can reduce against that scope.
+   * Localparams are evaluated in source order; each new value extends
+   * the scope used for the next, so chains like
+   *   localparam A = 8; localparam B = A * 2;
+   * resolve correctly. *)
+  let int_scope_of mdecl overrides =
+    let scope = List.filter_map (fun (k, v) ->
+      Option.map (fun n -> (k, n)) (Eval.eval_string [] v)
+    ) overrides in
+    let lps = extract_module_internal_params mdecl.m_body in
+    List.fold_left (fun sc (name, rhs_tok) ->
+      let s = resolve_value pkgs rhs_tok in
+      match Eval.eval_string sc s with
+      | Some n -> (name, n) :: sc
+      | None -> sc
+    ) scope lps
+  in
+  let resolve_overrides_with scope ovs =
+    List.map (fun (name, tok) ->
+      let s = resolve_value pkgs tok in
+      let v =
+        match Eval.eval_string scope s with
+        | Some n -> string_of_int n
+        | None -> s
+      in
+      (name, v)
+    ) ovs
   in
   let seen : (string, specialised) Hashtbl.t = Hashtbl.create 64 in
   let rec visit ?(inst_label = None) base overrides =
@@ -425,10 +699,11 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
             s_base = base; s_name = sname;
             s_params = overrides; s_inst = inst_label;
           };
+          let scope = int_scope_of mdecl overrides in
           List.iter (fun inst ->
             visit ~inst_label:(Some inst.i_inst)
               inst.i_module
-              (resolve_overrides inst.i_overrides_tok)
+              (resolve_overrides_with scope inst.i_overrides_tok)
           ) (extract_instantiations mdecl.m_body)
         end
   in
