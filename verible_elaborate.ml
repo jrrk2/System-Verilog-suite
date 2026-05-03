@@ -116,6 +116,12 @@ let leaf_text = function
   | LPAREN -> Some "("  | RPAREN -> Some ")"
   | COMMA  -> Some ","  | DOT    -> Some "."
   | COLON_COLON -> Some "::"
+  | EQ_EQ  -> Some "==" | PLING_EQ -> Some "!="
+  | LESS   -> Some "<"  | GREATER  -> Some ">"
+  | LT_EQ  -> Some "<="
+  | AMPERSAND_AMPERSAND -> Some "&&"
+  | VBAR_VBAR -> Some "||"
+  | PLING -> Some "!"
   | _ -> None
 
 let deep_string_of_token tok =
@@ -264,6 +270,8 @@ let evaluator_for_walk
     : ((string * int) list -> string -> int option) ref
     = ref (fun _ _ -> None)
 
+let walk_live_debug = ref false
+
 let rec walk_live scope f tok =
   let take_branch cond_expr_opt branches =
     let resolved =
@@ -271,6 +279,10 @@ let rec walk_live scope f tok =
       | None -> None
       | Some e ->
           let s = !resolver_for_walk e in
+          if !walk_live_debug then
+            Printf.eprintf "[walk_live] cond=%S → %s\n%!" s
+              (match !evaluator_for_walk scope s with
+               | Some n -> string_of_int n | None -> "?");
           !evaluator_for_walk scope s
     in
     match resolved, branches with
@@ -1018,6 +1030,7 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
   in
   Hashtbl.clear Eval.struct_table;
   let debug = Sys.getenv_opt "ELAB_DEBUG" <> None in
+  walk_live_debug := debug;
   if debug then
     Printf.eprintf "[elab] %d modules, %d packages, %d const-functions\n%!"
       (List.length mods) (List.length pkgs) (List.length functions);
@@ -1111,14 +1124,23 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
             s_params = overrides; s_inst = inst_label;
           };
           let scope = int_scope_of mdecl overrides in
+          if debug then
+            Printf.eprintf "[elab] visit %s, scope=[%s]\n%!" sname
+              (String.concat ", "
+                (List.map (fun (k, v) ->
+                  Printf.sprintf "%s=%d" k v) scope));
           (* Plug the resolver+eval through the globals so walk_live
            * can fold scope refs in the if-condition expression text. *)
           resolver_for_walk := (fun t -> resolve_value pkgs t);
           evaluator_for_walk := Eval.eval_string;
           List.iter (fun inst ->
-            visit ~inst_label:(Some inst.i_inst)
-              inst.i_module
-              (resolve_overrides_with scope inst.i_overrides_tok)
+            let ovs = resolve_overrides_with scope inst.i_overrides_tok in
+            if debug then
+              Printf.eprintf "[elab]   inst %s of %s: %s\n%!"
+                inst.i_inst inst.i_module
+                (String.concat ", "
+                  (List.map (fun (k, v) -> k^"="^v) ovs));
+            visit ~inst_label:(Some inst.i_inst) inst.i_module ovs
           ) (extract_instantiations ~scope mdecl.m_body)
         end
   in
