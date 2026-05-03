@@ -238,9 +238,101 @@ let extract_inst_name node =
        | [] -> first_id c)
   | [] -> None
 
-let extract_instantiations root : instantiation list =
-  let inst_nodes = collect_by
-    (has_tag (prefix_is "instantiation_base")) root
+(* Walk a token tree like `walk`, but when a conditional_generate_construct
+ * node is reached, evaluate the if-condition (or case selector) in the
+ * supplied scope and descend only into the live branch. Falls back to
+ * walking everything when the condition can't be reduced.
+ *
+ * Knows the three shapes from Source_text_verible.mly:
+ *   conditional_generate_construct1: TUPLE5(STRING tag, generate_if, item,
+ *                                            Else, item)
+ *   conditional_generate_construct2: TUPLE3(STRING tag, generate_if, item)
+ *   conditional_generate_construct3: TUPLE7(STRING tag, Case, LPAREN,
+ *                                            expression, RPAREN,
+ *                                            generate_case_items, Endcase)
+ *
+ * `generate_if1` is TUPLE3(STRING tag, If, expression_in_parens). *)
+let extract_if_cond = function
+  | TUPLE3 (STRING tag, _, expr) when prefix_is "generate_if" tag -> Some expr
+  | _ -> None
+
+(* The forward-decl: walk_live needs Eval.eval_string and resolve_value
+ * but those are defined further down. Refs broken at the chained call
+ * sites: assigned in specialise_design before any walk_live runs. *)
+let resolver_for_walk : (token -> string) ref = ref (fun _ -> "")
+let evaluator_for_walk
+    : ((string * int) list -> string -> int option) ref
+    = ref (fun _ _ -> None)
+
+let rec walk_live scope f tok =
+  let take_branch cond_expr_opt branches =
+    let resolved =
+      match cond_expr_opt with
+      | None -> None
+      | Some e ->
+          let s = !resolver_for_walk e in
+          !evaluator_for_walk scope s
+    in
+    match resolved, branches with
+    | Some n, [_, body] when n <> 0 -> walk_live scope f body
+    | Some 0, [_, _] -> ()           (* if only, condition false → skip *)
+    | Some n, [_, then_b; _, else_b] ->
+        walk_live scope f (if n <> 0 then then_b else else_b)
+    | _ ->
+        (* Can't decide — fall back to walking every branch. *)
+        List.iter (fun (_, b) -> walk_live scope f b) branches
+  in
+  match tok with
+  | TUPLE5 (STRING tag, gif, t_item, _, e_item)
+    when prefix_is "conditional_generate_construct" tag ->
+      f tok;
+      take_branch (extract_if_cond gif) [(`T, t_item); (`E, e_item)]
+  | TUPLE3 (STRING tag, gif, t_item)
+    when prefix_is "conditional_generate_construct" tag ->
+      f tok;
+      take_branch (extract_if_cond gif) [(`T, t_item)]
+  | _ ->
+      (* Fall through to the same recursion shape walk uses. *)
+      f tok;
+      (match tok with
+       | TUPLE2 (a, b) -> walk_live scope f a; walk_live scope f b
+       | TUPLE3 (a, b, c) ->
+           walk_live scope f a; walk_live scope f b; walk_live scope f c
+       | TUPLE4 (a, b, c, d) ->
+           List.iter (walk_live scope f) [a; b; c; d]
+       | TUPLE5 (a, b, c, d, e) ->
+           List.iter (walk_live scope f) [a; b; c; d; e]
+       | TUPLE6 (a, b, c, d, e, f') ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f']
+       | TUPLE7 (a, b, c, d, e, f', g) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g]
+       | TUPLE8 (a, b, c, d, e, f', g, h) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h]
+       | TUPLE9 (a, b, c, d, e, f', g, h, i) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h; i]
+       | TUPLE10 (a, b, c, d, e, f', g, h, i, j) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h; i; j]
+       | TUPLE11 (a, b, c, d, e, f', g, h, i, j, k) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h; i; j; k]
+       | TUPLE12 (a, b, c, d, e, f', g, h, i, j, k, l) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h; i; j; k; l]
+       | TUPLE13 (a, b, c, d, e, f', g, h, i, j, k, l, m) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h; i; j; k; l; m]
+       | TUPLE14 (a, b, c, d, e, f', g, h, i, j, k, l, m, n) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h; i; j; k; l; m; n]
+       | TUPLE15 (a, b, c, d, e, f', g, h, i, j, k, l, m, n, o) ->
+           List.iter (walk_live scope f) [a; b; c; d; e; f'; g; h; i; j; k; l; m; n; o]
+       | TLIST xs -> List.iter (walk_live scope f) xs
+       | _ -> ())
+
+let collect_live_by scope pred root =
+  let acc = ref [] in
+  walk_live scope (fun t -> if pred t then acc := t :: !acc) root;
+  List.rev !acc
+
+let extract_instantiations ?(scope = []) root : instantiation list =
+  let inst_nodes =
+    collect_live_by scope (has_tag (prefix_is "instantiation_base")) root
   in
   List.filter_map (fun node ->
     (* The first SymbolIdentifier in the instantiation_base subtree
@@ -444,6 +536,8 @@ module Eval = struct
     | TLP | TRP | TComma
     | TPlus | TMinus | TStar | TSlash | TPercent
     | TShl | TShr
+    | TEq | TNeq | TLt | TLe | TGt | TGe
+    | TLAnd | TLOr | TBang
     | TDollar of string
 
   let tokenize s =
@@ -469,6 +563,15 @@ module Eval = struct
       | '%' -> push TPercent; incr i
       | '<' when !i + 1 < n && s.[!i + 1] = '<' -> push TShl; i := !i + 2
       | '>' when !i + 1 < n && s.[!i + 1] = '>' -> push TShr; i := !i + 2
+      | '=' when !i + 1 < n && s.[!i + 1] = '=' -> push TEq; i := !i + 2
+      | '!' when !i + 1 < n && s.[!i + 1] = '=' -> push TNeq; i := !i + 2
+      | '<' when !i + 1 < n && s.[!i + 1] = '=' -> push TLe; i := !i + 2
+      | '>' when !i + 1 < n && s.[!i + 1] = '=' -> push TGe; i := !i + 2
+      | '<' -> push TLt; incr i
+      | '>' -> push TGt; incr i
+      | '&' when !i + 1 < n && s.[!i + 1] = '&' -> push TLAnd; i := !i + 2
+      | '|' when !i + 1 < n && s.[!i + 1] = '|' -> push TLOr; i := !i + 2
+      | '!' -> push TBang; incr i
       | '$' ->
           let j = ref (!i + 1) in
           while !j < n && is_id s.[!j] do incr j done;
@@ -523,7 +626,56 @@ module Eval = struct
     done;
     List.rev !out
 
-  let rec parse_expr scope toks = parse_add scope toks
+  let bool_int b = if b then 1 else 0
+
+  let rec parse_expr scope toks = parse_lor scope toks
+  and parse_lor scope toks =
+    let l, t = parse_land scope toks in
+    let rec loop l = function
+      | TLOr :: rest ->
+          let r, t' = parse_land scope rest in
+          (match l, r with
+           | Some a, Some b -> loop (Some (bool_int (a <> 0 || b <> 0))) t'
+           | _ -> loop None t')
+      | rest -> (l, rest)
+    in loop l t
+  and parse_land scope toks =
+    let l, t = parse_eq scope toks in
+    let rec loop l = function
+      | TLAnd :: rest ->
+          let r, t' = parse_eq scope rest in
+          (match l, r with
+           | Some a, Some b -> loop (Some (bool_int (a <> 0 && b <> 0))) t'
+           | _ -> loop None t')
+      | rest -> (l, rest)
+    in loop l t
+  and parse_eq scope toks =
+    let l, t = parse_rel scope toks in
+    let rec loop l = function
+      | TEq  :: rest ->
+          let r, t' = parse_rel scope rest in
+          (match l, r with Some a, Some b -> loop (Some (bool_int (a = b))) t'
+                         | _ -> loop None t')
+      | TNeq :: rest ->
+          let r, t' = parse_rel scope rest in
+          (match l, r with Some a, Some b -> loop (Some (bool_int (a <> b))) t'
+                         | _ -> loop None t')
+      | rest -> (l, rest)
+    in loop l t
+  and parse_rel scope toks =
+    let l, t = parse_add scope toks in
+    let rec loop l = function
+      | TLt :: rest -> rel scope (<)  l rest loop
+      | TLe :: rest -> rel scope (<=) l rest loop
+      | TGt :: rest -> rel scope (>)  l rest loop
+      | TGe :: rest -> rel scope (>=) l rest loop
+      | rest -> (l, rest)
+    in loop l t
+  and rel scope op l rest cont =
+    let r, t = parse_add scope rest in
+    (match l, r with
+     | Some a, Some b -> cont (Some (bool_int (op a b))) t
+     | _ -> cont None t)
   and parse_add scope toks =
     let l, t = parse_mul scope toks in
     let rec loop l = function
@@ -546,6 +698,9 @@ module Eval = struct
         let v, t = parse_unary scope rest in
         (Option.map (~-) v, t)
     | TPlus :: rest -> parse_unary scope rest
+    | TBang :: rest ->
+        let v, t = parse_unary scope rest in
+        (Option.map (fun n -> bool_int (n = 0)) v, t)
     | toks -> parse_atom scope toks
   and parse_atom scope = function
     | TNum n :: rest -> (Some n, rest)
@@ -700,11 +855,15 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
             s_params = overrides; s_inst = inst_label;
           };
           let scope = int_scope_of mdecl overrides in
+          (* Plug the resolver+eval through the globals so walk_live
+           * can fold scope refs in the if-condition expression text. *)
+          resolver_for_walk := (fun t -> resolve_value pkgs t);
+          evaluator_for_walk := Eval.eval_string;
           List.iter (fun inst ->
             visit ~inst_label:(Some inst.i_inst)
               inst.i_module
               (resolve_overrides_with scope inst.i_overrides_tok)
-          ) (extract_instantiations mdecl.m_body)
+          ) (extract_instantiations ~scope mdecl.m_body)
         end
   in
   visit ~inst_label:None top_name [];
