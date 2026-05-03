@@ -1,0 +1,253 @@
+(* Per-entity FF-set comparator for CVA6.
+ *
+ * For every entity present in the Vivado-elaborated VHDL, extract the
+ * FF set (Q__Q + Q__D signal names from Behavioral_ffrip) on:
+ *   - the Vivado side  (cva6_elab.vhd → vhdl_to_ver_front)
+ *   - the Verible side (SV files → verible_to_behavioral)
+ *   - optionally, the Verilator side (V*.tree.json) for sanity
+ *
+ * Reports a per-entity similarity score (Jaccard over Q-name set) and
+ * lists what's only-in-Vivado / only-in-Verible. Sorted closest-first
+ * — the smallest non-zero "only" lists are the best triage candidates
+ * for the next elaboration fix.
+ *
+ * Args:
+ *   test_cva6_ff_diff <vivado.vhd> [verilator.json] [filter ...]
+ * Env:
+ *   MITER_VERIBLE_FILES = colon-separated SV source list
+ *   MITER_VERIBLE_TOP   = top entity name for Verible elaboration *)
+
+open Behavioral_ir
+
+let usage () =
+  Printf.eprintf
+    "usage: %s <vivado.vhd> [verilator.json|-] [filter ...]\n\
+     env: MITER_VERIBLE_FILES (colon-sep), MITER_VERIBLE_TOP\n"
+    Sys.argv.(0);
+  exit 2
+
+let contains substr s =
+  let ls = String.length s and lp = String.length substr in
+  if lp = 0 then true
+  else if lp > ls then false
+  else
+    let rec loop i =
+      if i + lp > ls then false
+      else if String.sub s i lp = substr then true
+      else loop (i + 1)
+    in loop 0
+
+let strip_suffix s sfx =
+  let ls = String.length s and lf = String.length sfx in
+  if ls > lf && String.sub s (ls - lf) lf = sfx
+  then Some (String.sub s 0 (ls - lf))
+  else None
+
+let ff_q_set (m : bmodule) =
+  let m = Behavioral_ffrip.rip_module m in
+  List.filter_map (fun (s : bsignal) ->
+    if s.direction = `Input then strip_suffix s.name "__Q" else None
+  ) m.signals
+  |> List.sort_uniq compare
+
+let jaccard a b =
+  let inter = List.filter (fun x -> List.mem x b) a |> List.length in
+  let union = List.length a + List.length b - inter in
+  if union = 0 then 1.0 else float inter /. float union
+
+let truncate s w =
+  if String.length s <= w then s
+  else String.sub s 0 (max 0 (w - 1)) ^ "…"
+
+let () =
+  if Array.length Sys.argv < 2 then usage ();
+  let vhd_file = Sys.argv.(1) in
+  let json_file =
+    if Array.length Sys.argv >= 3 && Sys.argv.(2) <> "-" then Some Sys.argv.(2)
+    else None
+  in
+  let filter_start = if json_file = None then 2 else 3 in
+  let filters =
+    if Array.length Sys.argv > filter_start
+    then Array.to_list (Array.sub Sys.argv filter_start
+                          (Array.length Sys.argv - filter_start))
+    else []
+  in
+  let matches name =
+    filters = [] || List.exists (fun s -> contains s name) filters
+  in
+
+  Printf.printf "[1/3] Loading Vivado VHDL → BIR ...\n%!";
+  let viv =
+    match Vhdl_to_ver_front.convert_vhd_file vhd_file with
+    | Some p -> p
+    | None -> Printf.eprintf "Vivado side load failed\n"; exit 1
+  in
+  Printf.printf "  %d Vivado modules\n" (List.length viv.modules);
+
+  let verilator =
+    match json_file with
+    | None -> None
+    | Some jf ->
+        Printf.printf "[2/3] Loading Verilator JSON → BIR ...\n%!";
+        match Verilator_to_behavioral.convert_verilator_json_to_behavioral jf with
+        | Some p ->
+            Printf.printf "  %d Verilator modules\n" (List.length p.modules);
+            Some p
+        | None -> Printf.eprintf "  Verilator side load failed (skipping)\n"; None
+  in
+
+  Printf.printf "[3/3] Loading Verible SV → BIR ...\n%!";
+  let verible =
+    match Sys.getenv_opt "MITER_VERIBLE_FILES",
+          Sys.getenv_opt "MITER_VERIBLE_TOP" with
+    | Some flist, Some top ->
+        let files = String.split_on_char ':' flist
+                    |> List.filter (fun s -> s <> "") in
+        (try Some (Verible_to_behavioral.convert_files ~top files)
+         with e ->
+           Printf.eprintf "  Verible failed: %s\n" (Printexc.to_string e);
+           None)
+    | _ ->
+        Printf.eprintf "  MITER_VERIBLE_FILES / MITER_VERIBLE_TOP unset\n";
+        None
+  in
+  (match verible with
+   | Some p ->
+       Printf.printf "  %d Verible modules\n" (List.length p.modules);
+       if Sys.getenv_opt "MITER_DEBUG_NAMES" <> None then
+         List.iter (fun (m : bmodule) ->
+           Printf.eprintf "  vrb:  %s\n" m.name) p.modules
+   | None -> ());
+
+  if Sys.getenv_opt "MITER_DEBUG_NAMES" <> None then
+    List.iter (fun (m : bmodule) ->
+      Printf.eprintf "  viv:  %s\n" m.name) viv.modules;
+
+  let by_name p =
+    List.fold_left (fun acc (m : bmodule) -> (m.name, m) :: acc) [] p.modules
+  in
+  let viv_idx = by_name viv in
+  let vlt_idx = match verilator with Some p -> by_name p | None -> [] in
+  let vrb_idx = match verible with Some p -> by_name p | None -> [] in
+
+  (* Pair Vivado entity → other-frontend entity:
+   *   1. exact name match
+   *   2. base name match after stripping Vivado's `__parameterized<N>`
+   *      OR the verible-style suffix __W..._M... etc.
+   *   3. port-shape match (same set of {name, width} for I/O signals)
+   * Step 3 handles Vivado's anonymous `__parameterized<N>` numbering
+   * vs. Verible's parameter-value-encoded names. *)
+  let base_of n =
+    try
+      let i = Str.search_forward (Str.regexp "__") n 0 in
+      String.sub n 0 i
+    with Not_found -> n
+  in
+  let port_shape (m : bmodule) =
+    List.filter_map (fun (s : bsignal) ->
+      match s.direction with
+      | `Input | `Output ->
+          let w = match s.stype with
+            | BInt { width; _ } -> width
+            | BArray { size; element = BInt { width; _ }; _ } -> size * width
+            | _ -> 0
+          in
+          Some (s.name, w)
+      | _ -> None
+    ) m.signals
+    |> List.sort compare
+  in
+  let lookup idx (viv_m : bmodule) =
+    let name = viv_m.name in
+    match List.assoc_opt name idx with
+    | Some m -> Some m
+    | None ->
+        let base = base_of name in
+        let viv_shape = port_shape viv_m in
+        let base_match =
+          if base = name then None
+          else List.assoc_opt base idx
+        in
+        (match base_match with
+         | Some m when port_shape m = viv_shape -> Some m
+         | _ ->
+             let candidates =
+               List.filter (fun (n, _) -> base_of n = base) idx in
+             (match List.find_opt (fun (_, m) ->
+                      port_shape m = viv_shape) candidates with
+              | Some (_, m) -> Some m
+              | None -> base_match))
+  in
+
+  Printf.printf "\n";
+  let rows = ref [] in
+  List.iter (fun (name, viv_m) ->
+    if matches name then begin
+      let vff = ff_q_set viv_m in
+      let vrb_ff = match lookup vrb_idx viv_m with
+        | Some m -> Some (ff_q_set m) | None -> None in
+      let vlt_ff = match lookup vlt_idx viv_m with
+        | Some m -> Some (ff_q_set m) | None -> None in
+      rows := (name, vff, vlt_ff, vrb_ff) :: !rows
+    end
+  ) viv_idx;
+
+  let scored = List.map (fun (name, vff, vlt_ff, vrb_ff) ->
+    let s_vlt = match vlt_ff with
+      | Some s -> jaccard vff s | None -> -1.0 in
+    let s_vrb = match vrb_ff with
+      | Some s -> jaccard vff s | None -> -2.0 in
+    (name, vff, vlt_ff, vrb_ff, s_vlt, s_vrb)
+  ) !rows in
+
+  (* Sort: best Verible match first, then by Vivado FF count (smaller
+   * entities are easier to triage). Failures (no Verible module) sink
+   * to the bottom. *)
+  let scored = List.sort (fun (_,_,_,_,_,a) (_,_,_,_,_,b) ->
+    compare b a) scored in
+
+  Printf.printf "═══════════════════════════════════════════════════════\n";
+  Printf.printf "  per-entity FF-set diff: vivado vs verible%s\n"
+    (if vlt_idx <> [] then " (verilator shown for reference)" else "");
+  Printf.printf "═══════════════════════════════════════════════════════\n\n";
+  Printf.printf "%-40s %4s %4s %4s  %4s  %s\n"
+    "entity" "viv" "vlt" "vrb" "J%" "verdict";
+  Printf.printf "%-40s %4s %4s %4s  %4s  %s\n"
+    (String.make 40 '-') "----" "----" "----" "----" "-------";
+
+  let fully_match = ref 0 in
+  let no_verible = ref 0 in
+  let mismatch = ref 0 in
+
+  List.iter (fun (name, vff, vlt_ff, vrb_ff, _, s_vrb) ->
+    let nv = List.length vff in
+    let nlt = match vlt_ff with Some s -> List.length s | None -> -1 in
+    let nrb = match vrb_ff with Some s -> List.length s | None -> -1 in
+    let pct, verdict =
+      match vrb_ff with
+      | None -> "-", "no verible"
+      | Some s when s = vff -> "100", "✓ match"
+      | Some _ ->
+          incr mismatch;
+          let p = int_of_float (s_vrb *. 100.0) in
+          (string_of_int p,
+           let only_v = List.filter (fun x -> not (List.mem x (Option.get vrb_ff))) vff in
+           let only_b = List.filter (fun x -> not (List.mem x vff)) (Option.get vrb_ff) in
+           Printf.sprintf "only-viv=[%s] only-vrb=[%s]"
+             (truncate (String.concat "," only_v) 40)
+             (truncate (String.concat "," only_b) 40))
+    in
+    (match vrb_ff with
+     | None -> incr no_verible
+     | Some s when s = vff -> incr fully_match
+     | _ -> ());
+    Printf.printf "%-40s %4d %4d %4d  %4s  %s\n"
+      (truncate name 40) nv nlt nrb pct verdict
+  ) scored;
+
+  let total = List.length scored in
+  Printf.printf "\n═══════════════════════════════════════════════════════\n";
+  Printf.printf "  Summary: %d entities, %d ✓ FF-match, %d mismatch, %d no-verible\n"
+    total !fully_match !mismatch !no_verible;
+  Printf.printf "═══════════════════════════════════════════════════════\n"

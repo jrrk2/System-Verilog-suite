@@ -89,26 +89,29 @@ let rec token_to_json_string ?(max_depth=3) depth token =
   (* Use getstr for any other token *)
   | other -> getstr other
 
-(* Parse Verilog file using Verible parser *)
+(* Parse Verilog file using Verible parser. The source goes through
+ * `Sv_preproc` first so `define / `ifdef / `ifndef / `else / `endif
+ * conditionals and macro expansions are resolved in-memory before
+ * the lexer ever sees them. *)
 let parse_verible_file filename =
-  let ic = open_in filename in
-  let lexbuf = Lexing.from_channel ic in
+  let preprocessed = Sv_preproc.preprocess_file filename in
+  let lexbuf = Lexing.from_string preprocessed in
+  Lexing.set_filename lexbuf filename;
   try
-    (* Create deflated lexer that converts token list to stream *)
     let deflated_lexer = Source_text_verible_lex.deflate Source_text_verible_lex.token in
-
-    (* Parse with the deflated lexer to get TUPLE tree *)
     let parse_tree = Source_text_verible.ml_start deflated_lexer lexbuf in
-    close_in ic;
     Some parse_tree
   with
   | Parsing.Parse_error ->
-      close_in ic;
-      Printf.eprintf "Parse error in %s\n" filename;
+      let p = Lexing.lexeme_start_p lexbuf in
+      Printf.eprintf "Parse error in %s at line %d col %d (token %S)\n"
+        filename p.pos_lnum (p.pos_cnum - p.pos_bol) (Lexing.lexeme lexbuf);
       None
   | e ->
-      close_in ic;
-      Printf.eprintf "Error parsing %s: %s\n" filename (Printexc.to_string e);
+      let p = Lexing.lexeme_start_p lexbuf in
+      Printf.eprintf "Error parsing %s at line %d col %d (token %S): %s\n"
+        filename p.pos_lnum (p.pos_cnum - p.pos_bol) (Lexing.lexeme lexbuf)
+        (Printexc.to_string e);
       Printexc.print_backtrace stderr;
       None
 

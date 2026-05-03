@@ -45,7 +45,6 @@
     List.iter 
       (fun (k,s) -> Hashtbl.add h s k)
       [
-( ACCEPT , "accept" );
 ( AMPERSAND , "ampersand" );
 ( AMPERSAND_AMPERSAND , "ampersand_AMPERSAND" );
 ( AMPERSAND_AMPERSAND_AMPERSAND , "ampersand_AMPERSAND_AMPERSAND" );
@@ -267,6 +266,7 @@
 ( Inside , "inside" );
 ( Instance , "instance" );
 ( Int , "int" );
+( Integer , "integer" );
 ( Interconnect , "interconnect" );
 ( Interface , "interface" );
 ( Intersect , "intersect" );
@@ -532,7 +532,19 @@ let space = [' ' '\t' '\r']+
 let newline = ['\n']
 let qstring = '"'[^'"']*'"'
 let comment = '/''/'[^'\n']*
-let line = '`'[^'\n']*
+(* `line` matches ONLY the standard Verilog preprocessor directives,
+ * which legitimately consume the rest of the source line. Anything
+ * else with a backtick prefix (e.g. `assert(cond);` macro calls in
+ * picorv32) is a real macro reference and must be tokenised so the
+ * parser can see it. *)
+let preproc_kw =
+    "define" | "undef" | "ifdef" | "ifndef" | "else" | "elsif" | "endif"
+  | "include" | "line" | "pragma" | "timescale" | "default_nettype"
+  | "resetall" | "celldefine" | "endcelldefine"
+  | "nounconnected_drive" | "unconnected_drive" | "begin_keywords"
+  | "end_keywords"
+let line = '`' preproc_kw [^'\n']*
+let macro_call_id = '`' ident
 let colon_begin = ':'[' ']*"begin"
    
 rule token = parse
@@ -603,6 +615,16 @@ rule token = parse
 | '~' { tok ( TILDE ) }
 
 | line { token lexbuf }
+(* `<ident>( ... );?` is a macro CALL. Without a real preprocessor
+ * we can't substitute the body, and the args may contain whatever
+ * the macro syntactically allows — `$display(...)` calls, embedded
+ * `;`s, etc. — which doesn't fit Verilog expression grammar. So
+ * consume the entire balanced-parens body via the `macro_args`
+ * sub-lexer below and silently drop it (plus any trailing `;`). *)
+| macro_call_id '(' { macro_args 1 lexbuf; token lexbuf }
+(* `<ident>` without an opening paren is a parameterless macro
+ * reference (e.g. picorv32's `FORMAL_KEEP reg [63:0] x;`). Skip. *)
+| macro_call_id { token lexbuf }
 | "/*" { comment lexbuf }
 | "(* " { comment lexbuf }
 
@@ -656,6 +678,28 @@ and comment = parse
 | '*''/' as com { if false then print_endline ("/*"^com); token lexbuf }
 | '*'')' as com { if false then print_endline ("/*"^com); token lexbuf }
 | _ { comment lexbuf }
+
+(* Skip the balanced-parens body of a macro call. `depth` is the
+ * number of unclosed `(` already consumed (the caller passes 1 after
+ * matching the macro's opening paren). String literals are tracked
+ * so that `(`/`)` inside them don't affect the depth. The trailing
+ * `;` (if any) is left for the parser to consume — it stands in for
+ * the empty statement that the skipped macro produces in contexts
+ * like `if (cond) `assert(...);`. *)
+and macro_args depth = parse
+| '(' { macro_args (depth + 1) lexbuf }
+| ')' { if depth <= 1 then () else macro_args (depth - 1) lexbuf }
+| '"' { macro_args_string depth lexbuf }
+| newline { incr lincnt; macro_args depth lexbuf }
+| _ { macro_args depth lexbuf }
+| eof { () }
+
+and macro_args_string depth = parse
+| '\\' '"' { macro_args_string depth lexbuf }
+| '"' { macro_args depth lexbuf }
+| newline { incr lincnt; macro_args_string depth lexbuf }
+| _ { macro_args_string depth lexbuf }
+| eof { () }
 
 (* pre-processing should have removed this stuff, but if not, skip over it *)
    
