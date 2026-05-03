@@ -328,6 +328,8 @@ let convert_cell (edif : edif_data) =
     signals;
     processes = [main_process];
     instances = hier_instances;
+    funcs = [];
+    mems = [];
   }
 
 (* Convert EDIF to Behavioral IR *)

@@ -457,6 +457,8 @@ let convert_vhdl_to_behavioral vhdl_ast =
     signals = all_signals;
     processes;
     instances = [];
+    funcs = [];
+    mems = [];
   } in
 
   { modules = [bmodule]; library_cells = [] }

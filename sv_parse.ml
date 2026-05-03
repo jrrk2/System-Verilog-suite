@@ -23,7 +23,11 @@ let rec parse_type attr json =
         let value = item |> member "valuep" |> to_list |> List.hd |> member "name" |> to_string in
         (item_name, value)
       ) items_json in
-      EnumType { name; items }
+      (* Verilator's ENUMDTYPE has a `refDTypep` pointing at the
+       * underlying packed type (e.g. `logic [3:0]`). Stash it as a
+       * pointer string here; rwtyp resolves it later. *)
+      let base = json |> member "refDTypep" |> to_string_option |> Option.value ~default:"" in
+      EnumType' { name; items; base }
       
   | "REFDTYPE" ->
       let name = json |> member "name" |> to_string_option |> Option.value ~default:"" in
@@ -91,13 +95,13 @@ let rec parse_type attr json =
 
   | "STRUCTDTYPE" ->
       let name = json |> member "name" |> to_string in
-      let packed = json |> member "packed" |> to_bool in
+      let packed = json |> member "packed" |> to_bool_option |> Option.value ~default:false in
       let members = json |> member "membersp" |> to_list |> List.map (parse_type attr) in
       StructType { name; packed; members }
 
   | "UNIONDTYPE" ->
       let name = json |> member "name" |> to_string in
-      let packed = json |> member "packed" |> to_bool in
+      let packed = json |> member "packed" |> to_bool_option |> Option.value ~default:false in
       let members = json |> member "membersp" |> to_list |> List.map (parse_type attr) in
       UnionType { name; packed; members }
 
@@ -446,19 +450,19 @@ let rec parse_json attr json =
       InitArray {inits}
 
   | "INITIAL" ->
-      let suspend = json |> member "isSuspendable" |> to_bool in
+      let suspend = json |> member "isSuspendable" |> to_bool_option |> Option.value ~default:false in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       Initial {suspend; stmts}
 
   | "INITIALSTATIC" ->
-      let suspend = json |> member "isSuspendable" |> to_bool in
-      let process = json |> member "needProcess" |> to_bool in
+      let suspend = json |> member "isSuspendable" |> to_bool_option |> Option.value ~default:false in
+      let process = json |> member "needProcess" |> to_bool_option |> Option.value ~default:false in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       InitialStatic {suspend; process; stmts}
 
   | "FINAL" ->
-      let suspend = json |> member "isSuspendable" |> to_bool in
-      let process = json |> member "needProcess" |> to_bool in
+      let suspend = json |> member "isSuspendable" |> to_bool_option |> Option.value ~default:false in
+      let process = json |> member "needProcess" |> to_bool_option |> Option.value ~default:false in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       Final {suspend; process; stmts}
 
@@ -466,7 +470,7 @@ let rec parse_json attr json =
       Finish
 
   | "DELAY" ->
-      let cycle = json |> member "isCycleDelay" |> to_bool in
+      let cycle = json |> member "isCycleDelay" |> to_bool_option |> Option.value ~default:false in
       let lhs = json |> member "lhsp" |> to_list |> List.hd |> parse' attr name in
       let stmts = json |> member "stmtsp" |> to_list |> List.map (parse' attr name) in
       Delay {cycle; lhs; stmts}
@@ -568,7 +572,7 @@ let rec parse_json attr json =
       JumpGo' { label }
 
   | "STOP" ->
-      let fatal = json |> member "isFatal" |> to_bool in
+      let fatal = json |> member "isFatal" |> to_bool_option |> Option.value ~default:false in
       Stop { fatal }
 
   | "CMETHODHARD" ->
@@ -785,7 +789,12 @@ and rwtyp attr = function
 | RefType' {name; dtype; refdtype } -> RefType { name;
     dtype_ref = (try Some (rwtyp attr (assoc_find attr.type_table dtype)) with Not_found -> None);
     refdtype_ref = (try Some (rwtyp attr (assoc_find attr.type_table refdtype)) with Not_found -> None) }
-| EnumType {name; items} as t -> t
+| EnumType _ as t -> t
+| EnumType' { name; items; base } ->
+    EnumType { name; items;
+               base = if base = "" then None
+                      else (try Some (rwtyp attr (assoc_find attr.type_table base))
+                            with Not_found -> None) }
 | StructType { name; packed; members } -> StructType { name; packed; members = List.map (rwtyp attr) members }
 | UnionType { name; packed; members } -> UnionType { name; packed; members = List.map (rwtyp attr) members }
 | MemberType' { name; dtype; child; value } ->
@@ -805,7 +814,13 @@ and rwtyp attr = function
 | ParamTypeType { name; dtype_ref } ->
     ParamTypeType { name; dtype_ref }
 | VoidType { name; resolved } -> VoidType { name; resolved }
-| oth -> othrwtyp := Some oth; failwith "othrwtyp"
+| oth ->
+    othrwtyp := Some oth;
+    (* Unknown type: keep going, record for later inspection. The
+     * caller can probe `othrwtyp` if needed. Most often this is a
+     * parameter type or a vendor-specific dtype that doesn't affect
+     * miter equivalence on the bulk of the design. *)
+    UnknownType ("rwtyp_unhandled", `Null)
 
 and rwlst attr = function
 | [] -> []

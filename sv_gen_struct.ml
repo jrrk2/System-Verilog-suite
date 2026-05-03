@@ -1,5 +1,16 @@
 (* ============================================================================
    sv_gen_struct.ml - Complete structural code generator with full type support
+   ============================================================================
+   DEPRECATED: this file is no longer on the active code path. The live
+   structural pipeline lives in sv_tran_struct.ml; sv_main_unified.ml dispatches
+   to it for both the `structural` and `xilinx_rtl` backends.
+
+   The local helpers below (is_clock_signal, is_reset_signal, detect_edge,
+   analyze_sensitivity_detailed, detect_reset_pattern, classify_always_block)
+   contain name-based clock/reset detection. DO NOT extend or revive them.
+   Any new clock/reset classification work should reuse the structural
+   classifier in sv_tran_struct.ml, which derives clock/reset/sync/async
+   purely from the always-block sensitivity list and body if-pattern.
    ============================================================================ *)
 
 open Sv_ast

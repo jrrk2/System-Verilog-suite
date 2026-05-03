@@ -105,6 +105,35 @@ type binstance = {
   port_connections: (string * bexpr) list;
 } [@@deriving yojson]
 
+(* Inferred memory. RAM: synchronous-write, async- or sync-read array,
+ * with `init_values = []`. ROM: read-only with `init_values` carrying
+ * the contents per address (small ROMs only — large ones would
+ * benefit from a different representation). *)
+type bmem_kind = BRam | BRom [@@deriving yojson]
+
+type bmem = {
+  mname: string;
+  data_width: int;
+  addr_width: int;
+  depth: int;
+  kind: bmem_kind;
+  init_values: int list;   (* indexed by address; empty for RAM *)
+} [@@deriving yojson]
+
+(* Function / task definition. Functions return a value; tasks don't.
+ * Both have parameter lists where each entry is (name, type, direction)
+ * — direction matters for tasks (input/output/inout). For functions
+ * every parameter is `Input. Local variables are listed separately
+ * from parameters; their initial values default to zero. *)
+type bfunc = {
+  fname: string;
+  is_task: bool;       (* false = function, true = task *)
+  ftype: btype;        (* return type (functions); BBool for tasks *)
+  params: (string * btype * [`Input | `Output | `Inout]) list;
+  locals: (string * btype) list;
+  body: bstmt list;
+} [@@deriving yojson]
+
 (* Module definition *)
 type bmodule = {
   name: string;
@@ -112,6 +141,8 @@ type bmodule = {
   signals: bsignal list;
   processes: bprocess list;
   instances: binstance list;
+  funcs: bfunc list;            (* function/task declarations in this module *)
+  mems: bmem list;              (* inferred memories — RAM or ROM *)
 } [@@deriving yojson]
 
 (* Library cell port specification - simpler than full bsignal *)

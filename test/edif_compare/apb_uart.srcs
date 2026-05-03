@@ -1,0 +1,12 @@
+../../sysver_tests/slib_clock_div.sv
+../../sysver_tests/slib_counter.sv
+../../sysver_tests/slib_edge_detect.sv
+../../sysver_tests/slib_fifo.sv
+../../sysver_tests/slib_input_filter.sv
+../../sysver_tests/slib_input_sync.sv
+../../sysver_tests/slib_mv_filter.sv
+../../sysver_tests/uart_baudgen.sv
+../../sysver_tests/uart_interrupt.sv
+../../sysver_tests/uart_receiver.sv
+../../sysver_tests/uart_transmitter.sv
+../../sysver_tests/apb_uart.sv

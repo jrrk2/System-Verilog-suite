@@ -26,6 +26,15 @@ type structural_context = {
   mutable current_clock: string option;
   mutable current_clock_edge: [`Posedge | `Negedge] option;
   mutable current_reset: string option;
+  mutable current_reset_edge: [`Async | `Sync] option;
+  (* Per-sequential-block substitution map for blocking assigns.
+   * After `x = expr` (blocking) inside a sequential always block, subsequent
+   * reads of `x` in the same block must resolve to the just-computed input
+   * wire (`expr` evaluated through any prior substitutions), not to the FF's
+   * Q output. The DFF for `x` is still emitted; if every use of `x` is
+   * substituted away (and `x` isn't externally observed), DCE drops it.
+   * Cleared on entry/exit of each sequential always block. *)
+  block_substitutions: (string, string) Hashtbl.t;
   memories: (string, Sv_memory.memory_info) Hashtbl.t;  (* Detected memories *)
   mutable registers_in_block: (string * int) list;  (* Track registers created in current always block *)
   mutable always_block_count: int;  (* Counter for always blocks *)
@@ -39,6 +48,8 @@ let create_context () = {
   current_clock = None;
   current_clock_edge = None;
   current_reset = None;
+  current_reset_edge = None;
+  block_substitutions = Hashtbl.create 16;
   memories = Hashtbl.create 10;
   registers_in_block = [];
   always_block_count = 0;
@@ -254,6 +265,11 @@ let gen_dff_en ctx clk clk_edge rst en d q width reset_val =
     | None -> "dff_en"
   in
   
+  let is_async =
+    match ctx.current_reset_edge with
+    | Some `Async -> 1
+    | _ -> 0
+  in
   let instance = Cell {
     name = inst_name;
     modp_addr = Some (Module {
@@ -275,6 +291,15 @@ let gen_dff_en ctx clk clk_edge rst en d q width reset_val =
           var_type = "GPARAM";
           direction = "NONE";
           value = Some (Const { name = string_of_int reset_val; dtype_ref = None });
+          dtype_name = "";
+          is_param = true;
+        };
+        Var {
+          name = "IS_ASYNC";
+          dtype_ref = None;
+          var_type = "GPARAM";
+          direction = "NONE";
+          value = Some (Const { name = string_of_int is_async; dtype_ref = None });
           dtype_name = "";
           is_param = true;
         }
@@ -843,100 +868,202 @@ type always_block_type =
   | Latch
   | Unsynthesizable of string
 
-(* Detect edge type from sensitivity *)
-let detect_edge edge_str =
-  let lower = String.lowercase_ascii edge_str in
-  if String.contains lower 'p' || lower = "pos" || lower = "posedge" then `Posedge
-  else if String.contains lower 'n' || lower = "neg" || lower = "negedge" then `Negedge
-  else failwith ("Unknown edge type: " ^ edge_str)
+(* ─── Structural classification ──────────────────────────────────────────
+ *
+ * Clock/reset/sync/async detection is purely structural — driven by the
+ * sensitivity list shape and the body's top-level `if` condition. Signal
+ * names play no role.
+ *
+ * Sensitivity list shape:
+ *   1 edge   → that signal is the clock; any reset is sync (lives in body).
+ *   2 edges  → one is the clock, one is an async reset; the body's top-level
+ *              `if` condition references the reset (the other is the clock).
+ *   3+ edges → unsynthesizable.
+ *
+ * Body if-pattern (used for sync detection and to disambiguate the 2-edge
+ * case): the top-level `if` of a sequential block has the form
+ *   if (<cond>) <constant-only assigns>; else <normal logic>;
+ * and <cond> is one of:  v  |  !v  |  v == K  |  v != K
+ * where v is the reset signal.
+ *
+ * ─────────────────────────────────────────────────────────────────────── *)
 
-(* Detect clock signals *)
-let is_clock_signal name =
-  let lower = String.lowercase_ascii name in
-  lower = "clk" || lower = "clock" || 
-  String.starts_with ~prefix:"clk" lower
-
-(* Detect reset signals *)
-let is_reset_signal name =
-  let lower = String.lowercase_ascii name in
-  lower = "rst" || lower = "reset" || lower = "rstn" || lower = "rst_n" ||
-  String.starts_with ~prefix:"rst" lower
-
-(* Analyze sensitivity list *)
-let analyze_sensitivity_detailed senses =
-  let clocks = ref [] in
-  let resets = ref [] in
-  let other_signals = ref [] in
-  
-  let rec process_sense = function
-    | SenTree items ->
-        List.iter process_sense items
-    | SenItem { edge_str; signal } ->
-        (match signal with
-        | VarRef { name; _ } ->
-            let edge = detect_edge edge_str in
-            if is_clock_signal name then
-              clocks := (name, edge) :: !clocks
-            else if is_reset_signal name then
-              resets := (name, edge) :: !resets
-            else
-              other_signals := (name, edge) :: !other_signals
-        | _ -> ())
+(* Collect all edge-triggered (signal_name, edge) pairs from a sensitivity
+ * list. Non-edge items (level-sensitive) are returned separately. *)
+let collect_sensitivity senses =
+  let edge_signals = ref [] in
+  let level_signals = ref [] in
+  let rec walk = function
+    | SenTree items -> List.iter walk items
+    | SenItem { edge_str; signal = VarRef { name; _ } } ->
+        (* Verilator emits "POS" / "NEG" for edge-triggered signals and
+         * "CHANGED" / "BOTH" / "" for level-sensitive ones. Match exactly
+         * — substring-matching on 'n' would catch "CHANGED" by accident. *)
+        let upper = String.uppercase_ascii edge_str in
+        if upper = "POS" || upper = "POSEDGE" then
+          edge_signals := (name, `Posedge) :: !edge_signals
+        else if upper = "NEG" || upper = "NEGEDGE" then
+          edge_signals := (name, `Negedge) :: !edge_signals
+        else
+          level_signals := name :: !level_signals
     | _ -> ()
   in
-  
-  List.iter process_sense senses;
-  (!clocks, !resets, !other_signals)
+  List.iter walk senses;
+  (List.rev !edge_signals, List.rev !level_signals)
 
-(* Detect reset pattern from statements *)
-let rec detect_reset_pattern stmt =
-  let rec has_only_resets = function
-    | Assign { rhs = Const { name; _ }; _ } when name = "0" || name = "'0" || name = "1'b0" -> true
-    | Begin { stmts; _ } -> List.for_all has_only_resets stmts
-    | _ -> false
-  in
-  
-  match stmt with
-  | If { condition; then_stmt; _ } ->
-      (match condition with
-      | VarRef { name; _ } when is_reset_signal name ->
-          if has_only_resets then_stmt then Some (name, `Sync) else None
-      | UnaryOp { op = "LOGNOT"; operand = VarRef { name; _ }; _ } when is_reset_signal name ->
-          if has_only_resets then_stmt then Some (name, `Sync) else None
-      | _ -> None)
-  | Begin { stmts; _ } ->
-      (match stmts with first :: _ -> detect_reset_pattern first | [] -> None)
+(* If the expression is a single-variable predicate (`v`, `!v`, `v == K`,
+ * `v != K`), return the variable name. Otherwise None. *)
+let predicate_signal = function
+  | VarRef { name; _ } -> Some name
+  | UnaryOp { op; operand = VarRef { name; _ }; _ }
+      when op = "LOGNOT" || op = "NOT" -> Some name
+  | BinaryOp { op; lhs = VarRef { name; _ }; rhs = Const _; _ }
+      when op = "EQ" || op = "NEQ" -> Some name
+  | BinaryOp { op; lhs = Const _; rhs = VarRef { name; _ }; _ }
+      when op = "EQ" || op = "NEQ" -> Some name
   | _ -> None
 
-(* Classify always block type *)
+(* Walk into the body of an always block and find its top-level `if`
+ * statement, skipping over nested Begin blocks but not over other
+ * statements. Returns (condition, then_stmt) of that if, or None. *)
+let rec find_top_if = function
+  | If { condition; then_stmt; _ } -> Some (condition, then_stmt)
+  | Begin { stmts; _ } ->
+      (match stmts with
+       | first :: _ -> find_top_if first
+       | [] -> None)
+  | _ -> None
+
+(* True if the statement assigns only constant values (recursively through
+ * nested begin blocks). Used to recognise the reset-clear pattern. *)
+let rec assigns_only_constants = function
+  | Assign { rhs = Const _; _ } -> true
+  | Begin { stmts; _ } -> List.for_all assigns_only_constants stmts
+  | _ -> false
+
+(* True if an expression is a literal constant (possibly nested through
+ * type-cast wrappers). Used to recognise reset-clear in folded ternary
+ * form, where Verilator turns
+ *   if (preset) q<=1'b1; else if (clear) q<=1'b0; else q<=d;
+ * into a single non-blocking assignment whose RHS is
+ *   preset ? 1'b1 : (clear ? 1'b0 : d)
+ *)
+let is_constant_expr = function
+  | Const _ -> true
+  | _ -> false
+
+(* Walk the if/else-if chain at the top of an always-block body and return
+ * the list of signals that look like async controls — i.e. each chain link
+ * has a single-signal predicate and a then-branch that assigns only
+ * constants. The list is in source order, so for
+ *   if (preset) q<=1; else if (clear) q<=0; else q<=d;
+ * we return ["preset"; "clear"]. Nested else-if chains keep extending while
+ * the pattern matches; the first non-reset-style else terminates the walk
+ * (typically the "real logic" branch).
+ *)
+(* Walk a chained ternary on the RHS of an assign, collecting reset signals.
+ * Each arm whose condition is a single-signal predicate AND whose then-value
+ * is a constant identifies an async control. *)
+let rec collect_reset_chain_cond = function
+  | Cond { condition; then_val; else_val } ->
+      (match predicate_signal condition with
+       | Some v when is_constant_expr then_val ->
+           v :: collect_reset_chain_cond else_val
+       | _ -> [])
+  | _ -> []
+
+let rec collect_reset_chain = function
+  | Begin { stmts = first :: _; _ } -> collect_reset_chain first
+  | If { condition; then_stmt; else_stmt } ->
+      (match predicate_signal condition with
+       | Some v when assigns_only_constants then_stmt ->
+           let rest = match else_stmt with
+             | Some es -> collect_reset_chain es
+             | None -> []
+           in
+           v :: rest
+       | _ -> [])
+  (* Folded form: a non-blocking assign whose RHS is a chained ternary.
+   * Verilator does this when the if/else-if body is a single-register
+   * sequence assigning the same lhs in every arm. *)
+  | Assign { rhs; _ } -> collect_reset_chain_cond rhs
+  | _ -> []
+
+let detect_body_reset_signals stmts =
+  collect_reset_chain (Begin { name = ""; stmts; is_generate = false })
+
+(* Classify an always block purely from its sensitivity list and body.
+ * No signal names are inspected. *)
 let classify_always_block always_type senses stmts =
   match always_type with
   | "always_comb" -> Combinational
   | "always_latch" -> Latch
-  | "always_ff" ->
-      let (clocks, resets, _) = analyze_sensitivity_detailed senses in
-      (match clocks, resets with
-      | (clk, clk_edge) :: [], [] ->
-          Sequential { clock = clk; clock_edge = clk_edge; reset = None }
-      | (clk, clk_edge) :: [], (rst, _) :: [] ->
-          Sequential { clock = clk; clock_edge = clk_edge; reset = Some (rst, `Async) }
-      | _ -> Unsynthesizable "always_ff must have exactly one clock")
-  | "always" ->
-      let (clocks, resets, others) = analyze_sensitivity_detailed senses in
-      if List.length clocks > 0 then
-        (match clocks, resets with
-        | (clk, clk_edge) :: [], [] ->
-            let sync_reset = detect_reset_pattern (Begin { name = ""; stmts; is_generate = false }) in
-            Sequential { clock = clk; clock_edge = clk_edge; reset = sync_reset }
-        | (clk, clk_edge) :: [], (rst, _) :: [] ->
-            Sequential { clock = clk; clock_edge = clk_edge; reset = Some (rst, `Async) }
-        | _ :: _ :: _, _ -> Unsynthesizable "Multiple clocks not supported"
-        | _, _ :: _ :: _ -> Unsynthesizable "Multiple resets not supported"
-        | _ -> Unsynthesizable "Invalid clock configuration")
-      else if List.length others > 0 || List.length senses = 0 then
-        Combinational
-      else
-        Unsynthesizable "Invalid sensitivity list"
+  | "always_ff" | "always" ->
+      let (edges, levels) = collect_sensitivity senses in
+
+      (* Given the list of async control names found in the body's if-chain
+       * and the (signal, edge) sensitivity-list entries, pick the clock as
+       * the unique edge signal not mentioned in the body, and the primary
+       * reset as the first body signal that's also in the sensitivity list.
+       * Returns the chosen clock and primary reset, plus any extras (body
+       * signals beyond the first that are also async edges — these are
+       * recognised but not currently wired into the cell). *)
+      let pick_clock_and_resets edges body_resets =
+        let edge_names = List.map fst edges in
+        let async_resets =
+          List.filter (fun r -> List.mem r edge_names) body_resets
+        in
+        let non_reset_edges =
+          List.filter (fun (n, _) -> not (List.mem n async_resets)) edges
+        in
+        match non_reset_edges, async_resets with
+        | [(clk, clk_edge)], primary :: extras ->
+            Some (clk, clk_edge, Some primary, extras)
+        | [(clk, clk_edge)], [] ->
+            Some (clk, clk_edge, None, [])
+        | _ -> None
+      in
+
+      (match edges, always_type with
+       (* Pure level-sensitive `always @(...)` with no edges → combinational *)
+       | [], "always" when levels <> [] || senses = [] -> Combinational
+
+       (* One edge → clock only; reset (if any) is sync, identified from
+        * the body if-chain. We only honour the *first* body match here since
+        * sync set/reset isn't a structural backend primitive. *)
+       | [(clk, clk_edge)], _ ->
+           let reset =
+             match detect_body_reset_signals stmts with
+             | r :: _ -> Some (r, `Sync)
+             | [] -> None
+           in
+           Sequential { clock = clk; clock_edge = clk_edge; reset }
+
+       (* Two or more edges → one is the clock, the rest are async controls.
+        * Disambiguate by matching body-if-chain signals against the
+        * sensitivity list. With three edges (set/reset FF) we recognise
+        * both controls but currently emit only the primary; warn on extras. *)
+       | _ :: _ :: _, _ ->
+           (match pick_clock_and_resets edges (detect_body_reset_signals stmts) with
+            | Some (clk, clk_edge, Some primary, extras) ->
+                List.iter (fun extra ->
+                  add_warning (Printf.sprintf
+                    "set/reset FF: secondary async control '%s' recognised but not wired into the register cell"
+                    extra)
+                ) extras;
+                Sequential { clock = clk; clock_edge = clk_edge;
+                             reset = Some (primary, `Async) }
+            | Some (_, _, None, _) | None ->
+                Unsynthesizable
+                  "multi-edge always block but body has no reset-style chain \
+                   (Verilator may have folded a 1-bit if/cond chain into pure \
+                   boolean logic — try widening the register or rewriting the \
+                   block to preserve structure)")
+
+       | [], "always_ff" ->
+           Unsynthesizable "always_ff with no edge-triggered signal"
+
+       | [], _ -> Unsynthesizable "Invalid sensitivity list")
   | _ -> Unsynthesizable ("Unknown always type: " ^ always_type)
 
 (* ============================================================================
@@ -1023,6 +1150,12 @@ let rec structural_expr ctx expr =
       (* References to memory arrays as variables are invalid - they should be ArraySel *)
       add_warning (Printf.sprintf "Invalid reference to memory array %s as variable" name);
       "/* mem_ref */"
+  | VarRef { name; _ }
+      when ctx.in_sequential && Hashtbl.mem ctx.block_substitutions name ->
+      (* Within a sequential always block, after `name = expr` (blocking),
+       * reads of `name` resolve to the just-computed input wire — not to
+       * the FF's Q output. *)
+      Hashtbl.find ctx.block_substitutions name
   | VarRef { name; _ } -> name
 
   | Const { name; _ } -> name
@@ -1129,11 +1262,17 @@ let rec structural_expr ctx expr =
   | _ -> 
       add_warning "Unsupported expression in structural conversion";
       "/* unsupported */"
+
 (* ============================================================================
    STATEMENT CONVERSION
    ============================================================================ *)
 
-let structural_assign ctx lhs rhs is_sequential =
+(* Both = and <= inside an always block produce a flip-flop by default.
+ * The is_blocking flag changes only how subsequent reads of lhs in the same
+ * sequential block resolve: after `lhs = expr`, reads see expr (the FF's D
+ * input); after `lhs <= expr`, reads still see lhs (the FF's Q output). The
+ * DCE pass later drops FFs whose Q is never used (purely-alias temporaries). *)
+let structural_assign ?(is_blocking=false) ctx lhs rhs is_sequential =
   (* Check if LHS is a memory array write or memory variable *)
   let is_memory_operation = match lhs with
     | ArraySel { expr = VarRef { name; _ }; _ } ->
@@ -1162,72 +1301,17 @@ let structural_assign ctx lhs rhs is_sequential =
         | Some { width; _ } -> width
         | None -> infer_width ctx rhs
       in
-      match ctx.current_clock with
-      | Some clk ->
-          let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
-          ()
-      | None ->
-          add_warning "Sequential assignment without clock context"
-    end else begin
-      if rhs_wire <> lhs_name then begin
-        let width = match get_var ctx lhs_name with
-          | Some { width; _ } -> width
-          | None -> infer_width ctx rhs
-        in
-        let range_str = if width > 1
-          then Some (Printf.sprintf "%d:0" (width - 1))
-          else None in
-
-        let assign = AssignW {
-          lhs = VarRef { name = lhs_name; access = "WR";
-                        dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
-          rhs = VarRef { name = rhs_wire; access = "RD";
-                        dtype_ref = Some (BasicType {keyword = "logic"; range = range_str}) };
-        } in
-        ctx.instances := assign :: !(ctx.instances)
-      end
-    end
-  end
-
-(* ============================================================================
-   STATEMENT CONVERSION
-   ============================================================================ *)
-
-let structural_assign ctx lhs rhs is_sequential =
-  (* Check if LHS is a memory array write or memory variable *)
-  let is_memory_operation = match lhs with
-    | ArraySel { expr = VarRef { name; _ }; _ } ->
-        (* Array element write mem[addr] <= data *)
-        Hashtbl.mem ctx.memories name
-    | VarRef { name; _ } ->
-        (* Whole array assignment mem <= value *)
-        Hashtbl.mem ctx.memories name
-    | _ -> false
-  in
-
-  (* Memory operations are handled by memory primitive, skip DFF/assign generation *)
-  if is_memory_operation then begin
-    Printf.eprintf "        Skipping DFF/assign for memory operation\n%!";
-    ()
-  end else begin
-    let lhs_name = match lhs with
-      | VarRef { name; _ } -> name
-      | Sel _ | ArraySel _ -> structural_expr ctx lhs
-      | _ -> "unknown"
-    in
-    let rhs_wire = structural_expr ctx rhs in
-
-    if is_sequential then begin
-      let width = match get_var ctx lhs_name with
-        | Some { width; _ } -> width
-        | None -> infer_width ctx rhs
-      in
-      match ctx.current_clock with
-      | Some clk ->
-          let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset None rhs_wire lhs_name width 0 in
-          ()
-      | None ->
-          add_warning "Sequential assignment without clock context"
+      (match ctx.current_clock with
+       | Some clk ->
+           let _ = gen_dff_en ctx clk ctx.current_clock_edge ctx.current_reset
+                     None rhs_wire lhs_name width 0 in
+           ()
+       | None ->
+           add_warning "Sequential assignment without clock context");
+      (* Blocking: subsequent reads of lhs in this block resolve to rhs_wire,
+       * not to the FF's Q output. *)
+      if is_blocking then
+        Hashtbl.replace ctx.block_substitutions lhs_name rhs_wire
     end else begin
       if rhs_wire <> lhs_name then begin
         let width = match get_var ctx lhs_name with
@@ -1253,7 +1337,12 @@ let structural_assign ctx lhs rhs is_sequential =
 let rec structural_if ctx condition then_stmt else_stmt =
   if ctx.in_sequential then begin
     let is_enable_condition = match condition with
-      | VarRef { name; _ } when not (is_reset_signal name) -> true
+      | VarRef { name; _ } ->
+          (* The reset condition was already lifted out by the classifier;
+           * any other VarRef condition is treated as an enable. *)
+          (match ctx.current_reset with
+           | Some r when r = name -> false
+           | _ -> true)
       | _ -> false
     in
     
@@ -1553,9 +1642,9 @@ and validate_hardware_expr ctx = function
 (* Convert statement to structural form *)
 let rec structural_stmt ctx stmt =
   match stmt with
-  | Assign { lhs; rhs; _ } ->
-      structural_assign ctx lhs rhs ctx.in_sequential
-  
+  | Assign { lhs; rhs; is_blocking } ->
+      structural_assign ~is_blocking ctx lhs rhs ctx.in_sequential
+
   | AssignW { lhs; rhs } ->
       structural_assign ctx lhs rhs false
   
@@ -1585,6 +1674,7 @@ let rec structural_stmt ctx stmt =
             let old_clock = ctx.current_clock in
             let old_clock_edge = ctx.current_clock_edge in
             let old_reset = ctx.current_reset in
+            let old_reset_edge = ctx.current_reset_edge in
 
             (* Increment block counter and clear register list *)
             ctx.always_block_count <- ctx.always_block_count + 1;
@@ -1594,8 +1684,13 @@ let rec structural_stmt ctx stmt =
             ctx.current_clock <- Some clock;
             ctx.current_clock_edge <- Some clock_edge;
             ctx.current_reset <- (match reset with Some (r, _) -> Some r | None -> None);
+            ctx.current_reset_edge <- (match reset with Some (_, e) -> Some e | None -> None);
+            (* Blocking-substitution map is per-block. *)
+            Hashtbl.clear ctx.block_substitutions;
 
             List.iter (structural_stmt ctx) stmts;
+
+            Hashtbl.clear ctx.block_substitutions;
 
             (* Report inferred registers after processing block *)
             report_inferred_registers ctx ctx.always_block_count clock ctx.current_reset;
@@ -1603,7 +1698,8 @@ let rec structural_stmt ctx stmt =
             ctx.in_sequential <- old_sequential;
             ctx.current_clock <- old_clock;
             ctx.current_clock_edge <- old_clock_edge;
-            ctx.current_reset <- old_reset
+            ctx.current_reset <- old_reset;
+            ctx.current_reset_edge <- old_reset_edge
           end
       
       | Combinational ->
@@ -1752,21 +1848,132 @@ let rec collect_vars ctx acc stmts =
     stmts = params @ ports @ body_stmts;
   }
 
+(* ============================================================================
+   DEAD CODE ELIMINATION
+   ============================================================================
+   After blocking-substitution rewrites reads of `tmp = expr` to use `expr`
+   directly, the FF emitted for `tmp` may have a Q output that nobody reads.
+   Such FFs (and their declared output wires) are pure aliases — the user's
+   blocking-vs-non-blocking principle says they shouldn't materialise as
+   registers. This pass removes them.
+
+   We iterate to a fixpoint: dropping one dead FF can make another one dead
+   (e.g. a chain of blocking aliases). *)
+
+let module_dce m =
+  let is_register_cell mod_name =
+    mod_name = "dff_en" || mod_name = "dffn_en"
+    || (String.length mod_name >= 8
+        && String.sub mod_name 0 8 = "RTL_REG_")
+  in
+
+  (* Collect every wire name that is "consumed" — read by something. *)
+  let collect_consumed stmts ports_with_drive =
+    let consumed = Hashtbl.create 64 in
+    List.iter (fun p -> Hashtbl.replace consumed p ()) ports_with_drive;
+    let rec walk = function
+      | VarRef { name; access = "RD"; _ } ->
+          Hashtbl.replace consumed name ()
+      | VarRef _ -> ()
+      | Pin { expr = Some e; _ } -> walk e
+      | Pin _ -> ()
+      | Cell { pins; _ } -> List.iter walk pins
+      | AssignW { rhs; _ } -> walk rhs
+      | UnaryOp { operand; _ } -> walk operand
+      | BinaryOp { lhs; rhs; _ } -> walk lhs; walk rhs
+      | Cond { condition; then_val; else_val } ->
+          walk condition; walk then_val; walk else_val
+      | Concat { parts } -> List.iter walk parts
+      | Sel { expr; lsb; _ } -> walk expr; (match lsb with Some e -> walk e | None -> ())
+      | ArraySel { expr; index } -> walk expr; walk index
+      | _ -> ()
+    in
+    List.iter walk stmts;
+    consumed
+  in
+
+  let cell_q_name pins =
+    List.fold_left (fun acc p ->
+      match acc, p with
+      | None, Pin { name; expr = Some (VarRef { name = qn; _ }) }
+        when name = "q" || name = "Q" -> Some qn
+      | _ -> acc
+    ) None pins
+  in
+
+  match m with
+  | Module { name; stmts } ->
+      (* Output port names are externally observed → always consumers. *)
+      let output_ports =
+        List.filter_map (function
+          | Var { name; var_type = "PORT"; direction; _ }
+            when direction = "OUTPUT" || direction = "INOUT" -> Some name
+          | _ -> None
+        ) stmts
+      in
+
+      let stmts_ref = ref stmts in
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        let consumed = collect_consumed !stmts_ref output_ports in
+        let kept = List.filter (fun s ->
+          match s with
+          | Cell { modp_addr = Some (Module { name = m; _ }); pins; _ }
+              when is_register_cell m ->
+              (match cell_q_name pins with
+               | Some qn when not (Hashtbl.mem consumed qn) ->
+                   changed := true; false
+               | _ -> true)
+          | _ -> true
+        ) !stmts_ref in
+        stmts_ref := kept
+      done;
+
+      (* Also drop now-orphaned wire/var declarations whose names appear
+       * neither as a consumer nor as the driver of any remaining cell. *)
+      let consumed_final = collect_consumed !stmts_ref output_ports in
+      let driven = Hashtbl.create 32 in
+      List.iter (function
+        | Cell { pins; _ } ->
+            List.iter (function
+              | Pin { expr = Some (VarRef { name; access = "WR"; _ }); _ } ->
+                  Hashtbl.replace driven name ()
+              | _ -> ()
+            ) pins
+        | AssignW { lhs = VarRef { name; _ }; _ } ->
+            Hashtbl.replace driven name ()
+        | _ -> ()
+      ) !stmts_ref;
+      let final = List.filter (function
+        | Var { name; var_type; _ }
+            when var_type <> "PORT" && var_type <> "GPARAM" ->
+            Hashtbl.mem consumed_final name || Hashtbl.mem driven name
+        | _ -> true
+      ) !stmts_ref in
+
+      Module { name; stmts = final }
+  | other -> other
+
+(* ============================================================================
+   ENTRY POINT
+   ============================================================================ *)
+
 let rec generate_structural node indent =
   match node with
   | Netlist modules ->
       clear_warnings ();
       let packages = extract_packages (Netlist modules) in
       let module_nodes = List.filter_map (function
-        | Module { name; stmts } -> 
-            Some (structural_module name stmts packages)
+        | Module { name; stmts } ->
+            Some (module_dce (structural_module name stmts packages))
         | _ -> None
       ) modules in
       Netlist module_nodes
-  
+
   | Module { name; stmts } ->
-      structural_module name stmts []
-  
+      module_dce (structural_module name stmts [])
+
   | _ -> node
 
 (* Return AST + warnings *)

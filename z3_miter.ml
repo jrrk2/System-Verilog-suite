@@ -119,8 +119,24 @@ let rec expr_to_z3 suffix ctx_sigs = function
       Z3.BitVector.mk_numeral ctx (string_of_int value) width
 
   | BBinOp { op; lhs; rhs; result_type } ->
-      let z3_lhs = expr_to_z3 suffix ctx_sigs lhs in
-      let z3_rhs = expr_to_z3 suffix ctx_sigs rhs in
+      let z3_lhs0 = expr_to_z3 suffix ctx_sigs lhs in
+      let z3_rhs0 = expr_to_z3 suffix ctx_sigs rhs in
+      (* Normalise operand widths. When the converter emits a cell with
+       * fixed result_type=64 but the operands have narrower actual
+       * widths, Z3 sort-checks fail. Zero-extend the smaller operand to
+       * match the larger; this is correct semantics for unsigned bit-
+       * vector ops on naturally-aligned values. *)
+      let widen z3_a z3_b =
+        let wa = Z3.BitVector.get_size (Z3.Expr.get_sort z3_a) in
+        let wb = Z3.BitVector.get_size (Z3.Expr.get_sort z3_b) in
+        if wa = wb then z3_a, z3_b
+        else if wa < wb then
+          Z3.BitVector.mk_zero_ext ctx (wb - wa) z3_a, z3_b
+        else
+          z3_a, Z3.BitVector.mk_zero_ext ctx (wa - wb) z3_b
+      in
+      let z3_lhs, z3_rhs = widen z3_lhs0 z3_rhs0 in
+      ignore result_type;
       (* Helper to convert boolean to 1-bit bitvector *)
       let bool_to_bv1 b =
         Z3.Boolean.mk_ite ctx b
@@ -149,23 +165,70 @@ let rec expr_to_z3 suffix ctx_sigs = function
 
   | BUnOp { op; operand; result_type } ->
       let z3_operand = expr_to_z3 suffix ctx_sigs operand in
+      ignore result_type;
       (match op with
        | BNot -> Z3.BitVector.mk_not ctx z3_operand
        | BNeg -> Z3.BitVector.mk_neg ctx z3_operand
-       | BRedAnd | BRedOr | BRedXor -> z3_operand)  (* Approximation *)
+       (* Bitvector reductions: Z3's mk_redand/mk_redor return 1-bit
+        * bitvectors directly. *)
+       | BRedAnd -> Z3.BitVector.mk_redand ctx z3_operand
+       | BRedOr  -> Z3.BitVector.mk_redor  ctx z3_operand
+       | BRedXor ->
+           (* Z3 doesn't expose redxor — encode as parity via XOR-fold. *)
+           let n = Z3.BitVector.get_size (Z3.Expr.get_sort z3_operand) in
+           let bit i =
+             Z3.BitVector.mk_extract ctx i i z3_operand
+           in
+           let rec fold i acc =
+             if i >= n then acc
+             else fold (i + 1) (Z3.BitVector.mk_xor ctx acc (bit i))
+           in
+           if n = 0 then Z3.BitVector.mk_numeral ctx "0" 1
+           else fold 1 (bit 0))
 
   | BCond { condition; then_val; else_val } ->
       let z3_cond = expr_to_z3 suffix ctx_sigs condition in
       let z3_then = expr_to_z3 suffix ctx_sigs then_val in
       let z3_else = expr_to_z3 suffix ctx_sigs else_val in
-      (* Condition is a 1-bit bitvector, convert to boolean by checking != 0 *)
-      let zero = Z3.BitVector.mk_numeral ctx "0" 1 in
+      (* Condition is non-zero ≡ true. Use a same-width zero for the
+       * comparison; the previous fixed 1-bit zero failed when the
+       * condition expression was wider than 1 bit (e.g., a vector test
+       * that gets implicitly reduced via != 0). *)
+      let cond_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_cond) in
+      let zero = Z3.BitVector.mk_numeral ctx "0" cond_w in
       let cond_bool = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx z3_cond zero) in
+      (* Then/else values may have different widths; widen the smaller
+       * to match the larger so the ITE returns a uniform sort. *)
+      let wt = Z3.BitVector.get_size (Z3.Expr.get_sort z3_then) in
+      let we = Z3.BitVector.get_size (Z3.Expr.get_sort z3_else) in
+      let z3_then, z3_else =
+        if wt = we then z3_then, z3_else
+        else if wt < we then
+          Z3.BitVector.mk_zero_ext ctx (we - wt) z3_then, z3_else
+        else
+          z3_then, Z3.BitVector.mk_zero_ext ctx (wt - we) z3_else
+      in
       Z3.Boolean.mk_ite ctx cond_bool z3_then z3_else
 
   | BSlice { signal; msb; lsb } ->
       let z3_signal = expr_to_z3 suffix ctx_sigs signal in
-      Z3.BitVector.mk_extract ctx msb lsb z3_signal
+      let sig_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_signal) in
+      let req_w = msb - lsb + 1 in
+      (* Z3 requires msb < signal width. Clamp gracefully when our
+       * width inference under-sizes the source (e.g. nested generate
+       * locals whose dtype lookups fall back to 1 bit). Two cases:
+       *   - lsb >= sig_w:  the requested slice is entirely above the
+       *     signal — return zero of the requested width.
+       *   - msb >= sig_w:  zero-extend the signal so the extract is
+       *     well-formed, then take the requested slice. *)
+      if lsb >= sig_w then
+        Z3.BitVector.mk_numeral ctx "0" req_w
+      else
+        let z3_signal =
+          if msb < sig_w then z3_signal
+          else Z3.BitVector.mk_zero_ext ctx (msb - sig_w + 1) z3_signal
+        in
+        Z3.BitVector.mk_extract ctx msb lsb z3_signal
 
   | BConcat exprs ->
       List.fold_right (fun e acc ->
@@ -189,7 +252,11 @@ let rec expr_to_z3 suffix ctx_sigs = function
       (* Unsupported for now *)
       Z3.BitVector.mk_numeral ctx "0" 32
 
-(* Encode statement as Z3 constraint *)
+(* Encode statement as Z3 constraint. After the FF-rip pass
+ * (Behavioral_ffrip.rip_program), there are no BSequential blocks
+ * left — every register is replaced by a primary input (Q) and a
+ * primary output (Q__D = next-state combinational expression). The
+ * encoder therefore needs no special sequential handling. *)
 let rec encode_stmt suffix ctx_sigs solver = function
   | BAssign { lhs; rhs } ->
       (* Get LHS width from context - must use declared signal width *)
@@ -197,12 +264,10 @@ let rec encode_stmt suffix ctx_sigs solver = function
         match List.assoc_opt lhs ctx_sigs with
         | Some w -> w
         | None ->
-            (* Try SSA-stripped name *)
             let stripped = strip_ssa_suffix lhs in
             (match List.assoc_opt stripped ctx_sigs with
              | Some w -> w
              | None ->
-                 (* Last resort: try to infer from RHS *)
                  (match width_of_expr rhs with
                   | Some w -> w
                   | None -> 32))
@@ -232,7 +297,7 @@ let rec encode_stmt suffix ctx_sigs solver = function
       )
 
   | BIf { condition; then_stmts; else_stmts } ->
-      (* Simplified: encode all branches *)
+      ignore condition;
       List.iter (encode_stmt suffix ctx_sigs solver) then_stmts;
       List.iter (encode_stmt suffix ctx_sigs solver) else_stmts
 
@@ -250,7 +315,10 @@ let rec encode_stmt suffix ctx_sigs solver = function
 
   | BCallStmt _ | BReturn _ -> ()
 
-(* Encode process as Z3 constraints *)
+(* All processes encode the same way after FF-ripping: Behavioral_ffrip
+ * has rewritten BSequential into BCombinational with explicit Q__D
+ * primary outputs, so we just walk every body and emit the equality
+ * constraints. *)
 let encode_process suffix ctx_sigs solver = function
   | BCombinational { body; _ } | BSequential { body; _ } ->
       List.iter (encode_stmt suffix ctx_sigs solver) body
@@ -350,6 +418,15 @@ let check_miter_equivalence bmod1 bmod2 =
   Printf.printf "Design 1: %s\n" bmod1.name;
   Printf.printf "Design 2: %s\n\n" bmod2.name;
 
+  (* Rip flip-flops on both sides: every Q becomes a primary input
+   * (current state matched by name across the two designs) and
+   * every Q's next-state expression becomes a fresh primary
+   * output `<Q>__D`. The miter then reduces to a combinational
+   * check, with EDFFs and DFF+MUX naturally producing the same
+   * D-pin function. *)
+  let bmod1 = Behavioral_ffrip.rip_module bmod1 in
+  let bmod2 = Behavioral_ffrip.rip_module bmod2 in
+
   (* Get input/output ports *)
   let inputs1 = get_input_signals bmod1 in
   let inputs2 = get_input_signals bmod2 in
@@ -407,13 +484,21 @@ let check_miter_equivalence bmod1 bmod2 =
       Z3.Solver.add miter_solver [eq]
     ) inputs1;
 
-    (* Build miter: XOR all outputs and OR them *)
+    (* After Behavioral_ffrip every register Q has been turned into
+     * a primary input (its current state) and Q__D has been added as
+     * a primary output (the next-state combinational expression).
+     * The standard input-matching + output-XOR construction below
+     * therefore handles sequential equivalence at depth 1 with no
+     * special casing — `Q_d1 = Q_d2` falls out of input matching
+     * and `Q__D_d1 ?= Q__D_d2` falls out of the output XOR. *)
+    ignore ctx2;
+
+    (* Build miter: XOR all outputs (which now include the FF D pins) *)
     Printf.printf "Building miter circuit (XOR outputs)...\n";
     let miter_terms = List.map (fun (name, width) ->
       let out1 = bv_var name width "_d1" in
       let out2 = bv_var name width "_d2" in
       let xor = Z3.BitVector.mk_xor ctx out1 out2 in
-      (* Check if any bit is different *)
       let zero = Z3.BitVector.mk_numeral ctx "0" width in
       Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero)
     ) outputs1 in

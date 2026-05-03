@@ -118,8 +118,11 @@ let clock_div_behavioral_ir =
         ];
 
         instances = [];
+        funcs = [];
+    mems = [];
       }
-    ]
+    ];
+    library_cells = [];
   }
 
 let () =

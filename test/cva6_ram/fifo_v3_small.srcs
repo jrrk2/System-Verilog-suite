@@ -1,0 +1,2 @@
+fifo_v3_small.sv
+../../../cva6/vendor/pulp-platform/common_cells/src/fifo_v3.sv

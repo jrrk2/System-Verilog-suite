@@ -1,0 +1,2 @@
+syncspram_small.sv
+../../../cva6/vendor/pulp-platform/fpga-support/rtl/SyncSpRam.sv

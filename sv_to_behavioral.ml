@@ -277,6 +277,8 @@ let module_data_to_bmodule module_name (mod_data : module_data) symbol_table =
     signals = port_signals @ internal_signals;
     processes = processes @ assign_process;
     instances = [];
+    funcs = [];
+    mems = [];
   }
 
 (* Main conversion function *)

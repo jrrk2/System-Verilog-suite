@@ -50,31 +50,49 @@ let strip_backslash s =
     String.sub s 1 (String.length s - 1)
   else s
 
+(* RTLIL sigspecs come in several shapes:
+ *   `\foo`            → SigWire "foo"
+ *   `\foo [N]`        → SigBit  ("foo", N)        (slice — space before `[`)
+ *   `\foo [M:N]`      → SigRange("foo", M, N)
+ *   `2'10`, `4'h7`    → SigConst (the raw literal)
+ *   `{ a b c }`       → SigWire of the raw text   (TODO: real concat)
+ *
+ * Yosys also writes wires whose *names* literally contain brackets,
+ * e.g. `$0\iRDAddr[6:0]` (SSA-renamed) or `\size64.iFIFOMem[60]`
+ * (memory bit-blasted to per-cell regs). The discriminator is the
+ * space: a slice has ` [` (space before bracket), a literal-bracket
+ * name has `[` directly. *)
 let parse_sigspec s =
   let s = String.trim s in
-  if String.length s > 0 && s.[0] = '{' then
-    (* TODO: Parse concatenation *)
+  let fallback () = SigWire (strip_backslash s) in
+  if String.length s = 0 then fallback ()
+  else if s.[0] = '{' then
+    (* TODO: parse concatenation properly. *)
     SigWire s
-  else if String.contains s '[' then
-    (* Bit select or range *)
-    let parts = String.split_on_char '[' s in
-    if List.length parts = 2 then
-      let wire = strip_backslash (List.nth parts 0) in
-      let bracket = List.nth parts 1 in
-      let bracket = String.sub bracket 0 (String.length bracket - 1) in
-      if String.contains bracket ':' then
-        let range_parts = String.split_on_char ':' bracket in
-        if List.length range_parts = 2 then
-          SigRange (wire, int_of_string (List.nth range_parts 0),
-                         int_of_string (List.nth range_parts 1))
-        else SigWire (strip_backslash s)
-      else
-        SigBit (wire, int_of_string bracket)
-    else SigWire (strip_backslash s)
-  else if String.length s > 0 && (s.[0] = '\'' || (String.length s > 1 && s.[1] = '\'')) then
+  else if String.length s > 1 && (s.[0] = '\'' || s.[1] = '\'') then
     SigConst s
   else
-    SigWire (strip_backslash s)
+    (* Look for ` [` (space + bracket) — only that form is a slice. *)
+    match String.index_opt s ' ' with
+    | Some i when i + 1 < String.length s && s.[i + 1] = '[' ->
+        let wire = strip_backslash (String.sub s 0 i) in
+        let after = String.sub s (i + 1) (String.length s - i - 1) in
+        let last = String.length after - 1 in
+        if last < 1 || after.[0] <> '[' || after.[last] <> ']'
+        then fallback ()
+        else
+          let bracket = String.sub after 1 (last - 1) in
+          if String.contains bracket ':' then
+            match String.split_on_char ':' bracket with
+            | [a; b] ->
+                (try SigRange (wire, int_of_string (String.trim a),
+                                     int_of_string (String.trim b))
+                 with Failure _ -> fallback ())
+            | _ -> fallback ()
+          else
+            (try SigBit (wire, int_of_string (String.trim bracket))
+             with Failure _ -> fallback ())
+    | _ -> fallback ()
 
 (* Line-based parser *)
 let parse_rtlil_file filename =

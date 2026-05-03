@@ -350,16 +350,11 @@ let anything_but_quote = [
 
 rule token = parse
 |  '\\'anything_but_blank+' ' as word {IDSTR (String.sub word 1 (String.length word -2)) }
-(*
-|  "//"anything_but_newline* as comment {trace_log (ASCNUM comment); token lexbuf}
-| "/*"
-    { comment (Lexing.lexeme_start lexbuf) lexbuf; token lexbuf }
-| "(*"
-    { comment2 (Lexing.lexeme_start lexbuf) lexbuf; token lexbuf }
-| "//"
-    { comment3 (Lexing.lexeme_start lexbuf) lexbuf; token lexbuf }
-|  "//ABC"anything_but_newline*'\n' as abc {hlog lexbuf (ABC (String.sub abc 5 (String.length abc -5))) }
-*)
+(* Verilog-2001 attribute instances: (* attr [, attr]* *) — consumed and
+ * discarded so they don't perturb downstream parsing. The pre-pass in
+ * my_input_line already strips /* */ and // comments; this rule is what
+ * Vivado-emitted Verilog tripped on. *)
+| "(*" { attr_block (Lexing.lexeme_start lexbuf) lexbuf; token lexbuf }
 |  "bufif"digit+ as def		{ hlog lexbuf (BUFIF def) }
 |  "notif"digit+ as def		{ hlog lexbuf (NOTIF def) }
 |  "tranif"digit+ as def	{ hlog lexbuf (TRANIF def) }
@@ -467,34 +462,7 @@ if Hashtbl.mem ksymbols word then hlog lexbuf (Hashtbl.find ksymbols word) else 
   | eof		{ hlog lexbuf (ENDOFFILE) }
   | _		{ hlog lexbuf (ILLEGAL ( lexeme_char lexbuf 0 ) ) }
 
-(*
-and comment start = parse
-  "/*"
-    { comment (Lexing.lexeme_start lexbuf) lexbuf; comment start lexbuf }
-| "*/"
-    { () }
-| eof
-    { failwith (Printf.sprintf "Unterminated /* comment */ at offset %d." start) }
-| _
-    { comment start lexbuf }
-
-and comment2 start = parse
-  "(*"
-    { comment2 (Lexing.lexeme_start lexbuf) lexbuf; comment2 start lexbuf }
-| "*)"
-    { () }
-| eof
-    { failwith (Printf.sprintf "Unterminated (* comment *) at offset %d." start) }
-| _
-    { comment2 start lexbuf }
-
-and comment3 start = parse
-  "//"
-    { comment3 (Lexing.lexeme_start lexbuf) lexbuf; comment3 start lexbuf }
-| '\n'
-    { () }
-| eof
-    { failwith (Printf.sprintf "Unterminated // comment at offset %d." start) }
-| _
-    { comment3 start lexbuf }
-*)
+and attr_block start = parse
+  "*)" { () }
+| eof  { failwith (Printf.sprintf "Unterminated (* *) at offset %d." start) }
+| _    { attr_block start lexbuf }

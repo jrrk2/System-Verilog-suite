@@ -1007,6 +1007,17 @@ and moditemlist out_chan tree =
               decls out_chan (init_tree [] "" newdecl syms "") Create
           | EMPTY -> enter_a_sym out_chan syms id IOPORT UNKNOWN Create
           | oth -> unhandled out_chan 977 oth)
+        (* Verilog-2001 explicit-named-port shorthand: `.NAME` in the port
+         * list means an external port named NAME (typically also bound to
+         * an internal expression of the same name, or an explicit
+         * concatenation). For declaration purposes we just need NAME
+         * registered as an I/O port — the binding details are downstream
+         * detail we don't model here. Vivado emits this for vector ports
+         * it bit-blasts internally (e.g. `.PRDATA({\PRDATA[31] , ...})`). *)
+        | DOUBLE (DOT, ID id)
+        | TRIPLE (DOT, ID id, _)
+        | TRIPLE (ID id, DOT, _) ->
+            enter_a_sym out_chan syms id IOPORT UNKNOWN Create
         | _ -> unhandled out_chan 971 arg) arg3;
 	Hashtbl.iter (fun item _ -> dispatch out_chan (init_tree [] "" item syms "") true) (fst targ4);
 	Hashtbl.iter (fun item _ -> dispatch out_chan (init_tree [] "" item syms "") true) (snd targ4);

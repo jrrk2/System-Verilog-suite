@@ -8,7 +8,8 @@ type interface_ref = {
 (* Type definitions from the TYPETABLE *)
 type sv_type =
   | BasicType of { keyword: string; range: string option }
-  | EnumType of { name: string; items: (string * string) list }
+  | EnumType' of { name: string; items: (string * string) list; base: string }
+  | EnumType of { name: string; items: (string * string) list; base: sv_type option }
   | StructType of { name: string; packed: bool; members: sv_type list;  }
   | UnionType of { name: string; packed: bool; members: sv_type list;  }
   | MemberType' of { name: string; dtype: string; child: sv_type list; value: sv_type list;  }

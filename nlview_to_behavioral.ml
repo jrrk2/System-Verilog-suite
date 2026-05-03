@@ -395,11 +395,14 @@ let convert filename =
     signals;
     processes = [main_process];
     instances = hier_instances;
+    funcs = [];
+    mems = [];
   } in
 
   (* Create program *)
   {
     modules = [bmod];
+    library_cells = [];
   }
 
 (* Convert and print statistics *)

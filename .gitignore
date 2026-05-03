@@ -62,3 +62,56 @@ test_vhdl_to_ir
 uart_ir_dumps/
 uart_sv_output/
 vhdl_to_sv_output/
+
+# Claude Code per-project state (chat history, hooks, etc.)
+.claude/
+
+# Vivado project artifacts (created by elab.tcl)
+project_*.cache/
+project_*.hw/
+project_*.ip_user_files/
+project_*.runs/
+project_*.sim/
+project_*.srcs/
+project_*.xpr
+*_elab_proj/
+fsm_encoding.os
+sample.tcl
+*.dcp
+
+# Vivado logs and journals
+vivado.jou
+vivado.log
+vivado_*.backup.jou
+vivado_*.backup.log
+vivado_synth.log
+
+# Per-test Vivado / sv_main outputs (produced by test/edif_compare etc.).
+# Each test/<suite>/.gitignore covers its own derivatives too — these
+# top-level patterns catch stray files dropped in the repo root.
+*_elab.edf
+*_elab.v
+*_elab.vhd
+*_elab_norm.v
+*_struct.v
+*_xilinx_rtl.v
+*_miter.log
+*_svmain.log
+*_vivado.log
+*_verilator.log
+.Xil/
+
+# Test runner log directories
+test/_logs_sweep/
+test/regressions/_logs/
+test/edif_compare/_logs/
+
+# Cluster runtime reports (LSF/SGE-style accounting files)
+report.[0-9]*.report
+report.[0-9]*.*.report
+
+# UART artifacts that drop into the repo root from interactive Vivado runs
+apb_uart.v
+apb_uart_from_edif.v
+uart.edf
+uart_synthesized.edf
