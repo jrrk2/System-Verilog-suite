@@ -267,4 +267,45 @@ let () =
   Printf.printf "\n═══════════════════════════════════════════════════════\n";
   Printf.printf "  Summary: %d entities, %d ✓ FF-match, %d mismatch, %d no-verible\n"
     total !fully_match !mismatch !no_verible;
-  Printf.printf "═══════════════════════════════════════════════════════\n"
+  Printf.printf "═══════════════════════════════════════════════════════\n";
+
+  (* Optional Z3 miter pass: only on entities whose Verible FF set
+   * already matches Vivado's. Without that match, the miter has zero
+   * chance of aligning the state. With Z3 enabled, the comparator
+   * upgrades each FF-matching pair to a real combinational
+   * equivalence check (after both sides have been ffrip'd). *)
+  if Sys.getenv_opt "MITER_Z3" <> None then begin
+    Printf.printf "\n═══════════════════════════════════════════════════════\n";
+    Printf.printf "  Z3 miter on FF-matching pairs\n";
+    Printf.printf "═══════════════════════════════════════════════════════\n";
+    let saved = Unix.dup Unix.stdout in
+    let z3_pass = ref 0 and z3_fail = ref 0 and z3_err = ref 0 in
+    List.iter (fun (name, vff, _, vrb_ff, _, _) ->
+      match vrb_ff with
+      | Some s when s = vff && vff <> [] ->
+          let viv_m = List.assoc name viv_idx in
+          (match lookup vrb_idx viv_m with
+           | None -> ()
+           | Some vrb_m ->
+               Printf.printf "  %-40s ... %!" (truncate name 40);
+               let devnull = Unix.openfile "/dev/null" [Unix.O_WRONLY] 0 in
+               Unix.dup2 devnull Unix.stdout;
+               Unix.close devnull;
+               let result =
+                 try if Z3_miter.check_miter_equivalence viv_m vrb_m
+                     then `Pass else `Fail
+                 with e -> `Error (Printexc.to_string e)
+               in
+               Unix.dup2 saved Unix.stdout;
+               (match result with
+                | `Pass -> incr z3_pass; Printf.printf "✅ Z3 PASS\n%!"
+                | `Fail -> incr z3_fail; Printf.printf "❌ Z3 FAIL\n%!"
+                | `Error e ->
+                    incr z3_err;
+                    Printf.printf "⚠ Z3 error: %s\n%!"
+                      (truncate e 60)))
+      | _ -> ()
+    ) scored;
+    Unix.close saved;
+    Printf.printf "\n  Z3 totals: %d ✅  %d ❌  %d ⚠\n" !z3_pass !z3_fail !z3_err
+  end
