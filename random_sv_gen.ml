@@ -445,6 +445,135 @@ let emit_cfg_struct ~name seed =
      endmodule\n"
     seed name wa wb name name name name name name
 
+(* Cross-package localparam chain: pkg A defines a base constant,
+ * pkg B's const-fn references it via A::CONST. Exercises layer-4
+ * cross-package localparam lookup. *)
+let emit_cfg_chain ~name seed =
+  Random.init seed;
+  let base_w = gen_width () in
+  let mult = 1 + rand_int 3 in
+  let a_value = base_w in
+  let b_value = base_w * mult in
+  Printf.sprintf
+    "// random_sv_gen seed=%d mode=cfg_chain\n\
+     package %s_base_pkg;\n\
+     \  localparam int unsigned BaseW = %d;\n\
+     \  localparam int unsigned ScaleW = %d;\n\
+     endpackage\n\
+     \n\
+     package %s_cfg_pkg;\n\
+     \  typedef struct packed {\n\
+     \    int unsigned A;\n\
+     \    int unsigned B;\n\
+     \  } cfg_t;\n\
+     \  function automatic cfg_t mk_cfg();\n\
+     \    cfg_t cfg;\n\
+     \    cfg.A = %s_base_pkg::BaseW;\n\
+     \    cfg.B = %s_base_pkg::ScaleW;\n\
+     \    return cfg;\n\
+     \  endfunction\n\
+     endpackage\n\
+     \n\
+     module %s_child #(parameter int unsigned WIDTH = 8) (\n\
+     \    input  logic [WIDTH-1:0] din,\n\
+     \    output logic [WIDTH-1:0] dout\n\
+     );\n\
+     \  assign dout = din;\n\
+     endmodule\n\
+     \n\
+     module %s\n\
+     \  #(parameter %s_cfg_pkg::cfg_t Cfg = %s_cfg_pkg::mk_cfg())\n\
+     (\n\
+     \    input  logic [Cfg.A-1:0] in_a,\n\
+     \    input  logic [Cfg.B-1:0] in_b,\n\
+     \    output logic [Cfg.A-1:0] out_a,\n\
+     \    output logic [Cfg.B-1:0] out_b\n\
+     );\n\
+     \  %s_child #(.WIDTH(Cfg.A)) u_a (.din(in_a), .dout(out_a));\n\
+     \  %s_child #(.WIDTH(Cfg.B)) u_b (.din(in_b), .dout(out_b));\n\
+     endmodule\n"
+    seed name a_value b_value name name name name name name name name name
+
+(* Const-fn body with ternary chains: cfg.X depends on a pair of
+ * inputs via nested ternaries. Stresses the parse_ternary path
+ * and ensures the >= / <= / && / || ops survive deep_string_of_token. *)
+let emit_cfg_ternary ~name seed =
+  Random.init seed;
+  (* Two arg-driven outputs: small_w if inputs are small, else big_w *)
+  let pivot   = pick [4; 8; 16; 32] in
+  let small_w = pick [2; 4] in
+  let big_w   = pick [16; 32; 64] in
+  let in_w    = if coin () then small_w else big_w in
+  Printf.sprintf
+    "// random_sv_gen seed=%d mode=cfg_ternary\n\
+     package %s_pkg;\n\
+     \  typedef struct packed {\n\
+     \    int unsigned IN_W;\n\
+     \  } in_cfg_t;\n\
+     \  typedef struct packed {\n\
+     \    int unsigned OUT_W;\n\
+     \  } out_cfg_t;\n\
+     \  function automatic out_cfg_t mk_cfg(in_cfg_t in_cfg);\n\
+     \    out_cfg_t cfg;\n\
+     \    cfg.OUT_W = (in_cfg.IN_W >= %d)\n\
+     \              ? ((in_cfg.IN_W >= %d) ? %d : %d)\n\
+     \              : %d;\n\
+     \    return cfg;\n\
+     \  endfunction\n\
+     endpackage\n\
+     \n\
+     module %s_child #(parameter int unsigned W = 8) (\n\
+     \    input  logic [W-1:0] din,\n\
+     \    output logic [W-1:0] dout\n\
+     );\n\
+     \  assign dout = din;\n\
+     endmodule\n\
+     \n\
+     module %s\n\
+     \  #(parameter %s_pkg::out_cfg_t Cfg =\n\
+     \      %s_pkg::mk_cfg('{IN_W: %d}))\n\
+     (\n\
+     \    input  logic [Cfg.OUT_W-1:0] in_d,\n\
+     \    output logic [Cfg.OUT_W-1:0] out_d\n\
+     );\n\
+     \  %s_child #(.W(Cfg.OUT_W)) u (.din(in_d), .dout(out_d));\n\
+     endmodule\n"
+    seed name pivot (pivot * 2) big_w small_w small_w name name name name in_w name
+
+(* Recursive instantiation with parameter-driven base case: a small
+ * popcount-shape that exercises generate-block pruning + child-name
+ * rewriting + flatten-via-instance-tree. Width chosen to be a power
+ * of two so the recursion tower is unambiguous. *)
+let emit_cfg_recursive ~name seed =
+  Random.init seed;
+  let log2_w = 2 + rand_int 4 in   (* 2..5 → W = 4, 8, 16, 32 *)
+  let w = 1 lsl log2_w in
+  Printf.sprintf
+    "// random_sv_gen seed=%d mode=cfg_recursive\n\
+     module %s_rec #(parameter int unsigned W = 8) (\n\
+     \    input  logic [W-1:0] data_i,\n\
+     \    output logic [W-1:0] sum_o\n\
+     );\n\
+     \  if (W == 1) begin : g_leaf\n\
+     \    assign sum_o = data_i;\n\
+     \  end else begin : g_split\n\
+     \    logic [W/2-1:0] lo, hi, lo_sum, hi_sum;\n\
+     \    assign lo = data_i[W/2-1:0];\n\
+     \    assign hi = data_i[W-1:W/2];\n\
+     \    %s_rec #(.W(W/2)) u_lo (.data_i(lo), .sum_o(lo_sum));\n\
+     \    %s_rec #(.W(W/2)) u_hi (.data_i(hi), .sum_o(hi_sum));\n\
+     \    assign sum_o = {hi_sum, lo_sum};\n\
+     \  end\n\
+     endmodule\n\
+     \n\
+     module %s (\n\
+     \    input  logic [%d:0] din,\n\
+     \    output logic [%d:0] dout\n\
+     );\n\
+     \  %s_rec #(.W(%d)) u (.data_i(din), .sum_o(dout));\n\
+     endmodule\n"
+    seed name name name name (w-1) (w-1) name w
+
 (* ─── Mode dispatcher ────────────────────────────────────────────── *)
 
 let emit_for_mode ~name ~seed mode =
@@ -453,7 +582,10 @@ let emit_for_mode ~name ~seed mode =
   | "func"   -> emit_func ~name seed
   | "gen"    -> emit_gen ~name seed
   | "mem2d"  -> emit_mem2d ~name seed
-  | "cfg_struct" -> emit_cfg_struct ~name seed
+  | "cfg_struct"    -> emit_cfg_struct ~name seed
+  | "cfg_chain"     -> emit_cfg_chain ~name seed
+  | "cfg_ternary"   -> emit_cfg_ternary ~name seed
+  | "cfg_recursive" -> emit_cfg_recursive ~name seed
   | "simple" | _ ->
       let include_clock = (let _ = Random.init seed in coin ()) in
       emit_module ~name ~include_clock seed
@@ -476,7 +608,9 @@ let pick_mode s =
   match active_modes with
   | [] -> "simple"
   | ["mixed"] ->
-      let modes = ["simple"; "struct"; "func"; "gen"; "mem2d"; "cfg_struct"] in
+      let modes = ["simple"; "struct"; "func"; "gen"; "mem2d";
+                   "cfg_struct"; "cfg_chain"; "cfg_ternary";
+                   "cfg_recursive"] in
       List.nth modes (s mod List.length modes)
   | _ ->
       List.nth active_modes (s mod List.length active_modes)
