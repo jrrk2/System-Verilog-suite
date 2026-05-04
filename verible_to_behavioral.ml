@@ -1056,6 +1056,31 @@ let convert_module ~pkgs (mdecl : module_decl)
     let known = List.map fst params in
     params @ List.filter (fun (n, _) -> not (List.mem n known)) body_params
   in
+  (* Build int scope from the merged params and prune dead generate
+   * branches from the body. Without this, popcount__W2's body would
+   * carry assigns from the W==1 / W>=3 branches alongside the W==2
+   * branch, with multiple writes to the same signal corrupting
+   * downstream Behavioral_flatten. *)
+  let int_scope =
+    List.filter_map (fun (n, v) ->
+      Option.map (fun i -> (n, i)) (Verible_elaborate.Eval.eval_string [] v)
+    ) params
+  in
+  Verible_elaborate.resolver_for_walk :=
+    (fun t -> Verible_elaborate.resolve_value pkgs t);
+  Verible_elaborate.evaluator_for_walk :=
+    Verible_elaborate.Eval.eval_string;
+  (* Opt-in via ENABLE_GEN_PRUNE — the prune helps the recursive-
+   * popcount case (eliminates dead-branch assigns that fight the
+   * live branch) but currently regresses 3 ct_vfdsu_* Z3 passes
+   * with width mismatches. Localparam-scope discrepancy still TBD;
+   * keeping it default-off until the regression is understood. *)
+  let mdecl =
+    if Sys.getenv_opt "ENABLE_GEN_PRUNE" <> None then
+      { mdecl with m_body =
+        Verible_elaborate.prune_dead_generates int_scope mdecl.m_body }
+    else mdecl
+  in
   (* Enum item names fold to their integer values via the same
    * params lookup that handles `parameter`. *)
   let enum_items = extract_enum_items ~pkgs ~params mdecl.m_body in

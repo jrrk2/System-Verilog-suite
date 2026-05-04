@@ -343,6 +343,126 @@ let collect_live_by scope pred root =
   walk_live scope (fun t -> if pred t then acc := t :: !acc) root;
   List.rev !acc
 
+(* Tree transformer: replace every dead conditional_generate branch
+ * with EMPTY_TOKEN, leaving the live branch in place. Used by
+ * verible_to_behavioral.convert_module to prune dead generate
+ * branches from the body BEFORE the BIR-level extractors walk it,
+ * so a popcount__W2 specialisation doesn't carry assigns from the
+ * W==1 / W>=3 branches that fight the W==2 branch. *)
+let rec prune_dead_generates scope tok =
+  let take_branch cond_expr_opt branches =
+    match cond_expr_opt with
+    | None -> None
+    | Some e ->
+        let s = !resolver_for_walk e in
+        !evaluator_for_walk scope s
+  in
+  match tok with
+  | TUPLE5 (STRING tag, gif, t_item, e_kw, e_item)
+    when prefix_is "conditional_generate_construct" tag ->
+      (match take_branch (extract_if_cond gif)
+               [(`T, t_item); (`E, e_item)] with
+       | Some n when n <> 0 ->
+           prune_dead_generates scope t_item
+       | Some _ ->
+           prune_dead_generates scope e_item
+       | None ->
+           TUPLE5 (STRING tag, gif,
+                   prune_dead_generates scope t_item, e_kw,
+                   prune_dead_generates scope e_item))
+  | TUPLE3 (STRING tag, gif, t_item)
+    when prefix_is "conditional_generate_construct" tag ->
+      (match take_branch (extract_if_cond gif) [(`T, t_item)] with
+       | Some n when n <> 0 -> prune_dead_generates scope t_item
+       | Some _ -> EMPTY_TOKEN
+       | None -> TUPLE3 (STRING tag, gif,
+                         prune_dead_generates scope t_item))
+  | TUPLE2 (a, b) ->
+      TUPLE2 (prune_dead_generates scope a,
+              prune_dead_generates scope b)
+  | TUPLE3 (a, b, c) ->
+      TUPLE3 (prune_dead_generates scope a,
+              prune_dead_generates scope b,
+              prune_dead_generates scope c)
+  | TUPLE4 (a, b, c, d) ->
+      TUPLE4 (prune_dead_generates scope a,
+              prune_dead_generates scope b,
+              prune_dead_generates scope c,
+              prune_dead_generates scope d)
+  | TUPLE5 (a, b, c, d, e) ->
+      TUPLE5 (prune_dead_generates scope a,
+              prune_dead_generates scope b,
+              prune_dead_generates scope c,
+              prune_dead_generates scope d,
+              prune_dead_generates scope e)
+  | TUPLE6 (a, b, c, d, e, f) ->
+      TUPLE6 (prune_dead_generates scope a, prune_dead_generates scope b,
+              prune_dead_generates scope c, prune_dead_generates scope d,
+              prune_dead_generates scope e, prune_dead_generates scope f)
+  | TUPLE7 (a, b, c, d, e, f, g) ->
+      TUPLE7 (prune_dead_generates scope a, prune_dead_generates scope b,
+              prune_dead_generates scope c, prune_dead_generates scope d,
+              prune_dead_generates scope e, prune_dead_generates scope f,
+              prune_dead_generates scope g)
+  | TUPLE8 (a, b, c, d, e, f, g, h) ->
+      TUPLE8 (prune_dead_generates scope a, prune_dead_generates scope b,
+              prune_dead_generates scope c, prune_dead_generates scope d,
+              prune_dead_generates scope e, prune_dead_generates scope f,
+              prune_dead_generates scope g, prune_dead_generates scope h)
+  | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+      TUPLE9 (prune_dead_generates scope a, prune_dead_generates scope b,
+              prune_dead_generates scope c, prune_dead_generates scope d,
+              prune_dead_generates scope e, prune_dead_generates scope f,
+              prune_dead_generates scope g, prune_dead_generates scope h,
+              prune_dead_generates scope i)
+  | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+      TUPLE10 (prune_dead_generates scope a, prune_dead_generates scope b,
+               prune_dead_generates scope c, prune_dead_generates scope d,
+               prune_dead_generates scope e, prune_dead_generates scope f,
+               prune_dead_generates scope g, prune_dead_generates scope h,
+               prune_dead_generates scope i, prune_dead_generates scope j)
+  | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+      TUPLE11 (prune_dead_generates scope a, prune_dead_generates scope b,
+               prune_dead_generates scope c, prune_dead_generates scope d,
+               prune_dead_generates scope e, prune_dead_generates scope f,
+               prune_dead_generates scope g, prune_dead_generates scope h,
+               prune_dead_generates scope i, prune_dead_generates scope j,
+               prune_dead_generates scope k)
+  | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+      TUPLE12 (prune_dead_generates scope a, prune_dead_generates scope b,
+               prune_dead_generates scope c, prune_dead_generates scope d,
+               prune_dead_generates scope e, prune_dead_generates scope f,
+               prune_dead_generates scope g, prune_dead_generates scope h,
+               prune_dead_generates scope i, prune_dead_generates scope j,
+               prune_dead_generates scope k, prune_dead_generates scope l)
+  | TUPLE13 (a, b, c, d, e, f, g, h, i, j, k, l, m) ->
+      TUPLE13 (prune_dead_generates scope a, prune_dead_generates scope b,
+               prune_dead_generates scope c, prune_dead_generates scope d,
+               prune_dead_generates scope e, prune_dead_generates scope f,
+               prune_dead_generates scope g, prune_dead_generates scope h,
+               prune_dead_generates scope i, prune_dead_generates scope j,
+               prune_dead_generates scope k, prune_dead_generates scope l,
+               prune_dead_generates scope m)
+  | TUPLE14 (a, b, c, d, e, f, g, h, i, j, k, l, m, n) ->
+      TUPLE14 (prune_dead_generates scope a, prune_dead_generates scope b,
+               prune_dead_generates scope c, prune_dead_generates scope d,
+               prune_dead_generates scope e, prune_dead_generates scope f,
+               prune_dead_generates scope g, prune_dead_generates scope h,
+               prune_dead_generates scope i, prune_dead_generates scope j,
+               prune_dead_generates scope k, prune_dead_generates scope l,
+               prune_dead_generates scope m, prune_dead_generates scope n)
+  | TUPLE15 (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ->
+      TUPLE15 (prune_dead_generates scope a, prune_dead_generates scope b,
+               prune_dead_generates scope c, prune_dead_generates scope d,
+               prune_dead_generates scope e, prune_dead_generates scope f,
+               prune_dead_generates scope g, prune_dead_generates scope h,
+               prune_dead_generates scope i, prune_dead_generates scope j,
+               prune_dead_generates scope k, prune_dead_generates scope l,
+               prune_dead_generates scope m, prune_dead_generates scope n,
+               prune_dead_generates scope o)
+  | TLIST xs -> TLIST (List.map (prune_dead_generates scope) xs)
+  | leaf -> leaf
+
 let extract_instantiations ?(scope = []) root : instantiation list =
   let inst_nodes =
     collect_live_by scope (has_tag (prefix_is "instantiation_base")) root
