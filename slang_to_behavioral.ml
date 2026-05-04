@@ -415,20 +415,30 @@ let extract_signals members =
  * synthesis treats `negedge rst_n` as the async-reset trigger,
  * not as a second clock. *)
 let extract_clock_event timing =
-  match assoc "events" timing with
-  | Some (`List (e :: _)) ->
-      let clk = match assoc "expr" e with
-        | Some j' ->
-            (match str_field "symbol" j' with
-             | Some s -> strip_addr s | None -> "clk")
-        | None -> "clk"
-      in
-      let edge = match str_field "edge" e with
-        | Some "PosEdge" -> `Pos
-        | Some "NegEdge" -> `Neg
-        | _ -> `Pos
-      in
-      (clk, edge)
+  (* Slang's timing comes in two shapes: a `SignalEvent` directly
+   * for `always @(posedge clk)` (single event), or an `EventList`
+   * with `events: [...]` for `always @(posedge clk or negedge
+   * rst_n)`. Handle both — pick the first event's expr+edge. *)
+  let pick_from_event e =
+    let clk = match assoc "expr" e with
+      | Some j' ->
+          (match str_field "symbol" j' with
+           | Some s -> strip_addr s | None -> "clk")
+      | None -> "clk"
+    in
+    let edge = match str_field "edge" e with
+      | Some "PosEdge" -> `Pos
+      | Some "NegEdge" -> `Neg
+      | _ -> `Pos
+    in
+    (clk, edge)
+  in
+  match kind_of timing with
+  | "SignalEvent" -> pick_from_event timing
+  | "EventList" ->
+      (match assoc "events" timing with
+       | Some (`List (e :: _)) -> pick_from_event e
+       | _ -> ("clk", `Pos))
   | _ -> ("clk", `Pos)
 
 let extract_processes members =
@@ -456,72 +466,195 @@ let extract_processes members =
         let kind = match str_field "procedureKind" m with
           | Some s -> s | None -> "Always" in
         let inner = match assoc "body" m with Some j' -> j' | None -> `Null in
-        (match kind with
-         | "AlwaysFF" | "Always_FF" ->
-             let timing, body_stmt =
-               match kind_of inner with
+        (* For procedureKind "Always" Slang doesn't tell us whether
+         * the block is sequential or combinational — we have to
+         * inspect the sensitivity list. PosEdge/NegEdge anywhere
+         * inside the Timed timing means sequential. Without this
+         * every cva6 `always @(posedge clk)` block (used heavily in
+         * the ct_vfdsu_* family) lowered to BCombinational, losing
+         * every FF and producing input-interface mismatches with
+         * Verible's BSequential-and-FF-rip path. *)
+        let has_edge_event timing =
+          let found = ref false in
+          let rec walk = function
+            | `Assoc xs ->
+                (match List.assoc_opt "edge" xs with
+                 | Some (`String ("PosEdge" | "NegEdge")) -> found := true
+                 | _ -> List.iter (fun (_, v) -> walk v) xs)
+            | `List xs -> List.iter walk xs
+            | _ -> ()
+          in
+          walk timing;
+          !found
+        in
+        let is_sequential =
+          match kind with
+          | "AlwaysFF" | "Always_FF" -> true
+          | "Always" ->
+              (match kind_of inner with
                | "Timed" ->
-                   let t = match assoc "timing" inner with
-                     | Some j' -> j' | None -> `Null in
-                   let s = match assoc "stmt" inner with
-                     | Some j' -> j' | None -> `Null in
-                   (t, s)
-               | _ -> (`Null, inner)
-             in
-             let (clk, edge) = extract_clock_event timing in
-             let body = [stmt_to_bstmt body_stmt] in
-             Some (BSequential {
-               name = "always_ff";
-               clock = clk;
-               clock_edge = edge;
-               reset = None;
-               reset_edge = None;
-               reset_async = false;
-               body;
-             })
-         | "AlwaysComb" | "Always_Comb" | "Always" | "AlwaysLatch" ->
-             let body = [stmt_to_bstmt inner] in
-             Some (BCombinational {
-               name = "always_comb";
-               sensitivity = [BAny];
-               body;
-             })
-         | _ -> None)
+                   (match assoc "timing" inner with
+                    | Some t -> has_edge_event t
+                    | None -> false)
+               | _ -> false)
+          | _ -> false
+        in
+        if is_sequential then begin
+          let timing, body_stmt =
+            match kind_of inner with
+            | "Timed" ->
+                let t = match assoc "timing" inner with
+                  | Some j' -> j' | None -> `Null in
+                let s = match assoc "stmt" inner with
+                  | Some j' -> j' | None -> `Null in
+                (t, s)
+            | _ -> (`Null, inner)
+          in
+          let (clk, edge) = extract_clock_event timing in
+          let body = [stmt_to_bstmt body_stmt] in
+          Some (BSequential {
+            name = "always_ff";
+            clock = clk;
+            clock_edge = edge;
+            reset = None;
+            reset_edge = None;
+            reset_async = false;
+            body;
+          })
+        end else
+          let body = [stmt_to_bstmt inner] in
+          Some (BCombinational {
+            name = "always_comb";
+            sensitivity = [BAny];
+            body;
+          })
     | _ -> None
   ) members
 
 (* ─── Top-level ──────────────────────────────────────────────────── *)
 
+(* Build a Verible-compatible specialised name from a base name and
+ * the InstanceBody's port-Parameter members. Mirrors
+ * verible_elaborate.suffix_of_params so paired modules across the
+ * two frontends use the same key — Verible specialises every unique
+ * (module, param-set) tuple into its own `<base>__<param-suffix>`
+ * bmodule, and Slang creates a separate InstanceBody per
+ * specialisation but always names them after the base. Without this
+ * suffix Slang's 90+ InstanceBodies named `cva6_fifo_v3` (one per
+ * specialisation) would collapse into a single bmodule, losing
+ * almost the entire design. *)
+let abbrev s =
+  let buf = Buffer.create 4 in
+  let next_upper = ref true in
+  String.iter (fun c ->
+    if c = '_' then next_upper := true
+    else if !next_upper then begin
+      Buffer.add_char buf (Char.uppercase_ascii c);
+      next_upper := false
+    end
+  ) s;
+  Buffer.contents buf
+
+let strip_value_prefix v =
+  (* Verible's suffix_of_params strips the SV `<width>'<base>` prefix
+   * from numeric values so a parameter `INPUT_WIDTH=32'd64` ends up
+   * as `IW64` not `IW32'd64`. *)
+  try
+    let i = String.index v '\'' in
+    if i + 1 < String.length v
+    then String.sub v (i + 2) (String.length v - i - 2)
+    else v
+  with Not_found -> v
+
+let suffix_of_slang_params members =
+  (* Include only port-parameters (`isPort: true`) whose value
+   * parses as a small-ish integer; struct-typed CVA6Cfg-style
+   * parameters carry hundreds of hex digits and would explode
+   * the suffix to thousands of characters. Verible's
+   * specialise_design also skips non-int params naturally because
+   * its scope-builder only stores names that resolve via Eval, so
+   * matching this rule keeps the two suffixes aligned. *)
+  let pairs = List.filter_map (fun m ->
+    match kind_of m with
+    | "Parameter" ->
+        let is_port = match assoc "isPort" m with
+          | Some (`Bool b) -> b
+          | _ -> false
+        in
+        if not is_port then None
+        else
+          let n = name_of m in
+          let v_raw = match str_field "value" m with
+            | Some s -> s | None -> ""
+          in
+          let v_clean = strip_value_prefix v_raw in
+          (* Only keep if v_clean is a reasonable integer in
+           * decimal or hex (≤ 32 chars). The 32-char limit lets us
+           * accept normal int parameters but reject the giant
+           * struct hex blobs Slang prints for CVA6Cfg. *)
+          if String.length v_clean = 0 || String.length v_clean > 32
+          then None
+          else
+            let is_dec_or_hex =
+              String.for_all (fun c ->
+                (c >= '0' && c <= '9') ||
+                (c >= 'a' && c <= 'f') ||
+                (c >= 'A' && c <= 'F')) v_clean
+            in
+            if not is_dec_or_hex then None
+            else Some (n, v_clean)
+    | _ -> None
+  ) members in
+  if pairs = [] then ""
+  else "__" ^ String.concat "_"
+    (List.map (fun (k, v) -> abbrev k ^ v) pairs)
+
 (* Walk every Instance / InstanceBody under `design.members` and
- * produce one bmodule each. *)
-let rec collect_instances acc j =
+ * produce one bmodule each. Recurse into the InstanceBody's
+ * members too — nested Instance nodes (sub-instances of the parent)
+ * point at their own InstanceBody, which is the next level of the
+ * hierarchy and needs its own bmodule. Each (base, param-suffix)
+ * combination becomes one bmodule; duplicate instances of the same
+ * specialisation collapse via the seen set. *)
+let rec collect_instances ~seen acc j =
   match kind_of j with
   | "InstanceBody" ->
-      let name = name_of j in
+      let base = name_of j in
       let members = list_field "members" j in
-      let signals = extract_signals members in
-      let processes = extract_processes members in
-      let m = {
-        name;
-        params = [];
-        signals;
-        processes;
-        instances = [];
-        funcs = [];
-        mems = [];
-      } in
-      m :: acc
+      let suffix = suffix_of_slang_params members in
+      let name = base ^ suffix in
+      let acc =
+        if name <> "" && not (Hashtbl.mem seen name) then begin
+          Hashtbl.add seen name ();
+          let signals = extract_signals members in
+          let processes = extract_processes members in
+          let m = {
+            name;
+            params = [];
+            signals;
+            processes;
+            instances = [];
+            funcs = [];
+            mems = [];
+          } in
+          m :: acc
+        end else acc
+      in
+      (* Sub-instances live inside members. Recurse to find their
+       * InstanceBody too. *)
+      List.fold_left (collect_instances ~seen) acc members
   | _ ->
       let acc =
         match assoc "body" j with
-        | Some j' -> collect_instances acc j'
+        | Some j' -> collect_instances ~seen acc j'
         | None -> acc
       in
-      List.fold_left collect_instances acc (list_field "members" j)
+      List.fold_left (collect_instances ~seen) acc (list_field "members" j)
 
 let convert_json (j : json) : bprogram =
   let design = match assoc "design" j with Some d -> d | None -> j in
-  let mods = List.rev (collect_instances [] design) in
+  let seen = Hashtbl.create 256 in
+  let mods = List.rev (collect_instances ~seen [] design) in
   { modules = mods; library_cells = [] }
 
 (* ─── Driver invocation ──────────────────────────────────────────── *)
