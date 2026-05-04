@@ -39,7 +39,9 @@ let () =
         | _ -> 1
       in
       Printf.printf "    %-10s %-6s [w=%d]\n" dir s.name w
-    ) m.signals
+    ) m.signals;
+    if Sys.getenv_opt "BIR_FULL" <> None then
+      Printf.printf "\n%s\n\n" (Behavioral_ir.string_of_bmodule m)
   ) prog.modules;
 
   (* Exit non-zero when nothing came out — convert_files traps the
