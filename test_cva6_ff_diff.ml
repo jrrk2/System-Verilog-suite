@@ -176,34 +176,53 @@ let () =
     ) m.signals
     |> List.sort compare
   in
+  (* Include FF-rip Q__Q widths too — for sequential modules these
+   * carry the post-elaboration register-state widths and can differ
+   * between Vivado (which always elaborates fully) and Verible (which
+   * picks per-spec widths). Used as the SECOND line of defense for
+   * pairing, after the bare-port shape. *)
+  let ff_widths (m : bmodule) =
+    let m = Behavioral_ffrip.rip_module m in
+    List.filter_map (fun (s : bsignal) ->
+      let n = s.name in
+      let l = String.length n in
+      let is_qq = l > 3 && String.sub n (l - 3) 3 = "__Q" in
+      if is_qq then
+        let w = match s.stype with
+          | BInt { width; _ } -> width
+          | BArray { size; element = BInt { width; _ }; _ } -> size * width
+          | _ -> 0
+        in
+        Some (n, w)
+      else None
+    ) m.signals
+    |> List.sort compare
+  in
+  (* Internal signals would be too strict — Vivado synth introduces
+   * RTL_* decomposition wires that Verible's pre-synth BIR doesn't
+   * have, so internal-set equality nukes legitimate matches. Stick
+   * with port + FF widths; the residual width-mismatch ⚠s on lfsr
+   * etc. are real bugs to chase, not pairing artefacts to hide. *)
+  let shapes_match a b =
+    port_shape a = port_shape b && ff_widths a = ff_widths b
+  in
   let lookup idx (viv_m : bmodule) =
     let name = viv_m.name in
-    match List.assoc_opt name idx with
+    let exact_match =
+      match List.assoc_opt name idx with
+      | Some m when shapes_match m viv_m -> Some m
+      | _ -> None
+    in
+    match exact_match with
     | Some m -> Some m
     | None ->
         let base = base_of name in
-        let viv_shape = port_shape viv_m in
-        let base_match =
-          if base = name then None
-          else List.assoc_opt base idx
-        in
-        (match base_match with
-         | Some m when port_shape m = viv_shape -> Some m
-         | _ ->
-             let candidates =
-               List.filter (fun (n, _) -> base_of n = base) idx in
-             (match List.find_opt (fun (_, m) ->
-                      port_shape m = viv_shape) candidates with
-              | Some (_, m) -> Some m
-              | None ->
-                  (* No port-shape match — refuse to pair. The previous
-                   * fallback to `base_match` (the bare base bmodule) was
-                   * a false-friend: bmodules with the same base but
-                   * different OutWidth specs would pair as if equivalent
-                   * and Z3 would error on width mismatches. Return None
-                   * here so the row shows up as "no verible" instead
-                   * of producing a corrupted comparison. *)
-                  None))
+        let candidates =
+          List.filter (fun (n, _) -> base_of n = base) idx in
+        (match List.find_opt (fun (_, m) -> shapes_match m viv_m)
+                 candidates with
+         | Some (_, m) -> Some m
+         | None -> None)
   in
 
   Printf.printf "\n";
