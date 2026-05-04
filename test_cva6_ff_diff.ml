@@ -195,7 +195,15 @@ let () =
              (match List.find_opt (fun (_, m) ->
                       port_shape m = viv_shape) candidates with
               | Some (_, m) -> Some m
-              | None -> base_match))
+              | None ->
+                  (* No port-shape match — refuse to pair. The previous
+                   * fallback to `base_match` (the bare base bmodule) was
+                   * a false-friend: bmodules with the same base but
+                   * different OutWidth specs would pair as if equivalent
+                   * and Z3 would error on width mismatches. Return None
+                   * here so the row shows up as "no verible" instead
+                   * of producing a corrupted comparison. *)
+                  None))
   in
 
   Printf.printf "\n";
