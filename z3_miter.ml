@@ -264,19 +264,56 @@ let rec expr_to_z3 suffix ctx_sigs = function
       in
       replicate (count - 1) z3_value
 
-  | BSelect { array; index = BConst { value; _ } } ->
-      (* Constant bit-select `array[N]` — equivalent to `array[N:N]`.
-       * Without this, every constant bit-extract dropped to a 32-bit
-       * zero, which silently zeros the leaf-level RTL_ADD operands in
-       * popcount (`popcount_o := data_i[1] + data_i[0]`) and the
-       * whole hierarchical popcount comes out as 0. *)
-      let z3_array = expr_to_z3 suffix ctx_sigs array in
-      let arr_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
-      if value >= arr_w then
-        Z3.BitVector.mk_numeral ctx "0" 1
-      else
-        Z3.BitVector.mk_extract ctx value value z3_array
-  | BSelect _ | BCall _ ->
+  | BSelect { array; index } ->
+      (* Bit-select / element-select `array[N]`. Try to const-fold the
+       * index so we can use Z3's mk_extract (which needs literal
+       * msb/lsb). Required for lzc's `index_lut[(32'0 * 32'2) + 32'1]`
+       * — the index expression is a small constant arithmetic tree
+       * after genvar substitution, but our Z3 BSelect handler
+       * previously only matched BConst indices and fell through to
+       * the 32-bit zero default for anything wrapped in arithmetic. *)
+      let rec eval_const = function
+        | BConst { value; _ } -> Some value
+        | BBinOp { op; lhs; rhs; _ } ->
+            (match eval_const lhs, eval_const rhs with
+             | Some a, Some b ->
+                 (match op with
+                  | BAdd -> Some (a + b)
+                  | BSub -> Some (a - b)
+                  | BMul -> Some (a * b)
+                  | _ -> None)
+             | _ -> None)
+        | BSlice { signal; msb; lsb } ->
+            (match eval_const signal with
+             | Some v -> Some ((v lsr lsb) land ((1 lsl (msb - lsb + 1)) - 1))
+             | None -> None)
+        | _ -> None
+      in
+      (match eval_const index with
+       | Some value ->
+           let z3_array = expr_to_z3 suffix ctx_sigs array in
+           let arr_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
+           if value >= arr_w then
+             Z3.BitVector.mk_numeral ctx "0" 1
+           else
+             Z3.BitVector.mk_extract ctx value value z3_array
+       | None ->
+           (* Variable index: `array >> idx` then take low bit. The
+            * shift is at the array's width; widen the index to match. *)
+           let z3_array = expr_to_z3 suffix ctx_sigs array in
+           let z3_idx = expr_to_z3 suffix ctx_sigs index in
+           let aw = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
+           let iw = Z3.BitVector.get_size (Z3.Expr.get_sort z3_idx) in
+           let z3_idx =
+             if iw = aw then z3_idx
+             else if iw < aw then
+               Z3.BitVector.mk_zero_ext ctx (aw - iw) z3_idx
+             else
+               Z3.BitVector.mk_extract ctx (aw - 1) 0 z3_idx
+           in
+           let shifted = Z3.BitVector.mk_lshr ctx z3_array z3_idx in
+           Z3.BitVector.mk_extract ctx 0 0 shifted)
+  | BCall _ ->
       (* Unsupported for now *)
       Z3.BitVector.mk_numeral ctx "0" 32
 

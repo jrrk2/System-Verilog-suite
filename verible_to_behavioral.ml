@@ -45,6 +45,33 @@ let rec eval_int ~pkgs ~params tok =
   match tok with
   | TK_DecNumber n | TK_UnBasedNumber n ->
       (try Some (int_of_string n) with _ -> None)
+  (* Sized literals: `1'b0`, `4'hA`, `8'd255`. Verible parses each as
+   * `<base>_based_number` wrapping the digits — for our purposes the
+   * width prefix doesn't change the integer value. *)
+  | TUPLE3 (STRING tag, _base, digits) when prefix_is "bin_based_number" tag ->
+      let s = ref "" in
+      walk (function
+        | TK_BinDigits n -> s := !s ^ n
+        | _ -> ()) digits;
+      (try Some (int_of_string ("0b" ^ !s)) with _ -> None)
+  | TUPLE3 (STRING tag, _base, digits) when prefix_is "hex_based_number" tag ->
+      let s = ref "" in
+      walk (function
+        | TK_HexDigits n -> s := !s ^ n
+        | _ -> ()) digits;
+      (try Some (int_of_string ("0x" ^ !s)) with _ -> None)
+  | TUPLE3 (STRING tag, _base, digits) when prefix_is "dec_based_number" tag ->
+      let s = ref "" in
+      walk (function
+        | TK_DecNumber n -> s := !s ^ n
+        | _ -> ()) digits;
+      (try Some (int_of_string !s) with _ -> None)
+  | TUPLE3 (STRING tag, _base, digits) when prefix_is "oct_based_number" tag ->
+      let s = ref "" in
+      walk (function
+        | TK_OctDigits n -> s := !s ^ n
+        | _ -> ()) digits;
+      (try Some (int_of_string ("0o" ^ !s)) with _ -> None)
   | SymbolIdentifier id -> lookup id
   | TUPLE4 (STRING "add_expr2", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
@@ -73,6 +100,15 @@ let rec eval_int ~pkgs ~params tok =
   | TUPLE4 (STRING "shift_expr3", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a lsr b)
+       | _ -> None)
+  (* `**` SystemVerilog power. Right-associative, parsed as
+   * `pow_expr STAR_STAR unary_expr`. Required for packed-array
+   * dimensions like `[2**NumLevels-1:0]` in lzc/cf_math_pkg. *)
+  | TUPLE4 (STRING "pow_expr2", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some e when e >= 0 ->
+           let rec p b e = if e = 0 then 1 else b * p b (e - 1) in
+           Some (p a e)
        | _ -> None)
   (* Function-like call wrapper: `reference_or_call_base1(reference,
    * call_base)`. The lexer treats `$clog2` as a SymbolIdentifier
@@ -140,6 +176,27 @@ let extract_range ~pkgs ~params tok =
        | Some mi, Some li -> Some (mi, li)
        | _ -> None)
   | _ -> None
+
+(* Return every packed dimension as `(msb, lsb)`, in declaration
+ * order (outermost first). For `logic [WIDTH-1:0][NumLevels-1:0]
+ * index_lut`, returns [(WIDTH-1, 0); (NumLevels-1, 0)] — the outer
+ * dim is the array index, the inner is the per-element width. The
+ * grammar shape for chained dimensions is left-recursive
+ * `decl_dimensions2`, so collect_by (prefix_is "decl_variable_dimension")
+ * already finds them all; this helper just evaluates each. *)
+let extract_packed_dims ~pkgs ~params tok =
+  let pairs = collect_by
+    (has_tag (prefix_is "decl_variable_dimension")) tok in
+  List.filter_map (fun n ->
+    match n with
+    | TUPLE6 (STRING _, _, msb, _, lsb, _) ->
+        let m = eval_int ~pkgs ~params msb in
+        let l = eval_int ~pkgs ~params lsb in
+        (match m, l with
+         | Some mi, Some li -> Some (mi, li)
+         | _ -> None)
+    | _ -> None
+  ) pairs
 
 (* Extract every `typedef <data_type> <name>;` from the module body and
  * return [(name, width)]. Verible parses these as `type_declaration1`
@@ -629,6 +686,20 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       (match a with
        | EMPTY_TOKEN -> recurse b
        | _ -> recurse a)
+  (* `**` constant power. BIR has no native power op, so we evaluate
+   * eagerly. Common case after genvar-substitution is `2 ** 0` etc.
+   * which folds to a small constant. *)
+  | TUPLE4 (STRING tag, lhs, _op, rhs) when prefix_is "pow_expr2" tag ->
+      (match eval_int ~pkgs ~params tok with
+       | Some n ->
+           (* Width: at minimum cover the value. 32-bit by default
+            * matches what SV unsized-int literals get. *)
+           BConst { value = n; width = 32 }
+       | None ->
+           (* No fold — best-effort: encode as repeated mul if rhs
+            * is small. For the unsupported general case, fall back
+            * to lhs (drops the power). *)
+           ignore rhs; recurse lhs)
   | TUPLE4 (STRING tag, lhs, _op, rhs) ->
       (* Binary expressions: add_expr, mul_expr, comp_expr, and_expr,
        * or_expr, xor_expr, shift_expr, logeq_expr, etc. *)
@@ -671,6 +742,14 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       BCond { condition = recurse cond;
               then_val = recurse t;
               else_val = recurse e }
+  (* `<type>'(<expr>)` cast — value-preserving for our integer
+   * arithmetic. cast1: TUPLE6(tag, casting_type, QUOTE, LPAREN,
+   * expression, RPAREN). Drop the cast and recurse on the inner
+   * expression. lzc.sv uses `(NumLevels)'(unsigned'(j))` to
+   * size-extend the genvar index — without unwrapping these the
+   * expression falls to the BConst{0,1} default. *)
+  | TUPLE6 (STRING tag, _ct, _quote, _lp, expr, _rp) when prefix_is "cast" tag ->
+      recurse expr
   | TLIST [single] -> recurse single
   | _ ->
       if Lazy.force debug_expr then
@@ -886,6 +965,62 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
       recurse_s inner
   | TUPLE3 (STRING tag, _, inner) when prefix_is "statement_item" tag ->
       recurse_s inner
+  (* `for (init; cond; step) body` — procedural for-loop.
+   *   loop_statement1: TUPLE10(tag, For, LPAREN, init_opt, SEMICOLON,
+   *                            cond_opt, SEMICOLON, step_opt, RPAREN, body)
+   * Emit BFor; Behavioral_unroll handles the actual unrolling
+   * downstream when init/cond/step are constants. Required for
+   * lzc.sv's `flip_vector: for (int unsigned i = 0; i < WIDTH;
+   * i++) in_tmp[i] = …` — without this the always_comb body
+   * extracts as empty, in_tmp is undriven, and the trailing-zero
+   * counter computes wrong values (cnt_o = 0 instead of 1 for
+   * in_i = 2'b10). *)
+  | TUPLE10 (STRING tag, _For, _, init_opt, _, cond_opt, _, step_opt, _, body)
+    when prefix_is "loop_statement" tag ->
+      let var_name = ref None in
+      let init_expr = ref None in
+      (match init_opt with
+       | TUPLE5 (STRING t, _, SymbolIdentifier id, _, expr)
+         when prefix_is "for_init_decl_or_assign" t ->
+           var_name := Some id; init_expr := Some expr
+       | TUPLE6 (STRING t, _, _, SymbolIdentifier id, _, expr)
+         when prefix_is "for_init_decl_or_assign" t ->
+           var_name := Some id; init_expr := Some expr
+       | TUPLE4 (STRING t, lhs, _, expr)
+         when prefix_is "for_init_decl_or_assign" t ->
+           walk (function
+             | SymbolIdentifier id when !var_name = None -> var_name := Some id
+             | _ -> ()) lhs;
+           init_expr := Some expr
+       | _ -> ());
+      let step_node = match step_opt with
+        | TUPLE3 (STRING t, _, _) when prefix_is "inc_or_dec_expression" t ->
+            Some step_opt
+        | _ -> None
+      in
+      (match !var_name, !init_expr, step_node with
+       | Some name, Some init_e, Some step_e ->
+           let delta = match step_e with
+             | TUPLE3 (_, PLUS_PLUS, _) -> 1
+             | TUPLE3 (_, _, PLUS_PLUS) -> 1
+             | TUPLE3 (_, HYPHEN_HYPHEN, _) -> -1
+             | TUPLE3 (_, _, HYPHEN_HYPHEN) -> -1
+             | _ -> 1
+           in
+           let init_b = BAssign { lhs = name; rhs = recurse_e init_e } in
+           let cond_b = recurse_e cond_opt in
+           let upd_b = BAssign {
+             lhs = name;
+             rhs = BBinOp {
+               op = if delta < 0 then BSub else BAdd;
+               lhs = BVar name;
+               rhs = BConst { value = abs delta; width = 32 };
+               result_type = BInt { width = 32; signed = Unsigned };
+             }
+           } in
+           BFor { init = init_b; condition = cond_b;
+                  update = upd_b; body = [recurse_s body] }
+       | _ -> BBlock [])
   | TLIST [single] -> recurse_s single
   | _ -> BBlock []
 
@@ -930,7 +1065,8 @@ let extract_always ~pkgs ~params ~arrays tok =
           prefix_is "nonblocking_assignment" t ||
           prefix_is "assignment_statement_no_expr" t ||
           prefix_is "conditional_statement" t ||
-          prefix_is "case_statement" t)) an in
+          prefix_is "case_statement" t ||
+          prefix_is "loop_statement" t)) an in
         let body = match body_nodes with
           | b :: _ -> [stmt_to_bstmt ~pkgs ~params ~arrays b]
           | [] -> []
@@ -1401,7 +1537,7 @@ let convert_module ~pkgs (mdecl : module_decl)
         | TUPLE3 (_, t, _) -> t
         | _ -> base
       in
-      let elem_w = width_of ~typedefs ~pkgs ~params inst_type in
+      let packed_dims = extract_packed_dims ~pkgs ~params inst_type in
       List.filter_map (fun n ->
         let nm = ref None in
         walk (function
@@ -1410,15 +1546,33 @@ let convert_module ~pkgs (mdecl : module_decl)
         (* Unpacked array: `reg [W-1:0] mem [0:N]` carries a
          * `decl_variable_dimension1` *inside the var node* (slot 2 of
          * `…_register_variable1`). When present, treat as BArray
-         * with depth = |msb − lsb| + 1. *)
+         * with depth = |msb − lsb| + 1.
+         *
+         * 2-D packed array (`logic [A-1:0][B-1:0] x`): outer dim is
+         * the array index, inner dim is the per-element width. lzc's
+         * `index_lut[WIDTH-1:0][NumLevels-1:0]` and `index_nodes` are
+         * exactly this shape — without recognising it as BArray, the
+         * per-element writes `index_lut[k] = …` collapse into multi-
+         * driver writes on a flat 1-D wire and the output is wrong. *)
         let unpacked = extract_range ~pkgs ~params n in
-        let stype = match unpacked with
-          | Some (m, l) ->
+        let stype = match unpacked, packed_dims with
+          | Some (m, l), _ ->
+              let elem_w = match packed_dims with
+                | (mi, li) :: _ -> abs (mi - li) + 1
+                | [] -> 1
+              in
               BArray {
                 element = BInt { width = elem_w; signed = Unsigned };
                 size = abs (m - l) + 1;
               }
-          | None -> BInt { width = elem_w; signed = Unsigned }
+          | None, [(om, ol); (im, il)] ->
+              BArray {
+                element = BInt { width = abs (im - il) + 1; signed = Unsigned };
+                size = abs (om - ol) + 1;
+              }
+          | None, _ ->
+              let elem_w = width_of ~typedefs ~pkgs ~params inst_type in
+              BInt { width = elem_w; signed = Unsigned }
         in
         match !nm with
         | Some id -> Some {
@@ -1457,11 +1611,116 @@ let convert_module ~pkgs (mdecl : module_decl)
   ) (collect_by (has_tag (prefix_is "continuous_assign")) mdecl.m_body) in
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params mdecl.m_body in
+  (* Post-pass: merge combinational @mem_write groups targeting the
+   * same array into a single full-array concat assignment. lzc's
+   * `for (genvar j…) assign index_lut[j] = …` unrolls to N
+   * BCombinational @mem_write nodes; downstream Z3 / meminfer
+   * doesn't track combinational @mem_write side-effects (meminfer's
+   * find_ram_writes only walks BSequential), so each @mem_write
+   * is a no-op and the array stays free. Fold them here while we
+   * still have ergonomic per-call info: collect all combinational
+   * @mem_write to a given array, sort by literal index ascending
+   * (LSB-first), build a BConcat in MSB-first order, and emit a
+   * single BAssign. *)
+  let merge_array_writes processes =
+    let mem_writes : (string, (int * bexpr) list) Hashtbl.t =
+      Hashtbl.create 8 in
+    (* Constant-fold a small set of arithmetic shapes so addresses
+     * like `((32'1 - 32'1) + 32'0)` (the lzc generate-for index
+     * expression after genvar-substitution) reduce to BConst, which
+     * lets the merge match on a literal index. *)
+    let rec fold = function
+      | BBinOp { op = BAdd;
+                 lhs = BConst { value = a; width = w };
+                 rhs = BConst { value = b; _ }; _ } ->
+          BConst { value = a + b; width = w }
+      | BBinOp { op = BSub;
+                 lhs = BConst { value = a; width = w };
+                 rhs = BConst { value = b; _ }; _ } ->
+          BConst { value = a - b; width = w }
+      | BBinOp { op = BMul;
+                 lhs = BConst { value = a; width = w };
+                 rhs = BConst { value = b; _ }; _ } ->
+          BConst { value = a * b; width = w }
+      | BBinOp r ->
+          let lhs' = fold r.lhs and rhs' = fold r.rhs in
+          (match lhs', rhs' with
+           | BConst { value = a; width = w }, BConst { value = b; _ } ->
+               (match r.op with
+                | BAdd -> BConst { value = a + b; width = w }
+                | BSub -> BConst { value = a - b; width = w }
+                | BMul -> BConst { value = a * b; width = w }
+                | _ -> BBinOp { r with lhs = lhs'; rhs = rhs' })
+           | _ -> BBinOp { r with lhs = lhs'; rhs = rhs' })
+      | e -> e
+    in
+    let other_procs = List.filter_map (fun p ->
+      match p with
+      | BCombinational { body = [BCallStmt {
+          func = "@mem_write";
+          args = [BVar arr; addr; data] }]; _ }
+        when List.mem arr array_names ->
+          (match fold addr with
+           | BConst { value = idx; _ } ->
+               let bucket =
+                 try Hashtbl.find mem_writes arr with Not_found -> [] in
+               Hashtbl.replace mem_writes arr ((idx, data) :: bucket);
+               None
+           | _ -> Some p)
+      | _ -> Some p
+    ) processes in
+    let merged = Hashtbl.fold (fun arr writes acc ->
+      let arr_size, elem_w =
+        match List.find_opt (fun (s : bsignal) -> s.name = arr) signals with
+        | Some { stype = BArray { size; element = BInt { width; _ } }; _ } ->
+            (size, width)
+        | _ -> (List.length writes, 1)
+      in
+      let truncate_to_elem e =
+        if elem_w >= 32 then e
+        else BSlice { signal = e; msb = elem_w - 1; lsb = 0 }
+      in
+      (* Sort msb-first so the concat reads top-to-bottom. *)
+      let sorted = List.sort (fun (a, _) (b, _) -> compare b a) writes in
+      (* Fill any uncovered indices with a self-read of the array. *)
+      let parts = ref [] in
+      let cursor = ref (arr_size - 1) in
+      List.iter (fun (idx, data) ->
+        if idx < !cursor then
+          for k = !cursor downto idx + 1 do
+            parts := BSelect {
+              array = BVar arr;
+              index = BConst { value = k; width = 32 };
+            } :: !parts
+          done;
+        parts := truncate_to_elem data :: !parts;
+        cursor := idx - 1
+      ) sorted;
+      if !cursor >= 0 then
+        for k = !cursor downto 0 do
+          parts := BSelect {
+            array = BVar arr;
+            index = BConst { value = k; width = 32 };
+          } :: !parts
+        done;
+      let rhs = match List.rev !parts with
+        | [single] -> single
+        | many -> BConcat many
+      in
+      BCombinational {
+        name = "merged_array_" ^ arr;
+        sensitivity = [BAny];
+        body = [BAssign { lhs = arr; rhs }];
+      } :: acc
+    ) mem_writes [] in
+    other_procs @ merged
+  in
+  let processes = merge_array_writes (assign_procs @ always_procs) in
   {
     name = mdecl.m_name;
     params = [];
     signals;
-    processes = assign_procs @ always_procs;
+    processes;
     instances;
     funcs = [];
     mems = [];
