@@ -161,8 +161,19 @@ let substitute_port_inputs port_subst expr =
 
 let substitute_port_inputs_stmt port_subst stmt =
   let mp = substitute_port_inputs port_subst in
+  (* LHS rewrite: when port_subst maps a name to BVar n', the rewrite
+   * for an assignment to that name becomes an assignment to n'.
+   * For non-BVar substitutions (e.g. expression-shaped input ports
+   * being assigned in the child — should never happen in well-formed
+   * SV) we leave the LHS as-is. *)
+  let lhs_rename name =
+    match List.assoc_opt name port_subst with
+    | Some (BVar n') -> n'
+    | _ -> name
+  in
   let rec map_s = function
-    | BAssign { lhs; rhs } -> BAssign { lhs; rhs = mp rhs }
+    | BAssign { lhs; rhs } ->
+        BAssign { lhs = lhs_rename lhs; rhs = mp rhs }
     | BIf { condition; then_stmts; else_stmts } ->
         BIf { condition = mp condition;
               then_stmts = List.map map_s then_stmts;
@@ -291,7 +302,19 @@ let flatten_module ~by_base ~by_name (parent : bmodule) : bmodule =
   loop 0 parent
 
 let flatten_program (p : bprogram) : bprogram =
+  let debug = Sys.getenv_opt "FLAT_DEBUG" <> None in
   let by_name = List.map (fun (m : bmodule) -> (m.name, m)) p.modules in
+  if debug then begin
+    Printf.eprintf "[flat] %d modules, instances per module:\n%!" (List.length p.modules);
+    List.iter (fun (m : bmodule) ->
+      if m.instances <> [] then
+        Printf.eprintf "  %s has %d instances: %s\n%!" m.name
+          (List.length m.instances)
+          (String.concat ", "
+            (List.map (fun i -> i.inst_name ^ "→" ^ i.module_name)
+                      m.instances))
+    ) p.modules
+  end;
   (* Group siblings sharing a base name (everything before "__"). *)
   let base_of n =
     try
@@ -304,4 +327,17 @@ let flatten_program (p : bprogram) : bprogram =
     let bucket = try List.assoc b acc with Not_found -> [] in
     (b, m :: bucket) :: List.remove_assoc b acc
   ) [] p.modules in
-  { p with modules = List.map (flatten_module ~by_base ~by_name) p.modules }
+  let result = { p with modules = List.map (flatten_module ~by_base ~by_name) p.modules } in
+  if debug then begin
+    Printf.eprintf "[flat] AFTER pass: %d modules, residual instances:\n%!"
+      (List.length result.modules);
+    List.iter (fun (m : bmodule) ->
+      if m.instances <> [] then
+        Printf.eprintf "  %s STILL has %d instances: %s\n%!" m.name
+          (List.length m.instances)
+          (String.concat ", "
+            (List.map (fun i -> i.inst_name ^ "→" ^ i.module_name)
+                      m.instances))
+    ) result.modules
+  end;
+  result

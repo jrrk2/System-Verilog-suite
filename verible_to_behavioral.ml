@@ -961,7 +961,8 @@ let extract_always ~pkgs ~params ~arrays tok =
  * as a port connection. Returns Behavioral_ir.binstance, with the
  * containing module name picked up from the surrounding
  * instantiation_base1. *)
-let extract_instances ~pkgs:_ ~params:_ tok =
+let extract_instances ~pkgs ~params tok =
+  let arrays = [] in
   let bases = collect_by (has_tag (prefix_is "instantiation_base")) tok in
   List.concat_map (fun base ->
     let mod_name = ref None in
@@ -981,12 +982,18 @@ let extract_instances ~pkgs:_ ~params:_ tok =
       List.iter (fun pn ->
         match pn with
         | TUPLE6 (_, _, SymbolIdentifier port, _, expr, _) ->
-            port_conns := (port, BVar (
-              match expr with
-              | TUPLE3 (_, SymbolIdentifier id, _) -> id
-              | SymbolIdentifier id -> id
-              | _ -> "?"
-            )) :: !port_conns
+            (* Use the full expression converter so port connections
+             * carrying slices, concats, replications, and constant
+             * expressions survive intact through to BIR — required
+             * for Behavioral_flatten to substitute correctly. *)
+            let be =
+              try expr_to_bexpr ~pkgs ~params ~arrays expr
+              with _ -> BVar (match expr with
+                              | TUPLE3 (_, SymbolIdentifier id, _) -> id
+                              | SymbolIdentifier id -> id
+                              | _ -> "?")
+            in
+            port_conns := (port, be) :: !port_conns
         | _ -> ()
       ) pn_tags;
       (match in_ with
@@ -1398,12 +1405,18 @@ let convert_files ~top files : bprogram =
          * specialise_design picked for this exact instance site. Without
          * this, Behavioral_flatten would pick an arbitrary popcount__W*
          * for an internal `popcount` instance — usually the wrong one. *)
-        let rewritten = List.map (fun (i : Behavioral_ir.binstance) ->
+        let rewritten = List.filter_map (fun (i : Behavioral_ir.binstance) ->
           let key = (s.s_name, i.inst_name) in
           match Hashtbl.find_opt
                   Verible_elaborate.inst_specialised key with
-          | Some specname -> { i with module_name = specname }
-          | None -> i
+          | Some specname -> Some { i with module_name = specname }
+          | None ->
+              (* No specialise_design entry → either a dead
+               * generate branch or a non-module identifier the
+               * extractor mis-classified ($clog2-typed locals).
+               * Drop it so Behavioral_flatten doesn't get
+               * confused by ghost instances. *)
+              None
         ) m.instances in
         Some { m with name = s.s_name; instances = rewritten }
   ) specs in

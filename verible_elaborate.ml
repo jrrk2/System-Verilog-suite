@@ -1315,20 +1315,26 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
           resolver_for_walk := (fun t -> resolve_value pkgs t);
           evaluator_for_walk := Eval.eval_string;
           List.iter (fun inst ->
-            let ovs = resolve_overrides_with scope inst.i_overrides_tok in
-            if debug then
-              Printf.eprintf "[elab]   inst %s of %s: %s\n%!"
-                inst.i_inst inst.i_module
-                (String.concat ", "
-                  (List.map (fun (k, v) -> k^"="^v) ovs));
-            (* Record the specialised child name for this instance
-             * site — Behavioral_flatten needs to know which sibling
-             * specialisation an instance refers to. *)
-            let child_suffix = suffix_of_params ovs in
-            let child_sname = inst.i_module ^ child_suffix in
-            Hashtbl.replace inst_specialised
-              (sname, inst.i_inst) child_sname;
-            visit ~inst_label:(Some inst.i_inst) inst.i_module ovs
+            (* Skip ghost "instances" — signal declarations whose
+             * type-tag the parser miscategorised as an
+             * instantiation_base (e.g. `logic [PaddedWidth-1:0]
+             * padded_input;` showing up as an instance of
+             * "PaddedWidth"). The cheap check is whether the
+             * target module name actually exists. *)
+            if not (Hashtbl.mem by_name inst.i_module) then ()
+            else begin
+              let ovs = resolve_overrides_with scope inst.i_overrides_tok in
+              if debug then
+                Printf.eprintf "[elab]   inst %s of %s: %s\n%!"
+                  inst.i_inst inst.i_module
+                  (String.concat ", "
+                    (List.map (fun (k, v) -> k^"="^v) ovs));
+              let child_suffix = suffix_of_params ovs in
+              let child_sname = inst.i_module ^ child_suffix in
+              Hashtbl.replace inst_specialised
+                (sname, inst.i_inst) child_sname;
+              visit ~inst_label:(Some inst.i_inst) inst.i_module ovs
+            end
           ) (extract_instantiations ~scope mdecl.m_body)
         end
   in
