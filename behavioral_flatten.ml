@@ -26,7 +26,16 @@
 
 open Behavioral_ir
 
-let max_depth = 16
+(* Cap on the flatten loop iteration count AND on the recursion depth
+ * encoded in migrated instance names (number of "." separators in
+ * inst_name). The motivating worst case is popcount with IW256 which
+ * needs 8 levels of recursion (256→128→…→1). 10 gives slack while
+ * keeping per-module instance count bounded at 2^10 = 1024 — large but
+ * not astronomical. Without this cap, a module with combinational
+ * children that themselves have combinational children doubles its
+ * instance count each pass, and 2^16 (the previous default) materialises
+ * 65K migrated instances per parent on cva6, hanging the run. *)
+let max_depth = 10
 
 (* Compute the port shape (name → width) of a bmodule, for the I/O
  * ports only. Used to disambiguate sibling specialisations sharing a
@@ -257,17 +266,60 @@ let inline_instance ~child (parent : bmodule) (i : binstance) : bmodule =
     in
     let _ = prefix_internal in
     let _ = prefix_internal_stmt in
+    (* Migrate the child's own instances into the parent, with the
+     * inst_name prefixed so they don't collide with the parent's
+     * instances. The flatten loop will then pick them up next iteration
+     * and recurse. Without this, multi-level recursive inlining (e.g.
+     * popcount__IW16 → IW8 → IW4 → IW2) loses everything past the
+     * first level — the IW8's own IW4 instances vanish.
+     *
+     * Depth cap: count "." separators in the prospective new inst_name.
+     * Verible's specialise_design only emits a few discrete sibling
+     * versions; if the pick_specialised fallback ever maps an instance
+     * back to a child with the same module_name as its caller (because
+     * port-shape disambiguation tied), we'd recurse forever. Cap the
+     * migration name depth at `max_depth` (10) — covers popcount up to
+     * IW1024 (log2=10) and bounds total per-parent instance count at
+     * 2^10 = 1024. *)
+    let inst_dot_depth s =
+      let n = ref 0 in
+      String.iter (fun c -> if c = '.' then incr n) s;
+      !n
+    in
+    let migrated_instances =
+      if inst_dot_depth i.inst_name >= max_depth then []
+      else
+        List.map (fun (ci : binstance) ->
+          { ci with
+            inst_name = i.inst_name ^ "." ^ ci.inst_name;
+            (* Rewrite the connected port-expressions: child's port
+             * connections reference signals (input ports of the child,
+             * which now map to the inlined-caller's connected exprs;
+             * internal signals, now prefixed). The same all_subst
+             * dictionary built above does both. *)
+            port_connections = List.map (fun (p, e) ->
+              (p, substitute_port_inputs all_subst e)
+            ) ci.port_connections;
+          }
+        ) child.instances
+    in
     { parent with
       signals = parent.signals @ new_signals;
       processes = parent.processes @ List.map rewrite_proc child.processes;
-      instances = List.filter (fun x -> x.inst_name <> i.inst_name) parent.instances;
+      instances =
+        List.filter (fun x -> x.inst_name <> i.inst_name) parent.instances
+        @ migrated_instances;
     }
   end
 
 (* Flatten a module: pick the right specialised child for each
  * instance, inline if combinational. Repeat until no further
- * inlining happens or depth limit hit. *)
+ * inlining happens or depth limit hit. With migration enabled in
+ * inline_instance, each pass may add migrated grandchild instances
+ * — those get processed on subsequent passes. Bounded by max_depth
+ * which caps recursive specialisations like popcount__IW16→IW1. *)
 let flatten_module ~by_base ~by_name (parent : bmodule) : bmodule =
+  let debug = Sys.getenv_opt "FLAT_DEBUG" <> None in
   let signal_widths = List.map (fun (s : bsignal) ->
     let w = match s.stype with
       | BInt { width; _ } -> width
@@ -276,12 +328,15 @@ let flatten_module ~by_base ~by_name (parent : bmodule) : bmodule =
     in (s.name, w)
   ) parent.signals in
   let rec loop depth p =
+    if debug then
+      Printf.eprintf "[flat] %s depth=%d insts=%d sigs=%d procs=%d\n%!"
+        parent.name depth
+        (List.length p.instances) (List.length p.signals) (List.length p.processes);
     if depth >= max_depth then p
     else begin
-      let progress = ref false in
+      let inlined_any = ref false in
       let p' = List.fold_left (fun acc i ->
         let candidates =
-          (* Exact name match first, then base-name match. *)
           (match List.assoc_opt i.module_name by_name with
            | Some m -> [m] | None ->
                (try List.assoc i.module_name by_base
@@ -291,12 +346,20 @@ let flatten_module ~by_base ~by_name (parent : bmodule) : bmodule =
                 ~candidates i with
         | None -> acc
         | Some child ->
+            (* Was this instance still around (acc may have lost it
+             * via earlier folds), and did inline_instance remove it?
+             * Use membership, not length — instances list grows when
+             * a non-empty child.instances gets migrated. *)
+            let was_present =
+              List.exists (fun x -> x.inst_name = i.inst_name) acc.instances in
             let acc' = inline_instance ~child acc i in
-            if List.length acc'.instances < List.length acc.instances then
-              progress := true;
+            let still_present =
+              List.exists (fun x -> x.inst_name = i.inst_name) acc'.instances in
+            if was_present && not still_present then
+              inlined_any := true;
             acc'
       ) p p.instances in
-      if !progress then loop (depth + 1) p' else p'
+      if !inlined_any then loop (depth + 1) p' else p'
     end
   in
   loop 0 parent
@@ -315,7 +378,6 @@ let flatten_program (p : bprogram) : bprogram =
                       m.instances))
     ) p.modules
   end;
-  (* Group siblings sharing a base name (everything before "__"). *)
   let base_of n =
     try
       let i = Str.search_forward (Str.regexp "__") n 0 in

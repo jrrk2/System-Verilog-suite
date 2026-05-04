@@ -269,6 +269,30 @@ let () =
     end;
     (match vrb_m with
      | None -> Printf.printf "  (no Verible counterpart paired)\n"
+     | Some vrb_m when Sys.getenv_opt "MITER_DUMP_PROCESSES" <> None ->
+         let dump_processes side (m : bmodule) =
+           Printf.printf "  --- %s processes (%d) ---\n"
+             side (List.length m.processes);
+           List.iter (fun p ->
+             let head, body = match p with
+               | BCombinational c -> "always_comb " ^ c.name, c.body
+               | BSequential s ->
+                   let edge = match s.clock_edge with
+                     | `Pos -> "posedge" | `Neg -> "negedge" in
+                   Printf.sprintf "always_ff @(%s %s) %s"
+                     edge s.clock s.name, s.body
+             in
+             Printf.printf "    %s\n" head;
+             List.iter (fun st ->
+               Printf.printf "      %s\n"
+                 (Behavioral_ir.string_of_bstmt 0 st
+                  |> String.split_on_char '\n'
+                  |> String.concat "\n      ")
+             ) body
+           ) m.processes
+         in
+         dump_processes "viv" viv_m;
+         dump_processes "vrb" vrb_m
      | Some _ -> ());
     Printf.printf "\n"
   in
