@@ -282,7 +282,7 @@ let () =
     let z3_pass = ref 0 and z3_fail = ref 0 and z3_err = ref 0 in
     List.iter (fun (name, vff, _, vrb_ff, _, _) ->
       match vrb_ff with
-      | Some s when s = vff && vff <> [] ->
+      | Some s when s = vff ->
           let viv_m = List.assoc name viv_idx in
           (match lookup vrb_idx viv_m with
            | None -> ()
