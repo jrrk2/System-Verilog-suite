@@ -83,6 +83,13 @@ let () =
     | Some p -> p
     | None -> Printf.eprintf "Vivado side load failed\n"; exit 1
   in
+  (* Same flatten pass we run on the Verible side: Vivado's post-synth
+   * VHDL is hierarchical too — `popcount__parameterized2` instantiates
+   * two `popcount__parameterized3` for left_child / right_child. Without
+   * inlining those, the Vivado-side bmodule has only the top-level
+   * `popcount_o = L + R` ADD process with L/R as free wires, which
+   * defeats Z3 equivalence checks on non-leaf entities. *)
+  let viv = Behavioral_flatten.flatten_program viv in
   Printf.printf "  %d Vivado modules\n" (List.length viv.modules);
 
   let verilator =

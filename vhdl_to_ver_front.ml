@@ -621,6 +621,25 @@ let rec actual_to_vparser = function
       (match extract_int idx_expr with
        | Some i -> TRIPLE (BITSEL, ID { Idhash.id = base }, INT i)
        | None -> mk_id base)
+  (* `name(MSB downto LSB)` — a sub-vector slice. Vivado uses these in
+   * port maps for whole-vector connections, e.g. `data_i(7 downto 0)
+   * => data_i(15 downto 8)`. Without preserving the range the slice
+   * collapses to the bare name and we lose the partition. The inner
+   * VhdRange shape is `Triple(VhdDecreasingRange, MSB, LSB)` for
+   * `downto` (always the case for std_logic_vector). *)
+  | Triple (VhdNameParametersPrimary, Str base,
+            Triple (Vhdassociation_element, _,
+                    Double (VhdActualDiscreteRange,
+                      Double (VhdRange,
+                        Triple (VhdDecreasingRange,
+                          Double (VhdIntPrimary, Num msb_s),
+                          Double (VhdIntPrimary, Num lsb_s)))))) ->
+      let base = unescape base in
+      (try
+        let msb = int_of_string msb_s in
+        let lsb = int_of_string lsb_s in
+        QUADRUPLE (PARTSEL, ID { Idhash.id = base }, INT msb, INT lsb)
+      with _ -> mk_id base)
   | Triple (VhdNameParametersPrimary, Str base,
             Triple (Vhdassociation_element, _,
                     Double (VhdActualDiscreteRange, _))) ->

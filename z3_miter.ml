@@ -125,17 +125,33 @@ let rec expr_to_z3 suffix ctx_sigs = function
        * fixed result_type=64 but the operands have narrower actual
        * widths, Z3 sort-checks fail. Zero-extend the smaller operand to
        * match the larger; this is correct semantics for unsigned bit-
-       * vector ops on naturally-aligned values. *)
+       * vector ops on naturally-aligned values.
+       *
+       * For BAdd specifically we also widen both operands by 1 bit so
+       * the unsigned sum can hold its carry. Vivado's flat-popcount
+       * leaf `popcount_o := data_i[1] + data_i[0]` adds two 1-bit
+       * values to produce a 2-bit result; without the carry-bit
+       * widening the add wraps mod 2 (1+1 → 0) and the per-leaf count
+       * is wrong. The downstream `BAssign` truncates back if the LHS
+       * is narrower. *)
+      let bump_to z w target =
+        if w >= target then z
+        else Z3.BitVector.mk_zero_ext ctx (target - w) z
+      in
       let widen z3_a z3_b =
         let wa = Z3.BitVector.get_size (Z3.Expr.get_sort z3_a) in
         let wb = Z3.BitVector.get_size (Z3.Expr.get_sort z3_b) in
-        if wa = wb then z3_a, z3_b
-        else if wa < wb then
-          Z3.BitVector.mk_zero_ext ctx (wb - wa) z3_a, z3_b
-        else
-          z3_a, Z3.BitVector.mk_zero_ext ctx (wa - wb) z3_b
+        let target = max wa wb in
+        (bump_to z3_a wa target, bump_to z3_b wb target)
       in
-      let z3_lhs, z3_rhs = widen z3_lhs0 z3_rhs0 in
+      let z3_lhs1, z3_rhs1 = widen z3_lhs0 z3_rhs0 in
+      let z3_lhs, z3_rhs =
+        match op with
+        | BAdd ->
+            let w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs1) in
+            (bump_to z3_lhs1 w (w + 1), bump_to z3_rhs1 w (w + 1))
+        | _ -> (z3_lhs1, z3_rhs1)
+      in
       ignore result_type;
       (* Helper to convert boolean to 1-bit bitvector *)
       let bool_to_bv1 b =
@@ -248,6 +264,18 @@ let rec expr_to_z3 suffix ctx_sigs = function
       in
       replicate (count - 1) z3_value
 
+  | BSelect { array; index = BConst { value; _ } } ->
+      (* Constant bit-select `array[N]` — equivalent to `array[N:N]`.
+       * Without this, every constant bit-extract dropped to a 32-bit
+       * zero, which silently zeros the leaf-level RTL_ADD operands in
+       * popcount (`popcount_o := data_i[1] + data_i[0]`) and the
+       * whole hierarchical popcount comes out as 0. *)
+      let z3_array = expr_to_z3 suffix ctx_sigs array in
+      let arr_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
+      if value >= arr_w then
+        Z3.BitVector.mk_numeral ctx "0" 1
+      else
+        Z3.BitVector.mk_extract ctx value value z3_array
   | BSelect _ | BCall _ ->
       (* Unsupported for now *)
       Z3.BitVector.mk_numeral ctx "0" 32

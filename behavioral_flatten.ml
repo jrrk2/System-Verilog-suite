@@ -226,12 +226,20 @@ let inline_instance ~child (parent : bmodule) (i : binstance) : bmodule =
       ) i.port_connections
     in
     (* Outputs get a unique parent-side name — the caller's
-     * connected expression's BVar (if any) becomes the alias. *)
+     * connected expression's BVar (if any) becomes the alias. We
+     * also accept BSlice(BVar) and pull the bare variable: Vivado's
+     * port_maps often look like `popcount_o(1 downto 0) =>
+     * left_child_result(1 downto 0)`, where the slice covers the
+     * whole receiving signal anyway. Without this, the inlined output
+     * assignment writes to the un-renamed `popcount_o`, polluting
+     * the parent's namespace and leaving the caller's wire free. *)
     let output_aliases =
       List.filter_map (fun (port, expr) ->
         if List.mem port outputs then
           (match expr with
            | BVar caller_var ->
+               Some (port, caller_var)
+           | BSlice { signal = BVar caller_var; _ } ->
                Some (port, caller_var)
            | _ -> None)
         else None

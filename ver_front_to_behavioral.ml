@@ -106,9 +106,14 @@ let rec expr_to_bexpr = function
         array = BVar id.Idhash.id;
         index = expr_to_bexpr idx;
       }
-  | TRIPLE (PARTSEL, ID id, _)
-  | QUADRUPLE (PARTSEL, ID id, _, _) ->
-      (* Part-select; for now collapse to whole-variable read. *)
+  | QUADRUPLE (PARTSEL, ID id, INT msb, INT lsb) ->
+      (* `name[MSB:LSB]` — a sub-vector slice. Vivado uses these in
+       * port maps to wire a sub-range of one bus to a child entity's
+       * full input. Encoding it as BSlice (rather than collapsing to
+       * BVar) is necessary so flatten's port-substitution chains the
+       * sliced expression into deeper inlined leaves. *)
+      BSlice { signal = BVar id.Idhash.id; msb; lsb }
+  | TRIPLE (PARTSEL, ID id, _) ->
       BVar id.Idhash.id
   | TRIPLE (PLUS, a, b) ->
       BBinOp { op = BAdd;
@@ -193,6 +198,8 @@ let extract_signals body =
 
 type cell_inst = {
   cell_type: string;       (* normalised, e.g. RTL_REG_SYNC *)
+  raw_cell_type: string;   (* pre-normalisation (e.g. popcount__parameterized3,
+                              kept for hierarchical entity-instance lookups) *)
   inst_name: string;
   pins: (string * sv_node) list;  (* (pin_name, expr_token) *)
 }
@@ -213,6 +220,7 @@ let extract_cells body =
               ) pin_list in
               cells := {
                 cell_type = normalize_cell_type cell_id.Idhash.id;
+                raw_cell_type = cell_id.Idhash.id;
                 inst_name = inst_name.Idhash.id;
                 pins;
               } :: !cells
@@ -350,6 +358,11 @@ let pin_lhs_name name pins =
   match List.assoc_opt name pins with
   | Some (ID id) -> Some id.Idhash.id
   | Some (TRIPLE (BITSEL, ID id, _)) -> Some id.Idhash.id
+  (* `name(MSB downto LSB)` on the LHS of a port_map — Vivado emits this
+   * for whole-vector connections to a child cell's output port. We
+   * still target the bare signal at the BIR level (the slice is
+   * implied by the signal's declared width). *)
+  | Some (QUADRUPLE (PARTSEL, ID id, _, _)) -> Some id.Idhash.id
   | _ -> None
 
 let cell_to_bprocess (c : cell_inst) =
@@ -634,6 +647,38 @@ let cell_to_bprocess (c : cell_inst) =
 
 (* ─── Module conversion ───────────────────────────────────────────────── *)
 
+(* Heuristic match for Vivado-emitted primitive cell types.  Anything
+ * that doesn't look like a primitive AND lives in our cell list is
+ * treated as a hierarchical user-module instance (e.g. an entity-
+ * instantiation of `popcount__parameterized3` from inside
+ * `popcount__parameterized2`). Without this, those cells were silently
+ * dropped during conversion to BIR and Behavioral_flatten saw the
+ * Vivado side as a leaf module — which leaves L+R as free wires when
+ * miter'd against the Verible side that DOES inline its sub-children. *)
+let cell_type_is_primitive ct =
+  let n = String.length ct in
+  (n >= 4 && String.sub ct 0 4 = "RTL_")
+  || ct = "LUT" || ct = "LUT1" || ct = "LUT2"
+  || ct = "LUT3" || ct = "LUT4" || ct = "LUT5"
+  || ct = "LUT6" || ct = "FDRE" || ct = "FDCE"
+  || ct = "FDPE" || ct = "FDSE" || ct = "CARRY4"
+  || ct = "MUXF7" || ct = "MUXF8"
+  || ct = "BUFG" || ct = "IBUF" || ct = "OBUF"
+  || ct = "GND" || ct = "VCC"
+
+let cell_to_binstance (c : cell_inst) : Behavioral_ir.binstance option =
+  if cell_type_is_primitive c.cell_type then None
+  else
+    let pcs = List.map (fun (pin, expr) ->
+      (pin, expr_to_bexpr expr)
+    ) c.pins in
+    Some {
+      Behavioral_ir.inst_name = c.inst_name;
+      module_name = c.raw_cell_type;
+      param_values = [];
+      port_connections = pcs;
+    }
+
 let module_to_bmodule name (mt : Globals.modtree) =
   let body = match mt.tree with
     | QUINTUPLE (MODULE, _, _, _, body) -> body
@@ -643,7 +688,8 @@ let module_to_bmodule name (mt : Globals.modtree) =
   let raw_cells = extract_cells body in
   let cells = group_register_cells raw_cells in
   let processes = List.filter_map cell_to_bprocess cells in
-  { name; params = []; signals; processes; instances = []; funcs = []; mems = [] }
+  let instances = List.filter_map cell_to_binstance cells in
+  { name; params = []; signals; processes; instances; funcs = []; mems = [] }
 
 let convert_v_file filename =
   Hashtbl.clear Globals.modprims;
