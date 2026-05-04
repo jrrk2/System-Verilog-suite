@@ -112,6 +112,7 @@ let leaf_text = function
   | SymbolIdentifier id -> Some id
   | LT_LT -> Some "<<"  | GT_GT -> Some ">>"
   | SLASH -> Some "/"   | STAR  -> Some "*"
+  | STAR_STAR -> Some "**"
   | PERCENT -> Some "%" | PLUS  -> Some "+" | HYPHEN -> Some "-"
   | LPAREN -> Some "("  | RPAREN -> Some ")"
   | COMMA  -> Some ","  | DOT    -> Some "."
@@ -461,7 +462,105 @@ let rec prune_dead_generates scope tok =
         let s = !resolver_for_walk e in
         !evaluator_for_walk scope s
   in
+  let _ = take_branch in
+  let take_branch cond_expr_opt _ =
+    match cond_expr_opt with
+    | None -> None
+    | Some e ->
+        let s = !resolver_for_walk e in
+        !evaluator_for_walk scope s
+  in
   match tok with
+  (* Loop-generate construct (`for (genvar k = 0; cond; step) body`).
+   * Unrolls the loop into N copies of the body, with `k` bound to
+   * its iteration value in the recursive prune scope so any
+   * conditional generate inside the body can resolve. Falls back
+   * to a no-op walk if init/cond/step can't be evaluated. The
+   * grammar shape is TUPLE13 (For, LPAREN, genvar_opt, ID, EQUALS,
+   * init_expr, SEMICOLON, cond_expr, SEMICOLON, for_step, RPAREN,
+   * body) so we destructure that here. Without this lzc's
+   * `for (genvar level = 0; level < NumLevels; level++)` body —
+   * which contains nested generate-ifs based on `level` and the
+   * inner k — never had the dead branches pruned, leaving multiple
+   * processes writing to the same sel_nodes/index_nodes. *)
+  | TUPLE13 (STRING tag, _, _, _, gv_id, _, init, _, cond, _, step, _, body)
+    when prefix_is "loop_generate_construct" tag ->
+      let extract_id t =
+        let id = ref None in
+        walk (function
+          | SymbolIdentifier s when !id = None -> id := Some s
+          | _ -> ()) t;
+        !id
+      in
+      let gv_name = extract_id gv_id in
+      let resolve_int e =
+        let s = !resolver_for_walk e in
+        !evaluator_for_walk scope s
+      in
+      let step_delta name =
+        match step with
+        | TUPLE3 (STRING t, _, _) when prefix_is "inc_or_dec_expression" t ->
+            (* `++name` / `name++` / `--name` / `name--`. Polarity
+             * comes from the position of PLUS_PLUS / HYPHEN_HYPHEN. *)
+            let s_pre = match step with
+              | TUPLE3 (_, PLUS_PLUS, _) -> Some 1
+              | TUPLE3 (_, HYPHEN_HYPHEN, _) -> Some (-1)
+              | TUPLE3 (_, _, PLUS_PLUS) -> Some 1
+              | TUPLE3 (_, _, HYPHEN_HYPHEN) -> Some (-1)
+              | _ -> None
+            in
+            (match s_pre with
+             | Some d -> Some d
+             | None -> ignore name; None)
+        | TUPLE4 (STRING t, _, _, rhs)
+          when prefix_is "assignment_statement_no_expr" t ->
+            (* `name = expr` — evaluate expr in current scope and
+             * subtract the current name-value to get the delta. *)
+            (match resolve_int rhs with
+             | Some new_v ->
+                 (match List.assoc_opt name scope with
+                  | Some old_v -> Some (new_v - old_v)
+                  | None -> None)
+             | None -> None)
+        | _ -> None
+      in
+      (match gv_name, resolve_int init with
+       | Some name, Some init_v ->
+           let max_iter = 256 in
+           let unrolled = ref [] in
+           let v = ref init_v in
+           let live = ref true in
+           let iter = ref 0 in
+           while !live && !iter < max_iter do
+             let scope' = (name, !v) :: scope in
+             (* Evaluate condition in current scope *)
+             let still_live =
+               let s = !resolver_for_walk cond in
+               match !evaluator_for_walk scope' s with
+               | Some n -> n <> 0
+               | None -> false  (* bail — can't decide *)
+             in
+             if still_live then begin
+               unrolled := prune_dead_generates scope' body :: !unrolled;
+               (* Advance v per step. *)
+               match step_delta name with
+               | Some d -> v := !v + d
+               | None -> live := false
+             end else
+               live := false;
+             incr iter
+           done;
+           (match List.rev !unrolled with
+            | [] -> EMPTY_TOKEN
+            | [x] -> x
+            | xs -> TLIST xs)
+       | _ ->
+           (* Couldn't evaluate; fall through to default subtree
+            * recursion so we at least walk into the body. *)
+           TUPLE13 (STRING tag, EMPTY_TOKEN, EMPTY_TOKEN, EMPTY_TOKEN,
+                    gv_id, EMPTY_TOKEN, init, EMPTY_TOKEN, cond,
+                    EMPTY_TOKEN, step, EMPTY_TOKEN,
+                    prune_dead_generates scope body))
   | TUPLE5 (STRING tag, gif, t_item, e_kw, e_item)
     when prefix_is "conditional_generate_construct" tag ->
       (match take_branch (extract_if_cond gif)
@@ -1217,7 +1316,7 @@ module Eval = struct
   type tok =
     | TNum of int | TId of string
     | TLP | TRP | TComma | TDot
-    | TPlus | TMinus | TStar | TSlash | TPercent
+    | TPlus | TMinus | TStar | TPow | TSlash | TPercent
     | TShl | TShr
     | TEq | TNeq | TLt | TLe | TGt | TGe
     | TLAnd | TLOr | TBang
@@ -1251,6 +1350,7 @@ module Eval = struct
       | ':' -> push TColon; incr i
       | '+' -> push TPlus; incr i
       | '-' -> push TMinus; incr i
+      | '*' when !i + 1 < n && s.[!i + 1] = '*' -> push TPow; i := !i + 2
       | '*' -> push TStar; incr i
       | '/' -> push TSlash; incr i
       | '%' -> push TPercent; incr i
@@ -1393,13 +1493,41 @@ module Eval = struct
       | rest -> (l, rest)
     in loop l t
   and parse_mul scope toks =
-    let l, t = parse_unary scope toks in
+    let l, t = parse_pow scope toks in
     let rec loop l = function
-      | TStar    :: rest -> binop scope ( * ) l rest loop
-      | TSlash   :: rest -> safe_binop scope (/) l rest loop
-      | TPercent :: rest -> safe_binop scope (mod) l rest loop
+      | TStar    :: rest -> binop_pow scope ( * ) l rest loop
+      | TSlash   :: rest -> safe_binop_pow scope (/) l rest loop
+      | TPercent :: rest -> safe_binop_pow scope (mod) l rest loop
       | rest -> (l, rest)
     in loop l t
+  and binop_pow scope op l rest cont =
+    let r, t = parse_pow scope rest in
+    (match l, r with
+     | Some a, Some b -> cont (Some (op a b)) t
+     | _ -> cont None t)
+  and safe_binop_pow scope op l rest cont =
+    let r, t = parse_pow scope rest in
+    (match l, r with
+     | Some a, Some b when b <> 0 -> cont (Some (op a b)) t
+     | _ -> cont None t)
+  (* Power: right-associative, tighter than `*`/`/`. SV uses `**`.
+   * For non-negative integer exponents, fold by repeated multiply. *)
+  and parse_pow scope toks =
+    let l, t = parse_unary scope toks in
+    match t with
+    | TPow :: rest ->
+        let r, t' = parse_pow scope rest in
+        let v = match l, r with
+          | Some a, Some e when e >= 0 ->
+              let rec pow b e =
+                if e = 0 then 1
+                else b * pow b (e - 1)
+              in
+              Some (pow a e)
+          | _ -> None
+        in
+        (v, t')
+    | _ -> (l, t)
   and parse_unary scope = function
     | TMinus :: rest ->
         let v, t = parse_unary scope rest in
@@ -1454,6 +1582,42 @@ module Eval = struct
      | _ -> cont None t)
 
   let eval_string scope s =
+    (* Strip SystemVerilog type-cast prefixes `id'(` → `(`. The cast
+     * preserves value (it just narrows/extends the type which we
+     * don't track), so dropping it is sound for integer evaluation.
+     * Without this, `unsigned'(k) * 2 < WIDTH - 1` (used in lzc.sv's
+     * generate-for body conditions) tokenises as garbage and the
+     * outer prune_dead_generates can't decide which inner if-branch
+     * is live. *)
+    let s =
+      let buf = Buffer.create (String.length s) in
+      let n = String.length s in
+      let i = ref 0 in
+      while !i < n do
+        let c = s.[!i] in
+        let is_id c =
+          (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+          || c = '_' || (c >= '0' && c <= '9') in
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_' then begin
+          let j = ref !i in
+          while !j < n && is_id s.[!j] do incr j done;
+          let id_end = !j in
+          (* Skip optional whitespace before `'(`. *)
+          while !j < n && (s.[!j] = ' ' || s.[!j] = '\t') do incr j done;
+          if !j + 1 < n && s.[!j] = '\'' && s.[!j + 1] = '(' then begin
+            (* Cast — drop the id and the apostrophe. *)
+            i := !j + 1
+          end else begin
+            Buffer.add_substring buf s !i (id_end - !i);
+            i := id_end
+          end
+        end else begin
+          Buffer.add_char buf c;
+          incr i
+        end
+      done;
+      Buffer.contents buf
+    in
     try fst (parse_expr scope (tokenize s)) with _ -> None
 end
 
