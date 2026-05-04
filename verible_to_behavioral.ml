@@ -54,9 +54,25 @@ let rec eval_int ~pkgs ~params tok =
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a - b)
        | _ -> None)
-  | TUPLE4 (STRING tag, lhs, _op, rhs) when prefix_is "mul_expr2" tag ->
+  | TUPLE4 (STRING "mul_expr2", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a * b)
+       | _ -> None)
+  | TUPLE4 (STRING "mul_expr3", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b when b <> 0 -> Some (a / b)
+       | _ -> None)
+  | TUPLE4 (STRING "mul_expr4", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b when b <> 0 -> Some (a mod b)
+       | _ -> None)
+  | TUPLE4 (STRING "shift_expr2", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (a lsl b)
+       | _ -> None)
+  | TUPLE4 (STRING "shift_expr3", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (a lsr b)
        | _ -> None)
   (* Function-like call wrapper: `reference_or_call_base1(reference,
    * call_base)`. The lexer treats `$clog2` as a SymbolIdentifier
