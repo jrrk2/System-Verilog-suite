@@ -343,6 +343,110 @@ let collect_live_by scope pred root =
   walk_live scope (fun t -> if pred t then acc := t :: !acc) root;
   List.rev !acc
 
+(* Tree transformer: replace every `function_declaration` and
+ * `task_declaration` subtree with EMPTY_TOKEN. Used by
+ * verible_to_behavioral.convert_module to keep function-local
+ * variable declarations (e.g. `logic [63:0] out;` inside an SV
+ * function body) from leaking into the enclosing module's signal
+ * list. The function body is consumed separately by extract_functions. *)
+let rec strip_function_decls tok =
+  match tok with
+  | TUPLE2 (STRING tag, _)
+  | TUPLE3 (STRING tag, _, _)
+  | TUPLE4 (STRING tag, _, _, _)
+  | TUPLE5 (STRING tag, _, _, _, _)
+  | TUPLE6 (STRING tag, _, _, _, _, _)
+  | TUPLE7 (STRING tag, _, _, _, _, _, _)
+  | TUPLE8 (STRING tag, _, _, _, _, _, _, _)
+  | TUPLE9 (STRING tag, _, _, _, _, _, _, _, _)
+  | TUPLE10 (STRING tag, _, _, _, _, _, _, _, _, _)
+  | TUPLE11 (STRING tag, _, _, _, _, _, _, _, _, _, _)
+  | TUPLE12 (STRING tag, _, _, _, _, _, _, _, _, _, _, _)
+  | TUPLE13 (STRING tag, _, _, _, _, _, _, _, _, _, _, _, _)
+  | TUPLE14 (STRING tag, _, _, _, _, _, _, _, _, _, _, _, _, _)
+  | TUPLE15 (STRING tag, _, _, _, _, _, _, _, _, _, _, _, _, _, _)
+    when prefix_is "function_declaration" tag
+      || prefix_is "task_declaration" tag ->
+      EMPTY_TOKEN
+  | TUPLE2 (a, b) -> TUPLE2 (strip_function_decls a, strip_function_decls b)
+  | TUPLE3 (a, b, c) ->
+      TUPLE3 (strip_function_decls a, strip_function_decls b,
+              strip_function_decls c)
+  | TUPLE4 (a, b, c, d) ->
+      TUPLE4 (strip_function_decls a, strip_function_decls b,
+              strip_function_decls c, strip_function_decls d)
+  | TUPLE5 (a, b, c, d, e) ->
+      TUPLE5 (strip_function_decls a, strip_function_decls b,
+              strip_function_decls c, strip_function_decls d,
+              strip_function_decls e)
+  | TUPLE6 (a, b, c, d, e, f) ->
+      TUPLE6 (strip_function_decls a, strip_function_decls b,
+              strip_function_decls c, strip_function_decls d,
+              strip_function_decls e, strip_function_decls f)
+  | TUPLE7 (a, b, c, d, e, f, g) ->
+      TUPLE7 (strip_function_decls a, strip_function_decls b,
+              strip_function_decls c, strip_function_decls d,
+              strip_function_decls e, strip_function_decls f,
+              strip_function_decls g)
+  | TUPLE8 (a, b, c, d, e, f, g, h) ->
+      TUPLE8 (strip_function_decls a, strip_function_decls b,
+              strip_function_decls c, strip_function_decls d,
+              strip_function_decls e, strip_function_decls f,
+              strip_function_decls g, strip_function_decls h)
+  | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+      TUPLE9 (strip_function_decls a, strip_function_decls b,
+              strip_function_decls c, strip_function_decls d,
+              strip_function_decls e, strip_function_decls f,
+              strip_function_decls g, strip_function_decls h,
+              strip_function_decls i)
+  | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+      TUPLE10 (strip_function_decls a, strip_function_decls b,
+               strip_function_decls c, strip_function_decls d,
+               strip_function_decls e, strip_function_decls f,
+               strip_function_decls g, strip_function_decls h,
+               strip_function_decls i, strip_function_decls j)
+  | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+      TUPLE11 (strip_function_decls a, strip_function_decls b,
+               strip_function_decls c, strip_function_decls d,
+               strip_function_decls e, strip_function_decls f,
+               strip_function_decls g, strip_function_decls h,
+               strip_function_decls i, strip_function_decls j,
+               strip_function_decls k)
+  | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+      TUPLE12 (strip_function_decls a, strip_function_decls b,
+               strip_function_decls c, strip_function_decls d,
+               strip_function_decls e, strip_function_decls f,
+               strip_function_decls g, strip_function_decls h,
+               strip_function_decls i, strip_function_decls j,
+               strip_function_decls k, strip_function_decls l)
+  | TUPLE13 (a, b, c, d, e, f, g, h, i, j, k, l, m) ->
+      TUPLE13 (strip_function_decls a, strip_function_decls b,
+               strip_function_decls c, strip_function_decls d,
+               strip_function_decls e, strip_function_decls f,
+               strip_function_decls g, strip_function_decls h,
+               strip_function_decls i, strip_function_decls j,
+               strip_function_decls k, strip_function_decls l,
+               strip_function_decls m)
+  | TUPLE14 (a, b, c, d, e, f, g, h, i, j, k, l, m, n) ->
+      TUPLE14 (strip_function_decls a, strip_function_decls b,
+               strip_function_decls c, strip_function_decls d,
+               strip_function_decls e, strip_function_decls f,
+               strip_function_decls g, strip_function_decls h,
+               strip_function_decls i, strip_function_decls j,
+               strip_function_decls k, strip_function_decls l,
+               strip_function_decls m, strip_function_decls n)
+  | TUPLE15 (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ->
+      TUPLE15 (strip_function_decls a, strip_function_decls b,
+               strip_function_decls c, strip_function_decls d,
+               strip_function_decls e, strip_function_decls f,
+               strip_function_decls g, strip_function_decls h,
+               strip_function_decls i, strip_function_decls j,
+               strip_function_decls k, strip_function_decls l,
+               strip_function_decls m, strip_function_decls n,
+               strip_function_decls o)
+  | TLIST xs -> TLIST (List.map strip_function_decls xs)
+  | leaf -> leaf
+
 (* Tree transformer: replace every dead conditional_generate branch
  * with EMPTY_TOKEN, leaving the live branch in place. Used by
  * verible_to_behavioral.convert_module to prune dead generate

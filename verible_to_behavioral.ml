@@ -1099,6 +1099,16 @@ let convert_module ~pkgs (mdecl : module_decl)
     else { mdecl with m_body =
       Verible_elaborate.prune_dead_generates int_scope mdecl.m_body }
   in
+  (* Strip function/task subtrees so their internal `logic` decls
+   * don't leak into the module's signal list. specialise_design's
+   * extract_functions consumed the bodies already; by this point
+   * we don't need them at module-extraction. Without this,
+   * e.g. lfsr.sv's `function sbox4_layer` has a 64-bit local `out`
+   * that surfaces as a module-level signal. *)
+  let mdecl =
+    { mdecl with m_body =
+      Verible_elaborate.strip_function_decls mdecl.m_body }
+  in
   (* Enum item names fold to their integer values via the same
    * params lookup that handles `parameter`. *)
   let enum_items = extract_enum_items ~pkgs ~params mdecl.m_body in
