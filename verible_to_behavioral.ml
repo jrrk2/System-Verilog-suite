@@ -1070,16 +1070,18 @@ let convert_module ~pkgs (mdecl : module_decl)
     (fun t -> Verible_elaborate.resolve_value pkgs t);
   Verible_elaborate.evaluator_for_walk :=
     Verible_elaborate.Eval.eval_string;
-  (* Opt-in via ENABLE_GEN_PRUNE — the prune helps the recursive-
-   * popcount case (eliminates dead-branch assigns that fight the
-   * live branch) but currently regresses 3 ct_vfdsu_* Z3 passes
-   * with width mismatches. Localparam-scope discrepancy still TBD;
-   * keeping it default-off until the regression is understood. *)
+  (* Default-on. The fuzzer (test/random/fuzz_const_fn.sh) shows
+   * the prune turns cfg_recursive from 0/25 to 25/25, and the
+   * 3 ct_vfdsu_* Z3 PASSes the prune-off path showed were false
+   * positives (multi-driver pollution where the un-pruned bmodule
+   * happened to be Z3-equivalent to Vivado's elaborated form by
+   * coincidence, not by elaboration correctness). Opt-out via
+   * DISABLE_GEN_PRUNE for triaging the residual width-mismatch
+   * cases. *)
   let mdecl =
-    if Sys.getenv_opt "ENABLE_GEN_PRUNE" <> None then
-      { mdecl with m_body =
-        Verible_elaborate.prune_dead_generates int_scope mdecl.m_body }
-    else mdecl
+    if Sys.getenv_opt "DISABLE_GEN_PRUNE" <> None then mdecl
+    else { mdecl with m_body =
+      Verible_elaborate.prune_dead_generates int_scope mdecl.m_body }
   in
   (* Enum item names fold to their integer values via the same
    * params lookup that handles `parameter`. *)
