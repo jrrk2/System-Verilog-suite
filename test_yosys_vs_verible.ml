@@ -15,8 +15,15 @@ let usage () =
     "usage: %s <top> <file.sv> [more.sv ...]\n" Sys.argv.(0);
   exit 2
 
+(* Two yosys candidates: the OSS CAD Suite (which ships yosys 0.64+
+ * AND the slang.so plugin in share/yosys/plugins/) is preferred when
+ * present, since `read_slang` has much wider SV-2017 coverage than
+ * yosys's built-in `read_verilog -sv`. Falls back to the f4pga yosys
+ * for the legacy code path. *)
 let find_yosys () =
+  let home = try Sys.getenv "HOME" with Not_found -> "/root" in
   let candidates = [
+    home ^ "/oss-cad-suite/bin/yosys";
     "/home/local/f4pga/xc7/conda/envs/xc7/bin/yosys";
     "/usr/local/bin/yosys";
     "/usr/bin/yosys";
@@ -27,6 +34,13 @@ let find_yosys () =
     else (Sys.command (Printf.sprintf "command -v %s > /dev/null" p) = 0)
   ) candidates
 
+(* Whether the slang.so plugin is reachable from this yosys. Triggered
+ * by the YOSYS_SLANG=1 env var; without it we keep the legacy
+ * `read_verilog -sv` path so existing regressions stay deterministic
+ * across machines that don't have OSS CAD Suite. *)
+let use_slang () =
+  Sys.getenv_opt "YOSYS_SLANG" <> None
+
 let run_yosys ~top ~files ~out =
   let yosys = match find_yosys () with
     | Some y -> y
@@ -34,7 +48,12 @@ let run_yosys ~top ~files ~out =
   in
   let script_file = Filename.temp_file "yosys_script_" ".ys" in
   let oc = open_out script_file in
-  Printf.fprintf oc "read_verilog -sv %s\n" (String.concat " " files);
+  if use_slang () then begin
+    Printf.fprintf oc "plugin -i slang\n";
+    Printf.fprintf oc "read_slang --top %s %s\n" top
+      (String.concat " " files)
+  end else
+    Printf.fprintf oc "read_verilog -sv %s\n" (String.concat " " files);
   Printf.fprintf oc "hierarchy -top %s\n" top;
   Printf.fprintf oc "proc\nopt -fast\nflatten\nopt -fast\n";
   Printf.fprintf oc "write_rtlil %s\n" out;
