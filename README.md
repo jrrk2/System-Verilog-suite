@@ -1,13 +1,20 @@
 # System-Verilog-decompiler
 
 A multi-frontend SystemVerilog elaborator and equivalence-checking pipeline,
-written in OCaml. Pulls SV/Verilog/VHDL/RTLIL/UHDM through five distinct
-parsers into a common Behavioral IR (BIR), runs SV-elaboration and
-post-elaboration optimisation passes on it, and proves equivalence
-between any two BIR modules via Z3 SMT. Originally built to recover
-behavioural Verilog from synthesised netlists; grown into a side-by-side
-correctness checker for SV elaboration, compared against
-Vivado's VHDL elaboration as the oracle.
+written in OCaml. Pulls SV/Verilog/RTLIL/UHDM and Vivado's
+post-elaboration structural VHDL through five distinct parsers into a
+common Behavioral IR (BIR), runs SV-elaboration and post-elaboration
+optimisation passes on it, and proves equivalence between any two BIR
+modules via Z3 SMT. Originally built to recover behavioural Verilog from
+synthesised netlists; grown into a side-by-side correctness checker for
+SV elaboration, with Vivado's elaborated form as the oracle.
+
+Vivado is an SV consumer in this pipeline, not a VHDL consumer: we
+feed it SystemVerilog, run `synth_design -rtl`, and use the
+structural VHDL it emits (RTL_REG_*, RTL_AND, RTL_MUX, …) as a
+post-elaboration intermediate language we can re-parse. So the
+"Vivado VHDL frontend" reads Vivado's *output*, not the project's
+*input*.
 
 The project is structured around the BIR as the lingua franca: every
 frontend's job is to land a `bprogram`; every pass operates on `bmodule`s;
@@ -19,7 +26,7 @@ every backend reads `bmodule`s.
 |---|---|---|---|
 | Verible | `verible_to_behavioral.ml` + `verible_elaborate.ml` | SV source via OCaml port of Verible's grammar | Full elaboration: parameter overrides, generate unrolling, const-fn evaluation, struct-typed parameters |
 | Verilator JSON | `verilator_to_behavioral.ml` | `verilator --json-only` AST dump | Already-elaborated, monomorphic — read after Verilator does the heavy lifting |
-| Vivado VHDL | `vhdl_to_ver_front.ml` → `ver_front_to_behavioral.ml` | Post-`synth_design -rtl` VHDL netlist | Treats RTL_REG_SYNC/ASYNC cells as `BSequential` processes; the structural oracle |
+| Vivado RTL VHDL | `vhdl_to_ver_front.ml` → `ver_front_to_behavioral.ml` | Structural VHDL emitted by Vivado's `synth_design -rtl` (after Vivado has parsed and elaborated the original SV source) | Treats RTL_REG_SYNC/ASYNC cells as `BSequential` processes; the structural oracle |
 | Yosys RTLIL | `rtlil_to_behavioral.ml` | `read_verilog`-then-`write_rtlil` | Used for the four-way miter |
 | Surelog UHDM | `surelog_to_behavioral.ml` | UHDM dump from Surelog | Leaf-cell pipecleaner; not used for CVA6-scale designs (type-parameter limitation) |
 
@@ -128,8 +135,8 @@ Built via `dune build`. The most-used executables:
 
 | Executable | Source | Use |
 |---|---|---|
-| `test_cva6_ff_diff.exe` | `test_cva6_ff_diff.ml` | Per-entity FF-set diff between Vivado-elaborated VHDL and Verible-elaborated SV. Optional `MITER_Z3=1` runs Z3 on FF-matching pairs |
-| `test_cva6_bottom_up.exe` | `test_cva6_bottom_up.ml` | Pairwise Z3 miter for every Verilator-JSON module against the matching `cva6_elab.vhd` entity |
+| `test_cva6_ff_diff.exe` | `test_cva6_ff_diff.ml` | Per-entity FF-set diff between Vivado's elaborated form (its `synth_design -rtl` VHDL output) and Verible-elaborated SV. Optional `MITER_Z3=1` runs Z3 on FF-matching pairs |
+| `test_cva6_bottom_up.exe` | `test_cva6_bottom_up.ml` | Pairwise Z3 miter for every Verilator-JSON module against the matching entity in Vivado's elaborated VHDL output (`cva6_elab.vhd`) |
 | `test_verilator_vs_verible.exe` | `test_verilator_vs_verible.ml` | Verilator-JSON ↔ Verible-OCaml miter on a single SV file |
 | `test_verible_to_bir.exe` | `test_verible_to_bir.ml` | Verible-side BIR dump for a single SV file. Useful for debugging elaboration. `--miter <vhd>` adds Z3 against a Vivado entity |
 | `ff_stats.exe` | `ff_stats.ml` | Run all four frontends on a single testcase and report each one's Q__Q / Q__D set, with pairwise overlap numbers |
@@ -184,12 +191,14 @@ See `test/sv_tests/README.md` for installation and full instructions.
 
 ### `test/cva6_ram/` — CVA6 hierarchical equivalence
 
-Real-design driver: pair every entity in `cva6_elab.vhd` (Vivado
-elaborated, 144 entities) against the corresponding Verible-elaborated
-specialisation, by base name + port-shape. The wrapper
+Real-design driver. Vivado was fed CVA6's SystemVerilog source, ran
+`synth_design -rtl`, and dumped the resulting structural VHDL to
+`cva6_elab.vhd` (144 elaborated entities). The driver pairs each of
+those entities against the corresponding Verible-elaborated
+specialisation by base name + port-shape. The wrapper
 `test/cva6_ram/run_ff_diff.sh` builds the flattened SV (verilator -E
-with pragma + assertion stripping) and drives the FF-set comparator
-end-to-end.
+with pragma + assertion stripping) for the Verible side and drives
+the FF-set comparator end-to-end.
 
 Current numbers (after the prune-default-on flip):
 - 26 / 144 entities show FF-set parity with Vivado
@@ -223,7 +232,7 @@ above.
 ## Memory-of-the-flow
 
 ```
-SV/RTLIL/JSON/VHDL/UHDM
+SV/RTLIL/UHDM    +   Vivado-emitted structural VHDL
      │
      ▼  per-frontend converter
    bprogram { modules: bmodule list }
