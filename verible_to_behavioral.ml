@@ -1393,6 +1393,18 @@ let convert_files ~top files : bprogram =
         None
     | Some mdecl ->
         let m = convert_module ~pkgs mdecl s.s_params in
-        Some { m with name = s.s_name }
+        (* Rewrite each instance's module_name from the BASE name (which
+         * extract_instances records) to the SPECIALISED sibling that
+         * specialise_design picked for this exact instance site. Without
+         * this, Behavioral_flatten would pick an arbitrary popcount__W*
+         * for an internal `popcount` instance — usually the wrong one. *)
+        let rewritten = List.map (fun (i : Behavioral_ir.binstance) ->
+          let key = (s.s_name, i.inst_name) in
+          match Hashtbl.find_opt
+                  Verible_elaborate.inst_specialised key with
+          | Some specname -> { i with module_name = specname }
+          | None -> i
+        ) m.instances in
+        Some { m with name = s.s_name; instances = rewritten }
   ) specs in
   { modules = bmods; library_cells = [] }

@@ -120,6 +120,7 @@ let () =
             |> Behavioral_iflift.lift_program
             |> Behavioral_blocking_subst.blocking_subst_program
             |> Behavioral_meminfer.infer_program
+            |> Behavioral_flatten.flatten_program
           in
           Some p
          with e ->

@@ -1188,9 +1188,18 @@ type specialised = {
  * provided, every override expression is resolved through it so
  * `config_pkg::XLEN` collapses to its integer value before we hash
  * it into the specialised name. *)
+(* Module-level: published map (parent_specname, inst_label) →
+ * child_specname, populated in specialise_design's visit. Used by
+ * verible_to_behavioral.convert_files to rewrite each binstance's
+ * module_name from base to its specialised counterpart, so that
+ * Behavioral_flatten can pick the right child to inline. *)
+let inst_specialised : (string * string, string) Hashtbl.t =
+  Hashtbl.create 64
+
 let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
+  Hashtbl.clear inst_specialised;
   (* Build the function table once from every module + package body.
    * Used by resolve_param_default to evaluate constant function calls
    * appearing as parameter defaults (e.g. CVA6Cfg = build_config(...)).
@@ -1312,6 +1321,13 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
                 inst.i_inst inst.i_module
                 (String.concat ", "
                   (List.map (fun (k, v) -> k^"="^v) ovs));
+            (* Record the specialised child name for this instance
+             * site — Behavioral_flatten needs to know which sibling
+             * specialisation an instance refers to. *)
+            let child_suffix = suffix_of_params ovs in
+            let child_sname = inst.i_module ^ child_suffix in
+            Hashtbl.replace inst_specialised
+              (sname, inst.i_inst) child_sname;
             visit ~inst_label:(Some inst.i_inst) inst.i_module ovs
           ) (extract_instantiations ~scope mdecl.m_body)
         end
