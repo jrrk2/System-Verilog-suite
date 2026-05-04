@@ -524,6 +524,78 @@ let rec prune_dead_generates scope tok =
              | None -> None)
         | _ -> None
       in
+      (* Substitute every reference to `name` (as a SymbolIdentifier)
+       * with a decimal numeric leaf carrying the current iteration
+       * value. Without this, the unrolled body still has the genvar
+       * as an opaque identifier and downstream eval_int / extract_*
+       * sees `k * 2 + 1` as a free variable expression. *)
+      let rec subst_genvar name v t =
+        match t with
+        | SymbolIdentifier id when id = name ->
+            TK_DecNumber (string_of_int v)
+        | TUPLE2 (a, b) ->
+            TUPLE2 (subst_genvar name v a, subst_genvar name v b)
+        | TUPLE3 (a, b, c) ->
+            TUPLE3 (subst_genvar name v a, subst_genvar name v b,
+                    subst_genvar name v c)
+        | TUPLE4 (a, b, c, d) ->
+            TUPLE4 (subst_genvar name v a, subst_genvar name v b,
+                    subst_genvar name v c, subst_genvar name v d)
+        | TUPLE5 (a, b, c, d, e) ->
+            TUPLE5 (subst_genvar name v a, subst_genvar name v b,
+                    subst_genvar name v c, subst_genvar name v d,
+                    subst_genvar name v e)
+        | TUPLE6 (a, b, c, d, e, f) ->
+            TUPLE6 (subst_genvar name v a, subst_genvar name v b,
+                    subst_genvar name v c, subst_genvar name v d,
+                    subst_genvar name v e, subst_genvar name v f)
+        | TUPLE7 (a, b, c, d, e, f, g) ->
+            TUPLE7 (subst_genvar name v a, subst_genvar name v b,
+                    subst_genvar name v c, subst_genvar name v d,
+                    subst_genvar name v e, subst_genvar name v f,
+                    subst_genvar name v g)
+        | TUPLE8 (a, b, c, d, e, f, g, h) ->
+            TUPLE8 (subst_genvar name v a, subst_genvar name v b,
+                    subst_genvar name v c, subst_genvar name v d,
+                    subst_genvar name v e, subst_genvar name v f,
+                    subst_genvar name v g, subst_genvar name v h)
+        | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+            TUPLE9 (subst_genvar name v a, subst_genvar name v b,
+                    subst_genvar name v c, subst_genvar name v d,
+                    subst_genvar name v e, subst_genvar name v f,
+                    subst_genvar name v g, subst_genvar name v h,
+                    subst_genvar name v i)
+        | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+            TUPLE10 (subst_genvar name v a, subst_genvar name v b,
+                     subst_genvar name v c, subst_genvar name v d,
+                     subst_genvar name v e, subst_genvar name v f,
+                     subst_genvar name v g, subst_genvar name v h,
+                     subst_genvar name v i, subst_genvar name v j)
+        | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+            TUPLE11 (subst_genvar name v a, subst_genvar name v b,
+                     subst_genvar name v c, subst_genvar name v d,
+                     subst_genvar name v e, subst_genvar name v f,
+                     subst_genvar name v g, subst_genvar name v h,
+                     subst_genvar name v i, subst_genvar name v j,
+                     subst_genvar name v k)
+        | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+            TUPLE12 (subst_genvar name v a, subst_genvar name v b,
+                     subst_genvar name v c, subst_genvar name v d,
+                     subst_genvar name v e, subst_genvar name v f,
+                     subst_genvar name v g, subst_genvar name v h,
+                     subst_genvar name v i, subst_genvar name v j,
+                     subst_genvar name v k, subst_genvar name v l)
+        | TUPLE13 (a, b, c, d, e, f, g, h, i, j, k, l, m) ->
+            TUPLE13 (subst_genvar name v a, subst_genvar name v b,
+                     subst_genvar name v c, subst_genvar name v d,
+                     subst_genvar name v e, subst_genvar name v f,
+                     subst_genvar name v g, subst_genvar name v h,
+                     subst_genvar name v i, subst_genvar name v j,
+                     subst_genvar name v k, subst_genvar name v l,
+                     subst_genvar name v m)
+        | TLIST xs -> TLIST (List.map (subst_genvar name v) xs)
+        | leaf -> leaf
+      in
       (match gv_name, resolve_int init with
        | Some name, Some init_v ->
            let max_iter = 256 in
@@ -541,7 +613,8 @@ let rec prune_dead_generates scope tok =
                | None -> false  (* bail — can't decide *)
              in
              if still_live then begin
-               unrolled := prune_dead_generates scope' body :: !unrolled;
+               let inst = subst_genvar name !v body in
+               unrolled := prune_dead_generates scope' inst :: !unrolled;
                (* Advance v per step. *)
                match step_delta name with
                | Some d -> v := !v + d

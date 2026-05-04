@@ -27,6 +27,21 @@ let () =
   Printf.printf "  Verible → BIR conversion: %s\n" top;
   Printf.printf "═══════════════════════════════════════════════════════\n\n";
   let prog = Verible_to_behavioral.convert_files ~top files in
+  (* Optionally apply the same downstream pipeline that
+   * test_cva6_ff_diff runs on the Verible side, so dumps reflect the
+   * fully-elaborated form rather than the raw bbody. Gated by
+   * BIR_FULL_PIPELINE=1 to keep the default cheap. *)
+  let prog =
+    if Sys.getenv_opt "BIR_FULL_PIPELINE" <> None then
+      prog
+      |> Behavioral_unroll.unroll_program
+      |> Behavioral_inline.inline_program
+      |> Behavioral_iflift.lift_program
+      |> Behavioral_blocking_subst.blocking_subst_program
+      |> Behavioral_meminfer.infer_program
+      |> Behavioral_flatten.flatten_program
+    else prog
+  in
   Printf.printf "Got %d bmodule(s):\n" (List.length prog.modules);
   List.iter (fun (m : Behavioral_ir.bmodule) ->
     Printf.printf "  %-40s %d signals, %d processes\n"

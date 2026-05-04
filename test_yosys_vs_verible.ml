@@ -107,6 +107,12 @@ let () =
   let yos_top = pick "yosys"   yos_prog.modules in
   let ver_top = pick "verible" ver_prog.modules in
 
+  if Sys.getenv_opt "BIR_DUMP" <> None then begin
+    Printf.printf "\n=== YOSYS BIR ===\n%s\n=== VERIBLE BIR ===\n%s\n"
+      (Behavioral_ir.string_of_bmodule yos_top)
+      (Behavioral_ir.string_of_bmodule ver_top)
+  end;
+
   Printf.printf "[3/3] Z3 miter ...\n";
   let ok = Z3_miter.check_miter_equivalence yos_top ver_top in
   if ok then begin
