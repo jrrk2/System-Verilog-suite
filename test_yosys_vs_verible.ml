@@ -51,11 +51,20 @@ let run_yosys ~top ~files ~out =
   if use_slang () then begin
     Printf.fprintf oc "plugin -i slang\n";
     Printf.fprintf oc "read_slang --top %s %s\n" top
-      (String.concat " " files)
-  end else
+      (String.concat " " files);
+    Printf.fprintf oc "hierarchy -top %s\n" top;
+    (* Skip `opt -fast` for the slang path — opt rewrites whole-wire
+     * cell outputs into bit-sliced part-writes (`connect \Y \g [3:0]`),
+     * which our rtlil_to_behavioral can't represent (BIR's BAssign LHS
+     * is a bare string, not a slice). Plain `proc; flatten` keeps the
+     * cell shape canonical: cell outputs go to whole-wire intermediates
+     * and a $buf collects them via SigConcat into the final port. *)
+    Printf.fprintf oc "proc\nflatten\n"
+  end else begin
     Printf.fprintf oc "read_verilog -sv %s\n" (String.concat " " files);
-  Printf.fprintf oc "hierarchy -top %s\n" top;
-  Printf.fprintf oc "proc\nopt -fast\nflatten\nopt -fast\n";
+    Printf.fprintf oc "hierarchy -top %s\n" top;
+    Printf.fprintf oc "proc\nopt -fast\nflatten\nopt -fast\n"
+  end;
   Printf.fprintf oc "write_rtlil %s\n" out;
   close_out oc;
   let cmd = Printf.sprintf "%s -q -s %s 2>&1"

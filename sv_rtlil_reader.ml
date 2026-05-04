@@ -62,14 +62,74 @@ let strip_backslash s =
  * (memory bit-blasted to per-cell regs). The discriminator is the
  * space: a slice has ` [` (space before bracket), a literal-bracket
  * name has `[` directly. *)
-let parse_sigspec s =
+(* Split a sigspec source string into top-level elements. Top-level
+ * means we skip whitespace and group bracket-suffixed wires together
+ * (`\foo [3:0]` is one element, NOT two). The string MUST be the
+ * inside of a `{ ... }` concat; the caller strips the outer braces.
+ * Nested concats (`{ ... { x y } ... }`) recurse. *)
+let split_concat_elems inner =
+  let n = String.length inner in
+  let elems = ref [] in
+  let i = ref 0 in
+  while !i < n do
+    while !i < n && (inner.[!i] = ' ' || inner.[!i] = '\t') do incr i done;
+    if !i >= n then ()
+    else begin
+      let start = !i in
+      if inner.[!i] = '{' then begin
+        (* Nested concat — find matching brace. *)
+        let depth = ref 1 in
+        incr i;
+        while !i < n && !depth > 0 do
+          (match inner.[!i] with
+           | '{' -> incr depth
+           | '}' -> decr depth
+           | _ -> ());
+          if !depth > 0 then incr i
+        done;
+        if !i < n then incr i  (* consume closing brace *)
+      end else begin
+        (* Word followed optionally by ` [...]`. *)
+        while !i < n && inner.[!i] <> ' ' && inner.[!i] <> '\t' do incr i done;
+        (* Allow ` [...]` suffix as part of this element. *)
+        let save = !i in
+        while !i < n && (inner.[!i] = ' ' || inner.[!i] = '\t') do incr i done;
+        if !i < n && inner.[!i] = '[' then begin
+          while !i < n && inner.[!i] <> ']' do incr i done;
+          if !i < n then incr i  (* consume ']' *)
+        end else
+          i := save
+      end;
+      let len = !i - start in
+      if len > 0 then elems := String.sub inner start len :: !elems
+    end
+  done;
+  List.rev !elems
+
+let rec parse_sigspec s =
   let s = String.trim s in
   let fallback () = SigWire (strip_backslash s) in
   if String.length s = 0 then fallback ()
-  else if s.[0] = '{' then
-    (* TODO: parse concatenation properly. *)
-    SigWire s
-  else if String.length s > 1 && (s.[0] = '\'' || s.[1] = '\'') then
+  else if s.[0] = '{' then begin
+    (* Concatenation `{ e1 e2 ... eN }`. RTLIL writes elements MSB
+     * first inside the braces. BIR's BConcat keeps the same order
+     * (sigspec_to_bexpr maps SigConcat xs → BConcat (map xs)), so
+     * pass the parts through verbatim. *)
+    let last = String.length s - 1 in
+    if last < 1 || s.[last] <> '}' then fallback ()
+    else
+      let inner = String.sub s 1 (last - 1) in
+      let parts = split_concat_elems inner in
+      SigConcat (List.map parse_sigspec parts)
+  end
+  else if String.contains s '\'' then
+    (* `<width>'<digits>` or `'b...` etc. The apostrophe can be at any
+     * position depending on the width's digit count. *)
+    SigConst s
+  else if String.length s > 0 && s.[0] >= '0' && s.[0] <= '9' then
+    (* Width-less integer literal — Yosys writes mux constants like
+     * `connect \A 0` for "32-bit zero". Treat as a 32-bit constant
+     * (the consumer's BAssign zero-extends/truncates to LHS width). *)
     SigConst s
   else
     (* Look for ` [` (space + bracket) — only that form is a slice. *)
@@ -238,18 +298,70 @@ let parse_rtlil_file filename =
            | None -> ())
 
       | "connect" :: pin :: rest ->
-          let signal_spec = parse_sigspec (String.concat " " rest) in
+          (* Inside a cell: pin is a bare port name, rest is the
+           * sigspec it's wired to. At top-level: both pin and rest
+           * form sigspecs. The split is non-trivial because a sigspec
+           * may span multiple whitespace-separated tokens — in
+           * particular `name [N]` / `name [N:M]` (slice suffix) and
+           * `{ a b ... }` (concat). For the cell case we feed the
+           * full `rest` joined with spaces to parse_sigspec, but for
+           * the top-level case we have to peel a sigspec off the
+           * front (lhs) and feed the remainder to parse_sigspec
+           * (rhs). Without that, `connect $3y [0] \rst_n` would
+           * parse as lhs=$3y (no slice), rhs=`[0] \rst_n` (garbage),
+           * losing the slice and emitting a full-wire write that
+           * collides with sibling slice-writes to the same wire. *)
+          let signal_spec_cell = parse_sigspec (String.concat " " rest) in
           (match !current_cell with
            | Some cell ->
                current_cell := Some {
                  cell with
-                 cell_conns = {conn_pin = strip_backslash pin; conn_sig = signal_spec} :: cell.cell_conns
+                 cell_conns = {conn_pin = strip_backslash pin;
+                               conn_sig = signal_spec_cell}
+                              :: cell.cell_conns
                }
            | None ->
-               (* Top-level connect *)
+               (* Top-level connect: peel one sigspec off the front. *)
                match !current_module with
                | Some _ ->
-                   let pin_sig = parse_sigspec pin in
+                   let take_one_sigspec toks =
+                     match toks with
+                     | [] -> ("", [])
+                     | first :: rest_toks ->
+                         if String.length first > 0 && first.[0] = '{' then
+                           (* Concat — collect tokens until matching } *)
+                           let acc = ref [first] in
+                           let depth = ref (
+                             let n = ref 0 in
+                             String.iter (fun c ->
+                               if c = '{' then incr n
+                               else if c = '}' then decr n) first;
+                             !n) in
+                           let rest_iter = ref rest_toks in
+                           while !depth > 0 && !rest_iter <> [] do
+                             match !rest_iter with
+                             | t :: tl ->
+                                 String.iter (fun c ->
+                                   if c = '{' then incr depth
+                                   else if c = '}' then decr depth) t;
+                                 acc := t :: !acc;
+                                 rest_iter := tl
+                             | [] -> ()
+                           done;
+                           (String.concat " " (List.rev !acc), !rest_iter)
+                         else if rest_toks <> [] &&
+                                 (let nx = List.hd rest_toks in
+                                  String.length nx > 0 && nx.[0] = '[') then
+                           (* Slice suffix in next token. *)
+                           (first ^ " " ^ List.hd rest_toks,
+                            List.tl rest_toks)
+                         else
+                           (first, rest_toks)
+                   in
+                   let lhs_str, rhs_toks = take_one_sigspec (pin :: rest) in
+                   let pin_sig = parse_sigspec lhs_str in
+                   let signal_spec =
+                     parse_sigspec (String.concat " " rhs_toks) in
                    add_connection (pin_sig, signal_spec)
                | None -> ())
 
