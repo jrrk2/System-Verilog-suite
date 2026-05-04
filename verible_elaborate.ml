@@ -576,15 +576,43 @@ let rec extract_struct_literal pkgs tok : sv_value option =
     if fields = [] then None
     else Some (SVStruct fields)
 
-(* Resolve a function-call argument to an sv_value. Handles:
- *  - integer literal
- *  - bare identifier in scope (looked up via lookup_int with empty
- *    scope, since arg evaluation happens at call site before
- *    function scope exists)
+(* Look up `name` as a localparam across every package, recurse into
+ * its RHS. Caller is responsible for ensuring the search isn't
+ * ambiguous (CVA6's config identifiers are uniquely named). *)
+and lookup_pkg_localparam pkgs name : sv_value =
+  let rec scan = function
+    | [] -> SVUnknown
+    | p :: rest ->
+        let lps = collect_by
+          (has_tag (prefix_is "any_param_declaration")) p.pkg_body in
+        let matched = List.find_opt (fun lp ->
+          let ids = ref [] in
+          let id_subs = collect_by
+            (has_tag (prefix_is "param_type_followed_by_id")) lp in
+          List.iter (fun s ->
+            walk (function
+              | SymbolIdentifier id -> ids := id :: !ids
+              | _ -> ()) s) id_subs;
+          match !ids with last :: _ -> last = name | _ -> false
+        ) lps in
+        (match matched with
+         | Some lp ->
+             let rhs = collect_by
+               (has_tag (prefix_is "trailing_assign")) lp in
+             (match rhs with
+              | r :: _ -> resolve_arg_to_sv pkgs r
+              | [] -> scan rest)
+         | None -> scan rest)
+  in scan pkgs
+
+(* Resolve a function-call argument or struct-literal field value
+ * to an sv_value. Handles:
  *  - struct literal `'{...}`
- *  - `pkg::name` qualified reference (fall through resolve_value;
- *    if it points to a struct-literal localparam, recurse into it
- *    via the package's body)
+ *  - integer literal
+ *  - bare identifier (looked up across all packages' localparams)
+ *  - `pkg::name` qualified reference
+ *  - cast wrappers like `unsigned'(...)` are transparent — strip
+ *    them and try the inner expression
  * Returns SVUnknown when nothing matches. *)
 and resolve_arg_to_sv pkgs tok : sv_value =
   match extract_struct_literal pkgs tok with
@@ -596,45 +624,33 @@ and resolve_arg_to_sv pkgs tok : sv_value =
        | Some n -> SVInt n
        | None ->
            (* `pkg :: name` reference to a struct localparam? *)
-           let try_pkg_local () =
-             let qrefs = collect_by (function
-               | TUPLE4 (STRING tag, _, _, _)
-                 when prefix_is "qualified_id" tag -> true
-               | _ -> false) tok in
-             match qrefs with
-             | TUPLE4 (_,
-                       TUPLE3 (_, SymbolIdentifier pkg, _), _,
-                       TUPLE3 (_, SymbolIdentifier name, _)) :: _ ->
-                 (match List.find_opt (fun p -> p.pkg_name = pkg) pkgs with
-                  | None -> SVUnknown
-                  | Some p ->
-                      (* Search for a localparam with this name in the
-                       * package body and recurse into its RHS. *)
-                      let lps = collect_by
-                        (has_tag (prefix_is "any_param_declaration")) p.pkg_body in
-                      let matched = List.find_opt (fun lp ->
-                        let ids = ref [] in
-                        let id_subs = collect_by
-                          (has_tag (prefix_is "param_type_followed_by_id")) lp in
-                        List.iter (fun s ->
-                          walk (function
-                            | SymbolIdentifier id -> ids := id :: !ids
-                            | _ -> ()) s) id_subs;
-                        match !ids with last :: _ -> last = name | _ -> false
-                      ) lps in
-                      (match matched with
-                       | None -> SVUnknown
-                       | Some lp ->
-                           (* The trailing_assign holds the RHS — if it's
-                            * a struct literal, recurse. *)
-                           let rhs = collect_by
-                             (has_tag (prefix_is "trailing_assign")) lp in
-                           (match rhs with
-                            | r :: _ -> resolve_arg_to_sv pkgs r
-                            | [] -> SVUnknown)))
-             | _ -> SVUnknown
-           in
-           try_pkg_local ())
+           let qrefs = collect_by (function
+             | TUPLE4 (STRING tag, _, _, _)
+               when prefix_is "qualified_id" tag -> true
+             | _ -> false) tok in
+           match qrefs with
+           | TUPLE4 (_,
+                     TUPLE3 (_, SymbolIdentifier pkg, _), _,
+                     TUPLE3 (_, SymbolIdentifier name, _)) :: _ ->
+               (match List.find_opt (fun p -> p.pkg_name = pkg) pkgs with
+                | Some _ ->
+                    (* Restrict to that one package by name. *)
+                    let one_pkg =
+                      List.filter (fun p -> p.pkg_name = pkg) pkgs in
+                    lookup_pkg_localparam one_pkg name
+                | None -> SVUnknown)
+           | _ ->
+               (* No qualified ref — last resort: walk the token for
+                * a single bare SymbolIdentifier and try cross-package
+                * localparam lookup. Catches `unsigned'(NAME)` cast
+                * wrappers and bare `NAME` constants alike. *)
+               let ids = ref [] in
+               walk (function
+                 | SymbolIdentifier id -> ids := id :: !ids
+                 | _ -> ()) tok;
+               (match !ids with
+                | [name] -> lookup_pkg_localparam pkgs name
+                | _ -> SVUnknown))
 
 (* Evaluate a constant function call. Walks the body collecting
  * `<local>.<field> = <expr>` assignments into an SVStruct, and
