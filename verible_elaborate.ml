@@ -1342,6 +1342,37 @@ module Eval = struct
     try fst (parse_expr scope (tokenize s)) with _ -> None
 end
 
+(* Pull module-port parameter DEFAULTS (everything in the
+ * `#(parameter ...)` header), as (name, rhs_token) pairs. The grammar
+ * tags each one with `module_parameter_port`. Used by int_scope_of to
+ * fold defaults into the scope when no override was supplied at the
+ * call site — without this, a top-level invocation like
+ *   popcount #() top();   // INPUT_WIDTH default = 256
+ * leaves INPUT_WIDTH unset and Eval can't resolve PaddedWidth=...
+ * making the recursive child come out as `popcount__IWPaddedWidth/2`
+ * (literal text) instead of `popcount__IW128`. *)
+let extract_module_port_param_defaults (body : token) : (string * token) list =
+  let nodes = collect_by
+    (has_tag (prefix_is "module_parameter_port")) body in
+  List.filter_map (fun n ->
+    let id_subs = collect_by
+      (has_tag (prefix_is "param_type_followed_by_id")) n in
+    let pname = match id_subs with
+      | s :: _ ->
+          let ids = ref [] in
+          walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) s;
+          (match List.rev !ids with last :: _ -> Some last | [] -> None)
+      | [] -> None
+    in
+    let rhs = match collect_by
+                (has_tag (prefix_is "trailing_assign")) n with
+      | a :: _ -> Some a | [] -> None
+    in
+    match pname, rhs with
+    | Some name, Some r -> Some (name, r)
+    | _ -> None
+  ) nodes
+
 (* Pull `localparam`/`parameter` declarations from a module body, as
  * (name, rhs_token) pairs. The grammar tags both as
  * `any_param_declaration<N>`; we trust that only ones inside the
@@ -1497,6 +1528,19 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
     let scope = List.filter_map (fun (k, v) ->
       Option.map (fun n -> (k, n)) (Eval.eval_string [] v)
     ) overrides in
+    (* For every module port-parameter that does NOT have an override,
+     * fold its DEFAULT into the scope. Lets a top-level instantiation
+     * with no `#(...)` use the declared defaults — without it Eval
+     * can't resolve later localparams that reference the parameter. *)
+    let defaults = extract_module_port_param_defaults mdecl.m_body in
+    let scope = List.fold_left (fun sc (name, rhs_tok) ->
+      if List.mem_assoc name sc then sc
+      else
+        let s = resolve_value pkgs rhs_tok in
+        match Eval.eval_string sc s with
+        | Some n -> (name, n) :: sc
+        | None -> sc
+    ) scope defaults in
     let lps = extract_module_internal_params mdecl.m_body in
     List.fold_left (fun sc (name, rhs_tok) ->
       let s = resolve_value pkgs rhs_tok in

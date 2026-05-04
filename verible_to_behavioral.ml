@@ -1040,11 +1040,16 @@ let extract_instances ~pkgs ~params tok =
  * defaults declared here fill in for unbound names. Both shapes have a
  * `trailing_assign1` slot whose subtree is the value expression. *)
 let extract_body_params ~pkgs ~params tok =
-  let nodes =
-    collect_by (has_tag (prefix_is "any_param_declaration")) tok
-    @ collect_by (has_tag (prefix_is "module_parameter_port")) tok
-  in
-  List.filter_map (fun n ->
+  (* Order matters: SystemVerilog localparams in the body resolve
+   * left-to-right against earlier ones, so PaddedWidth = 1 <<
+   * $clog2(INPUT_WIDTH) needs INPUT_WIDTH (a port-param default) to
+   * already be in scope. We accumulate `params` as we process each
+   * node, so the next eval_int call sees prior defaults/localparams. *)
+  let port_nodes =
+    collect_by (has_tag (prefix_is "module_parameter_port")) tok in
+  let local_nodes =
+    collect_by (has_tag (prefix_is "any_param_declaration")) tok in
+  let one acc n =
     let nm = ref None in
     walk (function
       | SymbolIdentifier id when !nm = None -> nm := Some id
@@ -1057,11 +1062,18 @@ let extract_body_params ~pkgs ~params tok =
       | _ -> ()) n;
     match !nm, !value_node with
     | Some id, Some v ->
-        (match eval_int ~pkgs ~params v with
-         | Some i -> Some (id, string_of_int i)
-         | None -> None)
-    | _ -> None
-  ) nodes
+        if List.mem_assoc id acc then acc
+        else
+          (match eval_int ~pkgs ~params:acc v with
+           | Some i -> (id, string_of_int i) :: acc
+           | None -> acc)
+    | _ -> acc
+  in
+  let acc = List.fold_left one params port_nodes in
+  let acc = List.fold_left one acc local_nodes in
+  (* Drop the original `params` we seeded with — caller already has
+   * those, we only want the additions. *)
+  List.filter (fun (k, _) -> not (List.mem_assoc k params)) acc
 
 let convert_module ~pkgs (mdecl : module_decl)
                           (params : (string * string) list) : bmodule =
