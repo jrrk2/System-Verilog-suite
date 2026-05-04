@@ -226,6 +226,60 @@ let () =
   in
 
   Printf.printf "\n";
+  (* Per-entity signal dump for triage. Set
+   *   MITER_DUMP_SIGNALS=<substr>
+   * and the comparator prints, for every Vivado entity whose name
+   * contains the substring, a side-by-side {direction, name, width}
+   * table of Vivado-side and Verible-side bsignals. Useful when the
+   * Z3 miter errors with a BitVec sort mismatch but the headline
+   * port_shape/ff_widths checks pass — the differing signal lives
+   * in the internals and the dump shows it. *)
+  let dump_filter = Sys.getenv_opt "MITER_DUMP_SIGNALS" in
+  let signal_summary (m : bmodule) =
+    List.map (fun (s : bsignal) ->
+      let dir = match s.direction with
+        | `Input -> "in" | `Output -> "out" | `Internal -> "int" in
+      let w = match s.stype with
+        | BInt { width; _ } -> width
+        | BArray { size; element = BInt { width; _ }; _ } -> size * width
+        | _ -> 0
+      in
+      Printf.sprintf "%-3s %-30s w=%d" dir s.name w
+    ) m.signals
+    |> List.sort compare
+  in
+  let dump_pair name (viv_m : bmodule) (vrb_m : bmodule option) =
+    Printf.printf "── %s ──\n" name;
+    let viv_lines = signal_summary viv_m in
+    let vrb_lines = match vrb_m with
+      | Some m -> signal_summary m | None -> [] in
+    let viv_set = List.fold_left (fun acc l ->
+      acc |> List.filter (fun x -> x <> l) |> (fun a -> l :: a)) [] viv_lines in
+    let vrb_set = List.fold_left (fun acc l ->
+      acc |> List.filter (fun x -> x <> l) |> (fun a -> l :: a)) [] vrb_lines in
+    let only_viv = List.filter (fun l -> not (List.mem l vrb_set)) viv_set in
+    let only_vrb = List.filter (fun l -> not (List.mem l viv_set)) vrb_set in
+    if only_viv = [] && only_vrb = [] then
+      Printf.printf "  (signal lists match)\n"
+    else begin
+      List.iter (fun l ->
+        Printf.printf "  only-viv: %s\n" l) only_viv;
+      List.iter (fun l ->
+        Printf.printf "  only-vrb: %s\n" l) only_vrb
+    end;
+    (match vrb_m with
+     | None -> Printf.printf "  (no Verible counterpart paired)\n"
+     | Some _ -> ());
+    Printf.printf "\n"
+  in
+  (match dump_filter with
+   | None -> ()
+   | Some substr ->
+       List.iter (fun (name, viv_m) ->
+         if contains substr name then
+           dump_pair name viv_m (lookup vrb_idx viv_m)
+       ) viv_idx);
+
   let rows = ref [] in
   List.iter (fun (name, viv_m) ->
     if matches name then begin
