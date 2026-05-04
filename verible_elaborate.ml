@@ -567,32 +567,147 @@ let rec prune_dead_generates scope tok =
   | TLIST xs -> TLIST (List.map (prune_dead_generates scope) xs)
   | leaf -> leaf
 
-let extract_instantiations ?(scope = []) root : instantiation list =
-  let inst_nodes =
-    collect_live_by scope (has_tag (prefix_is "instantiation_base")) root
+(* Pull the begin-label (if any) from a `begin_rule` node:
+ *   begin1:    TUPLE3("begin1", Begin, label_opt)
+ *   label_opt: TUPLE3("label_opt1", COLON, symbol_or_label) | EMPTY *)
+let extract_begin_label = function
+  | TUPLE3 (STRING t, _, lbl) when prefix_is "begin1" t ->
+      let ids = ref [] in
+      walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) lbl;
+      (match List.rev !ids with x :: _ -> Some x | _ -> None)
+  | _ -> None
+
+(* Pull the label from a `generate_block` shape:
+ *   generate_block1: TUPLE4(tag, begin_rule, item_list, end_rule)
+ *   generate_block2: TUPLE6(tag, label_id, COLON, Begin, item_list, end_rule)
+ * Either returns the begin-label name or None when the block is
+ * unlabeled. SV-2017 requires synthesis to use this label as a
+ * hierarchical-name segment, e.g. `if (...) begin : non_leaf_node`
+ * makes the contained `left_child` instance hierarchically known as
+ * `non_leaf_node.left_child`. *)
+let extract_block_label = function
+  | TUPLE4 (STRING t, b, _, _) when prefix_is "generate_block1" t ->
+      extract_begin_label b
+  | TUPLE6 (STRING t, id_node, _, _, _, _) when prefix_is "generate_block2" t ->
+      let ids = ref [] in
+      walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) id_node;
+      (match List.rev !ids with x :: _ -> Some x | _ -> None)
+  | _ -> None
+
+(* Walk like walk_live but additionally maintain a stack of enclosing
+ * generate-block labels. Calls `f label_stack node` on every visit.
+ * The stack is in outer-to-inner order; `String.concat "."` over it
+ * produces the SV hierarchical-name prefix that yosys-slang and
+ * synthesis tools use for instances inside labeled generate blocks. *)
+let rec walk_live_labeled scope label_stack f tok =
+  let take_branch cond_expr_opt branches =
+    let resolved =
+      match cond_expr_opt with
+      | None -> None
+      | Some e ->
+          let s = !resolver_for_walk e in
+          !evaluator_for_walk scope s
+    in
+    match resolved, branches with
+    | Some n, [_, body] when n <> 0 ->
+        walk_live_labeled scope label_stack f body
+    | Some 0, [_, _] -> ()
+    | Some n, [_, then_b; _, else_b] ->
+        walk_live_labeled scope label_stack f
+          (if n <> 0 then then_b else else_b)
+    | _ ->
+        List.iter (fun (_, b) -> walk_live_labeled scope label_stack f b)
+          branches
   in
-  List.filter_map (fun node ->
-    (* The first SymbolIdentifier in the instantiation_base subtree
-     * is the instantiated module name (modulo wrapping). *)
-    let mod_name = ref None in
-    walk (function
-      | SymbolIdentifier id when !mod_name = None -> mod_name := Some id
-      | _ -> ()
-    ) node;
-    match !mod_name with
-    | None -> None
-    | Some mn ->
-        let in_ = match extract_inst_name node with
-          | Some s -> s
-          | None -> "?"
-        in
-        Some {
-          i_module = mn;
-          i_inst = in_;
-          i_overrides = extract_overrides node;
-          i_overrides_tok = extract_overrides_tok node;
-        }
-  ) inst_nodes
+  let push_block_label_then_recurse t =
+    let new_stack = match extract_block_label t with
+      | Some lbl -> label_stack @ [lbl]
+      | None -> label_stack
+    in
+    f new_stack t;
+    (match t with
+     | TUPLE2 (a, b) ->
+         walk_live_labeled scope new_stack f a;
+         walk_live_labeled scope new_stack f b
+     | TUPLE3 (a, b, c) ->
+         List.iter (walk_live_labeled scope new_stack f) [a; b; c]
+     | TUPLE4 (a, b, c, d) ->
+         List.iter (walk_live_labeled scope new_stack f) [a; b; c; d]
+     | TUPLE5 (a, b, c, d, e) ->
+         List.iter (walk_live_labeled scope new_stack f) [a; b; c; d; e]
+     | TUPLE6 (a, b, c, d, e, f') ->
+         List.iter (walk_live_labeled scope new_stack f) [a; b; c; d; e; f']
+     | TUPLE7 (a, b, c, d, e, f', g) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g]
+     | TUPLE8 (a, b, c, d, e, f', g, h) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h]
+     | TUPLE9 (a, b, c, d, e, f', g, h, i) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h; i]
+     | TUPLE10 (a, b, c, d, e, f', g, h, i, j) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h; i; j]
+     | TUPLE11 (a, b, c, d, e, f', g, h, i, j, k) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h; i; j; k]
+     | TUPLE12 (a, b, c, d, e, f', g, h, i, j, k, l) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h; i; j; k; l]
+     | TUPLE13 (a, b, c, d, e, f', g, h, i, j, k, l, m) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h; i; j; k; l; m]
+     | TUPLE14 (a, b, c, d, e, f', g, h, i, j, k, l, m, n) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h; i; j; k; l; m; n]
+     | TUPLE15 (a, b, c, d, e, f', g, h, i, j, k, l, m, n, o) ->
+         List.iter (walk_live_labeled scope new_stack f)
+           [a; b; c; d; e; f'; g; h; i; j; k; l; m; n; o]
+     | TLIST xs -> List.iter (walk_live_labeled scope new_stack f) xs
+     | _ -> ())
+  in
+  match tok with
+  | TUPLE5 (STRING tag, gif, t_item, _, e_item)
+    when prefix_is "conditional_generate_construct" tag ->
+      f label_stack tok;
+      take_branch (extract_if_cond gif) [(`T, t_item); (`E, e_item)]
+  | TUPLE3 (STRING tag, gif, t_item)
+    when prefix_is "conditional_generate_construct" tag ->
+      f label_stack tok;
+      take_branch (extract_if_cond gif) [(`T, t_item)]
+  | _ -> push_block_label_then_recurse tok
+
+let extract_instantiations ?(scope = []) root : instantiation list =
+  let acc = ref [] in
+  walk_live_labeled scope [] (fun label_stack node ->
+    if has_tag (prefix_is "instantiation_base") node then begin
+      let mod_name = ref None in
+      walk (function
+        | SymbolIdentifier id when !mod_name = None -> mod_name := Some id
+        | _ -> ()
+      ) node;
+      match !mod_name with
+      | None -> ()
+      | Some mn ->
+          let leaf = match extract_inst_name node with
+            | Some s -> s
+            | None -> "?"
+          in
+          (* Prepend any enclosing labeled-generate-block segments so
+           * the inst_name matches what synthesis and yosys-slang use,
+           * e.g. `non_leaf_node.left_child`. *)
+          let in_ = String.concat "."
+                      (label_stack @ [leaf]) in
+          acc := {
+            i_module = mn;
+            i_inst = in_;
+            i_overrides = extract_overrides node;
+            i_overrides_tok = extract_overrides_tok node;
+          } :: !acc
+    end
+  ) root;
+  List.rev !acc
 
 (* ─── Package declarations (must precede specialise_design) ──────── *)
 

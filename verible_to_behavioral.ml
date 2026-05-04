@@ -979,8 +979,26 @@ let extract_always ~pkgs ~params ~arrays tok =
  * instantiation_base1. *)
 let extract_instances ~pkgs ~params tok =
   let arrays = [] in
-  let bases = collect_by (has_tag (prefix_is "instantiation_base")) tok in
-  List.concat_map (fun base ->
+  (* Use the labeled walker so each instance picks up the
+   * `<begin_label>.` prefix of every enclosing labeled generate
+   * block. This matches the inst_name format that
+   * Verible_elaborate.specialise_design records into
+   * inst_specialised, and the format yosys-slang and synthesis
+   * tools use as the SV-2017 hierarchical-name segment
+   * (e.g. `non_leaf_node.left_child`). Without the prefix,
+   * convert_files's lookup `(s.s_name, i.inst_name)` against
+   * inst_specialised misses (it has the labeled key but i.inst_name
+   * was unlabeled) and the instance gets dropped. *)
+  let bases_with_labels = ref [] in
+  Verible_elaborate.walk_live_labeled
+    (List.filter_map (fun (k, v) ->
+       try Some (k, int_of_string v) with _ -> None) params)
+    [] (fun label_stack node ->
+    if has_tag (prefix_is "instantiation_base") node then
+      bases_with_labels := (label_stack, node) :: !bases_with_labels
+  ) tok;
+  let bases_with_labels = List.rev !bases_with_labels in
+  List.concat_map (fun (label_stack, base) ->
     let mod_name = ref None in
     walk (function
       | TUPLE3 (STRING t, SymbolIdentifier id, _)
@@ -1022,15 +1040,16 @@ let extract_instances ~pkgs ~params tok =
              | _ -> ()) in_);
       match !mod_name, !inst_name with
       | Some m, Some i ->
+          let prefixed_inst = String.concat "." (label_stack @ [i]) in
           Some {
-            inst_name = i;
+            inst_name = prefixed_inst;
             module_name = m;
             param_values = [];
             port_connections = List.rev !port_conns;
           }
       | _ -> None
     ) inst_nodes
-  ) bases
+  ) bases_with_labels
 
 (* ─── Module conversion ──────────────────────────────────────────── *)
 
