@@ -15,6 +15,6 @@
  (modules def_file_types def_file def_file_tokens def_file_lex
           lef_file lef_file_lex
           placement nets hpwl wire_delay placement_timing lef_pins
-          bir_def_bind)
+          bir_def_bind synth_mac)
  (flags (:standard -w -a))
  (libraries menhirLib))
