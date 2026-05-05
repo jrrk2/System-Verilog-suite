@@ -30,26 +30,32 @@ let () =
   let prefixes = [ "rebuffer"; "output"; "clkbuf"; "FILLER"; "clone" ] in
   let bindings = Bir_def_bind.bind_by_prefix prefixes placements in
 
-  Printf.printf "%-12s  %6s  %12s  %s\n"
-    "BIR-prefix" "count" "worst arr ps" "bbox";
-  Printf.printf "%s\n" (String.make 70 '-');
-  List.iter (fun b ->
-    let arr = Bir_def_bind.subgraph_worst arr_tbl b in
-    let bbox = match Bir_def_bind.bbox b with
-      | None -> "(empty)"
-      | Some ((xa,ya),(xb,yb)) ->
-          Printf.sprintf "x=[%d..%d] y=[%d..%d]" xa xb ya yb in
-    Printf.printf "%-12s  %6d  %12.1f  %s\n"
-      b.Bir_def_bind.bir_path
-      (List.length b.Bir_def_bind.members) arr bbox) bindings;
+  let dump label bs =
+    Printf.printf "\n%s\n" label;
+    Printf.printf "  %-12s  %6s  %12s  %s\n"
+      "BIR-prefix" "count" "worst arr ps" "bbox";
+    Printf.printf "  %s\n" (String.make 70 '-');
+    List.iter (fun b ->
+      let arr = Bir_def_bind.subgraph_worst arr_tbl b in
+      let bbox = match Bir_def_bind.bbox b with
+        | None -> "(empty)"
+        | Some ((xa,ya),(xb,yb)) ->
+            Printf.sprintf "x=[%d..%d] y=[%d..%d]" xa xb ya yb in
+      Printf.printf "  %-12s  %6d  %12.1f  %s\n"
+        b.Bir_def_bind.bir_path
+        (List.length b.Bir_def_bind.members) arr bbox) bs;
+    let u = Bir_def_bind.unbound bs placements in
+    Printf.printf "  unbound: %d\n" (List.length u)
+  in
+  dump "=== prefix-only ===" bindings;
 
-  let unbound = Bir_def_bind.unbound bindings placements in
-  Printf.printf "\nUnbound (no prefix matched): %d\n"
-    (List.length unbound);
-  Printf.printf "  examples:";
-  let rec take n = function
-    | [] -> () | _ when n = 0 -> ()
-    | (p : Placement.placement) :: tl ->
-        Printf.printf " %s" p.Placement.inst; take (n-1) tl in
-  take 8 unbound;
-  print_newline ()
+  let bindings_c, iters =
+    Bir_def_bind.bind_with_connectivity bindings
+      ~edges ~placements in
+  dump (Printf.sprintf "=== + connectivity (%d iters) ===" iters) bindings_c;
+
+  let bindings_b, iters_b =
+    Bir_def_bind.bind_with_connectivity ~bbox_pad:None bindings
+      ~edges ~placements in
+  dump (Printf.sprintf "=== + connectivity, no bbox gate (%d iters) ==="
+          iters_b) bindings_b
