@@ -57,4 +57,32 @@ let () =
     r_real.total_wire_ps;
 
   let speedup = r_default.worst_arr_ps /. r_real.worst_arr_ps in
-  Printf.printf "\nReal/default ratio = %.2fx\n" (1. /. speedup)
+  Printf.printf "\nReal/default ratio = %.2fx\n" (1. /. speedup);
+
+  (* Per-prefix worst-arrival breakdown — this is where a
+     cert-gated arch swap reads its target.  CLI args 4..N are
+     BIR instance-prefix probes. *)
+  let probes = ref [] in
+  for k = 4 to Array.length Sys.argv - 1 do
+    probes := Sys.argv.(k) :: !probes
+  done;
+  if !probes <> [] then begin
+    let probes = List.rev !probes in
+    let plc_tbl = Lef_def.Hpwl.placement_table placements in
+    let cell_of = Hashtbl.create (List.length placements) in
+    List.iter (fun (p : Lef_def.Placement.placement) ->
+      Hashtbl.replace cell_of p.Lef_def.Placement.inst
+        p.Lef_def.Placement.cell) placements;
+    let edges = Lef_def.Placement_timing.fanout_edges
+                  ?pin_dir ~cell_of plc_tbl nets in
+    let arr_tbl = Lef_def.Placement_timing.arrival_table
+                    ~delay_of:(Cell_delay.lookup delay_tbl)
+                    edges placements in
+    let bindings = Lef_def.Bir_def_bind.bind_by_prefix probes placements in
+    Printf.printf "\nPer-BIR-prefix worst arrival (Liberty-grounded):\n";
+    List.iter (fun b ->
+      let arr = Lef_def.Bir_def_bind.subgraph_worst arr_tbl b in
+      Printf.printf "  %-20s  %4d cells  %.1f ps\n"
+        b.Lef_def.Bir_def_bind.bir_path
+        (List.length b.Lef_def.Bir_def_bind.members) arr) bindings
+  end

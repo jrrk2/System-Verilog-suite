@@ -1,4 +1,5 @@
 (executables
  (names lex_smoke lef_lex_smoke placement_smoke hpwl_smoke
-        timing_regression timing_real lef_pins_smoke)
+        timing_regression timing_real lef_pins_smoke
+        bir_bind_smoke bind_regression)
  (libraries lef_def))
