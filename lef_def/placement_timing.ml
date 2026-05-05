@@ -45,15 +45,16 @@ let fanout_edges ?(wp=Wire_delay.default_params) plc_tbl nets =
           end) eps) nets;
   edges
 
-(* Per-cell intrinsic delay placeholder. Real flow would index
-   by (cell, in_pin, out_pin) into a Liberty table. *)
-let cell_delay_ps _cell = 50.0
+(* Per-cell intrinsic delay.  Default is a 50-ps placeholder so the
+   regression has a deterministic number; pass [~delay_of] to plug
+   in real Liberty-derived numbers. *)
+let default_cell_delay_ps _cell = 50.0
 
 (* Memoised longest path from each node, with cycle break.
    Real gate-level netlists contain FF feedback loops; without
    LEF we can't classify FFs, so we treat any node already
    being computed as a 0-arrival sequential boundary. *)
-let arrival_table edges placements =
+let arrival_table ?(delay_of=default_cell_delay_ps) edges placements =
   let memo = Hashtbl.create 4096 in
   let in_progress = Hashtbl.create 64 in
   let cell_of = Hashtbl.create 4096 in
@@ -72,7 +73,7 @@ let arrival_table edges placements =
           | _ -> List.fold_left
                    (fun acc (next, w) -> max acc (w +. arr next)) 0. outs
         in
-        let total = cell_delay_ps cell +. downstream in
+        let total = delay_of cell +. downstream in
         Hashtbl.remove in_progress inst;
         Hashtbl.replace memo inst total;
         total
@@ -87,10 +88,11 @@ type report = {
   total_wire_ps : float;
 }
 
-let report ?(wp=Wire_delay.default_params) placements nets =
+let report ?(wp=Wire_delay.default_params)
+           ?(delay_of=default_cell_delay_ps) placements nets =
   let plc_tbl = Hpwl.placement_table placements in
   let edges = fanout_edges ~wp plc_tbl nets in
-  let arr   = arrival_table edges placements in
+  let arr   = arrival_table ~delay_of edges placements in
   let worst_inst = ref "" and worst_v = ref 0. and worst_cell = ref "" in
   let cell_of = Hashtbl.create 4096 in
   List.iter (fun (p : Placement.placement) ->
