@@ -95,6 +95,12 @@ type bsignal = {
   stype: btype;
   direction: [`Input | `Output | `Internal];
   initial_value: bexpr option;
+  (* SystemVerilog `(* key = "value" *)` attributes attached to the
+   * signal. sv_decompiler-specific keys: `sv_decomp_adder` /
+   * `sv_decomp_mul` (architecture knobs for HardCaml emit and
+   * hierarchical substitution). Defaults to []; vendor keys
+   * (use_dsp, multstyle, etc.) survive but are ignored. *)
+  attrs: (string * string) list [@default []];
 } [@@deriving yojson]
 
 (* Module instance *)
@@ -151,6 +157,12 @@ type bmodule = {
   instances: binstance list;
   funcs: bfunc list;            (* function/task declarations in this module *)
   mems: bmem list;              (* inferred memories — RAM or ROM *)
+  (* Module-level `(* key = "value" *)` attributes. The miter consults
+   * `sv_decomp_adder` / `sv_decomp_mul` here to decide whether an
+   * instance of this module can be abstracted to BBinOp BAdd/BMul
+   * (see Behavioral_arch_subst). Survives boundary-preserving
+   * flatten and shows up in BIR dumps for downstream tools. *)
+  attrs: (string * string) list [@default []];
 } [@@deriving yojson]
 
 (* Library cell port specification - simpler than full bsignal *)
@@ -274,6 +286,14 @@ let string_of_bprocess = function
       let body_str = String.concat "\n" (List.map (string_of_bstmt 2) body) in
       Printf.sprintf "process %s (@%s %s%s)\n%s\nend process" name edge_str clock reset_str body_str
 
+let string_of_attrs attrs =
+  if attrs = [] then ""
+  else
+    let pairs = List.map (fun (k, v) ->
+      if v = "" then k else Printf.sprintf "%s = \"%s\"" k v
+    ) attrs in
+    "(* " ^ String.concat ", " pairs ^ " *) "
+
 let string_of_bmodule bmod =
   let params_str = if List.length bmod.params > 0 then
     " #(" ^ String.concat ", " (List.map (fun (n, v) -> Printf.sprintf "%s=%d" n v) bmod.params) ^ ")"
@@ -285,12 +305,14 @@ let string_of_bmodule bmod =
       | `Output -> "output"
       | `Internal -> "signal"
     in
-    Printf.sprintf "  %s %s: %s" dir s.name (string_of_btype s.stype)
+    Printf.sprintf "  %s%s %s: %s"
+      (string_of_attrs s.attrs) dir s.name (string_of_btype s.stype)
   ) bmod.signals) in
 
   let processes_str = String.concat "\n\n" (List.map string_of_bprocess bmod.processes) in
 
-  Printf.sprintf "module %s%s\n%s\n\n%s\nend module" bmod.name params_str signals_str processes_str
+  Printf.sprintf "%smodule %s%s\n%s\n\n%s\nend module"
+    (string_of_attrs bmod.attrs) bmod.name params_str signals_str processes_str
 
 let string_of_bprogram prog =
   String.concat "\n\n" (List.map string_of_bmodule prog.modules)

@@ -73,13 +73,59 @@ let rec width_of_expr_ctx widths = function
            let stripped = strip_ssa_suffix name in
            Hashtbl.find_opt widths stripped)
   | BConst { width; _ } -> Some width
-  | BBinOp { result_type; _ } -> Some (width_of_btype result_type)
-  | BUnOp { result_type; _ } -> Some (width_of_btype result_type)
-  | BCond { then_val; _ } -> width_of_expr_ctx widths then_val  (* Width of branches *)
+  | BBinOp { op; lhs; rhs; result_type } ->
+      let declared = width_of_btype result_type in
+      (* Comparisons are always 1-bit; trust result_type. For
+       * arithmetic/bitwise, a declared width of 1 is suspicious
+       * (Verible's converter falls back to 1 when it can't infer
+       * the op's width) — recompute from the operands. *)
+      (match op with
+       | BEq | BNe | BLt | BLe | BGt | BGe -> Some 1
+       | BAdd | BSub | BMul | BDiv | BMod
+       | BAnd | BOr  | BXor
+       | BShl | BShr | BAshr ->
+           if declared > 1 then Some declared
+           else
+             let wl = width_of_expr_ctx widths lhs in
+             let wr = width_of_expr_ctx widths rhs in
+             (match wl, wr with
+              | Some a, Some b -> Some (max a b)
+              | Some a, None | None, Some a -> Some a
+              | None, None ->
+                  (* Defer: returning `Some declared` (=1) here would
+                   * commit a wrong width that the outer fixed point
+                   * can't unstick (LHS-already-set short-circuit). *)
+                  None))
+  | BUnOp { op; operand; result_type } ->
+      let declared = width_of_btype result_type in
+      (match op with
+       | BRedAnd | BRedOr | BRedXor -> Some 1
+       | BNot | BNeg ->
+           if declared > 1 then Some declared
+           else
+             (match width_of_expr_ctx widths operand with
+              | Some w -> Some w
+              | None -> None))             (* defer; same as BBinOp *)
+  | BCond { then_val; else_val; _ } ->
+      (* Width of branches — pick the wider, fall back to either *)
+      (match width_of_expr_ctx widths then_val,
+             width_of_expr_ctx widths else_val with
+       | Some a, Some b -> Some (max a b)
+       | Some a, None | None, Some a -> Some a
+       | None, None -> None)
   | BSlice { msb; lsb; _ } -> Some (msb - lsb + 1)
   | BConcat exprs ->
-      let widths_list = List.filter_map (width_of_expr_ctx widths) exprs in
-      Some (List.fold_left (+) 0 widths_list)
+      (* Don't sum partials: if any child is unknown, the whole
+       * concat is unknown — otherwise an early visit collapses to
+       * width 0 and gets stuck (the fixed-point iteration's purge
+       * doesn't unstick it because each pass re-encounters the same
+       * intra-iteration ordering). *)
+      let widths_list = List.map (width_of_expr_ctx widths) exprs in
+      if List.for_all Option.is_some widths_list then
+        Some (List.fold_left (+) 0
+                (List.map (fun o -> Option.value ~default:0 o)
+                          widths_list))
+      else None
   | BReplicate { count; value } ->
       Option.map (fun w -> count * w) (width_of_expr_ctx widths value)
   | BSelect _ | BCall _ -> None  (* Need more info *)
@@ -391,19 +437,19 @@ let encode_process suffix ctx_sigs solver = function
 (* Infer widths from assignments - walk all statements to find actual widths *)
 let rec infer_widths_from_stmt widths = function
   | BAssign { lhs; rhs } ->
-      (* Only infer width if we don't already have it from signal declaration *)
       (match Hashtbl.find_opt widths lhs with
-       | Some _ ->
-           (* Signal already has declared width - don't overwrite it *)
-           ()
+       | Some _ -> ()       (* declared / already inferred — keep *)
        | None ->
-           (* Signal not declared, infer from RHS *)
-           let width =
-             match width_of_expr_ctx widths rhs with
-             | Some w -> w
-             | None -> 32  (* Default if we can't infer *)
-           in
-           Hashtbl.add widths lhs width)
+           (* Only commit a width if it can actually be derived from
+            * the RHS. Don't pollute with a 32-default here: that
+            * sticks across inference iterations and silently
+            * produces wrong widths (e.g. a 9-bit BConcat collapses
+            * to 32 if children aren't yet known). The post-pass
+            * after the outer fixed point fills genuinely unknown
+            * LHSes with 32 as a last-resort fallback. *)
+           (match width_of_expr_ctx widths rhs with
+            | Some w when w > 0 -> Hashtbl.add widths lhs w
+            | _ -> ()))
 
   | BIf { then_stmts; else_stmts; _ } ->
       List.iter (infer_widths_from_stmt widths) then_stmts;
@@ -424,17 +470,84 @@ let infer_widths_from_process widths = function
   | BCombinational { body; _ } | BSequential { body; _ } ->
       List.iter (infer_widths_from_stmt widths) body
 
+(* Fixed-point inference. Process order matters: when an `assign A =
+ * {…B…}` is visited before B itself is defined, the BConcat width
+ * collapses to 0. Iterating until widths stop changing fixes that
+ * without forcing a topological sort.
+ *
+ * Each iteration revisits assignments that produced suspicious widths
+ * (0, or 1 on what looks like a multi-bit op). To make a width
+ * "revisitable", we move it from the primary table to a tentative
+ * shadow before each pass; declared widths from the bsignal list stay
+ * pinned. *)
 let infer_widths_from_module bmod =
   let widths = Hashtbl.create 256 in
+  let pinned = Hashtbl.create 64 in
 
-  (* Add signal widths *)
   List.iter (fun (signal : bsignal) ->
-    Hashtbl.add widths signal.name (width_of_btype signal.stype)
+    let w = width_of_btype signal.stype in
+    Hashtbl.replace widths signal.name w;
+    Hashtbl.replace pinned signal.name ()
   ) bmod.signals;
 
-  (* Infer widths from all assignments in all processes *)
-  List.iter (infer_widths_from_process widths) bmod.processes;
-
+  (* The inference is order-sensitive: an assignment visited before
+   * its RHS operands have widths produces a coarse estimate, which
+   * then sticks (because subsequent visits skip already-known LHSes).
+   * Two-level fixed point fixes that: outer loop purges all
+   * non-pinned entries and replays inference; inner loop replays
+   * inference WITHIN one outer iteration until widths stabilise, so
+   * downstream assignments pick up upstream widths even when the
+   * process order is unfriendly. *)
+  let changed = ref true in
+  let outer_iters = ref 0 in
+  let prev_snapshot = ref [] in
+  while !changed && !outer_iters < 8 do
+    incr outer_iters;
+    let kill = Hashtbl.fold (fun k _ acc ->
+      if Hashtbl.mem pinned k then acc else k :: acc
+    ) widths [] in
+    List.iter (fun k -> Hashtbl.remove widths k) kill;
+    let inner_changed = ref true in
+    let inner_iters = ref 0 in
+    while !inner_changed && !inner_iters < 8 do
+      incr inner_iters;
+      let before =
+        Hashtbl.fold (fun k v acc -> (k, v) :: acc) widths []
+        |> List.sort compare in
+      List.iter (infer_widths_from_process widths) bmod.processes;
+      let after =
+        Hashtbl.fold (fun k v acc -> (k, v) :: acc) widths []
+        |> List.sort compare in
+      inner_changed := (before <> after)
+    done;
+    let snapshot =
+      Hashtbl.fold (fun k v acc -> (k, v) :: acc) widths []
+      |> List.sort compare in
+    if snapshot = !prev_snapshot then changed := false
+    else (prev_snapshot := snapshot; changed := true)
+  done;
+  (* Last-resort post-pass: any LHS that never became computable
+   * (BCall, BSelect, etc. with no width info) gets a default of 32.
+   * This preserves the original "32 means unknown" convention while
+   * keeping the iterative inference clean. *)
+  let rec fill_default = function
+    | BAssign { lhs; _ } ->
+        if not (Hashtbl.mem widths lhs) then
+          Hashtbl.add widths lhs 32
+    | BIf { then_stmts; else_stmts; _ } ->
+        List.iter fill_default then_stmts;
+        List.iter fill_default else_stmts
+    | BCase { cases; default; _ } ->
+        List.iter (fun (_, body) -> List.iter fill_default body) cases;
+        List.iter fill_default default
+    | BWhile { body; _ } | BFor { body; _ } | BBlock body ->
+        List.iter fill_default body
+    | BCallStmt _ | BReturn _ -> ()
+  in
+  List.iter (function
+    | BCombinational { body; _ } | BSequential { body; _ } ->
+        List.iter fill_default body
+  ) bmod.processes;
   widths
 
 (* Build signal width context from module *)

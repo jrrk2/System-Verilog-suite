@@ -228,7 +228,7 @@ let extract_internal_signals symbol_table =
           stype = if sig_info.signal_width = 1 then BBool
                   else BInt { width = sig_info.signal_width; signed = Unsigned };
           direction = `Internal;
-          initial_value = None;
+          initial_value = None; attrs = []; 
         } in
         internals := signal :: !internals
     | _ -> ()
@@ -249,7 +249,7 @@ let module_data_to_bmodule module_name (mod_data : module_data) symbol_table =
       stype = if port.port_width = 1 then BBool
               else BInt { width = port.port_width; signed = Unsigned };
       direction;
-      initial_value = None;
+      initial_value = None; attrs = []; 
     }
   ) mod_data.mod_ports in
 
@@ -278,7 +278,7 @@ let module_data_to_bmodule module_name (mod_data : module_data) symbol_table =
     processes = processes @ assign_process;
     instances = [];
     funcs = [];
-    mems = [];
+    mems = []; attrs = [];
   }
 
 (* Main conversion function *)

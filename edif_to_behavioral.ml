@@ -185,7 +185,7 @@ let convert_cell (edif : edif_data) =
         name = p.name;
         stype = BInt { width = p.width; signed = Unsigned };
         direction;
-        initial_value = None;
+        initial_value = None; attrs = []; 
       }
     ) edif.ports
     @
@@ -204,7 +204,7 @@ let convert_cell (edif : edif_data) =
             name = n.name;
             stype = BInt { width = 1; signed = Unsigned };
             direction = `Internal;
-            initial_value = None;
+            initial_value = None; attrs = []; 
           }
         else None
     ) edif.nets
@@ -329,7 +329,7 @@ let convert_cell (edif : edif_data) =
     processes = [main_process];
     instances = hier_instances;
     funcs = [];
-    mems = [];
+    mems = []; attrs = [];
   }
 
 (* Convert EDIF to Behavioral IR *)

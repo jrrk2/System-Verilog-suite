@@ -365,7 +365,7 @@ let wire_to_bsignal (w : rtlil_wire) : bsignal =
     stype = BInt { width = w.wire_width;
                    signed = if w.wire_signed then Signed else Unsigned };
     direction = dir;
-    initial_value = None;
+    initial_value = None; attrs = []; 
   }
 
 (* Decompose a sigspec used as a write target into (name, msb, lsb).
@@ -469,7 +469,7 @@ let module_to_bmodule (m : rtlil_module) : bmodule =
     processes = cell_procs @ connect_procs;
     instances = [];
     funcs = [];
-    mems = [];
+    mems = []; attrs = [];
   }
 
 (* Inline single-definition internal-wire aliases. yosys-slang emits

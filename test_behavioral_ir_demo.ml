@@ -21,23 +21,23 @@ let clock_div_behavioral_ir =
 
         signals = [
           (* Input ports *)
-          { name = "CLK"; stype = BBool; direction = `Input; initial_value = None };
-          { name = "RST"; stype = BBool; direction = `Input; initial_value = None };
-          { name = "CE"; stype = BBool; direction = `Input; initial_value = None };
+          { name = "CLK"; stype = BBool; direction = `Input; initial_value = None; attrs = [] };
+          { name = "RST"; stype = BBool; direction = `Input; initial_value = None; attrs = [] };
+          { name = "CE"; stype = BBool; direction = `Input; initial_value = None; attrs = [] };
 
           (* Output ports *)
-          { name = "Q"; stype = BBool; direction = `Output; initial_value = None };
+          { name = "Q"; stype = BBool; direction = `Output; initial_value = None; attrs = [] };
 
           (* Internal signals *)
           { name = "iCounter";
             stype = BInt { width = 2; signed = Unsigned };
             direction = `Internal;
-            initial_value = Some (BConst { value = 0; width = 2 }) };
+            initial_value = Some (BConst { value = 0; width = 2 }) ; attrs = [] };
 
           { name = "iQ";
             stype = BBool;
             direction = `Internal;
-            initial_value = Some (BConst { value = 0; width = 1 }) };
+            initial_value = Some (BConst { value = 0; width = 1 }) ; attrs = [] };
         ];
 
         processes = [
@@ -119,7 +119,7 @@ let clock_div_behavioral_ir =
 
         instances = [];
         funcs = [];
-    mems = [];
+    mems = []; attrs = [];
       }
     ];
     library_cells = [];

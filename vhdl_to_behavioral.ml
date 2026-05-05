@@ -351,7 +351,7 @@ let extract_entity_ports ctx = function
               name;
               stype = BBool;  (* Default to bool for now *)
               direction = `Input;
-              initial_value = None;
+              initial_value = None; attrs = []; 
             } in
             add_signal_type ctx name BBool;
             [signal]
@@ -364,7 +364,7 @@ let extract_entity_ports ctx = function
               name;
               stype = BBool;
               direction = `Output;
-              initial_value = None;
+              initial_value = None; attrs = []; 
             } in
             add_signal_type ctx name BBool;
             [signal]
@@ -397,6 +397,7 @@ let extract_architecture ctx entity_name = function
                     stype = BInt { width = 2; signed = Unsigned };  (* Default *)
                     direction = `Internal;
                     initial_value = Some (BConst { value = 0; width = 2 });
+                    attrs = [];
                   } in
                   add_signal_type ctx name (BInt { width = 2; signed = Unsigned });
                   internal_signals := signal :: !internal_signals
@@ -458,7 +459,7 @@ let convert_vhdl_to_behavioral vhdl_ast =
     processes;
     instances = [];
     funcs = [];
-    mems = [];
+    mems = []; attrs = [];
   } in
 
   { modules = [bmodule]; library_cells = [] }

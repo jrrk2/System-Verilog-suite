@@ -251,7 +251,7 @@ let convert filename =
         name = p.NetlistParser.name;
         stype = BInt { width = p.width; signed = Unsigned };
         direction = (p.direction :> [`Input | `Output | `Internal]);
-        initial_value = None;
+        initial_value = None; attrs = []; 
       }
     ) ports
     @
@@ -262,7 +262,7 @@ let convert filename =
           name = n.name;
           stype = BInt { width = if n.is_bus then 32 else 1; signed = Unsigned };
           direction = `Internal;
-          initial_value = None;
+          initial_value = None; attrs = []; 
         }
       else None
     ) nets
@@ -396,7 +396,7 @@ let convert filename =
     processes = [main_process];
     instances = hier_instances;
     funcs = [];
-    mems = [];
+    mems = []; attrs = [];
   } in
 
   (* Create program *)

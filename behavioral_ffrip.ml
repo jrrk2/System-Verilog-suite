@@ -162,6 +162,7 @@ let rip_module (m : bmodule) : bmodule =
         stype = BInt { width; signed = Unsigned };
         direction = `Input;
         initial_value = None;
+        attrs = [];
       } :: !new_signals
   in
   let add_signal name width dir =
@@ -171,6 +172,7 @@ let rip_module (m : bmodule) : bmodule =
         stype = BInt { width; signed = Unsigned };
         direction = dir;
         initial_value = None;
+        attrs = [];
       } :: !new_signals
   in
 

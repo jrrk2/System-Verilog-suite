@@ -371,23 +371,136 @@ let cur_struct_defs : (string * (string * int) list) list ref = ref []
  * member-select on bare references like `p.field`). *)
 let cur_signal_struct : (string * string) list ref = ref []
 
+(* Per-module signal name → declared width. Populated by
+ * `convert_module` before any `expr_to_bexpr` call so the operator
+ * builders can compute a real `result_type` width instead of falling
+ * back to dummy_bool. *)
+let cur_signal_widths : (string * int) list ref = ref []
+
 (* ─── Expression conversion ──────────────────────────────────────── *)
 
 let dummy_bool = BInt { width = 1; signed = Unsigned }
+
+(* Parse a parameter value string that came in via specialise_design /
+ * extract_body_params. Handles plain integers (`255`, `-1`), SV-style
+ * sized literals (`8'd255`, `64'hFF`, `1'b1`), and the all-ones short-
+ * hand `'1`. Falls back to `BVar id` if the value isn't recognisable
+ * as a numeric constant — that way `parameter type T = …` keeps its
+ * symbolic name. *)
+let param_value_to_bexpr id v =
+  let v = String.trim v in
+  if v = "" then BVar id
+  else
+    let parse_radix base s =
+      try Some (int_of_string ("0" ^ base ^ s))
+      with _ -> None in
+    let parse_dec s = try Some (int_of_string s) with _ -> None in
+    (* Sized literal: <w>'<base><digits>. Width determines bit-width. *)
+    (match String.index_opt v '\'' with
+     | Some i when i > 0 && i + 1 < String.length v ->
+         let w_str = String.sub v 0 i in
+         let base = v.[i + 1] in
+         let digits = String.sub v (i + 2) (String.length v - i - 2) in
+         let w = try int_of_string w_str with _ -> 32 in
+         let n = match base with
+           | 'd' | 'D' -> parse_dec digits
+           | 'h' | 'H' -> parse_radix "x" digits
+           | 'b' | 'B' -> parse_radix "b" digits
+           | 'o' | 'O' -> parse_radix "o" digits
+           | _ -> None in
+         (match n with
+          | Some n -> BConst { value = n; width = w }
+          | None -> BVar id)
+     | Some 0 ->
+         (* `'1` / `'0` — width inferred elsewhere; use 32 as default *)
+         (try
+           let bit = String.sub v 1 (String.length v - 1) in
+           if bit = "1" then BConst { value = -1; width = 32 }
+           else if bit = "0" then BConst { value = 0; width = 32 }
+           else BVar id
+          with _ -> BVar id)
+     | _ ->
+         (match parse_dec v with
+          | Some n -> BConst { value = n; width = 32 }
+          | None -> BVar id))
 
 (* Best-effort expr → bexpr translator. Walks one level at a time,
  * recursing where the shape is recognised. Anything else becomes a
  * 1-bit zero with a stderr note (when MITER_VERIBLE_DEBUG is set). *)
 let debug_expr = lazy (Sys.getenv_opt "MITER_VERIBLE_DEBUG" <> None)
 
+(* Recursive width computation over a bexpr against `cur_signal_widths`.
+ * Returns `Some w` when computable; `None` when we can't tell (caller
+ * falls back to `dummy_bool`, and z3_miter's fixed-point inference
+ * picks it up from operands later). *)
+let rec width_of_bexpr_ctx widths = function
+  | BVar n -> List.assoc_opt n widths
+  | BConst { width; _ } -> Some width
+  | BBinOp { op = (BEq|BNe|BLt|BLe|BGt|BGe); _ } -> Some 1
+  | BBinOp { op = _; lhs; rhs; result_type } ->
+      let dw = match result_type with BInt { width; _ } -> width | _ -> 0 in
+      if dw > 1 then Some dw
+      else
+        (match width_of_bexpr_ctx widths lhs,
+               width_of_bexpr_ctx widths rhs with
+         | Some a, Some b -> Some (max a b)
+         | Some a, None | None, Some a -> Some a
+         | None, None -> None)
+  | BUnOp { op = (BRedAnd|BRedOr|BRedXor); _ } -> Some 1
+  | BUnOp { operand; _ } -> width_of_bexpr_ctx widths operand
+  | BSlice { msb; lsb; _ } -> Some (msb - lsb + 1)
+  | BConcat es ->
+      let ws = List.map (width_of_bexpr_ctx widths) es in
+      if List.for_all Option.is_some ws then
+        Some (List.fold_left (+) 0
+                (List.map (Option.value ~default:0) ws))
+      else None
+  | BReplicate { count; value } ->
+      Option.map (fun w -> count * w) (width_of_bexpr_ctx widths value)
+  | BCond { then_val; else_val; _ } ->
+      (match width_of_bexpr_ctx widths then_val,
+             width_of_bexpr_ctx widths else_val with
+       | Some a, Some b -> Some (max a b)
+       | Some a, None | None, Some a -> Some a
+       | _ -> None)
+  | BSelect _ | BCall _ -> None
+
+let result_type_for op lhs rhs =
+  let comparison = match op with
+    | BEq | BNe | BLt | BLe | BGt | BGe -> true
+    | _ -> false in
+  if comparison then BInt { width = 1; signed = Unsigned }
+  else
+    let widths = !cur_signal_widths in
+    match width_of_bexpr_ctx widths lhs,
+          width_of_bexpr_ctx widths rhs with
+    | Some a, Some b ->
+        BInt { width = max a b; signed = Unsigned }
+    | Some a, None | None, Some a ->
+        BInt { width = a; signed = Unsigned }
+    | None, None ->
+        BInt { width = 1; signed = Unsigned }   (* legacy dummy_bool fallback *)
+
+let result_type_for_un op operand =
+  let reduction = match op with
+    | BRedAnd | BRedOr | BRedXor -> true
+    | _ -> false in
+  if reduction then BInt { width = 1; signed = Unsigned }
+  else
+    match width_of_bexpr_ctx !cur_signal_widths operand with
+    | Some w -> BInt { width = w; signed = Unsigned }
+    | None -> BInt { width = 1; signed = Unsigned }
+
 let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
   let recurse = expr_to_bexpr ~pkgs ~params ~arrays in
   let bin op a b =
-    BBinOp { op; lhs = recurse a; rhs = recurse b;
-             result_type = dummy_bool }
+    let lhs = recurse a in
+    let rhs = recurse b in
+    BBinOp { op; lhs; rhs; result_type = result_type_for op lhs rhs }
   in
   let un op a =
-    BUnOp { op; operand = recurse a; result_type = dummy_bool }
+    let operand = recurse a in
+    BUnOp { op; operand; result_type = result_type_for_un op operand }
   in
   (* Sized literal: TUPLE3(STRING "bin_based_number1",
    *   TK_BinBase "<W>'b", TK_BinDigits "<bits>")
@@ -417,13 +530,22 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
   match tok with
   | SymbolIdentifier id ->
       (match List.assoc_opt id params with
-       | Some v ->
-           (try BConst { value = int_of_string v; width = 32 }
-            with _ -> BVar id)
+       | Some v -> param_value_to_bexpr id v
        | None -> BVar id)
   | TK_DecNumber n | TK_UnBasedNumber n ->
-      (try BConst { value = int_of_string n; width = 32 }
-       with _ -> BConst { value = 0; width = 32 })
+      (* SV unbased-unsized literals: `'0`, `'1`, `'x`, `'z`. The
+       * value should be the bit pattern broadcast to the LHS width.
+       * We don't know the LHS width here so emit BConst with -1
+       * (all-ones in two's complement) for `'1` and 0 for the
+       * others; downstream encoders mask to the destination width. *)
+      let n2 = String.trim n in
+      if n2 = "'1" then BConst { value = -1; width = 32 }
+      else if n2 = "'0" then BConst { value = 0; width = 32 }
+      else if n2 = "'x" || n2 = "'z" || n2 = "'X" || n2 = "'Z" then
+        BConst { value = 0; width = 32 }
+      else
+        (try BConst { value = int_of_string n; width = 32 }
+         with _ -> BConst { value = 0; width = 32 })
   | TUPLE3 (STRING tag, base, digits) when prefix_is "bin_based_number" tag ->
       parse_sized "b" base digits
   | TUPLE3 (STRING tag, base, digits) when prefix_is "hex_based_number" tag ->
@@ -437,9 +559,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        * value here so downstream Z3 sees a concrete int rather than a
        * free variable. *)
       (match List.assoc_opt id params with
-       | Some v ->
-           (try BConst { value = int_of_string v; width = 32 }
-            with _ -> BVar id)
+       | Some v -> param_value_to_bexpr id v
        | None -> BVar id)
   (* Struct assignment pattern `'{f1: x, f2: y}`. The Verible parse
    * is `assignment_pattern2` wrapping a TLIST of
@@ -637,9 +757,26 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       (match dim_node with
        | TUPLE6 (STRING dt, _, msb, _, lsb, _)
          when prefix_is "select_variable_dimension" dt ->
+           let signal_width () = match signal with
+             | BVar n -> List.assoc_opt n !cur_signal_widths
+             | _ -> None in
            (match eval_int ~pkgs ~params msb,
                   eval_int ~pkgs ~params lsb with
             | Some m, Some l -> BSlice { signal; msb = m; lsb = l }
+            | None, Some l ->
+                (* msb is something like `$high(sig)` we can't fold.
+                 * If the signal width is known, treat msb as
+                 * width-1 (the common SV idiom for "from MSB down").
+                 * Without this fallback the slice silently collapses
+                 * to the whole signal — see cva6's exp_backoff
+                 * `lfsr_q[$high(lfsr_q):1]`. *)
+                (match signal_width () with
+                 | Some w when w > 0 ->
+                     BSlice { signal; msb = w - 1; lsb = l }
+                 | _ -> signal)
+            | Some m, None ->
+                (* Symmetric: lsb unknown, msb known. Default lsb=0. *)
+                BSlice { signal; msb = m; lsb = 0 }
             | _ -> signal)
        | TUPLE4 (STRING dt, _, idx, _)
          when prefix_is "select_variable_dimension" dt ->
@@ -799,13 +936,44 @@ let extract_port_decl ~pkgs ~params tok =
     | _ -> ()
   in
   walk_skip tok;
+  (* K&R-style port decls (`input [51:0] frac_num;`) carry the port
+   * name as a bare `SymbolIdentifier` rather than wrapped in
+   * `unqualified_id`. If the strict walk found nothing, fall back to
+   * a permissive sweep that grabs every SymbolIdentifier outside a
+   * packed/select dimension. *)
+  if !names = [] then begin
+    let rec walk_loose t =
+      match t with
+      | TUPLE6 (STRING t', _, _, _, _, _)
+        when prefix_is "decl_variable_dimension" t'
+          || prefix_is "select_variable_dimension" t' -> ()
+      | TUPLE4 (STRING t', _, _, _)
+        when prefix_is "decl_variable_dimension" t'
+          || prefix_is "select_variable_dimension" t' -> ()
+      | SymbolIdentifier id -> names := id :: !names
+      | TUPLE2 (a, b) -> walk_loose a; walk_loose b
+      | TUPLE3 (a, b, c) -> walk_loose a; walk_loose b; walk_loose c
+      | TUPLE4 (a, b, c, d) -> walk_loose a; walk_loose b; walk_loose c; walk_loose d
+      | TUPLE5 (a, b, c, d, e) ->
+          List.iter walk_loose [a; b; c; d; e]
+      | TUPLE6 (a, b, c, d, e, f) ->
+          List.iter walk_loose [a; b; c; d; e; f]
+      | TUPLE7 (a, b, c, d, e, f, g) ->
+          List.iter walk_loose [a; b; c; d; e; f; g]
+      | TUPLE8 (a, b, c, d, e, f, g, h) ->
+          List.iter walk_loose [a; b; c; d; e; f; g; h]
+      | TLIST xs -> List.iter walk_loose xs
+      | _ -> ()
+    in
+    walk_loose tok
+  end;
   let w = width_of ~pkgs ~params tok in
   List.rev !names |> List.sort_uniq compare |> List.map (fun n ->
     {
       name = n;
       stype = BInt { width = w; signed = Unsigned };
       direction = !dir;
-      initial_value = None;
+      initial_value = None; attrs = [];
     })
 
 (* ─── Continuous assigns ─────────────────────────────────────────── *)
@@ -1205,10 +1373,36 @@ let extract_body_params ~pkgs ~params tok =
   let local_nodes =
     collect_by (has_tag (prefix_is "any_param_declaration")) tok in
   let one acc n =
+    (* Find the parameter NAME — but skip identifiers that live inside
+     * the parameter's type/range subtree. For
+     * `parameter logic [LfsrWidth-1:0] RstVal = '1`, a naive first-id
+     * walk would grab `LfsrWidth` (inside the range) instead of
+     * `RstVal`. The actual parameter name lives just before
+     * `trailing_assign` — usually in a `param_assignment` or sibling. *)
     let nm = ref None in
-    walk (function
+    let rec walk_skip_type t =
+      match t with
+      | TUPLE6 (STRING t', _, _, _, _, _)
+        when prefix_is "decl_variable_dimension" t'
+          || prefix_is "select_variable_dimension" t' -> ()
+      | TUPLE4 (STRING t', _, _, _)
+        when prefix_is "decl_variable_dimension" t'
+          || prefix_is "select_variable_dimension" t' -> ()
+      | TUPLE3 (STRING t', _, _) when prefix_is "instantiation_type" t'
+                                    || prefix_is "data_type" t' -> ()
+      | TUPLE3 (STRING t', SymbolIdentifier id, _)
+        when prefix_is "param_assignment" t' || prefix_is "param_decl" t' ->
+          if !nm = None then nm := Some id
       | SymbolIdentifier id when !nm = None -> nm := Some id
-      | _ -> ()) n;
+      | TUPLE2 (a, b) -> walk_skip_type a; walk_skip_type b
+      | TUPLE3 (a, b, c) -> walk_skip_type a; walk_skip_type b; walk_skip_type c
+      | TUPLE4 (a, b, c, d) -> List.iter walk_skip_type [a; b; c; d]
+      | TUPLE5 (a, b, c, d, e) -> List.iter walk_skip_type [a; b; c; d; e]
+      | TUPLE6 (a, b, c, d, e, f) -> List.iter walk_skip_type [a; b; c; d; e; f]
+      | TLIST xs -> List.iter walk_skip_type xs
+      | _ -> ()
+    in
+    walk_skip_type n;
     let value_node = ref None in
     walk (function
       | TUPLE4 (STRING t, _, v, _) when prefix_is "trailing_assign" t
@@ -1221,7 +1415,13 @@ let extract_body_params ~pkgs ~params tok =
         else
           (match eval_int ~pkgs ~params:acc v with
            | Some i -> (id, string_of_int i) :: acc
-           | None -> acc)
+           | None ->
+               (try
+                  match expr_to_bexpr ~pkgs ~params:acc ~arrays:[] v with
+                  | BConst { value; _ } ->
+                      (id, string_of_int value) :: acc
+                  | _ -> acc
+                with _ -> acc))
     | _ -> acc
   in
   let acc = List.fold_left one params port_nodes in
@@ -1350,6 +1550,10 @@ let convert_module ~pkgs (mdecl : module_decl)
     !acc
   in
   cur_signal_struct := signal_struct_decls;
+  (* Reset per-module width cache; populated below as soon as the
+   * port + internal signals are extracted, before any expr_to_bexpr
+   * call. Keeps result_type_for from falling back to dummy_bool. *)
+  cur_signal_widths := [];
   if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
     List.iter (fun (n, t) ->
       Printf.eprintf "  signal %s : %s\n" n t
@@ -1367,6 +1571,9 @@ let convert_module ~pkgs (mdecl : module_decl)
   let explicit_signals =
     List.concat_map (extract_port_decl ~pkgs ~params) port_nodes
   in
+  if Sys.getenv_opt "PORT_DEBUG" <> None then
+    Printf.eprintf "[port] %s: port_nodes=%d explicit=%d\n%!"
+      mdecl.m_name (List.length port_nodes) (List.length explicit_signals);
   let explicit_names = List.map (fun (s : bsignal) -> s.name)
                          explicit_signals in
   (* Inherited ports (`output [3:0] sum1, sum2;` — sum2 is a bare
@@ -1487,7 +1694,7 @@ let convert_module ~pkgs (mdecl : module_decl)
             name;
             stype = BInt { width = !cur_width; signed = Unsigned };
             direction = !cur_dir;
-            initial_value = None;
+            initial_value = None; attrs = []; 
           } :: !acc
       | _ -> ()
     ) source_order;
@@ -1579,7 +1786,7 @@ let convert_module ~pkgs (mdecl : module_decl)
             name = id;
             stype;
             direction = `Internal;
-            initial_value = None;
+            initial_value = None; attrs = []; 
           }
         | None -> None
       ) var_nodes
@@ -1599,13 +1806,49 @@ let convert_module ~pkgs (mdecl : module_decl)
      |> List.map (fun s -> { s with direction = `Internal }))
     @ reg_var_signals
   in
+  (* Merge by name. When the same signal appears twice (bare name from
+   * the port-list AND an explicit K&R `output [W:0] X;` decl), the
+   * second entry usually carries better information — explicit
+   * direction (Output rather than the default Internal) and explicit
+   * width. Old code did first-wins dedup which kept the bare-name
+   * Internal/width=1 placeholder, so cva6's K&R-style ct_vfdsu_*
+   * modules ended up with all ports classed as Input/1-bit. New rule:
+   * later wins for direction (Output > Input > Internal) and for
+   * width (>1 > 1).  *)
   let signals : bsignal list =
-    let seen = Hashtbl.create 16 in
-    List.filter (fun (s : bsignal) ->
-      if Hashtbl.mem seen s.name then false
-      else (Hashtbl.replace seen s.name (); true)
-    ) (port_signals @ internal_signals)
+    let dir_rank = function
+      | `Output -> 2 | `Input -> 1 | `Internal -> 0 in
+    let bsignal_width (s : bsignal) =
+      match s.stype with
+      | BInt { width; _ } -> width
+      | BArray { size; element = BInt { width; _ }; _ } -> size * width
+      | _ -> 0 in
+    let merge a b : bsignal =
+      let pick = if dir_rank b.direction > dir_rank a.direction then b
+                 else if dir_rank b.direction < dir_rank a.direction then a
+                 else if bsignal_width b > bsignal_width a then b
+                 else a in
+      pick
+    in
+    let by_name : (string, bsignal) Hashtbl.t = Hashtbl.create 16 in
+    let order = ref [] in
+    List.iter (fun (s : bsignal) ->
+      match Hashtbl.find_opt by_name s.name with
+      | None -> Hashtbl.replace by_name s.name s; order := s.name :: !order
+      | Some prev -> Hashtbl.replace by_name s.name (merge prev s)
+    ) (port_signals @ internal_signals);
+    List.rev_map (Hashtbl.find by_name) !order
   in
+  (* Populate per-module width cache before any expr_to_bexpr call —
+   * lets `result_type_for` set real widths on BBinOp/BUnOp instead
+   * of falling back to dummy_bool. *)
+  cur_signal_widths := List.filter_map (fun (s : bsignal) ->
+    let w = match s.stype with
+      | BInt { width; _ } -> width
+      | BArray { size; element = BInt { width; _ }; _ } -> size * width
+      | _ -> 0 in
+    if w > 0 then Some (s.name, w) else None
+  ) signals;
   let assign_procs = List.concat_map (fun ca ->
     extract_assign ~pkgs ~params ~arrays:array_names ca
   ) (collect_by (has_tag (prefix_is "continuous_assign")) mdecl.m_body) in
@@ -1723,14 +1966,14 @@ let convert_module ~pkgs (mdecl : module_decl)
     processes;
     instances;
     funcs = [];
-    mems = [];
+    mems = []; attrs = [];
   }
 
 (* ─── Top-level entry ────────────────────────────────────────────── *)
 
 (* Parse a list of SV files via Verible, find the top module, and
  * convert it (and its specialised children) to BIR. *)
-let convert_files ~top files : bprogram =
+let convert_files_inner ~keep_external ~top files : bprogram =
   let mods, pkgs = parse_files_full files in
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
@@ -1755,12 +1998,36 @@ let convert_files ~top files : bprogram =
           | Some specname -> Some { i with module_name = specname }
           | None ->
               (* No specialise_design entry → either a dead
-               * generate branch or a non-module identifier the
-               * extractor mis-classified ($clog2-typed locals).
-               * Drop it so Behavioral_flatten doesn't get
-               * confused by ghost instances. *)
-              None
+               * generate branch, a non-module identifier the
+               * extractor mis-classified ($clog2-typed locals),
+               * or — when keep_external is true — an external
+               * library cell (Liberty cell, vendor primitive)
+               * that has no SV body in `files`. Default behaviour
+               * drops these so Behavioral_flatten doesn't get
+               * confused by ghost instances; gate-level miters
+               * pass keep_external=true to retain them. *)
+              if keep_external then Some i else None
         ) m.instances in
         Some { m with name = s.s_name; instances = rewritten }
   ) specs in
-  { modules = bmods; library_cells = [] }
+  let prog = { modules = bmods; library_cells = [] } in
+  (* Stamp `(* sv_decomp_* *)` attributes from each source file's
+   * pre-scan. Sv_attr_extract is a regex-based side pass that runs
+   * on the raw SV text — Verible's parse-tree carries attributes in
+   * tag layouts that vary per declaration kind, and threading them
+   * through the converter cleanly would touch every extract_*
+   * helper. The side pass is sufficient for module / signal /
+   * port-level attributes, which is where sv_decomp_adder /
+   * sv_decomp_mul attach in practice. *)
+  let attr_tables = List.map Sv_attr_extract.extract_file files in
+  List.fold_left (fun p tbl -> Sv_attr_extract.stamp_program tbl p)
+    prog attr_tables
+
+let convert_files ~top files : bprogram =
+  convert_files_inner ~keep_external:false ~top files
+
+(* Variant that retains unmatched instances. Use for gate-level
+ * netlists where every leaf is a Liberty cell with no in-file
+ * module declaration. *)
+let convert_files_with_externals ~top files : bprogram =
+  convert_files_inner ~keep_external:true ~top files

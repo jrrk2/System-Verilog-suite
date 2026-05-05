@@ -7,12 +7,27 @@ type pin_info = {
   name: string;
   direction: pin_direction;
   function_expr: string option;
+  is_clock: bool;
+}
+
+(* FF/latch state info, captured from `ff(IQ, IQN) { … }` /
+ * `latch(…) { … }` blocks in simcells.lib-style libraries. The
+ * pin functions of clocked outputs typically reference the iq /
+ * iqn names (e.g. `function: "IQ"` on pin Q), so we keep both. *)
+type ff_info = {
+  iq_name: string;       (* internal Q name, e.g. "IQ" *)
+  iqn_name: string;      (* internal Qbar, e.g. "IQN"; "" if absent *)
+  clocked_on: string;    (* Liberty function expr for clock, e.g. "C" or "!C" *)
+  next_state: string;    (* Liberty function expr for D, e.g. "D" *)
+  clear: string option;  (* async-clear function (forces Q→0) *)
+  preset: string option; (* async-preset function (forces Q→1) *)
 }
 
 type cell_info = {
   cell_name: string;
   pins: pin_info list;
   cell_type: string;  (* "combinational", "ff", "latch", etc *)
+  ff: ff_info option;
 }
 
 type library_info = {
@@ -34,200 +49,84 @@ let parse_direction = function
   | "internal" -> Internal
   | s -> failwith ("Unknown direction: " ^ s)
 
-(* Simple tokenizer *)
-type token =
-  | TIdent of string
-  | TString of string
-  | TLParen
-  | TRParen
-  | TLBrace
-  | TRBrace
-  | TColon
-  | TSemicolon
-  | TComma
-  | TEOF
+(* The hand-rolled tokenizer + recursive-descent parser that previously
+ * lived here was replaced by the menhir-based liberty.mly /
+ * liberty_lex.mll / liberty_rewrite.ml ported from hardcaml-lua. The
+ * adapter from Liberty_rewrite.liberty into our cell_info / pin_info /
+ * ff_info records lives below in `parse_liberty_file`. *)
 
-let tokenize content =
-  let tokens = ref [] in
-  let pos = ref 0 in
-  let len = String.length content in
+(* Adapter from Liberty_rewrite.liberty (the typed Liberty AST produced
+ * by the menhir parser ported from hardcaml-lua) into our existing
+ * cell_info / pin_info / ff_info records. The menhir parser handles
+ * the full Liberty grammar (Synopsys-style groups, define statements,
+ * lu_table_template, operating_conditions, etc.) — replaces the
+ * hand-rolled tokenizer + recursive-descent that kept tripping on
+ * Nangate's richer constructs. *)
 
-  let skip_whitespace () =
-    while !pos < len && (content.[!pos] = ' ' || content.[!pos] = '\t' ||
-                         content.[!pos] = '\n' || content.[!pos] = '\r') do
-      incr pos
-    done
+let pin_of_cellpin name attrs =
+  let dir = ref Internal in
+  let func = ref None in
+  let is_clk = ref false in
+  List.iter (function
+    | Liberty_rewrite.Direction d -> dir := parse_direction d
+    | Liberty_rewrite.Function f -> func := Some f
+    | Liberty_rewrite.Related ("clock", "true") -> is_clk := true
+    | _ -> ()
+  ) attrs;
+  { name; direction = !dir; function_expr = !func; is_clock = !is_clk }
+
+let ff_of_block oplst body =
+  let iq, iqn =
+    match oplst with
+    | [Liberty_rewrite.String iq; Liberty_rewrite.String iqn] -> (iq, iqn)
+    | [Liberty_rewrite.String iq] -> (iq, "")
+    | _ -> ("IQ", "IQN")
   in
+  let clocked_on = ref "" in
+  let next_state = ref "" in
+  let clear      = ref None in
+  let preset     = ref None in
+  List.iter (function
+    | Liberty_rewrite.Related ("clocked_on", v) -> clocked_on := v
+    | Liberty_rewrite.Related ("next_state", v) -> next_state := v
+    | Liberty_rewrite.Related ("clear",      v) -> clear  := Some v
+    | Liberty_rewrite.Related ("preset",     v) -> preset := Some v
+    | _ -> ()
+  ) body;
+  { iq_name = iq; iqn_name = iqn;
+    clocked_on = !clocked_on; next_state = !next_state;
+    clear = !clear; preset = !preset }
 
-  let skip_comment () =
-    if !pos < len - 1 && content.[!pos] = '/' && content.[!pos + 1] = '*' then begin
-      pos := !pos + 2;
-      while !pos < len - 1 && not (content.[!pos] = '*' && content.[!pos + 1] = '/') do
-        incr pos
-      done;
-      if !pos < len - 1 then pos := !pos + 2;
-      true
-    end else if !pos < len - 1 && content.[!pos] = '/' && content.[!pos + 1] = '/' then begin
-      pos := !pos + 2;
-      while !pos < len && content.[!pos] != '\n' do
-        incr pos
-      done;
-      true
-    end else
-      false
-  in
+let cell_of_libcell name body =
+  let pins = ref [] in
+  let ff = ref None in
+  let kind = ref "combinational" in
+  List.iter (function
+    | Liberty_rewrite.CellPin (n, attrs) ->
+        pins := pin_of_cellpin n attrs :: !pins
+    | Liberty_rewrite.FlipFlop (oplst, body) ->
+        kind := "ff"; ff := Some (ff_of_block oplst body)
+    | Liberty_rewrite.Latch (oplst, body) ->
+        kind := "latch"; ff := Some (ff_of_block oplst body)
+    | _ -> ()
+  ) body;
+  { cell_name = name;
+    pins = List.rev !pins;
+    cell_type = !kind;
+    ff = !ff }
 
-  while !pos < len do
-    skip_whitespace ();
-    if !pos >= len then ()
-    else if skip_comment () then ()
-    else match content.[!pos] with
-      | '(' -> tokens := TLParen :: !tokens; incr pos
-      | ')' -> tokens := TRParen :: !tokens; incr pos
-      | '{' -> tokens := TLBrace :: !tokens; incr pos
-      | '}' -> tokens := TRBrace :: !tokens; incr pos
-      | ':' -> tokens := TColon :: !tokens; incr pos
-      | ';' -> tokens := TSemicolon :: !tokens; incr pos
-      | ',' -> tokens := TComma :: !tokens; incr pos
-      | '"' ->
-          incr pos;
-          let start = !pos in
-          while !pos < len && content.[!pos] != '"' do incr pos done;
-          let str = String.sub content start (!pos - start) in
-          tokens := TString str :: !tokens;
-          if !pos < len then incr pos
-      | c when (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_' ->
-          let start = !pos in
-          while !pos < len &&
-                let c = content.[!pos] in
-                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') || c = '_' || c = '.' || c = '-' do
-            incr pos
-          done;
-          let ident = String.sub content start (!pos - start) in
-          tokens := TIdent ident :: !tokens
-      | c when c >= '0' && c <= '9' || c = '-' || c = '+' ->
-          let start = !pos in
-          incr pos;
-          while !pos < len &&
-                let c = content.[!pos] in
-                (c >= '0' && c <= '9') || c = '.' || c = 'e' || c = 'E' ||
-                c = '+' || c = '-' do
-            incr pos
-          done;
-          let num = String.sub content start (!pos - start) in
-          tokens := TIdent num :: !tokens
-      | _ -> incr pos
-  done;
-  List.rev !tokens
-
-(* Simple recursive descent parser *)
-type parse_node =
-  | PNLibrary of string * parse_node list
-  | PNCell of string * parse_node list
-  | PNPin of string * parse_node list
-  | PNAttr of string * string
-  | PNFF of parse_node list
-  | PNLatch of parse_node list
-  | PNTiming of parse_node list
-  | PNOther
-
-let rec parse_library tokens =
-  let rec skip_to_brace = function
-    | TLBrace :: rest -> rest
-    | _ :: rest -> skip_to_brace rest
-    | [] -> []
-  in
-
-  let rec parse_body acc = function
-    | TRBrace :: rest -> (List.rev acc, rest)
-    | TIdent "cell" :: TLParen :: (TString name | TIdent name) :: TRParen :: TLBrace :: rest ->
-        let (cell_body, rest') = parse_body [] rest in
-        parse_body (PNCell (name, cell_body) :: acc) rest'
-    | TIdent "pin" :: TLParen :: (TString name | TIdent name) :: TRParen :: TLBrace :: rest ->
-        let (pin_body, rest') = parse_body [] rest in
-        parse_body (PNPin (name, pin_body) :: acc) rest'
-    | TIdent "ff" :: TLParen :: rest ->
-        let rest' = skip_to_brace rest in
-        let (ff_body, rest'') = parse_body [] rest' in
-        parse_body (PNFF ff_body :: acc) rest''
-    | TIdent "latch" :: TLParen :: rest ->
-        let rest' = skip_to_brace rest in
-        let (latch_body, rest'') = parse_body [] rest' in
-        parse_body (PNLatch latch_body :: acc) rest''
-    | TIdent "timing" :: TLParen :: TRParen :: TLBrace :: rest ->
-        let (timing_body, rest') = parse_body [] rest in
-        parse_body (PNTiming timing_body :: acc) rest'
-    | TIdent key :: TColon :: (TString value | TIdent value) :: TSemicolon :: rest ->
-        parse_body (PNAttr (key, value) :: acc) rest
-    | TIdent _ :: TLParen :: rest ->
-        (* Skip function calls we don't care about *)
-        let rec skip_parens depth = function
-          | TLParen :: rest -> skip_parens (depth + 1) rest
-          | TRParen :: rest when depth > 1 -> skip_parens (depth - 1) rest
-          | TRParen :: rest -> rest
-          | _ :: rest -> skip_parens depth rest
-          | [] -> []
-        in
-        parse_body acc (skip_parens 1 rest)
-    | _ :: rest -> parse_body acc rest
-    | [] -> (List.rev acc, [])
-  in
-
-  match tokens with
-  | TIdent "library" :: TLParen :: (TString name | TIdent name) :: TRParen :: TLBrace :: rest ->
-      let (body, _) = parse_body [] rest in
-      Some (PNLibrary (name, body))
-  | _ -> None
-
-(* Extract cell information from parse tree *)
-let extract_cell_info node =
-  let rec get_pins acc = function
-    | [] -> List.rev acc
-    | PNPin (name, attrs) :: rest ->
-        let dir = ref Internal in
-        let func = ref None in
-        List.iter (function
-          | PNAttr ("direction", d) -> dir := parse_direction d
-          | PNAttr ("function", f) -> func := Some f
-          | _ -> ()
-        ) attrs;
-        get_pins ({name; direction = !dir; function_expr = !func} :: acc) rest
-    | _ :: rest -> get_pins acc rest
-  in
-
-  let rec get_cell_type = function
-    | [] -> "combinational"
-    | PNFF _ :: _ -> "ff"
-    | PNLatch _ :: _ -> "latch"
-    | _ :: rest -> get_cell_type rest
-  in
-
-  match node with
-  | PNCell (name, body) ->
-      let pins = get_pins [] body in
-      let cell_type = get_cell_type body in
-      Some {cell_name = name; pins; cell_type}
-  | _ -> None
-
-(* Main parsing function *)
 let parse_liberty_file filename =
-  let ic = open_in filename in
-  let content = really_input_string ic (in_channel_length ic) in
-  close_in ic;
-
-  let tokens = tokenize content in
-  match parse_library tokens with
-  | Some (PNLibrary (lib_name, body)) ->
+  let (lib, _hash) = Liberty_rewrite.rewrite filename in
+  match lib with
+  | Liberty_rewrite.Library (lib_name, items) ->
       let cells = Hashtbl.create 256 in
-      List.iter (fun node ->
-        match extract_cell_info node with
-        | Some cell -> Hashtbl.add cells cell.cell_name cell
-        | None -> ()
-      ) body;
-      {lib_name; cells}
-  | Some _ -> failwith ("Unexpected parse result for: " ^ filename)
-  | None -> failwith ("Failed to parse library file: " ^ filename)
+      List.iter (function
+        | Liberty_rewrite.LibCell (n, body) ->
+            Hashtbl.replace cells n (cell_of_libcell n body)
+        | _ -> ()
+      ) items;
+      { lib_name; cells }
+  | _ -> failwith ("Liberty top is not a Library: " ^ filename)
 
 (* Query functions *)
 let get_cell lib cell_name =
@@ -281,3 +180,151 @@ let print_library_summary lib =
   Hashtbl.iter (fun name cell ->
     print_cell_info cell
   ) lib.cells
+
+(* ──────────────────────────────────────────────────────────────────────
+ * Liberty function-expression parser.
+ *
+ * Grammar (loose, matches simcells.lib + most ASIC libs):
+ *   expr   := orterm
+ *   orterm := xorterm ('+' xorterm)* | xorterm ('|' xorterm)*
+ *   xorterm:= andterm ('^' andterm)*
+ *   andterm:= notterm (('*' | '&' | <space>) notterm)*
+ *   notterm:= atom ("'")*           — postfix NOT
+ *   atom   := '(' expr ')' | '!' atom | '~' atom
+ *           | IDENT | '0' | '1'
+ *
+ * Note: Liberty allows whitespace as implicit AND ("A B C" = A&B&C).
+ * The output is Behavioral_ir.bexpr at width 1; downstream callers
+ * substitute identifiers with the actual wire names.
+ *
+ * Identifier resolution: when `input_map` carries (formal, bexpr)
+ * entries, IDENT lookups produce that bexpr; otherwise the IDENT
+ * survives as `BVar formal` for the caller to handle (FF state pins
+ * like IQ/IQN do this — they refer to internal cell state, not a
+ * port). *)
+let parse_function_to_bexpr (input_map : (string * Behavioral_ir.bexpr) list)
+                            (s : string) : Behavioral_ir.bexpr =
+  let len = String.length s in
+  let pos = ref 0 in
+  let bool1 = Behavioral_ir.BInt { width = 1; signed = Unsigned } in
+  let one  = Behavioral_ir.BConst { value = 1; width = 1 } in
+  let zero = Behavioral_ir.BConst { value = 0; width = 1 } in
+  let mk_and a b = Behavioral_ir.BBinOp { op = BAnd; lhs = a; rhs = b;
+                                          result_type = bool1 } in
+  let mk_or  a b = Behavioral_ir.BBinOp { op = BOr;  lhs = a; rhs = b;
+                                          result_type = bool1 } in
+  let mk_xor a b = Behavioral_ir.BBinOp { op = BXor; lhs = a; rhs = b;
+                                          result_type = bool1 } in
+  let mk_not a   = Behavioral_ir.BUnOp  { op = BNot; operand = a;
+                                          result_type = bool1 } in
+
+  let skip_ws () =
+    while !pos < len &&
+          (let c = s.[!pos] in
+           c = ' ' || c = '\t' || c = '\n' || c = '\r')
+    do incr pos done
+  in
+
+  let peek () = if !pos < len then Some s.[!pos] else None in
+
+  let lookup name =
+    try List.assoc name input_map
+    with Not_found -> Behavioral_ir.BVar name
+  in
+
+  let rec parse_atom () =
+    skip_ws ();
+    match peek () with
+    | None -> zero
+    | Some '(' ->
+        incr pos;
+        let e = parse_or () in
+        skip_ws ();
+        (match peek () with
+         | Some ')' -> incr pos
+         | _ -> ());
+        apply_postfix_not e
+    | Some '!' | Some '~' ->
+        incr pos;
+        let e = parse_atom () in
+        mk_not e
+    | Some c when c = '0' ->
+        incr pos; apply_postfix_not zero
+    | Some c when c = '1' ->
+        incr pos; apply_postfix_not one
+    | Some c when (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+               || c = '_' ->
+        let start = !pos in
+        while !pos < len &&
+              (let c = s.[!pos] in
+               (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') || c = '_')
+        do incr pos done;
+        let name = String.sub s start (!pos - start) in
+        apply_postfix_not (lookup name)
+    | Some _ ->
+        (* Unrecognised char — skip and try to recover. Liberty has a
+         * few non-standard chars (e.g. backslashes around names) we
+         * don't model yet. *)
+        incr pos; parse_atom ()
+
+  and apply_postfix_not e =
+    skip_ws ();
+    match peek () with
+    | Some '\'' -> incr pos; apply_postfix_not (mk_not e)
+    | _ -> e
+
+  and parse_and () =
+    let left = ref (parse_atom ()) in
+    let rec loop () =
+      skip_ws ();
+      match peek () with
+      | Some '*' | Some '&' ->
+          incr pos;
+          left := mk_and !left (parse_atom ());
+          loop ()
+      | Some c when (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                 || c = '_' || c = '(' || c = '!' || c = '~'
+                 || c = '0' || c = '1' ->
+          (* Implicit AND via juxtaposition: "A B" ≡ "A*B" *)
+          left := mk_and !left (parse_atom ());
+          loop ()
+      | _ -> ()
+    in
+    loop (); !left
+
+  and parse_xor () =
+    let left = ref (parse_and ()) in
+    let rec loop () =
+      skip_ws ();
+      match peek () with
+      | Some '^' ->
+          incr pos;
+          left := mk_xor !left (parse_and ());
+          loop ()
+      | _ -> ()
+    in
+    loop (); !left
+
+  and parse_or () =
+    let left = ref (parse_xor ()) in
+    let rec loop () =
+      skip_ws ();
+      match peek () with
+      | Some '+' | Some '|' ->
+          incr pos;
+          left := mk_or !left (parse_xor ());
+          loop ()
+      | _ -> ()
+    in
+    loop (); !left
+  in
+  parse_or ()
+
+(* Convenience: parse with the pin→bexpr map carried as
+ * (string * string) — common when callers only have wire names. *)
+let parse_function_with_names
+      (input_names : (string * string) list)
+      (s : string) : Behavioral_ir.bexpr =
+  let m = List.map (fun (k, v) -> (k, Behavioral_ir.BVar v)) input_names in
+  parse_function_to_bexpr m s

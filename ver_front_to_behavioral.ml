@@ -191,7 +191,7 @@ let extract_signals body =
     { name;
       stype = BInt { width; signed = Unsigned };
       direction;
-      initial_value = None } :: acc
+      initial_value = None; attrs = [] } :: acc
   ) signals []
 
 (* ─── Cell instance walking ───────────────────────────────────────────── *)
@@ -689,7 +689,7 @@ let module_to_bmodule name (mt : Globals.modtree) =
   let cells = group_register_cells raw_cells in
   let processes = List.filter_map cell_to_bprocess cells in
   let instances = List.filter_map cell_to_binstance cells in
-  { name; params = []; signals; processes; instances; funcs = []; mems = [] }
+  { name; params = []; signals; processes; instances; funcs = []; mems = []; attrs = [] }
 
 let convert_v_file filename =
   Hashtbl.clear Globals.modprims;

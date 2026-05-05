@@ -20,6 +20,23 @@ open Behavioral_ir
 
 type json = Yojson.Safe.t
 
+(* Slang's JSON output prints each unique InstanceBody only once. Repeat
+ * uses (e.g. left_child / right_child of a recursive popcount) appear
+ * as `"body": "<addr> <name>"` strings — back-references to the first
+ * full occurrence keyed by `"addr"`. We pre-scan the whole tree once
+ * to build the address table so `extract_instances` can resolve those
+ * references back to a full InstanceBody node. *)
+let body_by_addr : (string, Yojson.Safe.t) Hashtbl.t = Hashtbl.create 64
+
+(* Parameter symbol address → (resolved value string, type string).
+ * Slang prints `Parameter` members with `addr` + `value` for any
+ * specialised instance. NamedValue references to those symbols don't
+ * always carry a `constant` annotation (only when slang's evaluator
+ * is sure of the context); folding via this table lets us resolve
+ * them anyway. *)
+let param_value_by_addr : (string, string * string) Hashtbl.t =
+  Hashtbl.create 64
+
 let assoc k (j : json) =
   match j with
   | `Assoc xs -> List.assoc_opt k xs
@@ -165,10 +182,26 @@ let parse_const value_str type_str =
 let rec expr_to_bexpr j =
   match kind_of j with
   | "NamedValue" ->
-      let sym = match str_field "symbol" j with
-        | Some s -> strip_addr s
-        | None -> "?" in
-      BVar sym
+      (* Resolve in priority order:
+       *   1. Inline `constant` annotation (slang's evaluator certain).
+       *   2. Symbol address → Parameter value table (any specialised
+       *      parameter has a known value, even if slang didn't fold
+       *      the inline NamedValue — covers cva6 lfsr's RstVal etc.).
+       *   3. Fall back to BVar for genuine signal references. *)
+      (match str_field "constant" j with
+       | Some s ->
+           let t = match str_field "type" j with
+             | Some t -> t | None -> "int" in
+           parse_const s t
+       | None ->
+           let raw_sym = match str_field "symbol" j with
+             | Some s -> s | None -> "?" in
+           let addr = match String.index_opt raw_sym ' ' with
+             | Some i -> String.sub raw_sym 0 i
+             | None -> "" in
+           match Hashtbl.find_opt param_value_by_addr addr with
+           | Some (v, t) -> parse_const v t
+           | None -> BVar (strip_addr raw_sym))
   | "IntegerLiteral" ->
       let v = match str_field "value" j with Some s -> s | None -> "0" in
       let t = match str_field "type" j with Some s -> s | None -> "int" in
@@ -253,16 +286,39 @@ let rec expr_to_bexpr j =
       let arr = match assoc "value" j with
         | Some j' -> expr_to_bexpr j'
         | None -> BConst { value = 0; width = 1 } in
-      let msb = match assoc "left" j with
+      (* Slang annotates the resolved value of arithmetic msb/lsb
+       * expressions in the `constant` field as `"<width>'d<num>"` or
+       * `"<width>'h<hex>"`. Trust that when present — otherwise
+       * recurse via expr_to_bexpr and only accept BConst.  Without
+       * this, RangeSelect with parameter-derived bounds (e.g.
+       * `padded_input[PaddedWidth-1 : PaddedWidth/2]` in cva6's
+       * popcount tree) collapsed to [0:0], silently producing the
+       * wrong bit-slice. *)
+      let const_of_constant_field j' =
+        match str_field "constant" j' with
+        | Some s ->
+            let s =
+              match String.index_opt s '\'' with
+              | Some i when i + 1 < String.length s ->
+                  String.sub s (i + 2) (String.length s - i - 2)
+              | _ -> s in
+            (try Some (int_of_string s)
+             with _ ->
+               try Some (int_of_string ("0x" ^ s))
+               with _ -> None)
+        | None -> None in
+      let resolve k =
+        match assoc k j with
         | Some j' ->
-            (match expr_to_bexpr j' with
-             | BConst { value; _ } -> value | _ -> 0)
+            (match const_of_constant_field j' with
+             | Some n -> n
+             | None ->
+                 match expr_to_bexpr j' with
+                 | BConst { value; _ } -> value
+                 | _ -> 0)
         | None -> 0 in
-      let lsb = match assoc "right" j with
-        | Some j' ->
-            (match expr_to_bexpr j' with
-             | BConst { value; _ } -> value | _ -> 0)
-        | None -> 0 in
+      let msb = resolve "left" in
+      let lsb = resolve "right" in
       BSlice { signal = arr; msb; lsb }
   | "Conversion" ->
       (* Type cast — value-preserving for our integer arithmetic. *)
@@ -363,10 +419,37 @@ let rec stmt_to_bstmt j =
 
 (* ─── Module body extraction ─────────────────────────────────────── *)
 
+(* Slang's elaborated AST keeps elaborated `GenerateBlock`s as nested
+ * members of the InstanceBody. The branch that was actually taken
+ * for the current parameter set has its `ContinuousAssign` /
+ * `ProceduralBlock` / `Variable` children inside that block —
+ * extract_signals / extract_processes need to descend recursively to
+ * find them. Branches that weren't taken carry
+ * `isUninstantiated: true` and we skip them. *)
+let bool_field f j =
+  match assoc f j with Some (`Bool b) -> b | _ -> false
+
+let rec flatten_members members =
+  List.concat_map (fun m ->
+    match kind_of m with
+    | "GenerateBlock" when not (bool_field "isUninstantiated" m) ->
+        let sub = list_field "members" m in
+        flatten_members sub
+    | "GenerateBlock" -> []     (* uninstantiated branch *)
+    | "GenerateBlockArray" ->
+        (* `for (genvar i …) generate ... endgenerate` — each
+         * iteration is a GenerateBlock entry. Recurse into all of
+         * them; only instantiated ones produce members. *)
+        let sub = list_field "members" m in
+        flatten_members sub
+    | _ -> [m]
+  ) members
+
 (* Slang emits two members per signal — a `Port` (carries direction)
  * and a `Variable` (carries storage type). Match by name and merge
  * into a single bsignal. *)
-let extract_signals members =
+let extract_signals members_raw =
+  let members = flatten_members members_raw in
   let ports : (string, [`Input|`Output|`Internal]) Hashtbl.t =
     Hashtbl.create 16 in
   List.iter (fun m ->
@@ -404,7 +487,7 @@ let extract_signals members =
             name;
             stype;
             direction = dir;
-            initial_value = None;
+            initial_value = None; attrs = []; 
           }
     | _ -> None
   ) members
@@ -441,18 +524,41 @@ let extract_clock_event timing =
        | _ -> ("clk", `Pos))
   | _ -> ("clk", `Pos)
 
-let extract_processes members =
+let extract_processes members_raw =
+  let members = flatten_members members_raw in
   List.filter_map (fun m ->
     match kind_of m with
     | "ContinuousAssign" ->
         let assignment = match assoc "assignment" m with
           | Some j' -> j'
           | None -> `Null in
+        (* LHS may be a plain NamedValue OR a RangeSelect /
+         * ElementSelect / Conversion wrapping the destination. Walk
+         * down the wrappers (looking at `value`/`operand` fields)
+         * until we hit a NamedValue, then take its symbol. Without
+         * this, `assign x[7:0] = ...` lost the LHS to "?" and the
+         * downstream miter saw `x` as undriven. *)
+        let rec lhs_name_of l =
+          match str_field "symbol" l with
+          | Some s -> strip_addr s
+          | None ->
+              (* Common wrappers: try each. *)
+              let try_field f =
+                match assoc f l with
+                | Some j' -> Some (lhs_name_of j')
+                | None -> None in
+              (match try_field "value" with
+               | Some n -> n
+               | None ->
+                   match try_field "operand" with
+                   | Some n -> n
+                   | None ->
+                       match try_field "target" with
+                       | Some n -> n
+                       | None -> "?")
+        in
         let lhs = match assoc "left" assignment with
-          | Some l ->
-              (match str_field "symbol" l with
-               | Some s -> strip_addr s
-               | None -> "?")
+          | Some l -> lhs_name_of l
           | None -> "?" in
         let rhs = match assoc "right" assignment with
           | Some r -> expr_to_bexpr r
@@ -609,6 +715,76 @@ let suffix_of_slang_params members =
   else "__" ^ String.concat "_"
     (List.map (fun (k, v) -> abbrev k ^ v) pairs)
 
+(* Extract child Instance members. Each Instance carries:
+ *   - name        (the instance label, e.g. "left_child")
+ *   - body        (the InstanceBody being instantiated; contains
+ *                  the Parameter list for suffix computation)
+ *   - connections (list of port-connection records; each has
+ *                  `port: { name; direction }` and `expr` which is
+ *                  the actual for inputs, or an Assignment whose
+ *                  `left` is the actual for outputs)
+ *
+ * Returns binstance records keyed by the specialised module_name
+ * (matching what `collect_instances` deposits into the bprogram). *)
+let extract_instances members_raw =
+  let members = flatten_members members_raw in
+  List.filter_map (fun m ->
+    match kind_of m with
+    | "Instance" ->
+        let inst_name = name_of m in
+        if inst_name = "" then None
+        else
+          (* Resolve body: it's either a full InstanceBody Assoc, or
+           * a `<addr> <name>` string back-reference to the first
+           * occurrence in `body_by_addr`. *)
+          let body = match assoc "body" m with
+            | Some (`Assoc _ as j) -> j
+            | Some (`String s) ->
+                let addr = match String.index_opt s ' ' with
+                  | Some i -> String.sub s 0 i
+                  | None -> s in
+                (try Hashtbl.find body_by_addr addr
+                 with Not_found -> `Null)
+            | _ -> `Null in
+          let body_members = list_field "members" body in
+          let base = match str_field "name" body with
+            | Some s -> s | None -> "" in
+          let suffix = suffix_of_slang_params body_members in
+          let module_name = base ^ suffix in
+          if Sys.getenv_opt "SLANG_INST_DEBUG" <> None then
+            Printf.eprintf "[slang] inst %s → %s\n" inst_name module_name;
+          let conns = list_field "connections" m in
+          let port_connections =
+            List.filter_map (fun c ->
+              let port = match assoc "port" c with
+                | Some j -> j | None -> `Null in
+              let pname = name_of port in
+              let dir = str_field "direction" port in
+              let expr_node = match assoc "expr" c with
+                | Some j -> j | None -> `Null in
+              (* For Output ports the expr is wrapped in an
+               * Assignment whose `left` is the actual we want. *)
+              let actual =
+                match dir, kind_of expr_node with
+                | Some "Out", "Assignment" ->
+                    (match assoc "left" expr_node with
+                     | Some j -> expr_to_bexpr j
+                     | None -> BConst { value = 0; width = 1 })
+                | _ -> expr_to_bexpr expr_node
+              in
+              if pname = "" then None
+              else Some (pname, actual)
+            ) conns
+          in
+          Some {
+            inst_name;
+            module_name;
+            param_values = [];
+            port_connections;
+          }
+    | _ -> None
+  ) members
+
 (* Walk every Instance / InstanceBody under `design.members` and
  * produce one bmodule each. Recurse into the InstanceBody's
  * members too — nested Instance nodes (sub-instances of the parent)
@@ -628,14 +804,15 @@ let rec collect_instances ~seen acc j =
           Hashtbl.add seen name ();
           let signals = extract_signals members in
           let processes = extract_processes members in
+          let instances = extract_instances members in
           let m = {
             name;
             params = [];
             signals;
             processes;
-            instances = [];
+            instances;
             funcs = [];
-            mems = [];
+            mems = []; attrs = [];
           } in
           m :: acc
         end else acc
@@ -651,8 +828,41 @@ let rec collect_instances ~seen acc j =
       in
       List.fold_left (collect_instances ~seen) acc (list_field "members" j)
 
+(* Pre-scan: stuff every InstanceBody's `addr` field into
+ * `body_by_addr` so later `Instance.body` string back-references
+ * resolve. *)
+let rec build_addr_table j =
+  let addr_string addr_j = match addr_j with
+    | `String s -> s
+    | `Int i -> string_of_int i
+    | `Intlit s -> s
+    | _ -> "" in
+  match j with
+  | `Assoc fields ->
+      (match List.assoc_opt "kind" fields,
+             List.assoc_opt "addr" fields with
+       | Some (`String "InstanceBody"), Some addr_j ->
+           let addr = addr_string addr_j in
+           if addr <> "" && not (Hashtbl.mem body_by_addr addr) then
+             Hashtbl.replace body_by_addr addr j
+       | Some (`String "Parameter"), Some addr_j ->
+           let addr = addr_string addr_j in
+           let value = match List.assoc_opt "value" fields with
+             | Some (`String s) -> s | _ -> "" in
+           let typ = match List.assoc_opt "type" fields with
+             | Some (`String s) -> s | _ -> "" in
+           if addr <> "" && value <> ""
+              && not (Hashtbl.mem param_value_by_addr addr) then
+             Hashtbl.replace param_value_by_addr addr (value, typ)
+       | _ -> ());
+      List.iter (fun (_, v) -> build_addr_table v) fields
+  | `List xs -> List.iter build_addr_table xs
+  | _ -> ()
+
 let convert_json (j : json) : bprogram =
   let design = match assoc "design" j with Some d -> d | None -> j in
+  Hashtbl.clear body_by_addr;
+  build_addr_table j;
   let seen = Hashtbl.create 256 in
   let mods = List.rev (collect_instances ~seen [] design) in
   { modules = mods; library_cells = [] }

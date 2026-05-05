@@ -589,14 +589,14 @@ let extract_signals stmts =
           name;
           stype;
           direction = dir_of direction;
-          initial_value = None;
+          initial_value = None; attrs = []; 
         }
     | Var' { name; direction; _ } ->
         Some {
           name;
           stype = BInt { width = 32; signed = Unsigned };
           direction = dir_of direction;
-          initial_value = None;
+          initial_value = None; attrs = []; 
         }
     | _ -> None
   ) stmts
@@ -968,11 +968,11 @@ let module_to_bmodule_with_funcs extra_funcs = function
         processes;
         instances = [];
         funcs;
-        mems = [];
+        mems = []; attrs = [];
       }
   | _ ->
       { name = "unknown"; params = []; signals = []; processes = [];
-        instances = []; funcs = []; mems = [] }
+        instances = []; funcs = []; mems = []; attrs = [] }
 
 (* Convenience for callers that don't need package-level imports. *)
 let module_to_bmodule m = module_to_bmodule_with_funcs [] m

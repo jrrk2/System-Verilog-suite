@@ -132,7 +132,7 @@ let extract_signal m_node port_dir net_node =
         name;
         stype = BInt { width; signed = Unsigned };
         direction;
-        initial_value = None;
+        initial_value = None; attrs = []; 
       }
   | _ -> None
 
@@ -166,7 +166,7 @@ let extract_module m_node : bmodule =
     processes = [];
     instances = [];
     funcs = [];
-    mems = [];
+    mems = []; attrs = [];
   }
 
 (* ─── Top-level: find every `Uhdmallmodules` payload ─────────────── *)

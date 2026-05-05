@@ -1,0 +1,360 @@
+(* Lua scripting layer for sv_decompiler.
+ *
+ * Modeled directly on hardcaml-lua's myluaclient.ml: a small sum type
+ * of artifacts (Prog/Mod/Lib/Bool/Str), a hashtable keyed by string
+ * handles, and one Lua-callable per existing subcommand. The Lua side
+ * only ever sees opaque handle strings; OCaml values stay in the
+ * hashtable.
+ *
+ * Lua API (all under the `svd` module):
+ *
+ *   h = svd.parse(frontend, top, {file1, file2, …})  -> prog handle
+ *   h = svd.pick(prog_handle, top)                   -> module handle
+ *   r = svd.miter(mod_a, mod_b)                      -> "EQUIVALENT" / "DIFFER"
+ *   r = svd.gate_miter(top, beh, gate)               -> same, with default Liberty
+ *   r = svd.gate_miter(top, beh, gate, lib)          -> same, explicit Liberty
+ *   h = svd.liberty(file)                            -> Liberty handle
+ *   h = svd.expand(prog_handle, lib_handle)          -> new prog handle
+ *   s = svd.bir(handle)                              -> textual BIR / dump
+ *   s = svd.name(handle)                             -> stored name
+ *   s = svd.items()                                  -> tab-separated index *)
+
+open Behavioral_ir
+
+(* ──────────────────────────────────────────────────────────────────
+ * Handle storage *)
+
+type luaitm =
+  | Prog of string * bprogram                 (* label, program *)
+  | Mod  of string * bmodule * bprogram       (* mod name, bmodule, owning program (for hier flatten) *)
+  | Lib  of string * Sv_liberty.library_info
+
+let lhash : (string, luaitm) Hashtbl.t = Hashtbl.create 64
+
+let nxtitm =
+  let c = ref 0 in
+  fun () -> incr c; "itm" ^ string_of_int !c
+
+(* Insert and return a unique handle. If an identical artifact is
+ * already stored, reuse its handle (cheap dedup mirrors hardcaml-lua). *)
+let hadd x =
+  let found = ref None in
+  Hashtbl.iter (fun k v -> match !found, x, v with
+    | Some _, _, _ -> ()
+    | None, Prog (n, p), Prog (n', p') when n = n' && p == p' -> found := Some k
+    | None, Mod  (n, m, _), Mod  (n', m', _) when n = n' && m == m' -> found := Some k
+    | None, Lib  (n, l), Lib  (n', l') when n = n' && l == l' -> found := Some k
+    | _ -> ()
+  ) lhash;
+  match !found with
+  | Some k -> k
+  | None ->
+      let h = nxtitm () in
+      Hashtbl.add lhash h x;
+      h
+
+let find_prog h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Prog (n, p)) -> (n, p)
+  | _ -> failwith ("handle " ^ h ^ " is not a program")
+
+let find_mod h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Mod (n, m, p)) -> (n, m, p)
+  | _ -> failwith ("handle " ^ h ^ " is not a module")
+
+let find_lib h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Lib (n, l)) -> (n, l)
+  | _ -> failwith ("handle " ^ h ^ " is not a library")
+
+(* ──────────────────────────────────────────────────────────────────
+ * Frontend / pipeline shims — duplicated from sv_decompiler.ml's
+ * load_frontend so the Lua layer doesn't pull in the executable. The
+ * shared library functions (Verible_to_behavioral, Slang_to_behavioral,
+ * Rtlil_to_behavioral, etc.) do the real work. *)
+
+let find_yosys () =
+  let home = try Sys.getenv "HOME" with Not_found -> "/root" in
+  List.find_opt (fun p ->
+    if String.length p > 0 && p.[0] = '/' then Sys.file_exists p
+    else Sys.command (Printf.sprintf "command -v %s > /dev/null" p) = 0
+  ) [
+    home ^ "/oss-cad-suite/bin/yosys";
+    "/usr/local/bin/yosys";
+    "/usr/bin/yosys";
+    "yosys";
+  ]
+
+let run_yosys_to_rtlil ~top ~files ~out =
+  let yosys = match find_yosys () with
+    | Some y -> y
+    | None -> failwith "yosys not found" in
+  let script = Filename.temp_file "yosys_" ".ys" in
+  let oc = open_out script in
+  if Sys.getenv_opt "YOSYS_SLANG" <> None then begin
+    Printf.fprintf oc "plugin -i slang\n";
+    Printf.fprintf oc "read_slang --top %s %s\n" top
+      (String.concat " " files);
+    Printf.fprintf oc "hierarchy -top %s\nproc\nflatten\n" top
+  end else begin
+    Printf.fprintf oc "read_verilog -sv %s\n" (String.concat " " files);
+    Printf.fprintf oc
+      "hierarchy -top %s\nproc\nopt -fast\nflatten\nopt -fast\n" top
+  end;
+  Printf.fprintf oc "write_rtlil %s\n" out;
+  close_out oc;
+  let rc = Sys.command
+             (Printf.sprintf "%s -q -s %s 2>&1"
+                (Filename.quote yosys) (Filename.quote script)) in
+  (try Sys.remove script with _ -> ());
+  if rc <> 0 then failwith (Printf.sprintf "yosys exit %d" rc)
+
+let load_frontend ~frontend ~top ~files : bprogram =
+  match frontend with
+  | "verible" ->
+      Verible_to_behavioral.convert_files ~top files
+  | "verible-ext" ->
+      Verible_to_behavioral.convert_files_with_externals ~top files
+  | "slang" ->
+      (match Slang_to_behavioral.convert_files ~top files with
+       | Some p -> p
+       | None -> failwith "slang frontend failed")
+  | "yosys" ->
+      let tmp = Filename.temp_file "yosys_" ".il" in
+      run_yosys_to_rtlil ~top ~files ~out:tmp;
+      let p = Rtlil_to_behavioral.convert_file tmp in
+      (try Sys.remove tmp with _ -> ());
+      p
+  | "verilator" ->
+      (match files with
+       | [j] ->
+           (match Verilator_to_behavioral.convert_verilator_json_to_behavioral j with
+            | Some p -> p
+            | None -> failwith "verilator JSON parse failed")
+       | _ -> failwith "verilator frontend takes a single .json")
+  | "vhdl" ->
+      (match files with
+       | [f] ->
+           (match Vhdl_to_behavioral.convert_vhdl_file_to_behavioral f with
+            | Some p -> p
+            | None -> failwith "vhdl frontend failed")
+       | _ -> failwith "vhdl frontend takes a single .vhd")
+  | other -> failwith ("unknown frontend: " ^ other)
+
+(* ──────────────────────────────────────────────────────────────────
+ * Lua-callable shims. Each takes/returns string handles. *)
+
+let lparse frontend top files =
+  let p = load_frontend ~frontend ~top ~files in
+  hadd (Prog (top, p))
+
+let lpick prog_h top =
+  let _, p = find_prog prog_h in
+  match List.find_opt (fun (m : bmodule) -> m.name = top) p.modules with
+  | Some m -> hadd (Mod (top, m, p))
+  | None ->
+      failwith (Printf.sprintf "no module '%s' in %s" top prog_h)
+
+(* Verification pipeline (mirrors cmd_miter in sv_decompiler.ml):
+ *   1. Behavioral_arch_subst — abstract attributed adder/mul leaves
+ *      to BBinOp ops gated on a `verify-arch` certificate.
+ *   2. Behavioral_hier — transiently flatten what remains for Z3.
+ * The source bprograms are not modified. *)
+let prep_for_z3 (m : bmodule) (p : bprogram) : bmodule =
+  let p, _n = Behavioral_arch_subst.substitute_program p in
+  match List.find_opt (fun (mm : bmodule) -> mm.name = m.name) p.modules with
+  | None -> m
+  | Some m' ->
+      if m'.instances = [] then m'
+      else Behavioral_hier.flatten_for_z3 p ~top:m'.name
+
+let lmiter a_h b_h =
+  let (_, ma, pa) = find_mod a_h in
+  let (_, mb, pb) = find_mod b_h in
+  let ma' = prep_for_z3 ma pa in
+  let mb' = prep_for_z3 mb pb in
+  if Z3_miter.check_miter_equivalence ma' mb' then "EQUIVALENT" else "DIFFER"
+
+let default_lib () =
+  let home = try Sys.getenv "HOME" with Not_found -> "" in
+  home ^ "/hardcaml-lua.0.0.1/liberty/simcells.lib"
+
+let lliberty file =
+  let lib = Sv_liberty.parse_liberty_file file in
+  hadd (Lib (lib.lib_name, lib))
+
+let lexpand prog_h lib_h =
+  let label, p = find_prog prog_h in
+  let _, lib  = find_lib lib_h in
+  let p' = Gate_netlist_to_behavioral.expand_program lib p in
+  hadd (Prog (label, p'))
+
+let lgate_miter top beh gate lib_opt =
+  let lib_path = match lib_opt with "" -> default_lib () | s -> s in
+  if not (Sys.file_exists lib_path) then
+    failwith ("Liberty file not found: " ^ lib_path);
+  let lib = Sv_liberty.parse_liberty_file lib_path in
+  let beh_p =
+    Verible_to_behavioral.convert_files ~top [beh] in
+  let gate_clean =
+    Gate_netlist_to_behavioral.preprocess_gate_file gate in
+  let gate_p =
+    Verible_to_behavioral.convert_files_with_externals
+      ~top [gate_clean] in
+  let gate_p = Gate_netlist_to_behavioral.expand_program lib gate_p in
+  let pick label src =
+    match List.find_opt (fun (m : bmodule) -> m.name = top) src with
+    | Some m -> m
+    | None -> failwith (label ^ ": no module " ^ top) in
+  let mb = pick "behavioral" beh_p.modules in
+  let mg = pick "gate"       gate_p.modules in
+  if Z3_miter.check_miter_equivalence mb mg then "EQUIVALENT" else "DIFFER"
+
+let lbir h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Prog (_, p))    -> string_of_bprogram p
+  | Some (Mod  (_, m, _)) -> string_of_bmodule m
+  | Some (Lib  (n, l)) ->
+      Printf.sprintf "library %s: %d cells" n (Hashtbl.length l.cells)
+  | None -> failwith ("unknown handle " ^ h)
+
+let linsts h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Mod (_, m, _)) ->
+      String.concat "\n"
+        (List.map (fun (i : binstance) ->
+          let conns = String.concat ", "
+            (List.map (fun (p, e) ->
+              Printf.sprintf ".%s(%s)" p (string_of_bexpr e)
+            ) i.port_connections) in
+          Printf.sprintf "  %s : %s (%s)"
+            i.inst_name i.module_name conns
+        ) m.instances)
+  | _ -> "<not a module>"
+
+let lname h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Prog (n, _)) | Some (Mod (n, _, _)) | Some (Lib (n, _)) -> n
+  | None -> failwith ("unknown handle " ^ h)
+
+let litems () =
+  let lst = Hashtbl.fold (fun k v acc ->
+    let kind = match v with
+      | Prog (n, p) ->
+          Printf.sprintf "program %s (%d modules)" n
+            (List.length p.modules)
+      | Mod (n, _, _) -> Printf.sprintf "module %s" n
+      | Lib (n, l) ->
+          Printf.sprintf "library %s (%d cells)" n
+            (Hashtbl.length l.cells)
+    in
+    (k ^ "\t" ^ kind) :: acc
+  ) lhash [] in
+  String.concat "\n" (List.sort compare lst)
+
+(* ──────────────────────────────────────────────────────────────────
+ * lua-ml interpreter setup. Boilerplate copied from
+ * hardcaml-lua/myluaclient.ml; the Char/Pair user-types are kept so the
+ * standard library combine works, but we don't expose them in scripts. *)
+
+module LuaChar = struct
+  type 'a t       = char
+  let tname       = "char"
+  let eq _        = fun x y -> x = y
+  let to_string   = fun _ c -> String.make 1 c
+end
+
+module Pair = struct
+  type 'a t       = 'a * 'a
+  let tname       = "pair"
+  let eq _        = fun x y -> x = y
+  let to_string   = fun f (x, y) -> Printf.sprintf "(%s,%s)" (f x) (f y)
+end
+
+module T =
+  Lua.Lib.Combine.T3
+    (LuaChar)
+    (Pair)
+    (Luaiolib.T)
+
+module LuaCharT = T.TV1
+module PairT    = T.TV2
+module LuaioT   = T.TV3
+
+module MakeLib
+    (CharV : Lua.Lib.TYPEVIEW with type 'a t = 'a LuaChar.t)
+    (PairV : Lua.Lib.TYPEVIEW with type 'a t = 'a Pair.t
+                              and  type 'a combined = 'a CharV.combined)
+  : Lua.Lib.USERCODE with type 'a userdata' = 'a CharV.combined = struct
+
+  type 'a userdata' = 'a PairV.combined
+  module M (C : Lua.Lib.CORE with type 'a V.userdata' = 'a userdata') = struct
+    module V = C.V
+    let ( **-> )  = V.( **-> )
+    let ( **->> ) x y = x **-> V.result y
+
+    let wrap1 f a   = try f a   with e -> Printexc.print_backtrace stdout; raise e
+    let wrap2 f a b = try f a b with e -> Printexc.print_backtrace stdout; raise e
+    let wrap3 f a b c   = try f a b c   with e -> Printexc.print_backtrace stdout; raise e
+    let wrap4 f a b c d = try f a b c d with e -> Printexc.print_backtrace stdout; raise e
+
+    let init g =
+      C.register_module "svd" [
+        "parse",      V.efunc (V.string **-> V.string **-> V.list V.string
+                               **->> V.string)
+                       (wrap3 lparse);
+        "pick",       V.efunc (V.string **-> V.string **->> V.string)
+                       (wrap2 lpick);
+        "miter",      V.efunc (V.string **-> V.string **->> V.string)
+                       (wrap2 lmiter);
+        "liberty",    V.efunc (V.string **->> V.string)
+                       (wrap1 lliberty);
+        "expand",     V.efunc (V.string **-> V.string **->> V.string)
+                       (wrap2 lexpand);
+        "gate_miter", V.efunc (V.string **-> V.string **-> V.string
+                               **-> V.string **->> V.string)
+                       (wrap4 lgate_miter);
+        "bir",        V.efunc (V.string **->> V.string) (wrap1 lbir);
+        "insts",      V.efunc (V.string **->> V.string) (wrap1 linsts);
+        "name",       V.efunc (V.string **->> V.string) (wrap1 lname);
+        "items",      V.efunc (V.unit **->> V.string)   (wrap1 litems);
+      ] g
+  end
+end
+
+module W = Lua.Lib.WithType (T)
+module C =
+  Lua.Lib.Combine.C5
+    (Luaiolib.Make (LuaioT))
+    (Luacamllib.Make (LuaioT))
+    (W (Luastrlib.M))
+    (W (Luamathlib.M))
+    (MakeLib (LuaCharT) (PairT))
+
+module I =
+  Lua.MakeInterp
+    (Lua.Parser.MakeStandard)
+    (Lua.MakeEval (T) (C))
+
+(* Public entry: run a Lua script file and return its exit code (0 on
+ * success, 1 on Lua exception). *)
+let run_script path =
+  if not (Sys.file_exists path) then begin
+    Printf.eprintf "lua script not found: %s\n" path;
+    1
+  end else begin
+    let ic = open_in path in
+    let buf = Buffer.create 1024 in
+    (try while true do
+       Buffer.add_channel buf ic 4096
+     done with End_of_file -> ());
+    close_in ic;
+    let state = I.mk () in
+    try
+      ignore (I.dostring state (Buffer.contents buf));
+      0
+    with e ->
+      Printf.eprintf "lua: %s\n" (Printexc.to_string e);
+      1
+  end
