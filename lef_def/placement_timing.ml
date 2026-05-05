@@ -18,31 +18,53 @@
 type net_role = Driver | Load
 type endpoint = { inst : string; pin : string; role : net_role }
 
-(* Tag pins as driver/load assuming first-listed = driver. *)
-let endpoints_of_net (net : Nets.net) =
-  match net.Nets.pins with
-  | [] -> []
-  | drv :: ld ->
-      { inst = drv.Nets.inst; pin = drv.Nets.pin; role = Driver } ::
-      List.map (fun p -> { inst = p.Nets.inst; pin = p.Nets.pin; role = Load }) ld
+(* Tag pins as driver/load.  When [cell_of] and [pin_dir] are
+   supplied (typically from LEF + DEF placements) we use the
+   real pin direction; otherwise we fall back to the
+   "first-pin-is-driver" convention. *)
+let endpoints_of_net ?cell_of ?pin_dir (net : Nets.net) =
+  let by_dir =
+    match cell_of, pin_dir with
+    | Some c_of, Some p_dir ->
+        let drivers, loads =
+          List.partition (fun (pr : Nets.pin_ref) ->
+            match Hashtbl.find_opt c_of pr.Nets.inst with
+            | None -> false
+            | Some cell ->
+                Hashtbl.find_opt p_dir (cell, pr.Nets.pin)
+                  = Some Lef_pins.Output) net.Nets.pins in
+        if drivers = [] then None else Some (drivers, loads)
+    | _ -> None
+  in
+  match by_dir with
+  | Some (drivers, loads) ->
+      List.map (fun (p : Nets.pin_ref) ->
+        { inst = p.Nets.inst; pin = p.Nets.pin; role = Driver }) drivers @
+      List.map (fun (p : Nets.pin_ref) ->
+        { inst = p.Nets.inst; pin = p.Nets.pin; role = Load }) loads
+  | None ->
+      match net.Nets.pins with
+      | [] -> []
+      | drv :: ld ->
+          { inst = drv.Nets.inst; pin = drv.Nets.pin; role = Driver } ::
+          List.map (fun p -> { inst = p.Nets.inst; pin = p.Nets.pin; role = Load }) ld
 
 (* Build [inst -> list of (downstream_inst, wire_delay_ps)]
-   so we can do a longest-path topological traversal. *)
-let fanout_edges ?(wp=Wire_delay.default_params) plc_tbl nets =
+   so we can do a longest-path topological traversal.  When
+   [pin_dir] is supplied it is used to identify drivers via LEF
+   pin direction; otherwise we fall back to first-pin convention. *)
+let fanout_edges ?(wp=Wire_delay.default_params) ?cell_of ?pin_dir plc_tbl nets =
   let edges = Hashtbl.create 4096 in
   List.iter (fun (net : Nets.net) ->
-    let eps = endpoints_of_net net in
-    let driver_opt =
-      List.find_opt (fun e -> e.role = Driver) eps in
-    match driver_opt with
-    | None -> ()
-    | Some d ->
-        let delay_ps, _ = Wire_delay.net_delay_ps ~p:wp plc_tbl net in
-        List.iter (fun e ->
-          if e.role = Load && e.inst <> d.inst then begin
-            let cur = try Hashtbl.find edges d.inst with Not_found -> [] in
-            Hashtbl.replace edges d.inst ((e.inst, delay_ps) :: cur)
-          end) eps) nets;
+    let eps = endpoints_of_net ?cell_of ?pin_dir net in
+    let drivers = List.filter (fun e -> e.role = Driver) eps in
+    let delay_ps, _ = Wire_delay.net_delay_ps ~p:wp plc_tbl net in
+    List.iter (fun (d : endpoint) ->
+      List.iter (fun (e : endpoint) ->
+        if e.role = Load && e.inst <> d.inst then begin
+          let cur = try Hashtbl.find edges d.inst with Not_found -> [] in
+          Hashtbl.replace edges d.inst ((e.inst, delay_ps) :: cur)
+        end) eps) drivers) nets;
   edges
 
 (* Per-cell intrinsic delay.  Default is a 50-ps placeholder so the
@@ -89,9 +111,13 @@ type report = {
 }
 
 let report ?(wp=Wire_delay.default_params)
-           ?(delay_of=default_cell_delay_ps) placements nets =
+           ?(delay_of=default_cell_delay_ps)
+           ?pin_dir placements nets =
   let plc_tbl = Hpwl.placement_table placements in
-  let edges = fanout_edges ~wp plc_tbl nets in
+  let cell_of = Hashtbl.create (List.length placements) in
+  List.iter (fun (p : Placement.placement) ->
+    Hashtbl.replace cell_of p.Placement.inst p.Placement.cell) placements;
+  let edges = fanout_edges ~wp ~cell_of ?pin_dir plc_tbl nets in
   let arr   = arrival_table ~delay_of edges placements in
   let worst_inst = ref "" and worst_v = ref 0. and worst_cell = ref "" in
   let cell_of = Hashtbl.create 4096 in

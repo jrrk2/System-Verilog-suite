@@ -6,11 +6,12 @@
 
 let () =
   if Array.length Sys.argv < 3 then begin
-    prerr_endline "usage: test_placement_timing <design.def> <library.lib>";
+    prerr_endline "usage: test_placement_timing <design.def> <library.lib> [tech.lef]";
     exit 2
   end;
   let def_path = Sys.argv.(1) in
   let lib_path = Sys.argv.(2) in
+  let lef_path = if Array.length Sys.argv > 3 then Some Sys.argv.(3) else None in
 
   Printf.printf "Loading Liberty %s ...\n%!" lib_path;
   let delay_tbl = Cell_delay.load lib_path in
@@ -32,8 +33,14 @@ let () =
   Printf.printf "  placements            : %d\n" (List.length placements);
   Printf.printf "  nets                  : %d\n%!" (List.length nets);
 
-  let r_default = Lef_def.Placement_timing.report placements nets in
-  let r_real    = Lef_def.Placement_timing.report
+  let pin_dir = Option.map (fun p ->
+    Printf.printf "Loading LEF %s ...\n%!" p;
+    let entries = Lef_def.Lef_pins.parse p in
+    Printf.printf "  cell pins             : %d\n%!" (List.length entries);
+    Lef_def.Lef_pins.table_of_entries entries) lef_path in
+
+  let r_default = Lef_def.Placement_timing.report ?pin_dir placements nets in
+  let r_real    = Lef_def.Placement_timing.report ?pin_dir
                     ~delay_of:(Cell_delay.lookup delay_tbl)
                     placements nets in
 
