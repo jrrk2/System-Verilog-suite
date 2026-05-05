@@ -48,23 +48,23 @@ let () =
 
   List.iter (fun ma ->
     List.iter (fun aa ->
-      let placements, nets, n_cells, depth =
-        Synth_mac.build ~width ~mul_arch:ma ~add_arch:aa in
+      let nl = Synth_mac.build ~width ~mul_arch:ma ~add_arch:aa in
       let r = Placement_timing.report
                 ~delay_of:(Cell_delay.lookup delay_tbl)
                 ~pin_dir
-                placements nets in
-      let plc_tbl = Hpwl.placement_table placements in
+                nl.cells nl.nets in
+      let plc_tbl = Hpwl.placement_table nl.cells in
       let total_hpwl =
         List.fold_left
           (fun acc n -> acc + Hpwl.hpwl_of_net plc_tbl n)
-          0 nets in
+          0 nl.nets in
+      let n_cells = List.length nl.cells in
       Printf.printf
         "  %-9s %-12s | %5d %5d | %6d | %10.2f | %10.2f\n"
         (Synth_mac.mul_arch_name ma)
         (Synth_mac.adder_arch_name aa)
-        depth n_cells total_hpwl r.total_wire_ps r.worst_arr_ps;
-      results := (ma, aa, depth, n_cells, total_hpwl, r) :: !results
+        nl.depth n_cells total_hpwl r.total_wire_ps r.worst_arr_ps;
+      results := (ma, aa, nl.depth, n_cells, total_hpwl, r) :: !results
     ) adds
   ) muls;
 
