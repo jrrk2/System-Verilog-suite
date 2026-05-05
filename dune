@@ -16,7 +16,7 @@
           verible_elaborate verible_to_behavioral rtlil_to_behavioral
           slang_to_behavioral
           sv_verify_hardcaml sv_memory sv_liberty sv_gate_map gate_netlist_to_behavioral
-          liberty liberty_lex liberty_rewrite sv_lua arch_verify sv_attr_extract behavioral_arch_subst behavioral_ffpack
+          liberty liberty_lex liberty_rewrite sv_lua arch_verify sv_attr_extract behavioral_arch_subst behavioral_ffpack behavioral_timing
           sv_netlist_reader sv_rtl_collapse sv_rtlil_reader
           sv_rtlil_to_ir sv_ir_verify
           Source_text_verible_types Source_text_verible_tokens

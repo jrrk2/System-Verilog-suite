@@ -490,6 +490,69 @@ let cmd_verify_arch args =
         \  mul   archs: ripple wallace dadda";
       exit 2
 
+let cmd_timing args =
+  let target = ref max_int in
+  let arch_adder = ref Behavioral_timing.default_adder_arch in
+  let arch_mul   = ref Behavioral_timing.default_mul_arch in
+  let positional = ref [] in
+  let rec scan = function
+    | "--target-depth" :: v :: rest -> target := int_of_string v; scan rest
+    | "--default-adder" :: v :: rest -> arch_adder := v; scan rest
+    | "--default-mul"   :: v :: rest -> arch_mul   := v; scan rest
+    | x :: rest -> positional := x :: !positional; scan rest
+    | [] -> ()
+  in
+  scan args;
+  let pos = List.rev !positional in
+  let (top, files) = match pos with
+    | t :: fs when fs <> [] -> (t, fs)
+    | _ ->
+        prerr_endline
+          "usage: sv_decompiler timing <top> <files…> \
+           [--target-depth N] [--default-adder X] [--default-mul Y]";
+        exit 2 in
+  Printf.printf "═══════════════════════════════════════════════════════\n";
+  Printf.printf "  Timing analysis: %s\n" top;
+  Printf.printf "  default arch:  adder=%s  mul=%s\n" !arch_adder !arch_mul;
+  Printf.printf "═══════════════════════════════════════════════════════\n\n";
+  let prog = load_frontend "verible" ~top files in
+  (* No arch-subst here: we want to SEE what each op will become, not
+   * abstract it away. The timing model reads `sv_decomp_*` attrs
+   * directly per-signal to pick depth. *)
+  let m_top =
+    let m = pick_top top prog in
+    if m.instances = [] then m
+    else Behavioral_hier.flatten_for_z3 prog ~top in
+  Printf.printf "[1/3] Walking dataflow graph …\n%!";
+  let arrivals = Behavioral_timing.compute_arrivals
+    ~arch_adder:!arch_adder ~arch_mul:!arch_mul m_top in
+  Printf.printf "[2/3] Endpoint paths …\n%!";
+  let paths = Behavioral_timing.endpoint_paths arrivals m_top in
+  print_string (Behavioral_timing.report ~target_depth:!target paths);
+  Printf.printf "[3/3] Optimisation suggestions …\n%!";
+  let upgrades =
+    if !target = max_int then []
+    else
+      let failing =
+        List.filter (fun (p : Behavioral_timing.path_report) ->
+          p.arrival > !target) paths in
+      Behavioral_timing.suggest_upgrades
+        ~arch_adder:!arch_adder ~arch_mul:!arch_mul failing
+  in
+  print_string (Behavioral_timing.format_upgrades upgrades);
+  if !target <> max_int then
+    let n_fail = List.length (List.filter
+      (fun (p : Behavioral_timing.path_report) ->
+        p.arrival > !target) paths) in
+    if n_fail = 0 then
+      Printf.printf "\n  ✅ all endpoints meet target depth %d\n" !target
+    else if upgrades <> [] then
+      Printf.printf "\n  ⚠ %d endpoints over target; %d cert-gated upgrades available\n"
+        n_fail (List.length upgrades)
+    else
+      Printf.printf "\n  ❌ %d endpoints over target; no certified upgrades available\n"
+        n_fail
+
 let cmd_emit_arch args =
   let pos, width = parse_arch_args args in
   match pos with
@@ -520,6 +583,7 @@ Verbs:
   script      <file.lua>                            run a Lua script (svd.* API)
   verify-arch <adder|mul> <arch> [--width N]        prove arch ≡ `+` / `*`, cache cert
   emit-arch   <adder|mul> <arch> <out.sv> [--width N]  write certified arch block as SV
+  timing      <top> <files…> [--target-depth N]     critical-path report + cert-gated upgrade hints
 
 <frontend> ∈ {verible, slang, yosys, verilator, vhdl}
   verible    — Verible parse-tree → BIR (default; pure OCaml, no subprocess)
@@ -555,6 +619,7 @@ let () =
   | "script"     :: rest -> cmd_script rest
   | "verify-arch":: rest -> cmd_verify_arch rest
   | "emit-arch"  :: rest -> cmd_emit_arch rest
+  | "timing"     :: rest -> cmd_timing rest
   | sub :: _ ->
       Printf.eprintf "unknown command: %s\n\n" sub;
       usage ();

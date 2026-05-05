@@ -219,6 +219,24 @@ let lbir h =
       Printf.sprintf "library %s: %d cells" n (Hashtbl.length l.cells)
   | None -> failwith ("unknown handle " ^ h)
 
+(* Critical-path timing report for a module. Returns the printable
+ * report (same string the CLI prints). Optional target-depth: if
+ * provided, also returns suggested cert-gated upgrades. *)
+let ltiming h target_depth =
+  let _, m, _ = find_mod h in
+  let arrivals = Behavioral_timing.compute_arrivals m in
+  let paths = Behavioral_timing.endpoint_paths arrivals m in
+  let target = if target_depth <= 0 then max_int else target_depth in
+  let report = Behavioral_timing.report ~target_depth:target paths in
+  let upgrades =
+    if target = max_int then []
+    else
+      let failing =
+        List.filter (fun (p : Behavioral_timing.path_report) ->
+          p.arrival > target) paths in
+      Behavioral_timing.suggest_upgrades failing in
+  report ^ Behavioral_timing.format_upgrades upgrades
+
 let linsts h =
   match Hashtbl.find_opt lhash h with
   | Some (Mod (_, m, _)) ->
@@ -317,6 +335,8 @@ module MakeLib
                        (wrap4 lgate_miter);
         "bir",        V.efunc (V.string **->> V.string) (wrap1 lbir);
         "insts",      V.efunc (V.string **->> V.string) (wrap1 linsts);
+        "timing",     V.efunc (V.string **-> V.int **->> V.string)
+                       (wrap2 ltiming);
         "name",       V.efunc (V.string **->> V.string) (wrap1 lname);
         "items",      V.efunc (V.unit **->> V.string)   (wrap1 litems);
       ] g
