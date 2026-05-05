@@ -48,7 +48,7 @@ let () =
 
   List.iter (fun ma ->
     List.iter (fun aa ->
-      let nl = Synth_mac.build ~width ~mul_arch:ma ~add_arch:aa in
+      let nl = Synth_mac.build ~width ~mul_arch:ma ~add_arch:aa () in
       let r = Placement_timing.report
                 ~delay_of:(Cell_delay.lookup delay_tbl)
                 ~pin_dir

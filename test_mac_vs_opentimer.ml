@@ -120,15 +120,18 @@ let () =
   with_temp_dir (fun temp_dir ->
     let muls = [ Synth_mac.Array_m; Synth_mac.Wallace_m ] in
     let adds = [ Synth_mac.Ripple_a; Synth_mac.Kogge_stone_a ] in
+    let multi_cell = Sys.getenv_opt "MULTI_CELL" <> None in
 
-    Printf.printf "\nMAC width = %d\n\n" width;
+    Printf.printf "\nMAC width = %d  (cells: %s)\n\n"
+      width (if multi_cell then "AND2_X1 + XOR2_X1" else "AND2_X1 only");
     Printf.printf "  %-9s %-12s | %5s %5s | %12s | %12s | %6s\n"
       "mul" "adder" "depth" "cells" "ours (ps)" "OT (ps)" "ratio";
     Printf.printf "  %s\n" (String.make 76 '-');
 
     List.iter (fun ma ->
       List.iter (fun aa ->
-        let nl = Synth_mac.build ~width ~mul_arch:ma ~add_arch:aa in
+        let nl = Synth_mac.build ~multi_cell ~width
+                   ~mul_arch:ma ~add_arch:aa () in
         let r_ours = Placement_timing.report
                        ~delay_of:(Cell_delay.lookup delay_tbl)
                        ~pin_dir nl.cells nl.nets in

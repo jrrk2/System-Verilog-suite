@@ -73,10 +73,30 @@ let mul_cells ~arch ~width =
   | Array_m              -> width * width + width * (width - 1)
   | Wallace_m | Dadda_m  -> width * width + (3 * width) / 2 + width
 
-let cell_type   = "AND2_X1"
-let in1_pin     = "A1"
-let in2_pin     = "A2"
-let out_pin     = "ZN"
+(* When [multi_cell] is true the netlist alternates AND2_X1 and
+   XOR2_X1 by stage parity — exactly the cell mix you'd see in a
+   real full-adder column.  Both have rise/fall arcs in Nangate45
+   and both compose into well-formed Verilog without coaxing
+   OpenTimer's Liberty reader past edge cases. *)
+
+type cell_kind = And2 | Xor2
+
+let kind_for ~multi_cell ~stage =
+  if multi_cell && stage mod 2 = 1 then Xor2 else And2
+
+let cell_name_of = function
+  | And2 -> "AND2_X1"
+  | Xor2 -> "XOR2_X1"
+
+let in1_pin_of = function
+  | And2 -> "A1"
+  | Xor2 -> "A"
+let in2_pin_of = function
+  | And2 -> "A2"
+  | Xor2 -> "B"
+let out_pin_of = function
+  | And2 -> "ZN"
+  | Xor2 -> "Z"
 
 let col_pitch = 1500
 let row_pitch = 2800
@@ -92,6 +112,7 @@ type netlist = {
   nets       : Nets.net list;
   inputs     : string list;            (* primary input port names *)
   outputs    : string list;            (* primary output port names *)
+  kind_of    : string -> cell_kind;    (* inst -> kind, for emit *)
 }
 
 let inst_name s b = Printf.sprintf "g_s%d_b%d" s b
@@ -101,9 +122,10 @@ let prefix_stride ~arch ~stage =
   | Ripple_a -> 1
   | _        -> 1 lsl (max 0 (stage - 1))
 
-let build ~width ~mul_arch ~add_arch =
+let build ?(multi_cell=false) ~width ~mul_arch ~add_arch () =
   let cells = ref [] in
   let nets  = ref [] in
+  let kind_tbl = Hashtbl.create 1024 in
 
   let aw    = 2 * width in     (* MAC output is 2W *)
   let mul_d = mul_depth ~arch:mul_arch ~width in
@@ -117,14 +139,23 @@ let build ~width ~mul_arch ~add_arch =
      for the multiplier, then the chain carries forward. *)
   let put ~stage ~bit =
     let inst = inst_name stage bit in
+    let k = kind_for ~multi_cell ~stage in
+    Hashtbl.replace kind_tbl inst k;
     let p =
-      { Placement.inst; cell = cell_type;
+      { Placement.inst; cell = cell_name_of k;
         x = bit  * col_pitch;
         y = stage * row_pitch;
         orient = Placement.N }
     in
     cells := p :: !cells;
     inst
+  in
+  let in_pin_of stage which =
+    let k = kind_for ~multi_cell ~stage in
+    if which = 1 then in1_pin_of k else in2_pin_of k
+  in
+  let out_pin_for stage =
+    out_pin_of (kind_for ~multi_cell ~stage)
   in
   let connect ~src_inst ~src_pin ~dst_inst ~dst_pin =
     let nm = Printf.sprintf "n_%s_%s_to_%s_%s"
@@ -159,13 +190,13 @@ let build ~width ~mul_arch ~add_arch =
               ] } :: !nets
   in
 
-  (* Stage 0: W cells across, A1 driven by a[b], A2 by b[b]. *)
+  (* Stage 0: W cells across, in1 driven by a[b], in2 by b[b]. *)
   for b = 0 to width - 1 do
     let inst = put ~stage:0 ~bit:b in
     connect_port ~port:(Printf.sprintf "a%d" b)
-      ~dst_inst:inst ~dst_pin:in1_pin;
+      ~dst_inst:inst ~dst_pin:(in_pin_of 0 1);
     connect_port ~port:(Printf.sprintf "b%d" b)
-      ~dst_inst:inst ~dst_pin:in2_pin;
+      ~dst_inst:inst ~dst_pin:(in_pin_of 0 2);
   done;
 
   (* Stages 1..total_d-1: width up to aw cells per stage.
@@ -189,14 +220,15 @@ let build ~width ~mul_arch ~add_arch =
       let prev_inst2 =
         if prev_b2 < (if s-1 = 0 then width else aw) then
           Some (inst_name (s-1) prev_b2) else None in
+      let src_pin = out_pin_for (s-1) in
       (match prev_inst1 with
-       | Some pi -> connect ~src_inst:pi ~src_pin:out_pin
-                            ~dst_inst:inst ~dst_pin:in1_pin
+       | Some pi -> connect ~src_inst:pi ~src_pin
+                            ~dst_inst:inst ~dst_pin:(in_pin_of s 1)
        | None -> ());
       (match prev_inst2 with
        | Some pi when prev_b2 <> prev_b1 ->
-           connect ~src_inst:pi ~src_pin:out_pin
-                   ~dst_inst:inst ~dst_pin:in2_pin
+           connect ~src_inst:pi ~src_pin
+                   ~dst_inst:inst ~dst_pin:(in_pin_of s 2)
        | _ ->
            (* If the offset bit is out of range or coincides with
               prev_b1, drive A2 from the same upstream cell as A1.
@@ -204,8 +236,8 @@ let build ~width ~mul_arch ~add_arch =
               input would create an arrival shortcut that isn't
               representative of the real arch. *)
            (match prev_inst1 with
-            | Some pi -> connect ~src_inst:pi ~src_pin:out_pin
-                                  ~dst_inst:inst ~dst_pin:in2_pin
+            | Some pi -> connect ~src_inst:pi ~src_pin
+                                  ~dst_inst:inst ~dst_pin:(in_pin_of s 2)
             | None -> ()));
     done
   done;
@@ -214,7 +246,7 @@ let build ~width ~mul_arch ~add_arch =
   for b = 0 to aw - 1 do
     let pi = inst_name (total_d - 1) b in
     connect_to_port ~port:(Printf.sprintf "y%d" b)
-                    ~src_inst:pi ~src_pin:out_pin
+                    ~src_inst:pi ~src_pin:(out_pin_for (total_d - 1))
   done;
 
   (* deduplicate input port names — multiple cells may share a
@@ -231,6 +263,8 @@ let build ~width ~mul_arch ~add_arch =
     nets  = List.rev !nets;
     inputs  = uniq (List.rev !inputs);
     outputs = uniq (List.rev !outputs);
+    kind_of = (fun inst ->
+      try Hashtbl.find kind_tbl inst with Not_found -> And2);
   }
 
 (* ── Verilog emitter for OpenTimer ─────────────────────────── *)
@@ -269,27 +303,31 @@ let emit_verilog ~module_name ~oc nl =
   List.iter (fun nm -> Hashtbl.replace port_set nm ()) nl.outputs;
   List.iter (fun (c : Placement.placement) ->
     if not (Hashtbl.mem port_set c.inst) then begin
+      let k    = nl.kind_of c.inst in
+      let in1  = in1_pin_of k in
+      let in2  = in2_pin_of k in
+      let outp = out_pin_of k in
       let net_of pin =
         try
           let nm = Hashtbl.find net_for_pin (c.inst, pin) in
-          (* If this net is a port-net, replace with the port *)
           if List.exists (fun s -> nm = "n_" ^ s ^ "_" ^ c.inst ^ "_" ^ pin)
                          nl.inputs
           then List.find (fun s -> nm = "n_" ^ s ^ "_" ^ c.inst ^ "_" ^ pin)
                          nl.inputs
           else nm
         with Not_found -> "1'b0" in
-      let zn_net =
+      let out_net =
         try
-          let nm = Hashtbl.find net_for_pin (c.inst, out_pin) in
-          if List.exists (fun s -> nm = "n_" ^ c.inst ^ "_" ^ out_pin ^ "_" ^ s)
+          let nm = Hashtbl.find net_for_pin (c.inst, outp) in
+          if List.exists (fun s -> nm = "n_" ^ c.inst ^ "_" ^ outp ^ "_" ^ s)
                          nl.outputs
-          then List.find (fun s -> nm = "n_" ^ c.inst ^ "_" ^ out_pin ^ "_" ^ s)
+          then List.find (fun s -> nm = "n_" ^ c.inst ^ "_" ^ outp ^ "_" ^ s)
                          nl.outputs
           else nm
         with Not_found -> "1'bz" in
-      p "  %s %s ( .A1(%s), .A2(%s), .ZN(%s) );\n"
-        cell_type c.inst (net_of in1_pin) (net_of in2_pin) zn_net
+      p "  %s %s ( .%s(%s), .%s(%s), .%s(%s) );\n"
+        (cell_name_of k) c.inst in1 (net_of in1) in2 (net_of in2)
+        outp out_net
     end) nl.cells;
   p "endmodule\n"
 
