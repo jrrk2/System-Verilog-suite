@@ -55,6 +55,7 @@ type lut = {
 type cell_arcs = {
   cell_name : string;
   arcs      : lut list;       (* every cell_rise + cell_fall arc *)
+  slew_arcs : lut list;       (* every rise_transition + fall_transition *)
 }
 
 type table = (string, cell_arcs) Hashtbl.t
@@ -114,14 +115,28 @@ let arcs_of_timing timing =
         lut_of_cellvalues body
     | _ -> None) timing
 
-(* Pull all timing arcs out of a cell body (across every output pin). *)
+(* Same shape but for rise_transition / fall_transition.  The
+   rewriter wraps these in [Transition (kind, name, body)] where
+   body is the inner CellValues structure (index_1, index_2,
+   values) after the strip+rw pre-pass. *)
+let slew_arcs_of_timing timing =
+  List.filter_map (function
+    | Transition ((  "rise_transition" | "fall_transition"), _,
+                  CellValues body) ->
+        lut_of_cellvalues body
+    | _ -> None) timing
+
+(* Pull all timing arcs out of a cell body (across every output pin).
+   Returns (delay_arcs, slew_arcs) so the propagation pass can read
+   both at once. *)
 let cell_arcs_of body =
-  List.fold_left (fun acc -> function
+  List.fold_left (fun (da, sa) -> function
     | CellPin (_, pin_body) ->
-        List.fold_left (fun a -> function
-          | Timing t -> arcs_of_timing t @ a
-          | _ -> a) acc pin_body
-    | _ -> acc) [] body
+        List.fold_left (fun (da', sa') -> function
+          | Timing t ->
+              (arcs_of_timing t @ da', slew_arcs_of_timing t @ sa')
+          | _ -> (da', sa')) (da, sa) pin_body
+    | _ -> (da, sa)) ([], []) body
 
 (* ── Bilinear interpolation ──────────────────────────────────── *)
 
@@ -165,8 +180,9 @@ let build_arc_table lib =
    | Library (_, items) ->
        List.iter (function
          | LibCell (name, body) ->
-             let arcs = cell_arcs_of body in
-             Hashtbl.replace h name { cell_name = name; arcs }
+             let arcs, slew_arcs = cell_arcs_of body in
+             Hashtbl.replace h name
+               { cell_name = name; arcs; slew_arcs }
          | _ -> ()) items
    | _ -> ());
   h
@@ -245,3 +261,27 @@ let at ?(default=50.0) ~slew ~load (tbl, scale) cell =
   match at_native ~slew ~load tbl cell with
   | Some v -> v *. scale
   | None   -> default
+
+(* Mean output-slew (in Liberty units) at the given conditions,
+   averaged across rise+fall transition arcs. *)
+let out_slew_native ~slew ~load tbl cell =
+  match Hashtbl.find_opt tbl cell with
+  | None | Some { slew_arcs = []; _ } -> None
+  | Some { slew_arcs; _ } ->
+      let total = List.fold_left
+        (fun acc lut -> acc +. interp_lut ~slew ~load lut)
+        0.0 slew_arcs in
+      Some (total /. float_of_int (List.length slew_arcs))
+
+(* Combined query: (delay_ps, output_slew_units).  output_slew is
+   in the library's time unit so callers can feed it back as the
+   next stage's input slew without a unit conversion. *)
+let delay_and_slew ?(default_delay=50.0) ?(default_out_slew=0.01)
+                   ~slew ~load (tbl, scale) cell =
+  let delay = match at_native ~slew ~load tbl cell with
+    | Some v -> v *. scale
+    | None -> default_delay in
+  let out_slew = match out_slew_native ~slew ~load tbl cell with
+    | Some v -> v
+    | None -> default_out_slew in
+  (delay, out_slew)

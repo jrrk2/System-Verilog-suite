@@ -72,6 +72,14 @@ let fanout_edges ?(wp=Wire_delay.default_params) ?cell_of ?pin_dir plc_tbl nets 
    in real Liberty-derived numbers. *)
 let default_cell_delay_ps _cell = 50.0
 
+(* Slew-aware lookup: returns [(delay_ps, out_slew_ns)].  The
+   default keeps the single-number delay model when no Liberty
+   data is available; out_slew defaults to a steady-state
+   ~10 ps so the propagation is well-defined. *)
+type delay_slew_fn = string -> slew:float -> load:float -> float * float
+let default_delay_slew_fn : delay_slew_fn =
+  fun cell ~slew:_ ~load:_ -> (default_cell_delay_ps cell, 0.01)
+
 (* Memoised longest path from each node, with cycle break.
    Real gate-level netlists contain FF feedback loops; without
    LEF we can't classify FFs, so we treat any node already
@@ -103,6 +111,66 @@ let arrival_table ?(delay_of=default_cell_delay_ps) edges placements =
   List.iter (fun (p : Placement.placement) -> ignore (arr p.Placement.inst)) placements;
   memo
 
+(* Forward-propagation arrival with per-pin slew tracking.  The
+   load seen by each driver is approximated as
+       fanout_count * pin_cap_fF + wire_cap_per_dbu * hpwl
+   with [pin_cap_fF] defaulting to 1.0 (a typical X1-strength
+   input-pin cap in Nangate45).  For a strict feed-forward
+   netlist (every cycle broken at FF boundaries upstream) a
+   topological order suffices; we get one via depth-first
+   traversal from the cells that have no fanin in [edges]. *)
+let arrival_table_forward
+    ?(pin_cap_fF=1.0)
+    ?(wp=Wire_delay.default_params)
+    ?(default_in_slew=0.05)
+    ~edges ~plc_tbl ~delay_slew_fn placements =
+  (* Reverse fanin: build [inst -> (driver_inst, wire_delay) list]. *)
+  let fanin = Hashtbl.create 4096 in
+  let fanout_count = Hashtbl.create 4096 in
+  Hashtbl.iter (fun src outs ->
+    Hashtbl.replace fanout_count src (List.length outs);
+    List.iter (fun (dst, w) ->
+      let cur = try Hashtbl.find fanin dst with Not_found -> [] in
+      Hashtbl.replace fanin dst ((src, w) :: cur)) outs) edges;
+  let arrival = Hashtbl.create 4096 in
+  let out_slew = Hashtbl.create 4096 in
+  let in_progress = Hashtbl.create 64 in
+  let cell_of = Hashtbl.create 4096 in
+  List.iter (fun (p : Placement.placement) ->
+    Hashtbl.replace cell_of p.Placement.inst p.Placement.cell) placements;
+  let _ = plc_tbl and _ = wp in
+  let rec eval inst =
+    match Hashtbl.find_opt arrival inst with
+    | Some _ -> ()
+    | None when Hashtbl.mem in_progress inst -> ()  (* cycle break *)
+    | None ->
+        Hashtbl.add in_progress inst ();
+        let cell = try Hashtbl.find cell_of inst with Not_found -> "" in
+        let is_port = (cell = "") in
+        let fanins = try Hashtbl.find fanin inst with Not_found -> [] in
+        List.iter (fun (src, _) -> eval src) fanins;
+        let in_slew, fanin_arr =
+          match fanins with
+          | [] -> (default_in_slew, 0.0)
+          | _  ->
+              List.fold_left (fun (sw, a) (src, w) ->
+                let src_arr = try Hashtbl.find arrival src with Not_found -> 0.0 in
+                let src_slew =
+                  try Hashtbl.find out_slew src
+                  with Not_found -> default_in_slew in
+                (max sw src_slew, max a (src_arr +. w))) (0.0, 0.0) fanins in
+        let n_out = try Hashtbl.find fanout_count inst with Not_found -> 1 in
+        let load = pin_cap_fF *. float_of_int (max 1 n_out) in
+        let delay, os =
+          if is_port then (0.0, in_slew)
+          else delay_slew_fn cell ~slew:in_slew ~load in
+        Hashtbl.replace arrival inst (fanin_arr +. delay);
+        Hashtbl.replace out_slew inst os;
+        Hashtbl.remove in_progress inst
+  in
+  List.iter (fun (p : Placement.placement) -> eval p.Placement.inst) placements;
+  arrival
+
 type report = {
   worst_inst    : string;
   worst_arr_ps  : float;
@@ -112,13 +180,19 @@ type report = {
 
 let report ?(wp=Wire_delay.default_params)
            ?(delay_of=default_cell_delay_ps)
+           ?delay_slew_fn
            ?pin_dir placements nets =
   let plc_tbl = Hpwl.placement_table placements in
   let cell_of = Hashtbl.create (List.length placements) in
   List.iter (fun (p : Placement.placement) ->
     Hashtbl.replace cell_of p.Placement.inst p.Placement.cell) placements;
   let edges = fanout_edges ~wp ~cell_of ?pin_dir plc_tbl nets in
-  let arr   = arrival_table ~delay_of edges placements in
+  let arr =
+    match delay_slew_fn with
+    | Some dsf ->
+        arrival_table_forward ~edges ~plc_tbl ~delay_slew_fn:dsf placements
+    | None ->
+        arrival_table ~delay_of edges placements in
   let worst_inst = ref "" and worst_v = ref 0. and worst_cell = ref "" in
   let cell_of = Hashtbl.create 4096 in
   List.iter (fun (p : Placement.placement) ->

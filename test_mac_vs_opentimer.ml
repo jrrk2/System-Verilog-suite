@@ -128,12 +128,16 @@ let () =
       "mul" "adder" "depth" "cells" "ours (ps)" "OT (ps)" "ratio";
     Printf.printf "  %s\n" (String.make 76 '-');
 
+    let pair = Cell_delay.load_arc_table lib_path in
+    let dsf cell ~slew ~load =
+      Cell_delay.delay_and_slew ~slew ~load pair cell in
+
     List.iter (fun ma ->
       List.iter (fun aa ->
         let nl = Synth_mac.build ~multi_cell ~width
                    ~mul_arch:ma ~add_arch:aa () in
         let r_ours = Placement_timing.report
-                       ~delay_of:(Cell_delay.lookup delay_tbl)
+                       ~delay_slew_fn:dsf
                        ~pin_dir nl.cells nl.nets in
         let tag = Printf.sprintf "%s_%s_w%d"
                     (Synth_mac.mul_arch_name ma)
