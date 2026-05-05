@@ -1,0 +1,19 @@
+; LEF/DEF parsers, generated from bison .output via output_parser
+; (the user's bison-listing → menhir-mly converter).  Kept in its
+; own library so the main parser's `token` type doesn't collide with
+; the one this menhir grammar declares.
+
+(ocamllex
+ (modules def_file_lex lef_file_lex))
+
+(menhir
+ (modules def_file lef_file)
+ (flags --table))
+
+(library
+ (name lef_def)
+ (modules def_file_types def_file def_file_tokens def_file_lex
+          lef_file lef_file_lex
+          placement)
+ (flags (:standard -w -a))
+ (libraries menhirLib))
