@@ -968,10 +968,28 @@ let extract_port_decl ~pkgs ~params tok =
     walk_loose tok
   end;
   let w = width_of ~pkgs ~params tok in
+  (* Detect unpacked-array net decls (`wire [W:0] arr[D:0]`):
+     two decl_variable_dimensions, first packed, second unpacked.
+     Emit BArray so [merge_array_writes] uses (size, elem_w) from
+     the type rather than its (writes_count, 1) fallback (which is
+     right for cell-Verilog `assign out[i] = X` but wrong for
+     source `assign in_[i] = in_$00i` where each element is many
+     bits).  Single-dim case stays BInt. *)
+  let dims = extract_packed_dims ~pkgs ~params tok in
+  let stype =
+    match dims with
+    | [(im, il); (om, ol)] ->
+        BArray {
+          element = BInt { width = abs (im - il) + 1; signed = Unsigned };
+          size = abs (om - ol) + 1;
+        }
+    | _ ->
+        BInt { width = w; signed = Unsigned }
+  in
   List.rev !names |> List.sort_uniq compare |> List.map (fun n ->
     {
       name = n;
-      stype = BInt { width = w; signed = Unsigned };
+      stype;
       direction = !dir;
       initial_value = None; attrs = [];
     })
@@ -1849,9 +1867,35 @@ let convert_module ~pkgs (mdecl : module_decl)
       | _ -> 0 in
     if w > 0 then Some (s.name, w) else None
   ) signals;
+  (* Pre-scan: any continuous assign with an indexed LHS gets its
+     target promoted into array_names — even if the underlying
+     signal is a plain BInt rather than a BArray.  This lets the
+     extract_assign path emit @mem_write for cases like
+     `assign out[i] = X` (cell-mapped Verilog from our own synth),
+     so the downstream merge_array_writes pass can consolidate the
+     N per-bit drives into a single full-bus concat assign — which
+     is what both the Z3 miter (slice indices preserved) and
+     OpenROAD's [read_verilog] (bit-blasted assigns visible in
+     source) need to see. *)
+  let cont_assigns =
+    collect_by (has_tag (prefix_is "continuous_assign")) mdecl.m_body in
+  let indexed_targets =
+    List.concat_map (fun ca ->
+      collect_by (has_tag (prefix_is "cont_assign")) ca
+      |> List.filter_map (fun a ->
+        match a with
+        | TUPLE4 (_, lhs, _, _) ->
+            (match lhs_indexed_of lhs with
+             | Some (name, Some _) -> Some name
+             | _ -> None)
+        | _ -> None)
+    ) cont_assigns
+    |> List.sort_uniq compare in
+  let array_names =
+    List.sort_uniq compare (array_names @ indexed_targets) in
   let assign_procs = List.concat_map (fun ca ->
     extract_assign ~pkgs ~params ~arrays:array_names ca
-  ) (collect_by (has_tag (prefix_is "continuous_assign")) mdecl.m_body) in
+  ) cont_assigns in
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params mdecl.m_body in
   (* Post-pass: merge combinational @mem_write groups targeting the

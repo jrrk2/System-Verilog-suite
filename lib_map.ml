@@ -417,10 +417,54 @@ let rec walk ctx sig_ =
            ctx.insts <-
              blast_mux ~out_name ~width:w
                ~sel_name:sn ~a_name:an ~b_name:bn @ ctx.insts
-       | Mux _ ->
-           (* N-way mux: fall through to assign — uncommon in the
-              kind of netlist hardcaml emits for our designs. *)
-           ()
+       | Mux { select; cases; _ } ->
+           (* N-way mux per output bit: cascaded chain of 2:1
+              muxes, one stage per select bit, using fresh 1-bit
+              intermediate wires.  Final stage's `.Z` drives
+              `out[j]` directly via per-bit assigns — Verible's
+              pre-scan in extract_assign auto-promotes the
+              indexed-LHS target into array_names so
+              merge_array_writes consolidates them into a single
+              full-bus assign for the miter, while OpenROAD's
+              read_verilog sees them as ordinary per-bit drives. *)
+           let sn = walk ctx select in
+           let case_names = List.map (walk ctx) cases in
+           let sel_w = width select in
+           let n = List.length cases in
+           ctx.wires <- (out_name, w) :: ctx.wires;
+           let final_bits = ref [] in
+           for j = 0 to w - 1 do
+             let bit_of_case k =
+               let cn = List.nth case_names k in
+               let cw = width (List.nth cases k) in
+               if cw = 1 then cn else Printf.sprintf "%s[%d]" cn j in
+             let level0 = List.init n bit_of_case in
+             let rec reduce level lst =
+               match lst with
+               | [] -> "1'b0"
+               | [x] -> x
+               | _ ->
+                   let sel_bit = if sel_w = 1 then sn
+                                 else Printf.sprintf "%s[%d]" sn level in
+                   let rec pair = function
+                     | [] -> []
+                     | [a] -> [a]
+                     | a :: b :: rest ->
+                         let mid = mint "t" in
+                         ctx.wires <- (mid, 1) :: ctx.wires;
+                         let inst_list = blast_mux ~out_name:mid ~width:1
+                           ~sel_name:sel_bit ~a_name:a ~b_name:b in
+                         ctx.insts <- inst_list @ ctx.insts;
+                         mid :: pair rest in
+                   reduce (level + 1) (pair lst)
+             in
+             final_bits := reduce 0 level0 :: !final_bits
+           done;
+           List.iteri (fun i b ->
+             let oi = if w = 1 then out_name
+                      else Printf.sprintf "%s[%d]" out_name (w - 1 - i) in
+             ctx.assigns <- (oi, b) :: ctx.assigns
+           ) !final_bits
        | Wire { driver; _ } ->
            (* For input ports, the wire's driver is Empty — leave
               the wire alone, it's driven externally.  Otherwise
