@@ -1,0 +1,3 @@
+(executables
+ (names baseline_capture baseline_diff)
+ (libraries yojson unix))
