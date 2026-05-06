@@ -78,19 +78,55 @@ let topo_sort (modules : bmodule list) : bmodule list =
   List.iter visit modules;
   List.rev !order
 
-(* Extract the parent-net name from a child port_connection's bexpr.
-   For now only [BVar n] is allowed; everything else fails loudly. *)
-let net_of_conn (parent_name : string) (port : string) (e : bexpr) =
+(* Render a child-pin connection expression to Verilog net text.
+   Returns also the list of underlying signal names referenced
+   (so the caller can promote them to phantom IO).  Sliced and
+   concatenated connections come out as Verilog `n[hi:lo]` and
+   `{a, b, …}` literally — the parent's hardcaml view sees the
+   underlying signals as whole, the slice/concat lives only in the
+   child instance line. *)
+let rec render_conn_expr (parent_name : string) (port : string) (e : bexpr)
+  : string * string list
+  =
   match e with
-  | BVar n -> n
+  | BVar n -> (n, [n])
+  | BSlice { signal; msb; lsb } ->
+      let inner, deps = render_conn_expr parent_name port signal in
+      let hi = max msb lsb and lo = min msb lsb in
+      let s =
+        if hi = lo then Printf.sprintf "%s[%d]" inner hi
+        else Printf.sprintf "%s[%d:%d]" inner hi lo in
+      (s, deps)
+  | BConcat parts ->
+      let rendered = List.map (render_conn_expr parent_name port) parts in
+      let texts = List.map fst rendered in
+      let deps = List.concat_map snd rendered in
+      ("{" ^ String.concat ", " texts ^ "}", deps)
+  | BConst { value; width } ->
+      (Printf.sprintf "%d'b%s" width
+         (let buf = Buffer.create width in
+          for i = width - 1 downto 0 do
+            Buffer.add_char buf (if (value lsr i) land 1 = 1 then '1' else '0')
+          done; Buffer.contents buf), [])
   | _ ->
       failwith (Printf.sprintf
-        "hier_synth: parent %s's child connection on port %s is not a \
-         simple signal — concat/slice/const on instance pins not yet supported"
+        "hier_synth: parent %s's child connection on port %s is too \
+         complex — only Var/Slice/Concat/Const supported on instance pins"
         parent_name port)
 
+let net_of_conn parent port e =
+  let txt, _deps = render_conn_expr parent port e in txt
+
 (* For each child instance, build the splice record + the list of
-   (parent-side-signal, width, direction) phantom IO it adds. *)
+   (parent-side-signal, width, direction) phantom IO it adds.
+
+   For non-trivial connection expressions (slices, concats), the
+   parent's hardcaml view promotes the *underlying* signal names —
+   not the slice/concat text.  The slice/concat lives only in the
+   child instance line.  Width for the promotion comes from the
+   parent's signal declaration, not the child's port — this matters
+   when a parent signal is shared across multiple children (e.g.
+   `subword` driven 8 bits at a time by 4 sboxes). *)
 let child_inst_phantoms
     ~(parent : bmodule) ~(modules : bmodule list)
     (i : binstance)
@@ -103,22 +139,34 @@ let child_inst_phantoms
         failwith (Printf.sprintf
           "hier_synth: parent %s instantiates unknown module %s"
           parent.name i.module_name) in
-  let ci_conns =
+  let ci_conns_with_deps =
     List.map (fun (port, e) ->
-      (port, net_of_conn parent.name port e)) i.port_connections in
+      let txt, deps = render_conn_expr parent.name port e in
+      (port, txt, deps)) i.port_connections in
+  let ci_conns =
+    List.map (fun (port, txt, _) -> (port, txt)) ci_conns_with_deps in
   let phantoms =
-    List.map (fun (port, parent_net) ->
+    List.concat_map (fun (port, _txt, deps) ->
       let cs = List.find (fun (s : bsignal) -> s.name = port) child.signals in
-      let w = signal_width cs in
       let dir =
         match cs.direction with
-        | `Output -> `In   (* child OUTPUT → drives parent ⇒ parent INPUT *)
-        | `Input  -> `Out  (* child INPUT  → driven by parent ⇒ parent OUTPUT *)
+        | `Output -> `In
+        | `Input  -> `Out
         | `Internal ->
             failwith (Printf.sprintf
               "hier_synth: child %s port %s has direction Internal — invalid"
               i.module_name port) in
-      (parent_net, w, dir)) ci_conns in
+      List.filter_map (fun dep_name ->
+        match List.find_opt (fun (s : bsignal) -> s.name = dep_name)
+                parent.signals with
+        | Some s -> Some (dep_name, signal_width s, dir)
+        | None ->
+            (* Signal not declared at parent — uncommon but could
+               happen if the parent uses a constant or an implicit
+               wire.  Fall back to the child port's width. *)
+            Some (dep_name, signal_width cs, dir)
+      ) deps
+    ) ci_conns_with_deps in
   { ci_module = i.module_name; ci_inst = i.inst_name; ci_conns }, phantoms
 
 (* Take a parent's bmodule, fold in phantom ports for child instances,
