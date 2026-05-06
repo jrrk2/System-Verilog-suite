@@ -12,7 +12,7 @@
  (modules sv_ast vhdl_dump_json sv_dump_json sv_gen sv_gen_struct sv_gen_xilinx_rtl sv_gen_yosys sv_gen_hardcaml
           sv_main_unified sv_parse sv_transform sv_tran_struct
           behavioural_to_opt_ir opt_ir_to_sv opt_ir_to_behavioral opt_ir_naming sv_opt_ir
-          behavioral_unroll behavioral_inline behavioral_iflift behavioral_meminfer behavioral_ffrip behavioral_share behavioral_sanity behavioral_blocking_subst behavioral_flatten behavioral_hier
+          behavioral_unroll behavioral_inline behavioral_iflift behavioral_meminfer behavioral_ffrip behavioral_share behavioral_sanity behavioral_blocking_subst behavioral_flatten behavioral_hier behavioral_boundary
           verible_elaborate verible_to_behavioral rtlil_to_behavioral
           slang_to_behavioral
           sv_verify_hardcaml sv_memory sv_liberty sv_gate_map gate_netlist_to_behavioral

@@ -33,6 +33,20 @@ let signal_cache : (string, Z3.Expr.expr) Hashtbl.t = Hashtbl.create 256
    instead of defaulting to a single-bit extract. *)
 let array_elem_w_table : (string, int) Hashtbl.t = Hashtbl.create 16
 
+(* Uninterpreted-function decls for [BCall].  Used at parent-module
+   miter time as a boundary for proven-equivalent child instances:
+   each child becomes a [BCall { func = "<module>__<port>"; args }]
+   that maps to the SAME Z3 FuncDecl on both sides — so the call's
+   value is identical when the args match (which they do, because
+   parent connections are textually the same on both sides). *)
+let bcall_decl_cache : (string, Z3.FuncDecl.func_decl) Hashtbl.t =
+  Hashtbl.create 16
+
+(* Output width for each [BCall] func name, set externally by the
+   pass that introduces the boundaries (so we know the result sort
+   when declaring the uninterpreted function). *)
+let bcall_out_w : (string, int) Hashtbl.t = Hashtbl.create 16
+
 (* Create or lookup a bitvector variable *)
 let bv_var name width suffix =
   let full_name = name ^ suffix in
@@ -45,6 +59,15 @@ let bv_var name width suffix =
 
 (* Clear the signal cache *)
 let clear_cache () = Hashtbl.clear signal_cache
+
+(* Clear caches that are scoped to a single miter so a decl created
+   during the first miter doesn't leak into a different-shape decl
+   in the next.  [bcall_out_w] is populated at boundary-substitute
+   time for the whole program and stays intact. *)
+let clear_miter_caches () =
+  Hashtbl.clear signal_cache;
+  Hashtbl.clear array_elem_w_table;
+  Hashtbl.clear bcall_decl_cache
 
 (* Get width from behavioral IR type *)
 let rec width_of_btype = function
@@ -377,9 +400,26 @@ let rec expr_to_z3 suffix ctx_sigs = function
                  Z3.Boolean.mk_ite ctx cond (mk_slice k) (build (k + 1))
              in
              build 0)
-  | BCall _ ->
-      (* Unsupported for now *)
-      Z3.BitVector.mk_numeral ctx "0" 32
+  | BCall { func; args } ->
+      (* Encode as Z3 uninterpreted function.  Both designs in the
+         miter share the same [ctx] and the same [bcall_decl_cache]
+         entry by name, so the same args produce the same Z3 value
+         on each side — exactly the behavioural contract of a proven-
+         equivalent leaf module.  *)
+      let z3_args = List.map (expr_to_z3 suffix ctx_sigs) args in
+      let arg_sorts = List.map Z3.Expr.get_sort z3_args in
+      let out_w =
+        match Hashtbl.find_opt bcall_out_w func with
+        | Some w -> w
+        | None -> 32 in
+      let decl = match Hashtbl.find_opt bcall_decl_cache func with
+        | Some d -> d
+        | None ->
+            let d = Z3.FuncDecl.mk_func_decl_s ctx func arg_sorts
+              (Z3.BitVector.mk_sort ctx out_w) in
+            Hashtbl.add bcall_decl_cache func d;
+            d in
+      Z3.FuncDecl.apply decl z3_args
 
 (* Encode statement as Z3 constraint. After the FF-rip pass
  * (Behavioral_ffrip.rip_program), there are no BSequential blocks

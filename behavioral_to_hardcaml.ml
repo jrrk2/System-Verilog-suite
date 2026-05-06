@@ -540,16 +540,24 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     if s.direction <> `Input
        && not (List.mem_assoc s.name ctx.variables) then begin
       let w = width_of_btype s.stype in
-      let var =
+      let is_reg, var =
         match Hashtbl.find_opt driver_proc s.name with
         | Some (Some (clock, reset)) ->
             let clk = get_signal ctx clock in
             let spec = match reset with
               | Some rst -> Reg_spec.create ~clock:clk ~reset:(get_signal ctx rst) ()
               | None     -> Reg_spec.create ~clock:clk () in
-            Always.Variable.reg spec ~width:w
+            (true, Always.Variable.reg spec ~width:w)
         | _ ->
-            Always.Variable.wire ~default:(Signal.zero w) in
+            (false, Always.Variable.wire ~default:(Signal.zero w)) in
+      (* Tag the variable's underlying signal with the BIR name so
+         lib_map's [net_for_signal] picks it up instead of falling
+         back to a hardcaml-minted `_n_N_`.  Only do this for
+         REGISTERS — naming combinational wires can collide when
+         hier_synth's phantom-IO promotion brings names from child
+         instance connections into the parent's variable list. *)
+      if is_reg then
+        (let _ = Signal.(--) (Always.Variable.value var) s.name in ());
       ctx.variables <- (s.name, var) :: ctx.variables
     end) bmod.signals;
 

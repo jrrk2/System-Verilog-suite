@@ -154,6 +154,29 @@ let rec body_to_expr fname bindings = function
   | [BReturn (Some rhs)] ->
       Some (List.fold_left (fun e (name, expr, _) ->
         subst_expr_expr name expr e) rhs bindings)
+  | stmts when List.for_all (function
+        | BCallStmt { func = "@slice_write"; args = [BVar n; _; _; _] }
+            when n = fname -> true
+        | _ -> false) stmts && stmts <> [] ->
+      (* Function body of `fname[hi:lo] = expr;` repeated for
+         contiguous slices covering the whole bus.  Coalesce into a
+         single BConcat (high-to-low).  Used by AES's mix_col which
+         writes [31:24], [23:16], [15:8], [7:0] separately to build
+         a 32-bit return value. *)
+      let subst e =
+        List.fold_left (fun acc (name, expr, _) ->
+          subst_expr_expr name expr acc) e bindings in
+      let parts = List.filter_map (function
+        | BCallStmt { func = "@slice_write";
+                      args = [BVar _; BConst { value = msb; _ };
+                              BConst { value = lsb; _ }; data] } ->
+            let hi = max msb lsb and lo = min msb lsb in
+            Some (hi, lo, subst data)
+        | _ -> None) stmts in
+      let sorted =
+        List.sort (fun (a, _, _) (b, _, _) -> compare b a) parts in
+      let concat = BConcat (List.map (fun (_, _, d) -> d) sorted) in
+      Some concat
   | [BCase { selector; cases; default }] ->
       (* Case statement function body: convert into nested BCond
          on `selector == case_value`, each branch being the case's

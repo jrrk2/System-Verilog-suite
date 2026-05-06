@@ -2155,7 +2155,194 @@ let convert_module ~pkgs (mdecl : module_decl)
     ) mem_writes [] in
     other_procs @ merged
   in
-  let processes = merge_array_writes (assign_procs @ always_procs) in
+  (* Convert @mem_write inside BSequential bodies to a full-bus
+     BAssign with read-modify-write semantics — same shape as the
+     downstream behavioral_to_hardcaml lowering, lifted to BIR
+     level so Behavioral_ffrip recognises BArray FFs as ordinary
+     register writes.  Without this, source's `reg [W:0] arr[D:0]`
+     with `always_ff @(posedge clk) arr[k] <= data` produces a
+     BSequential with [BCallStmt @mem_write(arr, k, data)] — ffrip
+     ignores BCallStmts, so arr never appears in the rip set, and
+     the parent miter's interface check fails because the cell-
+     mapped side (which uses BAssign throughout) does have arr. *)
+  let lower_mem_writes_in_seq processes =
+    List.map (fun p ->
+      match p with
+      | BSequential ({ body; _ } as s) ->
+          (* Collect every @mem_write per target array, building an
+             ordered list of (idx, data) pairs.  After merge_seq_processes,
+             all writes from a clock domain live in one body, so we can
+             build ONE full-bus BAssign per array — folding multiple
+             writes via BCond chains so that non-blocking semantics
+             survive ffrip's last-write-wins behaviour on BAssign. *)
+          let writes : (string, (bexpr * bexpr) list) Hashtbl.t =
+            Hashtbl.create 4 in
+          List.iter (fun stmt ->
+            match stmt with
+            | BCallStmt { func = "@mem_write";
+                          args = [BVar arr; idx; data] } ->
+                let cur = try Hashtbl.find writes arr with Not_found -> [] in
+                Hashtbl.replace writes arr (cur @ [(idx, data)])
+            | _ -> ()) body;
+          let emitted = Hashtbl.create 4 in
+          let body' = List.filter_map (fun stmt ->
+            match stmt with
+            | BCallStmt { func = "@mem_write"; args = [BVar arr; _; _] } ->
+                if Hashtbl.mem emitted arr then None
+                else begin
+                  Hashtbl.add emitted arr ();
+                  match List.find_opt (fun (sg : bsignal) -> sg.name = arr)
+                          signals with
+                  | Some { stype = BArray { size; element = BInt { width=_; _ } }; _ } ->
+                      let pairs = Hashtbl.find writes arr in
+                      let parts = List.init size (fun k ->
+                        let k_const = BConst { value = k; width = 32 } in
+                        let init = BSelect { array = BVar arr;
+                                             index = k_const } in
+                        List.fold_left (fun acc (idx, data) ->
+                          BCond {
+                            condition = BBinOp {
+                              op = BEq;
+                              lhs = idx;
+                              rhs = k_const;
+                              result_type = BInt { width = 1; signed = Unsigned };
+                            };
+                            then_val = data;
+                            else_val = acc;
+                          }
+                        ) init pairs) in
+                      let rhs = BConcat (List.rev parts) in
+                      Some (BAssign { lhs = arr; rhs })
+                  | _ -> Some stmt
+                end
+            | other -> Some other
+          ) body in
+          BSequential { s with body = body' }
+      | other -> other
+    ) processes
+  in
+  (* Merge BSequentials with the same clock-domain key, so that 16
+     separate `always @(posedge clk) text_out[hi:lo] <= byte` blocks
+     coalesce into one BSequential whose body has 16 @slice_writes —
+     then [lower_slice_writes_in_seq] can fuse them into a single
+     [BAssign { lhs=text_out; rhs=BConcat […] }].  Without this, ffrip
+     processes each slice's BSequential separately and the last one
+     wins, leaving 15/16 slices undriven. *)
+  let merge_seq_processes processes =
+    let domain_key clock clock_edge reset reset_edge reset_async =
+      Printf.sprintf "%s|%s|%s|%s|%b"
+        clock
+        (match clock_edge with `Pos -> "p" | `Neg -> "n")
+        (Option.value reset ~default:"")
+        (match reset_edge with
+         | None -> "" | Some `Pos -> "rp" | Some `Neg -> "rn")
+        reset_async
+    in
+    let groups = Hashtbl.create 4 in
+    let order = ref [] in
+    let other_procs = List.filter (fun p -> match p with
+      | BSequential { name; clock; clock_edge; reset; reset_edge;
+                      reset_async; body } ->
+          let key = domain_key clock clock_edge reset reset_edge reset_async in
+          (match Hashtbl.find_opt groups key with
+           | None ->
+               Hashtbl.add groups key
+                 (name, clock, clock_edge, reset, reset_edge,
+                  reset_async, ref body);
+               order := key :: !order
+           | Some (_, _, _, _, _, _, body_ref) ->
+               body_ref := !body_ref @ body);
+          false
+      | _ -> true
+    ) processes in
+    let merged_seqs =
+      List.rev_map (fun key ->
+        let (name, clock, clock_edge, reset, reset_edge, reset_async,
+             body_ref) = Hashtbl.find groups key in
+        BSequential { name; clock; clock_edge; reset; reset_edge;
+                      reset_async; body = !body_ref }
+      ) !order
+    in
+    other_procs @ merged_seqs
+  in
+  (* Lower @slice_write calls inside BSequential bodies to a single
+     full-bus BAssign per target lvalue.  After [merge_seq_processes]
+     a target's slice writes all live in the same body, so we can
+     build a [BConcat] high-to-low covering the whole bus. *)
+  let lower_slice_writes_in_seq processes =
+    List.map (fun p ->
+      match p with
+      | BSequential ({ body; _ } as s) ->
+          (* Collect @slice_writes per target. *)
+          let slices : (string, (int * int * bexpr) list) Hashtbl.t =
+            Hashtbl.create 4 in
+          let const_of = function
+            | BConst { value; _ } -> Some value
+            | _ -> None in
+          List.iter (fun stmt ->
+            match stmt with
+            | BCallStmt { func = "@slice_write";
+                          args = [BVar lhs; m; l; data] } ->
+                (match const_of m, const_of l with
+                 | Some msb, Some lsb ->
+                     let cur = try Hashtbl.find slices lhs with Not_found -> [] in
+                     Hashtbl.replace slices lhs ((msb, lsb, data) :: cur)
+                 | _ -> ())
+            | _ -> ()
+          ) body;
+          let body' = List.filter_map (fun stmt ->
+            match stmt with
+            | BCallStmt { func = "@slice_write";
+                          args = [BVar lhs; _; _; _] }
+              when Hashtbl.mem slices lhs ->
+                if Hashtbl.find slices lhs = [] then None
+                else begin
+                  let writes = Hashtbl.find slices lhs in
+                  Hashtbl.replace slices lhs [];
+                  let total_w =
+                    match List.find_opt
+                            (fun (sg : bsignal) -> sg.name = lhs) signals with
+                    | Some s -> width_of_type s.stype
+                    | None -> 1 in
+                  let sorted =
+                    List.sort (fun (a, _, _) (b, _, _) -> compare b a) writes in
+                  let parts = ref [] in
+                  let cursor = ref (total_w - 1) in
+                  List.iter (fun (msb, lsb, data) ->
+                    let hi = max msb lsb and lo = min msb lsb in
+                    if hi < !cursor then begin
+                      let gap_msb = !cursor in
+                      let gap_lsb = hi + 1 in
+                      parts := BSlice { signal = BVar lhs;
+                                        msb = gap_msb; lsb = gap_lsb }
+                               :: !parts
+                    end;
+                    parts := data :: !parts;
+                    cursor := lo - 1
+                  ) sorted;
+                  if !cursor >= 0 then
+                    parts := BSlice { signal = BVar lhs;
+                                      msb = !cursor; lsb = 0 } :: !parts;
+                  let rhs = match List.rev !parts with
+                    | [single] -> single
+                    | many -> BConcat many in
+                  Some (BAssign { lhs; rhs })
+                end
+            | other -> Some other
+          ) body in
+          BSequential { s with body = body' }
+      | other -> other
+    ) processes
+  in
+  let processes =
+    let merged = merge_array_writes (assign_procs @ always_procs) in
+    if Sys.getenv_opt "DISABLE_MEM_WRITE_LOWER" <> None then merged
+    else
+      merged
+      |> merge_seq_processes
+      |> lower_mem_writes_in_seq
+      |> lower_slice_writes_in_seq
+  in
   let funcs =
     (* Extract every function_declaration before the strip pass
        erased its body — using the ORIGINAL mdecl_body we captured.

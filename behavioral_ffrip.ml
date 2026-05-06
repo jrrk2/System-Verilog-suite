@@ -137,12 +137,15 @@ let rip_module (m : bmodule) : bmodule =
   let new_processes = ref [] in
   let new_signals = ref m.signals in
 
+  let rec width_of_btype = function
+    | BInt { width; _ } -> width
+    | BBool -> 1
+    | BArray { element; size } -> size * width_of_btype element
+    | _ -> 1
+  in
   let lookup_width name =
     match List.find_opt (fun (s : bsignal) -> s.name = name) m.signals with
-    | Some s -> (match s.stype with
-                 | BInt { width; _ } -> width
-                 | BBool -> 1
-                 | _ -> 1)
+    | Some s -> width_of_btype s.stype
     | None -> 1
   in
 

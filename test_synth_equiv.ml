@@ -154,11 +154,11 @@ let () =
     |> Behavioral_iflift.lift_program
     |> Behavioral_blocking_subst.blocking_subst_program
     |> Behavioral_meminfer.infer_program
-    |> Behavioral_flatten.flatten_program ~force_ff:true
+    |> Behavioral_boundary.substitute_program
   in
   let cell_behav =
     cell_behav
-    |> Behavioral_flatten.flatten_program ~force_ff:true
+    |> Behavioral_boundary.substitute_program
   in
   Printf.printf "After flatten: source=%d, cells=%d module(s)\n"
     (List.length src_prog.modules)
@@ -193,11 +193,24 @@ let () =
     exit 1
   end;
 
+  if Sys.getenv_opt "DUMP_BMOD" <> None then begin
+    let dump (label : string) (p : bprogram) =
+      List.iter (fun (m : bmodule) ->
+        if Sys.getenv_opt "DUMP_BMOD" = Some m.name
+        || Sys.getenv_opt "DUMP_BMOD" = Some "all" then begin
+          Printf.printf "\n##### %s : %s #####\n" label m.name;
+          Printf.printf "%s\n" (Behavioral_ir.string_of_bmodule m)
+        end
+      ) p.modules in
+    dump "SRC" src_prog;
+    dump "CELL" cell_behav;
+  end;
   let n_pass = ref 0 and n_fail = ref 0 in
   List.iter (fun name ->
     let src_m  = Hashtbl.find src_h  name in
     let cell_m = Hashtbl.find cell_h name in
     Printf.printf "──── %s ────\n" name;
+    Z3_miter.clear_miter_caches ();
     let ok =
       try Z3_miter.check_miter_equivalence src_m cell_m
       with e ->
