@@ -316,11 +316,74 @@ let rec stmt_to_always ~is_reg ctx alw = function
   | BCallStmt _ | BReturn _ ->
       alw
 
+(* Pre-process a process body to merge @slice_write calls per
+   target into single full-bus read-modify-write BAssigns.  Each
+   `name[hi:lo] <= data` pattern at the converter level becomes
+   a `@slice_write(name, hi, lo, data)` BCallStmt; gathering all
+   such calls per (name, body) and combining into one
+   `name := BConcat[...]` makes the resulting hardcaml Always block
+   produce one `var <-- ...` with the right read-modify-write
+   semantics — multiple stacked `var <-- ...` calls on the same
+   variable would otherwise overwrite each other.  Self-reads of
+   uncovered bits are emitted via [BSlice]. *)
+let merge_slice_writes ctx body =
+  let groups : (string, (int * int * bexpr) list) Hashtbl.t = Hashtbl.create 4 in
+  let rest = ref [] in
+  let const_of = function
+    | BConst { value; _ } -> Some value
+    | _ -> None in
+  List.iter (fun stmt ->
+    match stmt with
+    | BCallStmt { func = "@slice_write";
+                  args = [BVar arr; m; l; data] } ->
+        (match const_of m, const_of l with
+         | Some msb, Some lsb ->
+             let prev = try Hashtbl.find groups arr with Not_found -> [] in
+             Hashtbl.replace groups arr ((msb, lsb, data) :: prev)
+         | _ ->
+             (* Non-const range — drop for now; would need a barrel-
+                shift translation. *)
+             rest := stmt :: !rest)
+    | other -> rest := other :: !rest
+  ) body;
+  let merged_assigns = Hashtbl.fold (fun arr writes acc ->
+    let total_w =
+      match List.assoc_opt arr ctx.variables with
+      | Some v -> Signal.width (Always.Variable.value v)
+      | None ->
+          (match List.assoc_opt arr ctx.signals with
+           | Some s -> Signal.width s
+           | None -> 0) in
+    if total_w = 0 then acc
+    else
+      let sorted = List.sort (fun (a,_,_) (b,_,_) -> compare b a) writes in
+      let parts = ref [] in
+      let cursor = ref (total_w - 1) in
+      List.iter (fun (msb, lsb, data) ->
+        if msb < !cursor then begin
+          let hi = !cursor and lo = msb + 1 in
+          parts := BSlice { signal = BVar arr; msb = hi; lsb = lo } :: !parts;
+        end;
+        parts := data :: !parts;
+        cursor := lsb - 1
+      ) sorted;
+      if !cursor >= 0 then begin
+        let hi = !cursor and lo = 0 in
+        parts := BSlice { signal = BVar arr; msb = hi; lsb = lo } :: !parts;
+      end;
+      let rhs = match List.rev !parts with
+        | [single] -> single
+        | many -> BConcat many in
+      BAssign { lhs = arr; rhs } :: acc
+  ) groups [] in
+  List.rev !rest @ merged_assigns
+
 (* Convert behavioral process to HardCaml Always block.
    Returns the compiled Always.t so the caller can keep a list
    of all the always-blocks that make up the module. *)
 let process_to_always ctx = function
   | BCombinational { body; _ } ->
+      let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:false ctx) [] body in
       Always.compile alw
 
@@ -333,6 +396,7 @@ let process_to_always ctx = function
       (match reset, reset_async with
        | Some rst_name, true -> ctx.reset <- Some (get_signal ctx rst_name)
        | _ -> ());
+      let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
       Always.compile alw
 
@@ -445,10 +509,11 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     | [] -> ()
     | BAssign { lhs; _ } :: tl ->
         Hashtbl.replace driver_proc lhs ck_rst; scan_lhs ck_rst tl
-    | BCallStmt { func = "@mem_write"; args = (BVar arr) :: _ } :: tl ->
-        (* @mem_write(arr, idx, data) inside a BSequential body means
-           [arr] is sequentially driven — pre-pass needs to create it
-           as a register, not a wire, otherwise the @mem_write
+    | BCallStmt { func = "@mem_write"; args = (BVar arr) :: _ } :: tl
+    | BCallStmt { func = "@slice_write"; args = (BVar arr) :: _ } :: tl ->
+        (* @mem_write / @slice_write inside a BSequential body means
+           [arr] is sequentially driven — pre-pass needs to create
+           it as a register, not a wire, otherwise the resulting
            translation forms a combinational loop. *)
         Hashtbl.replace driver_proc arr ck_rst; scan_lhs ck_rst tl
     | BIf { then_stmts; else_stmts; _ } :: tl ->

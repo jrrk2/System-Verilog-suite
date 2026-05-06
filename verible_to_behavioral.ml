@@ -1071,17 +1071,44 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
   let recurse_e = expr_to_bexpr ~pkgs ~params ~arrays in
   let recurse_s = stmt_to_bstmt ~pkgs ~params ~arrays in
   let assign_to lhs rhs =
-    (* If lhs is `name[idx]` and `name` is a memory-array signal,
-     * emit `@mem_write(name, idx, rhs)` so meminfer can recognise
-     * the pattern. Otherwise plain BAssign. *)
-    match lhs_indexed_of lhs with
-    | Some (name, Some idx_node) when List.mem name arrays ->
+    (* Three cases for indexed LHS:
+       (1) `name[hi:lo]` with explicit RANGE: emit
+           `@slice_write(name, hi, lo, rhs)` regardless of whether
+           name is in arrays.  Multiple slice-writes to the same
+           target get merged into a single full-bus
+           read-modify-write at lowering time so non-overlapping
+           writes compose correctly.
+       (2) `name[idx]` single-index, name in arrays: emit
+           `@mem_write(name, idx, rhs)` (memory write semantics).
+       (3) plain `name`: BAssign on the whole signal. *)
+    let range_endpoints =
+      let msb = ref None and lsb = ref None in
+      walk (function
+        | TUPLE6 (STRING dt, _, m, _, l, _)
+          when prefix_is "select_variable_dimension" dt
+            && !msb = None ->
+            msb := Some m; lsb := Some l
+        | _ -> ()) lhs;
+      match !msb, !lsb with
+      | Some m, Some l -> Some (m, l)
+      | _ -> None
+    in
+    match lhs_indexed_of lhs, range_endpoints with
+    | Some (name, _), Some (m_node, l_node) ->
+        BCallStmt {
+          func = "@slice_write";
+          args = [BVar name;
+                  recurse_e m_node;
+                  recurse_e l_node;
+                  recurse_e rhs];
+        }
+    | Some (name, Some idx_node), None when List.mem name arrays ->
         BCallStmt {
           func = "@mem_write";
           args = [BVar name; recurse_e idx_node; recurse_e rhs];
         }
-    | Some (name, _) -> BAssign { lhs = name; rhs = recurse_e rhs }
-    | None -> BBlock []
+    | Some (name, _), None -> BAssign { lhs = name; rhs = recurse_e rhs }
+    | None, _ -> BBlock []
   in
   match tok with
   (* Blocking assignment: lhs = rhs *)
