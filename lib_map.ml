@@ -284,6 +284,24 @@ let gen_lt ~a_name ~a_w ~b_name ~b_w =
               ~ins:[cout] ~out:lt in
   (lt, insts @ [inv], (lt, 1) :: wires)
 
+(* N-bit ripple-carry adder: a + b.  Same FA chain as gen_sub but
+   feeds b directly (no inversion) and cin = 0.  Returns
+   (sum_bits_msb_first, final_cout, all_insts, all_wires). *)
+let gen_add ~a_name ~a_w ~b_name ~b_w =
+  let w = max a_w b_w in
+  let insts = ref [] and wires = ref [] in
+  let sums = ref [] and cin = ref "1'b0" in
+  for i = 0 to w - 1 do
+    let ai = if i < a_w then bit_at a_name a_w i else "1'b0" in
+    let bi = if i < b_w then bit_at b_name b_w i else "1'b0" in
+    let s, co, fa_insts, fa_wires = gen_fa ~a:ai ~b:bi ~cin:!cin in
+    sums := s :: !sums;
+    insts := List.rev_append fa_insts !insts;
+    wires := !wires @ fa_wires;
+    cin := co
+  done;
+  (List.rev !sums, !cin, List.rev !insts, !wires)
+
 (* DFF mapping.  hardcaml's Reg has a [register] record with
    clock, optional reset, optional clear, optional enable.  For
    our subset:
@@ -375,28 +393,34 @@ let rec walk ctx sig_ =
                                                 ~b_name:bn ~b_w in
                      absorb_helper insts wires_;
                      ctx.assigns <- (out_name, res) :: ctx.assigns
-                 | Signal_sub ->
+                 | Signal_sub | Signal_add ->
                      let sums, _co, insts, wires_ =
-                       gen_sub ~a_name:an ~a_w ~b_name:bn ~b_w in
+                       (match op with
+                        | Signal_add -> gen_add ~a_name:an ~a_w ~b_name:bn ~b_w
+                        | _          -> gen_sub ~a_name:an ~a_w ~b_name:bn ~b_w)
+                     in
                      absorb_helper insts wires_;
-                     (* Per-bit alias the requested out_name[i] to sums[i]. *)
-                     List.iteri (fun i s ->
-                       let oi = if w = 1 then out_name
-                                else Printf.sprintf "%s[%d]" out_name i in
-                       ctx.assigns <- (oi, s) :: ctx.assigns
-                     ) (let n = min w (List.length sums) in
-                        List.filteri (fun i _ -> i < n) sums)
+                     let sums = let n = min w (List.length sums) in
+                                List.filteri (fun i _ -> i < n) sums in
+                     if w = 1 then
+                       (match sums with
+                        | [s] -> ctx.assigns <- (out_name, s) :: ctx.assigns
+                        | _ -> ())
+                     else begin
+                       List.iter (fun s ->
+                         ctx.wires <- (s, 1) :: ctx.wires) sums;
+                       let concat_rhs =
+                         "{" ^ String.concat ", " (List.rev sums) ^ "}" in
+                       ctx.assigns <- (out_name, concat_rhs) :: ctx.assigns
+                     end
                  | Signal_lt ->
                      let res, insts, wires_ =
                        gen_lt ~a_name:an ~a_w ~b_name:bn ~b_w in
                      absorb_helper insts wires_;
                      ctx.assigns <- (out_name, res) :: ctx.assigns
                  | _ ->
-                     (* Add/Mul still raw — gcd doesn't need them as
-                        gates, but flag them so we notice if a future
-                        design hits this path. *)
+                     (* Mul still raw — needs a multiplier tree. *)
                      let op_str = match op with
-                       | Signal_add -> "+"
                        | Signal_mulu | Signal_muls -> "*"
                        | _ -> "/* op? */" in
                      Printf.eprintf
