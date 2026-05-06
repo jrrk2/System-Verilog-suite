@@ -271,6 +271,45 @@ let rec stmt_to_always ~is_reg ctx alw = function
   | BBlock stmts ->
       List.fold_left (stmt_to_always ~is_reg ctx) alw stmts
 
+  | BCallStmt { func; args } when func = "@mem_write" ->
+      (* Array write: @mem_write(arr, idx, data).  Translate to a
+         full-bus update of arr where the slot at idx becomes data
+         and other slots keep their current values.  Needs elem_w
+         from [ctx.array_elem_w] (populated by the pre-pass). *)
+      (match args with
+       | [BVar arr; idx_e; data_e] ->
+           (match Hashtbl.find_opt ctx.array_elem_w arr with
+            | None ->
+                Printf.eprintf
+                  "[behavioral_to_hardcaml] WARN: @mem_write to %s but no \
+                   array_elem_w entry — dropping\n" arr;
+                alw
+            | Some elem_w ->
+                let var = get_or_create_var ctx arr 0 is_reg in
+                let total_w = Signal.width (Always.Variable.value var) in
+                let size = total_w / elem_w in
+                let s_idx = expr_to_signal ctx idx_e in
+                let s_data0 = expr_to_signal ctx data_e in
+                let s_data =
+                  let dw = Signal.width s_data0 in
+                  if dw = elem_w then s_data0
+                  else if dw > elem_w then Signal.select s_data0 (elem_w - 1) 0
+                  else Signal.uresize s_data0 elem_w in
+                let cur = Always.Variable.value var in
+                (* For each slot k, pick (idx==k ? data : cur_slot_k). *)
+                let slots = List.init size (fun k ->
+                  let hi = (k + 1) * elem_w - 1 in
+                  let lo = k * elem_w in
+                  let cur_slot = Signal.select cur hi lo in
+                  let k_const =
+                    Signal.of_int ~width:(Signal.width s_idx) k in
+                  Signal.mux2 (Signal.(s_idx ==: k_const)) s_data cur_slot
+                ) in
+                (* Concat MSB-first: slots[size-1] is the MSB slice. *)
+                let new_val =
+                  Signal.concat_msb (List.rev slots) in
+                Always.(var <-- new_val) :: alw)
+       | _ -> alw)
   | BCallStmt _ | BReturn _ ->
       alw
 
@@ -403,6 +442,12 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     | [] -> ()
     | BAssign { lhs; _ } :: tl ->
         Hashtbl.replace driver_proc lhs ck_rst; scan_lhs ck_rst tl
+    | BCallStmt { func = "@mem_write"; args = (BVar arr) :: _ } :: tl ->
+        (* @mem_write(arr, idx, data) inside a BSequential body means
+           [arr] is sequentially driven — pre-pass needs to create it
+           as a register, not a wire, otherwise the @mem_write
+           translation forms a combinational loop. *)
+        Hashtbl.replace driver_proc arr ck_rst; scan_lhs ck_rst tl
     | BIf { then_stmts; else_stmts; _ } :: tl ->
         scan_lhs ck_rst then_stmts; scan_lhs ck_rst else_stmts; scan_lhs ck_rst tl
     | BCase { cases; default; _ } :: tl ->
@@ -462,12 +507,45 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
         sensitivity = [BAny];
         body = List.concat bodies })
   in
+  (* Group BSequential processes by (clock, clock_edge, reset,
+     reset_edge, reset_async) and merge each group's bodies — same
+     logic as the BCombinational merge but per-FF-domain.  The
+     motivating case is multi-slot @mem_write to the same array,
+     where the Verible converter emits one BSequential per slot;
+     each gets translated to a full-bus var<--new_val and Always.
+     compile would otherwise drive the underlying wire multiple
+     times. *)
+  let seq_key (s : Behavioral_ir.bprocess) =
+    match s with
+    | BSequential { clock; clock_edge; reset; reset_edge; reset_async; _ } ->
+        Some (clock, clock_edge, reset, reset_edge, reset_async)
+    | _ -> None in
+  let seq_groups = Hashtbl.create 4 in
+  List.iter (fun p ->
+    match p with
+    | BSequential { body; _ } ->
+        (match seq_key p with
+         | Some k ->
+             let prev = try Hashtbl.find seq_groups k with Not_found -> [] in
+             Hashtbl.replace seq_groups k (prev @ body)
+         | None -> ())
+    | _ -> ()
+  ) bmod.processes;
+  let merged_seqs =
+    Hashtbl.fold (fun (clock, clock_edge, reset, reset_edge, reset_async) body acc ->
+      BSequential {
+        name = "merged_seq_" ^ clock;
+        clock; clock_edge; reset; reset_edge; reset_async;
+        body;
+      } :: acc
+    ) seq_groups [] in
   let other_processes = List.filter (function
-    | BCombinational _ -> false
+    | BCombinational _ | BSequential _ -> false
     | _ -> true) bmod.processes in
-  let processes_to_run = match merged_combs with
-    | Some p -> p :: other_processes
-    | None -> other_processes in
+  let processes_to_run =
+    (match merged_combs with Some p -> [p] | None -> [])
+    @ merged_seqs
+    @ other_processes in
 
   let _always_blocks =
     List.map (process_to_always ctx) processes_to_run in

@@ -232,8 +232,9 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
   let circuit =
     try Behavioral_to_hardcaml.create_circuit synth_bmod
     with e ->
-      failwith (Printf.sprintf "hier_synth: lowering failed for module %s: %s"
-                  m.name (Printexc.to_string e))
+      let bt = Printexc.get_backtrace () in
+      failwith (Printf.sprintf "hier_synth: lowering failed for module %s: %s\n%s"
+                  m.name (Printexc.to_string e) bt)
   in
   let raw = Lib_map.map_circuit circuit in
   (* DCE on the per-module netlist, gated behind LIB_MAP_DCE=1.
