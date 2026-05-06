@@ -120,3 +120,8 @@ uart_synthesized.edf
 obj_dir_test/
 test_z3_mul
 
+
+# Baseline QoR snapshots (#107) — these are reference data the repo
+# tracks across yosys/openroad upgrades; they must NOT be ignored.
+!baseline/results/
+!baseline/results/**
