@@ -38,7 +38,9 @@ let () =
 
   (* Full BIR elaboration pipeline — same passes as test_cva6_ff_diff
      uses for its dumps; gives us flat behavioural code closer to the
-     gate level. *)
+     gate level.  Note: flatten here does NOT kill hierarchy; it's a
+     boundary-preserving wrapper-stripper.  Hierarchy is handled in
+     hier_synth.synth_program. *)
   let prog =
     prog
     |> Behavioral_unroll.unroll_program
@@ -49,36 +51,45 @@ let () =
     |> Behavioral_flatten.flatten_program
   in
 
-  (* Prefer the named top.  If we got >1 module, refuse for now —
-     hierarchical synth lives in the next ticket. *)
-  let n_mods = List.length prog.modules in
-  if n_mods > 1 then
-    fail (Printf.sprintf "%d modules after elab, hierarchical synth not yet wired" n_mods);
+  if not (List.exists
+            (fun (m : Behavioral_ir.bmodule) -> m.name = top) prog.modules)
+  then fail (Printf.sprintf "top %s not found in Verible output" top);
 
-  let m =
-    match List.find_opt (fun (m : Behavioral_ir.bmodule) -> m.name = top)
-            prog.modules with
-    | Some m -> m
-    | None -> fail (Printf.sprintf "top %s not found in Verible output" top)
+  Printf.eprintf "[synth_orfs_shim] %d module(s) after elaboration\n"
+    (List.length prog.modules);
+
+  (* Synth each module to gate level, leaves first.  Fails loudly on
+     any leaf the hardcaml lowerer can't handle — surfaces real bugs
+     instead of silently omitting cells. *)
+  let netlists =
+    try Hier_synth.synth_program prog
+    with Failure msg -> fail msg
+       | e -> fail (Printf.sprintf "hier_synth crashed: %s" (Printexc.to_string e))
   in
 
-  (* If the module has Inst sub-modules in its body, the lib_map walker
-     would skip them silently — that's a wrong netlist.  Hierarchical
-     synth (#103a) handles this case; for now refuse loudly so we
-     notice the gap. *)
-  if m.instances <> [] then
-    fail (Printf.sprintf "%d submodule instance(s) — needs flatten" (List.length m.instances));
+  (* Emit one Verilog file with all module blocks in dependency order
+     (children first, top last).  ORFS doesn't care about order, but
+     readability does. *)
+  let oc = open_out out_path in
+  let total_cells = ref 0 in
+  let total_children = ref 0 in
+  List.iter (fun (mn : Hier_synth.module_netlist) ->
+    let child_insts =
+      List.map (fun (c : Hier_synth.child_inst_emit) ->
+        { Cell_verilog_emit.ci_module = c.ci_module;
+          ci_inst = c.ci_inst;
+          ci_conns = c.ci_conns }) mn.mn_child_insts in
+    Cell_verilog_emit.emit_module_hier
+      ~oc ~module_name:mn.mn_name
+      ~real_inputs:mn.mn_real_inputs
+      ~real_outputs:mn.mn_real_outputs
+      ~child_insts
+      mn.mn_netlist;
+    total_cells := !total_cells + List.length mn.mn_netlist.insts;
+    total_children := !total_children + List.length mn.mn_child_insts
+  ) netlists;
+  close_out oc;
 
-  (try
-     let circuit = Behavioral_to_hardcaml.create_circuit m in
-     let netlist = Lib_map.map_circuit circuit in
-     let n_cells = List.length netlist.insts in
-     if n_cells = 0 then fail "no cells emitted";
-     let _ = Cell_verilog_emit.emit_to_file ~module_name:m.name netlist out_path in
-     Printf.eprintf "[synth_orfs_shim] OK — %d cells, %s\n"
-       n_cells (Cell_verilog_emit.summary netlist
-                |> String.split_on_char '\n' |> List.hd);
-     Printf.eprintf "[synth_orfs_shim] wrote %s\n" out_path;
-     exit 0
-   with e ->
-     fail (Printf.sprintf "lowering failed: %s" (Printexc.to_string e)))
+  Printf.eprintf "[synth_orfs_shim] OK — %d module block(s), %d cells, %d child instances\n"
+    (List.length netlists) !total_cells !total_children;
+  Printf.eprintf "[synth_orfs_shim] wrote %s\n" out_path

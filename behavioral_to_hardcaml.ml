@@ -72,8 +72,15 @@ let rec expr_to_signal ctx = function
       Signal.of_int ~width value
 
   | BBinOp { op; lhs; rhs; result_type } ->
-      let s_lhs = expr_to_signal ctx lhs in
-      let s_rhs = expr_to_signal ctx rhs in
+      let s_lhs0 = expr_to_signal ctx lhs in
+      let s_rhs0 = expr_to_signal ctx rhs in
+      (* Width-coerce both operands to a common width before applying
+         hardcaml's binary ops — these all require equal-width inputs.
+         Same root cause as in BCond: BIR width inference still leaks
+         32-bit default constants in places. *)
+      let common_w = max (Signal.width s_lhs0) (Signal.width s_rhs0) in
+      let pad s = if Signal.width s = common_w then s else Signal.uresize s common_w in
+      let s_lhs = pad s_lhs0 and s_rhs = pad s_rhs0 in
       let result_width = width_of_btype result_type in
       (match op with
        | BAdd -> Signal.(s_lhs +: s_rhs)
@@ -125,7 +132,15 @@ let rec expr_to_signal ctx = function
       let s_cond = expr_to_signal ctx condition in
       let s_then = expr_to_signal ctx then_val in
       let s_else = expr_to_signal ctx else_val in
-      Signal.mux2 s_cond s_then s_else
+      (* Width-coerce the two arms so [Signal.mux2] doesn't choke on
+         BIR mismatches — common cause is a default-32-bit localparam
+         constant feeding one arm while the other is a narrower
+         declared signal.  Use the wider of the two as the result
+         width and zero-extend the narrower side. *)
+      let wt = Signal.width s_then and we = Signal.width s_else in
+      let w = max wt we in
+      let pad s = if Signal.width s = w then s else Signal.uresize s w in
+      Signal.mux2 s_cond (pad s_then) (pad s_else)
 
   | BSelect { array; index } ->
       let s_array = expr_to_signal ctx array in
@@ -157,9 +172,22 @@ let rec expr_to_signal ctx = function
 let rec stmt_to_always ~is_reg ctx alw = function
   | BAssign { lhs; rhs } ->
       let rhs_signal = expr_to_signal ctx rhs in
-      let width = Signal.width rhs_signal in
-      let var = get_or_create_var ctx lhs width is_reg in
-      Always.(var <-- rhs_signal) :: alw
+      let rhs_w = Signal.width rhs_signal in
+      let var = get_or_create_var ctx lhs rhs_w is_reg in
+      (* Resize the RHS to match the declared LHS width.  The pre-pass
+         in [create_circuit] sets each Always.Variable to its bsignal-
+         declared width — when the RHS is wider (e.g. a 32-bit default
+         localparam being stored into a 2-bit reg) or narrower we need
+         to coerce, otherwise [Always.compile] later builds a mux of
+         mismatched arms.  Truncate when wider, zero-extend when
+         narrower; both sides agree this is the SystemVerilog rule for
+         non-blocking assigns of unsigned integers. *)
+      let var_w = Signal.width (Always.Variable.value var) in
+      let rhs_signal' =
+        if rhs_w = var_w then rhs_signal
+        else if rhs_w > var_w then Signal.select rhs_signal (var_w - 1) 0
+        else Signal.uresize rhs_signal var_w in
+      Always.(var <-- rhs_signal') :: alw
 
   | BIf { condition; then_stmts; else_stmts } ->
       let cond_signal = expr_to_signal ctx condition in
