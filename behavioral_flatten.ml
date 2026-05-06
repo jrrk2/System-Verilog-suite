@@ -201,10 +201,10 @@ let substitute_port_inputs_stmt port_subst stmt =
 (* Inline one combinational instance into a parent. Returns updated
  * parent (signals + processes augmented, instance removed) when
  * inlinable, otherwise the parent unchanged. *)
-let inline_instance ~child (parent : bmodule) (i : binstance) : bmodule =
+let inline_instance ?(force_ff=false) ~child (parent : bmodule) (i : binstance) : bmodule =
   let has_ff = List.exists (function BSequential _ -> true | _ -> false)
                  child.processes in
-  if has_ff then parent  (* skip FF-bearing children for now *)
+  if has_ff && not force_ff then parent  (* skip FF-bearing children unless forced *)
   else begin
     (* Classify child signals into ports vs internals. *)
     let inputs =
@@ -326,7 +326,7 @@ let inline_instance ~child (parent : bmodule) (i : binstance) : bmodule =
  * inline_instance, each pass may add migrated grandchild instances
  * — those get processed on subsequent passes. Bounded by max_depth
  * which caps recursive specialisations like popcount__IW16→IW1. *)
-let flatten_module ~by_base ~by_name (parent : bmodule) : bmodule =
+let flatten_module ?(force_ff=false) ~by_base ~by_name (parent : bmodule) : bmodule =
   let debug = Sys.getenv_opt "FLAT_DEBUG" <> None in
   let signal_widths = List.map (fun (s : bsignal) ->
     let w = match s.stype with
@@ -360,7 +360,7 @@ let flatten_module ~by_base ~by_name (parent : bmodule) : bmodule =
              * a non-empty child.instances gets migrated. *)
             let was_present =
               List.exists (fun x -> x.inst_name = i.inst_name) acc.instances in
-            let acc' = inline_instance ~child acc i in
+            let acc' = inline_instance ~force_ff ~child acc i in
             let still_present =
               List.exists (fun x -> x.inst_name = i.inst_name) acc'.instances in
             if was_present && not still_present then
@@ -372,7 +372,7 @@ let flatten_module ~by_base ~by_name (parent : bmodule) : bmodule =
   in
   loop 0 parent
 
-let flatten_program (p : bprogram) : bprogram =
+let flatten_program ?(force_ff=false) (p : bprogram) : bprogram =
   let debug = Sys.getenv_opt "FLAT_DEBUG" <> None in
   let by_name = List.map (fun (m : bmodule) -> (m.name, m)) p.modules in
   if debug then begin
@@ -397,7 +397,7 @@ let flatten_program (p : bprogram) : bprogram =
     let bucket = try List.assoc b acc with Not_found -> [] in
     (b, m :: bucket) :: List.remove_assoc b acc
   ) [] p.modules in
-  let result = { p with modules = List.map (flatten_module ~by_base ~by_name) p.modules } in
+  let result = { p with modules = List.map (flatten_module ~force_ff ~by_base ~by_name) p.modules } in
   if debug then begin
     Printf.eprintf "[flat] AFTER pass: %d modules, residual instances:\n%!"
       (List.length result.modules);

@@ -133,6 +133,36 @@ let () =
     Gate_netlist_to_behavioral.expand_program_with_liberty lib_file cell_raw in
   Printf.printf "Cells : %d module(s) after  expand\n"
     (List.length cell_behav.modules);
+
+  (* Hierarchical substitution (#115).  Parent modules with child
+     instances would otherwise miter against unconstrained child
+     outputs — Z3 picks any non-matching values and the parent
+     "fails" even though every leaf has been independently proven
+     equivalent.  Behavioral_flatten inlines combinational children
+     into parents.  Apply to BOTH sides equally so the miter sees
+     parent logic with all child operations explicit and matched
+     module-by-module.
+
+     We keep this OFF in the synth shim (gates emitted into ORFS
+     must preserve module boundaries for the dual hier/flat
+     representation) but turn it ON here in the miter, where
+     flattening is a verification convenience. *)
+  let src_prog =
+    src_prog
+    |> Behavioral_unroll.unroll_program
+    |> Behavioral_inline.inline_program
+    |> Behavioral_iflift.lift_program
+    |> Behavioral_blocking_subst.blocking_subst_program
+    |> Behavioral_meminfer.infer_program
+    |> Behavioral_flatten.flatten_program ~force_ff:true
+  in
+  let cell_behav =
+    cell_behav
+    |> Behavioral_flatten.flatten_program ~force_ff:true
+  in
+  Printf.printf "After flatten: source=%d, cells=%d module(s)\n"
+    (List.length src_prog.modules)
+    (List.length cell_behav.modules);
   if Sys.getenv_opt "DUMP_EXPAND" <> None then
     List.iter (fun m ->
       Printf.printf "\n%s\n" (Behavioral_ir.string_of_bmodule m)
