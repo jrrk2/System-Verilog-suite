@@ -150,7 +150,14 @@ let rec expr_to_signal ctx = function
 
   | BSlice { signal; msb; lsb } ->
       let s = expr_to_signal ctx signal in
-      Signal.select s lsb (msb - lsb + 1)
+      (* Hardcaml's [Signal.select s hi lo] expects hi >= lo and
+         returns bits [hi:lo] inclusive.  BIR's BSlice uses (msb, lsb)
+         with msb = high index, lsb = low index — but the converter
+         occasionally emits little-endian (`[0:N]`) where msb < lsb.
+         Normalise here. *)
+      let hi = max msb lsb and lo = min msb lsb in
+      let hi = min hi (Signal.width s - 1) in
+      Signal.select s hi lo
 
   | BConcat exprs ->
       let signals = List.map (expr_to_signal ctx) exprs in
@@ -380,11 +387,37 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
       ctx.variables <- (s.name, var) :: ctx.variables
     end) bmod.signals;
 
-  (* Run every process — building Always blocks AND mutating the
-     shared variable list.  The compiled Always.t blocks must be
-     held onto and ignored only after all variables are wired. *)
+  (* Coalesce all BCombinational processes into a single one before
+     lowering.  Each [Always.compile] call drives the underlying wire
+     of every Always.Variable assigned in its body — so two separate
+     BCombinational processes that each assign the SAME variable
+     would each try to drive the variable's wire, and hardcaml errors
+     with "attempt to assign wire multiple times".  By merging, all
+     assigns end up in one Always.compile and last-wins applies (which
+     is the correct SV semantics for blocking continuous assigns).
+     This also masks a known Verible-converter bug where indexed
+     array-LHS like `assign arr[i] = …` loses the index and produces
+     N separate BCombinational processes against the same bare name. *)
+  let merged_combs =
+    let bodies = List.filter_map (function
+      | BCombinational { body; _ } -> Some body
+      | _ -> None) bmod.processes in
+    match bodies with
+    | [] -> None
+    | _ -> Some (BCombinational {
+        name = "merged_comb";
+        sensitivity = [BAny];
+        body = List.concat bodies })
+  in
+  let other_processes = List.filter (function
+    | BCombinational _ -> false
+    | _ -> true) bmod.processes in
+  let processes_to_run = match merged_combs with
+    | Some p -> p :: other_processes
+    | None -> other_processes in
+
   let _always_blocks =
-    List.map (process_to_always ctx) bmod.processes in
+    List.map (process_to_always ctx) processes_to_run in
   let _ = _always_blocks in    (* compiled side-effects are in ctx *)
 
   (* Wire up declared outputs to whatever variable / signal carries
