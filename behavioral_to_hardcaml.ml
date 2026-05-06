@@ -59,7 +59,14 @@ let get_or_create_var ctx name width is_reg =
 (* Convert behavioral IR expression to HardCaml Signal *)
 let rec expr_to_signal ctx = function
   | BVar name ->
-      get_signal ctx name
+      (* Variable lookup priority: ctx.variables (Always.Variable.t)
+         carries the live value of registers and wires written by
+         processes; ctx.signals carries Signal.input port wires.
+         Falling back to get_signal (which mints a 32-bit default
+         wire) is a last resort and signals a missing pre-pass. *)
+      (match List.assoc_opt name ctx.variables with
+       | Some v -> Always.Variable.value v
+       | None -> get_signal ctx name)
 
   | BConst { value; width } ->
       Signal.of_int ~width value
@@ -143,29 +150,32 @@ let rec expr_to_signal ctx = function
       (* Unsupported for now *)
       Signal.zero 32
 
-(* Convert behavioral statement to Always assignment *)
-let rec stmt_to_always ctx alw = function
+(* Convert behavioral statement to Always assignment.
+   [is_reg] tells [get_or_create_var] whether new variables here
+   should be flip-flops (sequential context) or wires (combinational).
+   Passed down through nested if/case/block bodies. *)
+let rec stmt_to_always ~is_reg ctx alw = function
   | BAssign { lhs; rhs } ->
       let rhs_signal = expr_to_signal ctx rhs in
       let width = Signal.width rhs_signal in
-      let var = get_or_create_var ctx lhs width false in
+      let var = get_or_create_var ctx lhs width is_reg in
       Always.(var <-- rhs_signal) :: alw
 
   | BIf { condition; then_stmts; else_stmts } ->
       let cond_signal = expr_to_signal ctx condition in
-      let then_alw = List.fold_left (stmt_to_always ctx) [] then_stmts in
-      let else_alw = List.fold_left (stmt_to_always ctx) [] else_stmts in
+      let then_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] then_stmts in
+      let else_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] else_stmts in
       Always.(if_ cond_signal then_alw else_alw) :: alw
 
   | BCase { selector; cases; default } ->
       let sel_signal = expr_to_signal ctx selector in
       let case_list = List.map (fun (value, stmts) ->
         let val_signal = expr_to_signal ctx value in
-        let case_alw = List.fold_left (stmt_to_always ctx) [] stmts in
+        let case_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] stmts in
         (val_signal, case_alw)
       ) cases in
-      let default_alw = List.fold_left (stmt_to_always ctx) [] default in
-      (* HardCaml doesn't have direct case, use nested if-else *)
+      let default_alw =
+        List.fold_left (stmt_to_always ~is_reg ctx) [] default in
       let rec build_cases = function
         | [] -> default_alw
         | (value, body) :: rest ->
@@ -175,28 +185,31 @@ let rec stmt_to_always ctx alw = function
       build_cases case_list @ alw
 
   | BWhile _ | BFor _ ->
-      (* Loops need to be unrolled - not supported in direct synthesis *)
+      (* Loops need to be unrolled by behavioral_unroll.ml first. *)
       alw
 
   | BBlock stmts ->
-      List.fold_left (stmt_to_always ctx) alw stmts
+      List.fold_left (stmt_to_always ~is_reg ctx) alw stmts
 
   | BCallStmt _ | BReturn _ ->
-      (* Skip unsupported statements *)
       alw
 
-(* Convert behavioral process to HardCaml Always block *)
+(* Convert behavioral process to HardCaml Always block.
+   Returns the compiled Always.t so the caller can keep a list
+   of all the always-blocks that make up the module. *)
 let process_to_always ctx = function
   | BCombinational { body; _ } ->
-      let alw = List.fold_left (stmt_to_always ctx) [] body in
-      Some (Always.compile alw)
+      let alw = List.fold_left (stmt_to_always ~is_reg:false ctx) [] body in
+      Always.compile alw
 
-  | BSequential { clock; body; _ } ->
-      (* Update context with clock *)
+  | BSequential { clock; reset; body; _ } ->
       let clk_sig = get_signal ctx clock in
-      let updated_ctx = { ctx with clock = Some clk_sig } in
-      let alw = List.fold_left (stmt_to_always updated_ctx) [] body in
-      Some (Always.compile alw)
+      ctx.clock <- Some clk_sig;
+      (match reset with
+       | Some rst_name -> ctx.reset <- Some (get_signal ctx rst_name)
+       | None -> ());
+      let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
+      Always.compile alw
 
 (* Build input interface from behavioral IR module *)
 let build_input_ports (bmod : Behavioral_ir.bmodule) =
@@ -214,67 +227,174 @@ let build_output_ports (bmod : Behavioral_ir.bmodule) =
     | _ -> None
   ) bmod.signals
 
-(* Convert behavioral IR module to HardCaml create function *)
+(* Build the (name, Signal.t) input list from a bmodule's
+   declared inputs.  Each becomes a hardcaml [Signal.input] which
+   gets wired up to the surrounding scope when the Circuit is
+   created. *)
+let build_inputs (bmod : Behavioral_ir.bmodule) =
+  List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+    match s.direction with
+    | `Input ->
+        let w = width_of_btype s.stype in
+        Some (s.name, Signal.input s.name w)
+    | _ -> None) bmod.signals
+
+(* Backward-compat shim for callers that pass an inputs assoc-list
+   and expect (name, Signal.t) outputs back.  New code should use
+   [create_circuit] directly. *)
 let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
   let scope = Scope.create () in
-
-  (* Initialize context with input signals *)
   let ctx = {
-    signals = List.map (fun (name, width) ->
-      (name, List.assoc name inputs)
-    ) (build_input_ports bmod);
+    signals = inputs;
     variables = [];
-    scope = scope;
+    scope;
+    clock = None;
+    reset = None;
+  } in
+  (* Clock/reset get bound by [process_to_always] when each
+     BSequential block tells us its clock and reset signal names
+     directly.  We deliberately do NOT recognise them by name
+     (clk/CLK/reset/rst) — pattern, not name, is the source of
+     truth.  Combinational-only modules end up with both fields
+     None, which is correct. *)
+  let _ = List.map (process_to_always ctx) bmod.processes in
+  List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+    match s.direction with
+    | `Output ->
+        let driver =
+          match List.assoc_opt s.name ctx.variables with
+          | Some var -> Always.Variable.value var
+          | None ->
+              (match List.assoc_opt s.name ctx.signals with
+               | Some sig_ -> sig_
+               | None -> Signal.zero (width_of_btype s.stype))
+        in
+        Some (s.name, driver)
+    | _ -> None) bmod.signals
+
+(* Convert a bmodule into a hardcaml [Circuit.t].  Produces a
+   real circuit that can be passed to [Rtl.print] for Verilog
+   emission and [Lib_map.map_bexpr] for technology mapping. *)
+let create_circuit (bmod : Behavioral_ir.bmodule) =
+  let scope = Scope.create () in
+  let inputs = build_inputs bmod in
+  let ctx = {
+    signals  = inputs;
+    variables = [];
+    scope;
     clock = None;
     reset = None;
   } in
 
-  (* Look for clock and reset signals *)
-  List.iter (fun (signal : Behavioral_ir.bsignal) ->
-    match signal.name with
-    | "clock" | "clk" | "CLK" ->
-        ctx.clock <- Some (get_signal ctx signal.name)
-    | "reset" | "rst" | "RST" ->
-        ctx.reset <- Some (get_signal ctx signal.name)
-    | _ -> ()
-  ) bmod.signals;
+  (* Clock/reset get bound by [process_to_always] when each
+     BSequential block names them via its [clock] / [reset] fields.
+     Pattern, not name, is the source of truth. *)
 
-  (* Process all processes *)
-  List.iter (fun proc ->
-    ignore (process_to_always ctx proc)
-  ) bmod.processes;
+  (* Pre-pass: classify each non-input signal and pre-declare an
+     Always.Variable of the right shape (register vs wire) at the
+     DECLARED width.
 
-  (* Build output signals *)
-  let outputs = List.map (fun (name, width) ->
-    let signal =
-      match List.assoc_opt name ctx.variables with
-      | Some var -> Always.Variable.value var
-      | None -> get_signal ctx name
-    in
-    (name, signal)
-  ) (build_output_ports bmod) in
+     For BSequential-driven signals we need clock and (optionally)
+     reset to construct a Reg_spec.  Walk processes once,
+     collecting (signal_name -> driving_BSequential_record).  Then
+     create the Always.Variable per signal using either:
+       Always.Variable.reg ~enable Reg_spec ~width    (register)
+       Always.Variable.wire ~default                   (combinational)
 
-  outputs
+     This is the hardcaml-lua pattern from Input_hardcaml.ml
+     line 381-384, adapted to our BIR. *)
+  (* (clock_name, reset_name option) for sequential; None for comb. *)
+  let driver_proc : (string, (string * string option) option) Hashtbl.t =
+    Hashtbl.create 16 in
+  let rec scan_lhs ck_rst = function
+    | [] -> ()
+    | BAssign { lhs; _ } :: tl ->
+        Hashtbl.replace driver_proc lhs ck_rst; scan_lhs ck_rst tl
+    | BIf { then_stmts; else_stmts; _ } :: tl ->
+        scan_lhs ck_rst then_stmts; scan_lhs ck_rst else_stmts; scan_lhs ck_rst tl
+    | BCase { cases; default; _ } :: tl ->
+        List.iter (fun (_, s) -> scan_lhs ck_rst s) cases;
+        scan_lhs ck_rst default; scan_lhs ck_rst tl
+    | BBlock s :: tl -> scan_lhs ck_rst s; scan_lhs ck_rst tl
+    | _ :: tl -> scan_lhs ck_rst tl in
+  List.iter (function
+    | BSequential { clock; reset; body; _ } ->
+        scan_lhs (Some (clock, reset)) body
+    | BCombinational { body; _ } -> scan_lhs None body)
+    bmod.processes;
 
-(* Create a HardCaml circuit from behavioral IR module *)
-let create_circuit (bmod : Behavioral_ir.bmodule) =
-  let input_ports = build_input_ports bmod in
-  let output_ports = build_output_ports bmod in
+  List.iter (fun (s : Behavioral_ir.bsignal) ->
+    if s.direction <> `Input
+       && not (List.mem_assoc s.name ctx.variables) then begin
+      let w = width_of_btype s.stype in
+      let var =
+        match Hashtbl.find_opt driver_proc s.name with
+        | Some (Some (clock, reset)) ->
+            let clk = get_signal ctx clock in
+            let spec = match reset with
+              | Some rst -> Reg_spec.create ~clock:clk ~reset:(get_signal ctx rst) ()
+              | None     -> Reg_spec.create ~clock:clk () in
+            Always.Variable.reg spec ~width:w
+        | _ ->
+            Always.Variable.wire ~default:(Signal.zero w) in
+      ctx.variables <- (s.name, var) :: ctx.variables
+    end) bmod.signals;
 
-  (* Build a simple wrapper for now *)
-  Printf.printf "Module: %s\n" bmod.name;
-  Printf.printf "Inputs: %d\n" (List.length input_ports);
-  Printf.printf "Outputs: %d\n" (List.length output_ports);
+  (* Run every process — building Always blocks AND mutating the
+     shared variable list.  The compiled Always.t blocks must be
+     held onto and ignored only after all variables are wired. *)
+  let _always_blocks =
+    List.map (process_to_always ctx) bmod.processes in
+  let _ = _always_blocks in    (* compiled side-effects are in ctx *)
 
-  (* Return port information *)
-  (input_ports, output_ports)
+  (* Wire up declared outputs to whatever variable / signal carries
+     their final value.  An output that's never written becomes a
+     zero so the Verilog still has a driver. *)
+  let outputs = List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+    match s.direction with
+    | `Output ->
+        let w = width_of_btype s.stype in
+        let driver =
+          match List.assoc_opt s.name ctx.variables with
+          | Some var -> Always.Variable.value var
+          | None ->
+              (match List.assoc_opt s.name ctx.signals with
+               | Some sig_ -> sig_
+               | None -> Signal.zero w)
+        in
+        Some (Signal.output s.name driver)
+    | _ -> None) bmod.signals in
 
-(* High-level conversion function *)
+  Circuit.create_exn ~name:bmod.name outputs
+
+(* Top-level: convert a whole bprogram, returning the FIRST
+   module's circuit information.  Kept this shape for backward
+   compatibility with z3_hardcaml_miter / interactive_client /
+   test_surelog_hardcaml which all expect [option] of
+   [(bmod, inputs, outputs)].  Use [convert_all_to_circuits] for
+   the new-style multi-module case. *)
 let convert_to_hardcaml (bprog : Behavioral_ir.bprogram) =
   match bprog.modules with
-  | [] ->
-      Printf.eprintf "No modules to convert\n";
-      None
+  | [] -> None
   | bmod :: _ ->
-      let (inputs, outputs) = create_circuit bmod in
+      let inputs = build_input_ports bmod in
+      let outputs = build_output_ports bmod in
       Some (bmod, inputs, outputs)
+
+(* New-style entry point: returns one Circuit.t per module. *)
+let convert_all_to_circuits (bprog : Behavioral_ir.bprogram) =
+  List.map (fun (m : Behavioral_ir.bmodule) -> (m.name, create_circuit m))
+    bprog.modules
+
+(* Convenience: emit a circuit's Verilog to a buffer via hardcaml's
+   Rtl backend.  Mirrors hardcaml-lua's Input_hardcaml.ml line 768:
+
+       Rtl.output ~output_mode:(Output_mode.To_buffer rtl) Verilog
+         (Circuit.create_exn ~name:modnam outputs)
+
+   The result string is what #100's cell-mapped post-pass and #101's
+   yosys-as-oracle stage take as input. *)
+let emit_verilog circuit =
+  let buf = Buffer.create 4096 in
+  Rtl.output ~output_mode:(Rtl.Output_mode.To_buffer buf) Verilog circuit;
+  Buffer.contents buf
