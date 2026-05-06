@@ -26,10 +26,16 @@ type candidate = {
   binding_name : string;
   current_arch : string;
   to_arch      : string;
+  kind         : string;          (* "adder" or "mul" — for cert lookup *)
+  width        : int;             (* width at which the swap operates *)
   depth_factor : float;
     (* D(to_arch) / D(current_arch); e.g. ripple W=8 -> kogge_stone
        W=8 has depth_factor = 3 / 8 = 0.375 *)
 }
+
+type cert_status =
+  | Proven      (* a .proven cert exists in the local cache *)
+  | Unproven    (* cert needed; user must run verify-arch *)
 
 type prediction = {
   cand               : candidate;
@@ -37,7 +43,27 @@ type prediction = {
   cone_delay_ps      : float;
   predicted_savings  : float;
   predicted_new_arr  : float;
+  cert               : cert_status;
 }
+
+(* Path of the local cert cache.  Mirrors
+   behavioral_arch_subst.cache_dir so a cert proved by
+   `verify-arch` is automatically visible here. *)
+let cert_cache_dir () =
+  let home = try Sys.getenv "HOME" with Not_found -> "/tmp" in
+  home ^ "/.cache/sv_decompiler/arch"
+
+let cert_path ~kind ~arch ~width =
+  Printf.sprintf "%s/%s_%s_%d.proven"
+    (cert_cache_dir ()) kind arch width
+
+let check_cert ~kind ~arch ~width =
+  if Sys.file_exists (cert_path ~kind ~arch ~width)
+  then Proven else Unproven
+
+let string_of_cert = function
+  | Proven    -> "proven"
+  | Unproven  -> "no-cert"
 
 (* For each cell in [cone], compute its "own" delay along the
    critical chain — i.e. its arrival minus the maximum
@@ -91,14 +117,33 @@ let predict
         if n_cone = 0 then None
         else
           let savings = dly *. (1.0 -. c.depth_factor) in
+          let cert = check_cert ~kind:c.kind ~arch:c.to_arch ~width:c.width in
           Some {
             cand = c;
             cells_in_cone     = n_cone;
             cone_delay_ps     = dly;
             predicted_savings = savings;
             predicted_new_arr = ep_arr -. savings;
+            cert;
           }) candidates in
 
   let sorted = List.sort
     (fun a b -> compare b.predicted_savings a.predicted_savings) preds in
   ((ep, ep_arr), cone, sorted)
+
+(* Drop predictions whose cert is missing — what the cert-gated
+   chooser actually returns to a downstream ECO emitter. *)
+let proven_only preds =
+  List.filter (fun p -> p.cert = Proven) preds
+
+(* For predictions lacking a cert, suggest the verify-arch command
+   the user would need to run.  Helpful UX: the predict report
+   tells you what to prove, in priority order. *)
+let verify_arch_commands_needed preds =
+  List.filter_map (fun p ->
+    match p.cert with
+    | Unproven ->
+        Some (Printf.sprintf "verify-arch %s %s --width %d  # +%.1f ps savings"
+                p.cand.kind p.cand.to_arch p.cand.width
+                p.predicted_savings)
+    | Proven -> None) preds

@@ -37,7 +37,8 @@ let depth_ratio kind ~from_a ~to_a ~width =
 let () =
   let lib_path = "lef_def/test/nangate.lib" in
   let lef_path = "lef_def/test/nangate.lef" in
-  let width = 8 in
+  let width =
+    if Array.length Sys.argv > 1 then int_of_string Sys.argv.(1) else 8 in
   let baseline_mul = "array" in
   let baseline_add = "ripple" in
 
@@ -95,6 +96,8 @@ let () =
         Predict_swap.binding_name = "u_mul";
         current_arch = baseline_mul;
         to_arch = alt;
+        kind = "mul";
+        width = width;
         depth_factor =
           depth_ratio `Mul ~from_a:baseline_mul ~to_a:alt ~width;
       }) mul_alts
@@ -105,6 +108,8 @@ let () =
         Predict_swap.binding_name = "u_add";
         current_arch = baseline_add;
         to_arch = alt;
+        kind = "adder";
+        width = 2 * width;
         depth_factor =
           depth_ratio `Add ~from_a:baseline_add ~to_a:alt ~width:(2*width);
       }) add_alts
@@ -116,25 +121,34 @@ let () =
   Printf.printf "\nWorst endpoint: %s @ %.2f ps  (cone size %d)\n\n"
     ep ep_arr (List.length cone);
 
-  Printf.printf "  %-8s  %-12s -> %-12s  cells  cone_delay  savings  new_arr\n"
+  Printf.printf "  %-8s  %-12s -> %-12s  cells  cone_delay   savings   new_arr  cert\n"
     "binding" "current" "to";
-  Printf.printf "  %s\n" (String.make 78 '-');
+  Printf.printf "  %s\n" (String.make 84 '-');
   List.iter (fun p ->
-    Printf.printf "  %-8s  %-12s -> %-12s  %3d   %8.1f ps  %8.1f ps  %8.1f ps\n"
+    Printf.printf
+      "  %-8s  %-12s -> %-12s  %3d   %8.1f ps %8.1f ps %8.1f ps  %s\n"
       p.Predict_swap.cand.binding_name
       p.cand.current_arch p.cand.to_arch
       p.cells_in_cone
       p.cone_delay_ps
       p.predicted_savings
-      p.predicted_new_arr) preds;
+      p.predicted_new_arr
+      (Predict_swap.string_of_cert p.cert)) preds;
 
-  Printf.printf "\nBest pick: ";
-  (match preds with
-   | [] -> print_endline "no candidate produces savings"
+  let proven = Predict_swap.proven_only preds in
+  Printf.printf "\nBest pick (cert-gated): ";
+  (match proven with
+   | [] -> print_endline "no PROVEN candidate produces savings"
    | top :: _ ->
-       Printf.printf "swap %s from %s to %s -> %.1f ps -> %.1f ps  (saves %.1f ps)\n"
+       Printf.printf "swap %s from %s to %s -> %.1f ps -> %.1f ps  (saves %.1f ps, cert OK)\n"
          top.cand.binding_name top.cand.current_arch top.cand.to_arch
          ep_arr top.predicted_new_arr top.predicted_savings);
+
+  let needed = Predict_swap.verify_arch_commands_needed preds in
+  if needed <> [] then begin
+    Printf.printf "\nUnproven candidates — run these to unlock more swaps:\n";
+    List.iter (fun s -> Printf.printf "  %s\n" s) needed
+  end;
 
   (* Verification: re-synth with the recommended arch and compare
      against the prediction.  This checks the projection model
