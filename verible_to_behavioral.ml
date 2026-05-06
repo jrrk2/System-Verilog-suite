@@ -1035,32 +1035,77 @@ let lhs_indexed_of tok =
   | Some name -> Some (name, !idx)
   | None -> None
 
+(* Detect concat-LHS `{a, b, c, d}` and split into per-name (name,
+   width) parts.  Returns None if lhs isn't a concat or any part
+   can't be resolved to a plain name.  Per-part widths come from
+   the signal-width cache. *)
+let concat_lhs_parts lhs =
+  match lhs with
+  | TUPLE4 (STRING tag, _, body, _) when prefix_is "range_list_in_braces" tag ->
+      let parts =
+        match body with
+        | TLIST xs ->
+            List.rev (List.filter (fun e -> match e with
+              | TLIST [] | EMPTY_TOKEN -> false
+              | _ -> true) xs)
+        | other -> [other] in
+      let infos = List.map (fun p ->
+        match lhs_indexed_of p with
+        | Some (n, _) ->
+            let w =
+              match List.assoc_opt n !cur_signal_widths with
+              | Some w -> w | None -> 1 in
+            Some (n, w)
+        | None -> None
+      ) parts in
+      if List.for_all (fun x -> x <> None) infos then
+        Some (List.map (function Some x -> x | None -> assert false) infos)
+      else None
+  | _ -> None
+
 let extract_assign ~pkgs ~params ~arrays tok =
   let assigns = collect_by (has_tag (prefix_is "cont_assign")) tok in
-  List.filter_map (fun a ->
+  List.concat_map (fun a ->
     match a with
     | TUPLE4 (STRING tag, lhs, _eq, rhs) when prefix_is "cont_assign" tag ->
-        (match lhs_indexed_of lhs with
-         | Some (name, Some idx_node) when List.mem name arrays ->
-             let idx = expr_to_bexpr ~pkgs ~params ~arrays idx_node in
+        (match concat_lhs_parts lhs with
+         | Some parts ->
+             (* Split: each name gets a slice of the RHS, MSB-first. *)
              let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
-             Some (BCombinational {
-               name = "assign_" ^ name;
-               sensitivity = [BAny];
-               body = [BCallStmt {
-                 func = "@mem_write";
-                 args = [BVar name; idx; rhs_e];
-               }];
-             })
-         | Some (name, _) ->
-             let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
-             Some (BCombinational {
-               name = "assign_" ^ name;
-               sensitivity = [BAny];
-               body = [BAssign { lhs = name; rhs = rhs_e }];
-             })
-         | None -> None)
-    | _ -> None
+             let total_w = List.fold_left (fun acc (_, w) -> acc + w) 0 parts in
+             let cursor = ref total_w in
+             List.map (fun (name, w) ->
+               let hi = !cursor - 1 and lo = !cursor - w in
+               cursor := !cursor - w;
+               let part_rhs = BSlice { signal = rhs_e; msb = hi; lsb = lo } in
+               BCombinational {
+                 name = "assign_concat_" ^ name;
+                 sensitivity = [BAny];
+                 body = [BAssign { lhs = name; rhs = part_rhs }];
+               }
+             ) parts
+         | None ->
+             (match lhs_indexed_of lhs with
+              | Some (name, Some idx_node) when List.mem name arrays ->
+                  let idx = expr_to_bexpr ~pkgs ~params ~arrays idx_node in
+                  let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
+                  [BCombinational {
+                    name = "assign_" ^ name;
+                    sensitivity = [BAny];
+                    body = [BCallStmt {
+                      func = "@mem_write";
+                      args = [BVar name; idx; rhs_e];
+                    }];
+                  }]
+              | Some (name, _) ->
+                  let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
+                  [BCombinational {
+                    name = "assign_" ^ name;
+                    sensitivity = [BAny];
+                    body = [BAssign { lhs = name; rhs = rhs_e }];
+                  }]
+              | None -> []))
+    | _ -> []
   ) assigns
 
 (* ─── Procedural statement → BIR statement ───────────────────────── *)
@@ -1071,44 +1116,103 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
   let recurse_e = expr_to_bexpr ~pkgs ~params ~arrays in
   let recurse_s = stmt_to_bstmt ~pkgs ~params ~arrays in
   let assign_to lhs rhs =
-    (* Three cases for indexed LHS:
-       (1) `name[hi:lo]` with explicit RANGE: emit
-           `@slice_write(name, hi, lo, rhs)` regardless of whether
-           name is in arrays.  Multiple slice-writes to the same
-           target get merged into a single full-bus
-           read-modify-write at lowering time so non-overlapping
-           writes compose correctly.
-       (2) `name[idx]` single-index, name in arrays: emit
-           `@mem_write(name, idx, rhs)` (memory write semantics).
-       (3) plain `name`: BAssign on the whole signal. *)
-    let range_endpoints =
-      let msb = ref None and lsb = ref None in
-      walk (function
-        | TUPLE6 (STRING dt, _, m, _, l, _)
-          when prefix_is "select_variable_dimension" dt
-            && !msb = None ->
-            msb := Some m; lsb := Some l
-        | _ -> ()) lhs;
-      match !msb, !lsb with
-      | Some m, Some l -> Some (m, l)
+    (* Concat-LHS detection: `{a, b, c, d} = expr` splits into
+       per-name assigns where each name takes a slice of the RHS,
+       MSB-first.  Names in the concat may themselves be sliced
+       (rare but handled).  Per-name width comes from the signal
+       width cache. *)
+    let concat_parts =
+      match lhs with
+      | TUPLE4 (STRING tag, _, body, _) when prefix_is "range_list_in_braces" tag ->
+          let parts =
+            match body with
+            | TLIST xs ->
+                List.rev (List.filter (fun e -> match e with
+                  | TLIST [] | EMPTY_TOKEN -> false
+                  | _ -> true) xs)
+            | other -> [other] in
+          (* For each part, get name + optional range. *)
+          let get_part p =
+            let name_opt = match lhs_indexed_of p with
+              | Some (n, _) -> Some n | None -> None in
+            let range = match
+              (let m = ref None and l = ref None in
+               walk (function
+                 | TUPLE6 (STRING dt, _, m_n, _, l_n, _)
+                   when prefix_is "select_variable_dimension" dt
+                     && !m = None ->
+                     m := Some m_n; l := Some l_n
+                 | _ -> ()) p;
+               !m, !l)
+            with
+            | Some mn, Some ln -> Some (mn, ln)
+            | _ -> None
+            in
+            (name_opt, range, p) in
+          let infos = List.map get_part parts in
+          if List.for_all (fun (n, _, _) -> n <> None) infos then Some infos
+          else None
       | _ -> None
     in
-    match lhs_indexed_of lhs, range_endpoints with
-    | Some (name, _), Some (m_node, l_node) ->
-        BCallStmt {
-          func = "@slice_write";
-          args = [BVar name;
-                  recurse_e m_node;
-                  recurse_e l_node;
-                  recurse_e rhs];
-        }
-    | Some (name, Some idx_node), None when List.mem name arrays ->
-        BCallStmt {
-          func = "@mem_write";
-          args = [BVar name; recurse_e idx_node; recurse_e rhs];
-        }
-    | Some (name, _), None -> BAssign { lhs = name; rhs = recurse_e rhs }
-    | None, _ -> BBlock []
+    (match concat_parts with
+     | Some infos ->
+         (* Compute per-part widths: from explicit range, or from
+            signal width cache, or default 1.  Then slice RHS
+            MSB-first at decreasing positions. *)
+         let rhs_e = recurse_e rhs in
+         let part_widths = List.map (fun (n, range, _) ->
+           let nm = match n with Some s -> s | None -> "?" in
+           match range with
+           | Some (m_node, l_node) ->
+               (match recurse_e m_node, recurse_e l_node with
+                | BConst { value = m; _ }, BConst { value = l; _ } ->
+                    abs (m - l) + 1
+                | _ -> 1)
+           | None ->
+               (match List.assoc_opt nm !cur_signal_widths with
+                | Some w -> w | None -> 1)
+         ) infos in
+         let total_w = List.fold_left (+) 0 part_widths in
+         let cursor = ref total_w in
+         let stmts = List.map2 (fun (n_opt, _, _) w ->
+           let nm = match n_opt with Some s -> s | None -> "?" in
+           let hi = !cursor - 1 and lo = !cursor - w in
+           cursor := !cursor - w;
+           let part_rhs = BSlice { signal = rhs_e; msb = hi; lsb = lo } in
+           BAssign { lhs = nm; rhs = part_rhs }
+         ) infos part_widths in
+         BBlock stmts
+     | None ->
+         (* Single LHS — fall through to the existing range / array /
+            plain dispatch. *)
+         let range_endpoints =
+           let msb = ref None and lsb = ref None in
+           walk (function
+             | TUPLE6 (STRING dt, _, m, _, l, _)
+               when prefix_is "select_variable_dimension" dt
+                 && !msb = None ->
+                 msb := Some m; lsb := Some l
+             | _ -> ()) lhs;
+           match !msb, !lsb with
+           | Some m, Some l -> Some (m, l)
+           | _ -> None
+         in
+         (match lhs_indexed_of lhs, range_endpoints with
+          | Some (name, _), Some (m_node, l_node) ->
+              BCallStmt {
+                func = "@slice_write";
+                args = [BVar name;
+                        recurse_e m_node;
+                        recurse_e l_node;
+                        recurse_e rhs];
+              }
+          | Some (name, Some idx_node), None when List.mem name arrays ->
+              BCallStmt {
+                func = "@mem_write";
+                args = [BVar name; recurse_e idx_node; recurse_e rhs];
+              }
+          | Some (name, _), None -> BAssign { lhs = name; rhs = recurse_e rhs }
+          | None, _ -> BBlock []))
   in
   match tok with
   (* Blocking assignment: lhs = rhs *)
