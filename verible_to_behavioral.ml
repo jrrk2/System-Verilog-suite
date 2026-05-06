@@ -936,37 +936,37 @@ let extract_port_decl ~pkgs ~params tok =
     | _ -> ()
   in
   walk_skip tok;
-  (* K&R-style port decls (`input [51:0] frac_num;`) carry the port
-   * name as a bare `SymbolIdentifier` rather than wrapped in
-   * `unqualified_id`. If the strict walk found nothing, fall back to
-   * a permissive sweep that grabs every SymbolIdentifier outside a
-   * packed/select dimension. *)
-  if !names = [] then begin
-    let rec walk_loose t =
-      match t with
-      | TUPLE6 (STRING t', _, _, _, _, _)
-        when prefix_is "decl_variable_dimension" t'
-          || prefix_is "select_variable_dimension" t' -> ()
-      | TUPLE4 (STRING t', _, _, _)
-        when prefix_is "decl_variable_dimension" t'
-          || prefix_is "select_variable_dimension" t' -> ()
-      | SymbolIdentifier id -> names := id :: !names
-      | TUPLE2 (a, b) -> walk_loose a; walk_loose b
-      | TUPLE3 (a, b, c) -> walk_loose a; walk_loose b; walk_loose c
-      | TUPLE4 (a, b, c, d) -> walk_loose a; walk_loose b; walk_loose c; walk_loose d
-      | TUPLE5 (a, b, c, d, e) ->
-          List.iter walk_loose [a; b; c; d; e]
-      | TUPLE6 (a, b, c, d, e, f) ->
-          List.iter walk_loose [a; b; c; d; e; f]
-      | TUPLE7 (a, b, c, d, e, f, g) ->
-          List.iter walk_loose [a; b; c; d; e; f; g]
-      | TUPLE8 (a, b, c, d, e, f, g, h) ->
-          List.iter walk_loose [a; b; c; d; e; f; g; h]
-      | TLIST xs -> List.iter walk_loose xs
-      | _ -> ()
-    in
-    walk_loose tok
-  end;
+  (* Always run a permissive sweep to pick up bare SymbolIdentifier
+     port names that walk_skip missed.  K&R `input clk, rst;` parses
+     such that only the first name is wrapped in `unqualified_id`;
+     subsequent comma-separated names are bare SymbolIdentifier
+     leaves.  Without the loose sweep, the second name is silently
+     lost and ends up classified as Internal/Output by the
+     downstream port-list merge.  Dedup later via sort_uniq. *)
+  let rec walk_loose t =
+    match t with
+    | TUPLE6 (STRING t', _, _, _, _, _)
+      when prefix_is "decl_variable_dimension" t'
+        || prefix_is "select_variable_dimension" t' -> ()
+    | TUPLE4 (STRING t', _, _, _)
+      when prefix_is "decl_variable_dimension" t'
+        || prefix_is "select_variable_dimension" t' -> ()
+    | SymbolIdentifier id -> names := id :: !names
+    | TUPLE2 (a, b) -> walk_loose a; walk_loose b
+    | TUPLE3 (a, b, c) -> walk_loose a; walk_loose b; walk_loose c
+    | TUPLE4 (a, b, c, d) -> walk_loose a; walk_loose b; walk_loose c; walk_loose d
+    | TUPLE5 (a, b, c, d, e) ->
+        List.iter walk_loose [a; b; c; d; e]
+    | TUPLE6 (a, b, c, d, e, f) ->
+        List.iter walk_loose [a; b; c; d; e; f]
+    | TUPLE7 (a, b, c, d, e, f, g) ->
+        List.iter walk_loose [a; b; c; d; e; f; g]
+    | TUPLE8 (a, b, c, d, e, f, g, h) ->
+        List.iter walk_loose [a; b; c; d; e; f; g; h]
+    | TLIST xs -> List.iter walk_loose xs
+    | _ -> ()
+  in
+  walk_loose tok;
   let w = width_of ~pkgs ~params tok in
   (* Detect unpacked-array net decls (`wire [W:0] arr[D:0]`):
      two decl_variable_dimensions, first packed, second unpacked.
