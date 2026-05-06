@@ -202,12 +202,15 @@ let process_to_always ctx = function
       let alw = List.fold_left (stmt_to_always ~is_reg:false ctx) [] body in
       Always.compile alw
 
-  | BSequential { clock; reset; body; _ } ->
+  | BSequential { clock; reset; reset_async; body; _ } ->
       let clk_sig = get_signal ctx clock in
       ctx.clock <- Some clk_sig;
-      (match reset with
-       | Some rst_name -> ctx.reset <- Some (get_signal ctx rst_name)
-       | None -> ());
+      (* Bind ctx.reset only when the reset is ASYNC.  Sync resets
+         are encoded as data-path muxes in the BIR body and do
+         not belong on the flip-flop's reset port. *)
+      (match reset, reset_async with
+       | Some rst_name, true -> ctx.reset <- Some (get_signal ctx rst_name)
+       | _ -> ());
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
       Always.compile alw
 
@@ -303,7 +306,15 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
 
      This is the hardcaml-lua pattern from Input_hardcaml.ml
      line 381-384, adapted to our BIR. *)
-  (* (clock_name, reset_name option) for sequential; None for comb. *)
+  (* Per-signal driving info: clock name, plus reset name only
+     when the reset is ASYNC.  Sync reset is *not* a register-port
+     property — the BIR body already encodes it as
+       if (rst) q <= 0; else q <= D
+     which becomes a data-path mux ahead of a plain DFF.  Mapping
+     it as a register-port reset would be wrong (it'd stack two
+     reset paths, one async by hardcaml default and one sync by
+     the BIf in the body).  We only pass reset to Reg_spec when
+     [reset_async = true]. *)
   let driver_proc : (string, (string * string option) option) Hashtbl.t =
     Hashtbl.create 16 in
   let rec scan_lhs ck_rst = function
@@ -318,8 +329,9 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     | BBlock s :: tl -> scan_lhs ck_rst s; scan_lhs ck_rst tl
     | _ :: tl -> scan_lhs ck_rst tl in
   List.iter (function
-    | BSequential { clock; reset; body; _ } ->
-        scan_lhs (Some (clock, reset)) body
+    | BSequential { clock; reset; reset_async; body; _ } ->
+        let async_rst = if reset_async then reset else None in
+        scan_lhs (Some (clock, async_rst)) body
     | BCombinational { body; _ } -> scan_lhs None body)
     bmod.processes;
 

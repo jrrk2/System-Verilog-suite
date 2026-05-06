@@ -94,13 +94,15 @@ let () =
       && (String.sub s i lp = sub || scan (i+1)) in
     scan 0 in
   let checks = [
-    "module counter",     contains verilog "module counter";
-    "input clk",          contains verilog "input clk";
-    "input rst",          contains verilog "input rst";
-    "output [3:0] q",     contains verilog "output [3:0] q";
-    "always @(posedge",   contains verilog "always @(posedge";
-    "if (rst)",           contains verilog "if (rst)";
-    "_8 <=",              contains verilog "<= ";
+    "module counter",       contains verilog "module counter";
+    "input clk",            contains verilog "input clk";
+    "input rst",            contains verilog "input rst";
+    "output [3:0] q",       contains verilog "output [3:0] q";
+    "always @(posedge clk)",contains verilog "always @(posedge clk)";
+    (* sync reset is in the data path, not on the FF port *)
+    "no reset on FF port",  not (contains verilog "posedge rst");
+    "rst becomes mux",      contains verilog "rst ?";
+    "non-blocking <=",      contains verilog "<= ";
   ] in
   Printf.printf "\nVerilog structural checks:\n";
   let all_pass = ref true in
