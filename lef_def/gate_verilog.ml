@@ -248,18 +248,16 @@ let parse_file path =
 
 type pin_dir = Pin_in | Pin_out
 
-let static_pin_dir : (string * string, pin_dir) Hashtbl.t =
-  let t = Hashtbl.create 16 in
-  List.iter (fun (cell, pin, dir) ->
-    Hashtbl.replace t (cell, pin) dir)
-    [ "AND2_X1", "A1", Pin_in;  "AND2_X1", "A2", Pin_in;  "AND2_X1", "ZN", Pin_out;
-      "XOR2_X1", "A",  Pin_in;  "XOR2_X1", "B",  Pin_in;  "XOR2_X1", "Z",  Pin_out;
-      "INV_X1",  "A",  Pin_in;  "INV_X1",  "ZN", Pin_out;
-      "BUF_X1",  "A",  Pin_in;  "BUF_X1",  "Z",  Pin_out;
-    ];
-  t
+(* Pin-direction table type kept abstract to the caller — fill it
+   from the Liberty (Cell_delay.pin_dir_table) for any real flow.
+   The empty table treats every pin as input, which is the correct
+   degenerate behaviour: a cell with all-input pins drives no nets,
+   so [build_nets] returns the netlist with nobody on the driver
+   side and the caller can detect the missing Liberty. *)
+let empty_pin_dir : (string * string, pin_dir) Hashtbl.t =
+  Hashtbl.create 1
 
-let build_nets ?(pin_dir=static_pin_dir) (m : vmodule) =
+let build_nets ~pin_dir (m : vmodule) =
   let net_pins = Hashtbl.create 256 in
   List.iter (fun c ->
     List.iter (fun (pin, net) ->

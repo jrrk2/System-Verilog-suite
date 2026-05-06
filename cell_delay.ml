@@ -56,6 +56,8 @@ type cell_arcs = {
   cell_name : string;
   arcs      : lut list;       (* every cell_rise + cell_fall arc *)
   slew_arcs : lut list;       (* every rise_transition + fall_transition *)
+  pin_dirs  : (string * Lef_def.Gate_verilog.pin_dir) list;
+                              (* (pin_name, direction) per pin *)
 }
 
 type table = (string, cell_arcs) Hashtbl.t
@@ -127,16 +129,31 @@ let slew_arcs_of_timing timing =
     | _ -> None) timing
 
 (* Pull all timing arcs out of a cell body (across every output pin).
-   Returns (delay_arcs, slew_arcs) so the propagation pass can read
-   both at once. *)
+   Returns (delay_arcs, slew_arcs, pin_directions) so the
+   propagation pass can read all three at once.  Pin direction
+   comes from the [direction:] entry per Liberty pin block;
+   skipping power/ground pins (which use pg_pin and are
+   irrelevant to signal-path STA). *)
 let cell_arcs_of body =
-  List.fold_left (fun (da, sa) -> function
-    | CellPin (_, pin_body) ->
+  List.fold_left (fun (da, sa, pd) -> function
+    | CellPin (pin_name, pin_body) ->
+        let dir =
+          List.find_map (function
+            | Direction "input"  -> Some Lef_def.Gate_verilog.Pin_in
+            | Direction "output" -> Some Lef_def.Gate_verilog.Pin_out
+            | Direction "inout"  -> Some Lef_def.Gate_verilog.Pin_in
+              (* inout pins are typically VDD/VSS — keep as input
+                 so we don't accidentally treat them as drivers *)
+            | _ -> None) pin_body in
+        let pd' = match dir with
+          | Some d -> (pin_name, d) :: pd
+          | None -> pd in
         List.fold_left (fun (da', sa') -> function
           | Timing t ->
               (arcs_of_timing t @ da', slew_arcs_of_timing t @ sa')
           | _ -> (da', sa')) (da, sa) pin_body
-    | _ -> (da, sa)) ([], []) body
+        |> (fun (da', sa') -> (da', sa', pd'))
+    | _ -> (da, sa, pd)) ([], [], []) body
 
 (* ── Bilinear interpolation ──────────────────────────────────── *)
 
@@ -180,11 +197,22 @@ let build_arc_table lib =
    | Library (_, items) ->
        List.iter (function
          | LibCell (name, body) ->
-             let arcs, slew_arcs = cell_arcs_of body in
+             let arcs, slew_arcs, pin_dirs = cell_arcs_of body in
              Hashtbl.replace h name
-               { cell_name = name; arcs; slew_arcs }
+               { cell_name = name; arcs; slew_arcs; pin_dirs }
          | _ -> ()) items
    | _ -> ());
+  h
+
+(* Build a (cell, pin) -> direction lookup table from a parsed
+   Liberty.  This is what gate_verilog.build_nets needs: the
+   pin-direction information that used to live in a hard-coded
+   "magic names" table inside lef_def. *)
+let pin_dir_table tbl =
+  let h = Hashtbl.create 1024 in
+  Hashtbl.iter (fun cell ca ->
+    List.iter (fun (pin, dir) ->
+      Hashtbl.replace h (cell, pin) dir) ca.pin_dirs) tbl;
   h
 
 let load_arc_table filename =

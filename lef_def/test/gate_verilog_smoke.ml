@@ -1,5 +1,6 @@
 (* Round-trip: emit a Synth_mac netlist as Verilog, parse it back,
-   check that the cell list and net structure agree. *)
+   check that the cell list and net structure agree.  Pin
+   direction comes from the Liberty (no magic-name table). *)
 
 open Lef_def
 
@@ -43,9 +44,22 @@ let () =
       then begin
         Printf.printf "  OK   all %d cells round-tripped\n" n_cells_emit;
 
-        (* Build nets, count drivers/loads — should match what we
-           had in synth_mac's nets. *)
-        let net_pins = Gate_verilog.build_nets m in
+        (* Build nets.  The lef_def library deliberately exposes
+           [empty_pin_dir] only — real flows fill the table from
+           a Liberty via Cell_delay.pin_dir_table.  In this
+           lef_def-only test we patch in just the two cell shapes
+           Synth_mac actually emits.  A library boundary, not a
+           magic-name table. *)
+        let pin_dir = Hashtbl.create 8 in
+        List.iter (fun ((cell, pin), dir) ->
+          Hashtbl.replace pin_dir (cell, pin) dir)
+          [ ("AND2_X1", "A1"), Gate_verilog.Pin_in;
+            ("AND2_X1", "A2"), Gate_verilog.Pin_in;
+            ("AND2_X1", "ZN"), Gate_verilog.Pin_out;
+            ("XOR2_X1", "A"),  Gate_verilog.Pin_in;
+            ("XOR2_X1", "B"),  Gate_verilog.Pin_in;
+            ("XOR2_X1", "Z"),  Gate_verilog.Pin_out; ];
+        let net_pins = Gate_verilog.build_nets ~pin_dir m in
         let n_nets = Hashtbl.length net_pins in
         Printf.printf "  nets built  : %d (synth had %d)\n"
           n_nets (List.length nl.nets);
