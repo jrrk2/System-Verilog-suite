@@ -51,6 +51,14 @@ let cell_dff  = { cell_name = "DFF_X1";  in_pins = ["D"; "CK"];    out_pin = "Q"
 (* DFFR_X1: D, CK, RN → Q.  Async low-active reset. *)
 let cell_dffr = { cell_name = "DFFR_X1"; in_pins = ["D"; "CK"; "RN"]; out_pin = "Q"  }
 
+(* Physical tie cells.  Driving a pin from a literal 1'b1 / 1'b0
+   makes OpenROAD's read_verilog tag the resulting net as POWER,
+   which TritonRoute then refuses to route ("Net foo of signal type
+   POWER is not routable").  Instantiate explicit tie cells so the
+   driving net is a regular SIGNAL. *)
+let cell_logic1 = { cell_name = "LOGIC1_X1"; in_pins = []; out_pin = "Z" }
+let cell_logic0 = { cell_name = "LOGIC0_X1"; in_pins = []; out_pin = "Z" }
+
 (* ── Output: list of cell instances + bit-level wire decls ──── *)
 
 type pin_conn = { pin : string; net : string }
@@ -140,6 +148,142 @@ let blast_mux ~out_name ~width ~sel_name ~a_name ~b_name =
   done;
   List.rev !insts
 
+(* ── Bit-blasted arithmetic / compare (#103b) ─────────────────────
+
+   ORFS's [read_verilog] is structural-only; it can't ingest raw
+   `==`, `<`, `+`, `-` operators.  So when [walk] sees an Op2 the
+   gate catalogue doesn't cover, we expand it into AND/OR/XOR/INV
+   cells right here.  Each helper returns the result-wire name and
+   emits the cells/wires into the supplied lists (`insts`, `wires`).
+
+   The conventions:
+     - Multi-bit nets follow the [name[i]] convention shared with
+       [blast_op2] / [blast_mux] — width-1 nets are bare names.
+     - Helpers take the input nets as already-existing names; they
+       only mint new wires for their internal nodes and the result.
+     - `pad_to` returns a per-bit accessor for any width — when the
+       requested bit index is out of range the result is constant 0
+       (a fresh wire we drive with a const-0).  This matters for
+       [a == b] where [a] is wider than [b]: the upper bits of the
+       narrower side become hardcoded zeroes. *)
+
+let gate_inst ~cell ~ipins ~ins ~out =
+  let conns =
+    List.map2 (fun p n -> { pin = p; net = n }) ipins ins
+    @ [{ pin = cell.out_pin; net = out }] in
+  { cell; inst_name = mint cell.cell_name; conns }
+
+let bit_at name w idx =
+  if w = 1 then name else Printf.sprintf "%s[%d]" name idx
+
+(* Reduce an OR over a list of single-bit nets.  Empty list ⇒ "1'b0".
+   Returns the net name carrying the final OR result + the list of
+   instances + new wires. *)
+let or_reduce nets =
+  let insts = ref [] and wires = ref [] in
+  let rec loop = function
+    | [] -> ("1'b0", List.rev !insts, !wires)
+    | [single] -> (single, List.rev !insts, !wires)
+    | a :: b :: rest ->
+        let out = mint "or" in
+        wires := (out, 1) :: !wires;
+        insts := gate_inst ~cell:cell_or
+                   ~ipins:cell_or.in_pins ~ins:[a; b] ~out :: !insts;
+        loop (out :: rest)
+  in
+  loop nets
+
+(* Equality: a == b.  Width [w] = max widths of a and b.  Returns
+   single-bit result wire name + cells/wires to emit. *)
+let gen_eq ~a_name ~a_w ~b_name ~b_w =
+  let w = max a_w b_w in
+  let insts = ref [] and wires = ref [] in
+  let zero_for_pad () =
+    let z = mint "z" in
+    wires := (z, 1) :: !wires;
+    (* Constant zero feeds in via a raw assign — emitted later by the
+       cell-Verilog stage when the net appears in [wires] without a
+       cell driver.  Simpler approach: emit a buffer of 1'b0. *)
+    insts := { cell = cell_buf;
+               inst_name = mint "buf";
+               conns = [{ pin = "A"; net = "1'b0" };
+                        { pin = cell_buf.out_pin; net = z }] } :: !insts;
+    z in
+  let xor_outs = List.init w (fun i ->
+    let ai = if i < a_w then bit_at a_name a_w i else zero_for_pad () in
+    let bi = if i < b_w then bit_at b_name b_w i else zero_for_pad () in
+    let oi = mint "xor" in
+    wires := (oi, 1) :: !wires;
+    insts := gate_inst ~cell:cell_xor
+               ~ipins:cell_xor.in_pins ~ins:[ai; bi] ~out:oi :: !insts;
+    oi) in
+  let or_out, or_insts, or_wires = or_reduce xor_outs in
+  let result = mint "eq" in
+  let inv_inst = gate_inst ~cell:cell_inv
+                   ~ipins:cell_inv.in_pins ~ins:[or_out] ~out:result in
+  let final_wires = !wires @ or_wires @ [(result, 1)] in
+  (result, List.rev !insts @ or_insts @ [inv_inst], final_wires)
+
+(* Build a full-adder from XOR/AND/OR gates.  Inputs (a, b, cin),
+   outputs (sum, cout).  Returns sum_net, cout_net, instances, wires. *)
+let gen_fa ~a ~b ~cin =
+  let insts = ref [] and wires = ref [] in
+  let add_w n = wires := (n, 1) :: !wires in
+  let add_i i = insts := i :: !insts in
+  let ab = mint "ab" in
+  add_w ab;
+  add_i (gate_inst ~cell:cell_xor ~ipins:cell_xor.in_pins
+           ~ins:[a; b] ~out:ab);
+  let sum = mint "sum" in
+  add_w sum;
+  add_i (gate_inst ~cell:cell_xor ~ipins:cell_xor.in_pins
+           ~ins:[ab; cin] ~out:sum);
+  let aandb = mint "aab" in
+  add_w aandb;
+  add_i (gate_inst ~cell:cell_and ~ipins:cell_and.in_pins
+           ~ins:[a; b] ~out:aandb);
+  let ab_and_cin = mint "abc" in
+  add_w ab_and_cin;
+  add_i (gate_inst ~cell:cell_and ~ipins:cell_and.in_pins
+           ~ins:[ab; cin] ~out:ab_and_cin);
+  let cout = mint "co" in
+  add_w cout;
+  add_i (gate_inst ~cell:cell_or ~ipins:cell_or.in_pins
+           ~ins:[aandb; ab_and_cin] ~out:cout);
+  (sum, cout, List.rev !insts, !wires)
+
+(* N-bit subtractor: a - b = a + ~b + 1.  Returns (sum_bits_msb_first,
+   final_cout, all_insts, all_wires). *)
+let gen_sub ~a_name ~a_w ~b_name ~b_w =
+  let w = max a_w b_w in
+  let insts = ref [] and wires = ref [] in
+  let inv_b_bits = List.init w (fun i ->
+    let bi = if i < b_w then bit_at b_name b_w i else "1'b0" in
+    let inv = mint "nb" in
+    wires := (inv, 1) :: !wires;
+    insts := gate_inst ~cell:cell_inv ~ipins:cell_inv.in_pins
+               ~ins:[bi] ~out:inv :: !insts;
+    inv) in
+  let sums = ref [] and cin = ref "1'b1" in
+  for i = 0 to w - 1 do
+    let ai = if i < a_w then bit_at a_name a_w i else "1'b0" in
+    let bi = List.nth inv_b_bits i in
+    let s, co, fa_insts, fa_wires = gen_fa ~a:ai ~b:bi ~cin:!cin in
+    sums := s :: !sums;
+    insts := List.rev_append fa_insts !insts;
+    wires := !wires @ fa_wires;
+    cin := co
+  done;
+  (List.rev !sums, !cin, List.rev !insts, !wires)
+
+(* Less-than: a < b ⇔ subtraction borrows out ⇔ ~cout. *)
+let gen_lt ~a_name ~a_w ~b_name ~b_w =
+  let _sums, cout, insts, wires = gen_sub ~a_name ~a_w ~b_name ~b_w in
+  let lt = mint "lt" in
+  let inv = gate_inst ~cell:cell_inv ~ipins:cell_inv.in_pins
+              ~ins:[cout] ~out:lt in
+  (lt, insts @ [inv], (lt, 1) :: wires)
+
 (* DFF mapping.  hardcaml's Reg has a [register] record with
    clock, optional reset, optional clear, optional enable.  For
    our subset:
@@ -215,23 +359,51 @@ let rec walk ctx sig_ =
            let an = walk ctx arg_a and bn = walk ctx arg_b in
            let a_w = width arg_a and b_w = width arg_b in
            ctx.wires <- (out_name, w) :: ctx.wires;
+           let absorb_helper insts wires_ =
+             ctx.insts <- List.rev_append insts ctx.insts;
+             ctx.wires <- wires_ @ ctx.wires
+           in
            (match signal_op_kind op with
             | Some cell ->
                 let inst_list = blast_op2 ~cell ~out_name ~width:w
                                   ~a_name:an ~b_name:bn ~a_w ~b_w in
                 ctx.insts <- inst_list @ ctx.insts
             | None ->
-                (* Arithmetic / comparison — pass through as raw
-                   Verilog assign; downstream yosys techmap maps
-                   it.  This is the "fall-through" the design
-                   memo allowed. *)
-                let op_str = match op with
-                  | Signal_add -> "+" | Signal_sub -> "-"
-                  | Signal_mulu | Signal_muls -> "*"
-                  | Signal_eq -> "==" | Signal_lt -> "<"
-                  | _ -> "/* op? */" in
-                ctx.assigns <- (out_name,
-                  Printf.sprintf "%s %s %s" an op_str bn) :: ctx.assigns)
+                (match op with
+                 | Hardcaml.Signal.Type.Signal_eq ->
+                     let res, insts, wires_ = gen_eq ~a_name:an ~a_w
+                                                ~b_name:bn ~b_w in
+                     absorb_helper insts wires_;
+                     ctx.assigns <- (out_name, res) :: ctx.assigns
+                 | Signal_sub ->
+                     let sums, _co, insts, wires_ =
+                       gen_sub ~a_name:an ~a_w ~b_name:bn ~b_w in
+                     absorb_helper insts wires_;
+                     (* Per-bit alias the requested out_name[i] to sums[i]. *)
+                     List.iteri (fun i s ->
+                       let oi = if w = 1 then out_name
+                                else Printf.sprintf "%s[%d]" out_name i in
+                       ctx.assigns <- (oi, s) :: ctx.assigns
+                     ) (let n = min w (List.length sums) in
+                        List.filteri (fun i _ -> i < n) sums)
+                 | Signal_lt ->
+                     let res, insts, wires_ =
+                       gen_lt ~a_name:an ~a_w ~b_name:bn ~b_w in
+                     absorb_helper insts wires_;
+                     ctx.assigns <- (out_name, res) :: ctx.assigns
+                 | _ ->
+                     (* Add/Mul still raw — gcd doesn't need them as
+                        gates, but flag them so we notice if a future
+                        design hits this path. *)
+                     let op_str = match op with
+                       | Signal_add -> "+"
+                       | Signal_mulu | Signal_muls -> "*"
+                       | _ -> "/* op? */" in
+                     Printf.eprintf
+                       "[lib_map] WARN: unmapped op %s — emitting raw \
+                        Verilog (read_verilog will reject)\n" op_str;
+                     ctx.assigns <- (out_name,
+                       Printf.sprintf "%s %s %s" an op_str bn) :: ctx.assigns))
        | Not { arg; _ } ->
            let an = walk ctx arg in
            ctx.wires <- (out_name, w) :: ctx.wires;
@@ -294,6 +466,62 @@ let rec walk ctx sig_ =
 
 (* ── Top-level: build a netlist for a Hardcaml.Circuit.t. ───── *)
 
+(* Replace constant drivers with explicit tie cells.  Without this,
+   OpenROAD's [read_verilog] sees a net driven by `1'b1` / `1'b0`
+   (or a wider constant literal), tags the resulting tie net as
+   POWER, and TritonRoute then refuses to route it
+   ("Net foo of signal type POWER is not routable").
+
+   Two rewrites:
+     - Pin connections: literal `1'bN` is replaced by the shared
+       `_tie_X_` wire driven by a single LOGIC1/LOGIC0 instance.
+     - Assigns whose RHS is a sized constant (e.g. `32'b00..0`):
+       expanded to a concat of per-bit tie nets, so the net's
+       driver is the LOGIC cell rather than the literal. *)
+let bin_const_re = Str.regexp "^\\([0-9]+\\)'b\\([01]+\\)$"
+let parse_bin_const s =
+  if Str.string_match bin_const_re s 0
+  then Some (int_of_string (Str.matched_group 1 s),
+             Str.matched_group 2 s)
+  else None
+
+let tie_resolve (insts, assigns) =
+  let needs_hi = ref false and needs_lo = ref false in
+  let scan_pin n =
+    if n = "1'b1" then (needs_hi := true; "_tie_hi_")
+    else if n = "1'b0" then (needs_lo := true; "_tie_lo_")
+    else n in
+  let insts' = List.map (fun (i : instance) ->
+    let conns = List.map (fun c ->
+      { c with net = scan_pin c.net }) i.conns in
+    { i with conns }) insts in
+  let assigns' = List.map (fun (lhs, rhs) ->
+    match parse_bin_const rhs with
+    | Some (1, "1") -> needs_hi := true; (lhs, "_tie_hi_")
+    | Some (1, "0") -> needs_lo := true; (lhs, "_tie_lo_")
+    | Some (_w, bits) ->
+        (* Multi-bit constant: emit a concat of tie nets, MSB first
+           (matches Verilog's `{}` ordering and the bits string). *)
+        let parts = String.to_seq bits |> List.of_seq |> List.map (fun c ->
+          if c = '1' then (needs_hi := true; "_tie_hi_")
+          else (needs_lo := true; "_tie_lo_")) in
+        (lhs, "{" ^ String.concat ", " parts ^ "}")
+    | None -> (lhs, rhs)
+  ) assigns in
+  let extras = ref [] in
+  if !needs_hi then
+    extras := { cell = cell_logic1;
+                inst_name = "_tie_hi_inst_";
+                conns = [{ pin = "Z"; net = "_tie_hi_" }] } :: !extras;
+  if !needs_lo then
+    extras := { cell = cell_logic0;
+                inst_name = "_tie_lo_inst_";
+                conns = [{ pin = "Z"; net = "_tie_lo_" }] } :: !extras;
+  let extra_wires =
+    (if !needs_hi then [("_tie_hi_", 1)] else [])
+    @ (if !needs_lo then [("_tie_lo_", 1)] else []) in
+  (!extras @ insts', assigns', extra_wires)
+
 let map_circuit (circuit : Hardcaml.Circuit.t) =
   next_id := 0;
   let ctx = {
@@ -307,6 +535,10 @@ let map_circuit (circuit : Hardcaml.Circuit.t) =
   let inputs = List.map (fun s -> (net_for_signal s, width s))
                  (Hardcaml.Circuit.inputs circuit) in
   let outputs = List.map (fun s -> (net_for_signal s, width s)) outs in
+  let raw_insts = List.rev ctx.insts in
+  let raw_assigns = List.rev ctx.assigns in
+  let final_insts, final_assigns, tie_wires =
+    tie_resolve (raw_insts, raw_assigns) in
   {
     inputs;
     outputs;
@@ -314,7 +546,7 @@ let map_circuit (circuit : Hardcaml.Circuit.t) =
     wires =
       List.filter (fun (n, _) ->
         not (List.mem_assoc n inputs) && not (List.mem_assoc n outputs))
-        ctx.wires;
-    insts = List.rev ctx.insts;
-    assigns = List.rev ctx.assigns;
+        (ctx.wires @ tie_wires);
+    insts = final_insts;
+    assigns = final_assigns;
   }

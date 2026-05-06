@@ -36,11 +36,13 @@ let () =
   let prog = Verible_to_behavioral.convert_files ~top files in
   if prog.modules = [] then fail "Verible produced no modules";
 
-  (* Full BIR elaboration pipeline — same passes as test_cva6_ff_diff
-     uses for its dumps; gives us flat behavioural code closer to the
-     gate level.  Note: flatten here does NOT kill hierarchy; it's a
-     boundary-preserving wrapper-stripper.  Hierarchy is handled in
-     hier_synth.synth_program. *)
+  (* Intra-module elaboration only — DO NOT run Behavioral_flatten
+     here.  Flatten is a hierarchical inlining pass that pulls
+     combinational children's signals + processes into their parents;
+     for our hier-synth flow that defeats the whole boundary-preserving
+     architecture and produces parent modules with `child.signal` style
+     names that ORFS would reject anyway.  Hierarchy is handled module-
+     by-module in [Hier_synth.synth_program]. *)
   let prog =
     prog
     |> Behavioral_unroll.unroll_program
@@ -48,7 +50,6 @@ let () =
     |> Behavioral_iflift.lift_program
     |> Behavioral_blocking_subst.blocking_subst_program
     |> Behavioral_meminfer.infer_program
-    |> Behavioral_flatten.flatten_program
   in
 
   if not (List.exists
