@@ -436,22 +436,60 @@ let rec walk ctx sig_ =
              ctx.assigns <- (out_name,
                "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
            end
-       | Mux { select; cases = [a; b]; _ } ->
+       | Mux { select; cases; _ } ->
            let sn = walk ctx select in
-           let an = walk ctx a and bn = walk ctx b in
+           let case_names = List.map (walk ctx) cases in
+           let n = List.length case_names in
            ctx.wires <- (out_name, w) :: ctx.wires;
-           let inst_list, per_bit = blast_mux ~out_name ~width:w
-             ~sel_name:sn ~a_name:an ~b_name:bn in
-           ctx.insts <- inst_list @ ctx.insts;
-           if per_bit <> [] then begin
-             List.iter (fun b -> ctx.wires <- (b, 1) :: ctx.wires) per_bit;
-             ctx.assigns <- (out_name,
-               "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
+           if n = 2 then begin
+             (* Fast path: hardcaml MUX with 1-bit select. *)
+             let an = List.nth case_names 0 in
+             let bn = List.nth case_names 1 in
+             let inst_list, per_bit = blast_mux ~out_name ~width:w
+               ~sel_name:sn ~a_name:an ~b_name:bn in
+             ctx.insts <- inst_list @ ctx.insts;
+             if per_bit <> [] then begin
+               List.iter (fun b -> ctx.wires <- (b, 1) :: ctx.wires) per_bit;
+               ctx.assigns <- (out_name,
+                 "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
+             end
            end
-       | Mux _ ->
-           (* N-way mux: fall through to assign — uncommon in the
-              kind of netlist hardcaml emits for our designs. *)
-           ()
+           else begin
+             (* N-way mux: build a tree of 2:1 muxes, one level per
+                select bit.  Hardcaml's [Signal.mux] treats over-range
+                select values as picking the LAST case, so we pad odd
+                groups with the last case to mirror that. *)
+             let sel_w = width select in
+             let mux2 ~level ~sel_bit a_net b_net =
+               let mid = mint "muxw" in
+               ctx.wires <- (mid, w) :: ctx.wires;
+               let inst_list, per_bit = blast_mux ~out_name:mid ~width:w
+                 ~sel_name:sel_bit ~a_name:a_net ~b_name:b_net in
+               ctx.insts <- inst_list @ ctx.insts;
+               if per_bit <> [] then begin
+                 List.iter (fun b -> ctx.wires <- (b, 1) :: ctx.wires) per_bit;
+                 ctx.assigns <- (mid,
+                   "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
+               end;
+               let _ = level in
+               mid in
+             let rec reduce level lst =
+               match lst with
+               | [] -> "1'b0"
+               | [x] -> x
+               | _ ->
+                   let sel_bit = if sel_w = 1 then sn
+                                 else Printf.sprintf "%s[%d]" sn level in
+                   let rec pair = function
+                     | [] -> []
+                     | [a] -> [a]  (* odd: leave alone, will appear at next level *)
+                     | a :: b :: rest -> mux2 ~level ~sel_bit a b :: pair rest in
+                   reduce (level + 1) (pair lst)
+             in
+             let result = reduce 0 case_names in
+             if result <> out_name then
+               ctx.assigns <- (out_name, result) :: ctx.assigns
+           end
        | Wire { driver; _ } ->
            (* For input ports, the wire's driver is Empty — leave
               the wire alone, it's driven externally.  Otherwise
