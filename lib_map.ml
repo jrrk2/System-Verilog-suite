@@ -96,22 +96,17 @@ let bit_net signal_name bit_idx width =
 
 (* ── Walk + map ──────────────────────────────────────────────── *)
 
-(* For multi-bit cells, drive each cell's output to a fresh per-bit
-   wire and let the caller emit ONE concat assign reconstructing the
-   bus.  Direct `.Z(out_name[i])` per-bit drives lose their indices
-   when Verible's BIR converter sees them on a non-BArray bus, so we
-   route through fresh wires that the converter handles cleanly.
-   Returns (cell instances, per-bit wire names to declare + concat,
-   per-bit width = 1 each). *)
+(* For each multi-bit op2, bit-blast: emit width copies of the
+   per-bit cell, each instance reads bit i of arg_a and arg_b,
+   drives bit i of the output. *)
 let blast_op2 ~cell ~out_name ~width ~a_name ~b_name ~a_w ~b_w =
   let insts = ref [] in
-  let per_bit = ref [] in
   for i = 0 to width - 1 do
     let inst_name = mint cell.cell_name in
     let ai = if a_w = 1 then a_name else Printf.sprintf "%s[%d]" a_name i in
     let bi = if b_w = 1 then b_name else Printf.sprintf "%s[%d]" b_name i in
-    let oi = if width = 1 then out_name else mint "bit" in
-    if width <> 1 then per_bit := oi :: !per_bit;
+    let oi = if width = 1 then out_name
+             else Printf.sprintf "%s[%d]" out_name i in
     insts := { cell; inst_name;
                conns = [
                  { pin = List.nth cell.in_pins 0; net = ai };
@@ -119,33 +114,30 @@ let blast_op2 ~cell ~out_name ~width ~a_name ~b_name ~a_w ~b_w =
                  { pin = cell.out_pin; net = oi };
                ] } :: !insts
   done;
-  (List.rev !insts, !per_bit)  (* per_bit already MSB-first via reversal *)
+  List.rev !insts
 
 let blast_unary ~cell ~out_name ~width ~a_name ~a_w =
   let insts = ref [] in
-  let per_bit = ref [] in
   for i = 0 to width - 1 do
     let inst_name = mint cell.cell_name in
     let ai = if a_w = 1 then a_name else Printf.sprintf "%s[%d]" a_name i in
-    let oi = if width = 1 then out_name else mint "bit" in
-    if width <> 1 then per_bit := oi :: !per_bit;
+    let oi = if width = 1 then out_name
+             else Printf.sprintf "%s[%d]" out_name i in
     insts := { cell; inst_name;
                conns = [
                  { pin = List.hd cell.in_pins; net = ai };
                  { pin = cell.out_pin;        net = oi };
                ] } :: !insts
   done;
-  (List.rev !insts, !per_bit)
+  List.rev !insts
 
 let blast_mux ~out_name ~width ~sel_name ~a_name ~b_name =
   let insts = ref [] in
-  let per_bit = ref [] in
   for i = 0 to width - 1 do
     let inst_name = mint cell_mux.cell_name in
     let ai = if width = 1 then a_name else Printf.sprintf "%s[%d]" a_name i in
     let bi = if width = 1 then b_name else Printf.sprintf "%s[%d]" b_name i in
-    let oi = if width = 1 then out_name else mint "bit" in
-    if width <> 1 then per_bit := oi :: !per_bit;
+    let oi = if width = 1 then out_name else Printf.sprintf "%s[%d]" out_name i in
     insts := { cell = cell_mux; inst_name;
                conns = [
                  { pin = "A"; net = ai };
@@ -154,7 +146,7 @@ let blast_mux ~out_name ~width ~sel_name ~a_name ~b_name =
                  { pin = cell_mux.out_pin; net = oi };
                ] } :: !insts
   done;
-  (List.rev !insts, !per_bit)
+  List.rev !insts
 
 (* ── Bit-blasted arithmetic / compare (#103b) ─────────────────────
 
@@ -373,14 +365,9 @@ let rec walk ctx sig_ =
            in
            (match signal_op_kind op with
             | Some cell ->
-                let inst_list, per_bit = blast_op2 ~cell ~out_name ~width:w
+                let inst_list = blast_op2 ~cell ~out_name ~width:w
                                   ~a_name:an ~b_name:bn ~a_w ~b_w in
-                ctx.insts <- inst_list @ ctx.insts;
-                if per_bit <> [] then begin
-                  List.iter (fun b -> ctx.wires <- (b, 1) :: ctx.wires) per_bit;
-                  ctx.assigns <- (out_name,
-                    "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
-                end
+                ctx.insts <- inst_list @ ctx.insts
             | None ->
                 (match op with
                  | Hardcaml.Signal.Type.Signal_eq ->
@@ -392,21 +379,13 @@ let rec walk ctx sig_ =
                      let sums, _co, insts, wires_ =
                        gen_sub ~a_name:an ~a_w ~b_name:bn ~b_w in
                      absorb_helper insts wires_;
-                     (* Emit ONE concat assign rather than N per-bit
-                        ones — Verible's BIR converter drops slice
-                        indices on bare-named LHS, so [out[i] = sX]
-                        collapses to multiple drives of [out].  A
-                        single [out = {s_w-1, …, s_0}] avoids that. *)
-                     let sums = let n = min w (List.length sums) in
-                                List.filteri (fun i _ -> i < n) sums in
-                     if w = 1 then
-                       (match sums with
-                        | [s] -> ctx.assigns <- (out_name, s) :: ctx.assigns
-                        | _ -> ())
-                     else
-                       let concat_rhs =
-                         "{" ^ String.concat ", " (List.rev sums) ^ "}" in
-                       ctx.assigns <- (out_name, concat_rhs) :: ctx.assigns
+                     (* Per-bit alias the requested out_name[i] to sums[i]. *)
+                     List.iteri (fun i s ->
+                       let oi = if w = 1 then out_name
+                                else Printf.sprintf "%s[%d]" out_name i in
+                       ctx.assigns <- (oi, s) :: ctx.assigns
+                     ) (let n = min w (List.length sums) in
+                        List.filteri (fun i _ -> i < n) sums)
                  | Signal_lt ->
                      let res, insts, wires_ =
                        gen_lt ~a_name:an ~a_w ~b_name:bn ~b_w in
@@ -428,68 +407,20 @@ let rec walk ctx sig_ =
        | Not { arg; _ } ->
            let an = walk ctx arg in
            ctx.wires <- (out_name, w) :: ctx.wires;
-           let inst_list, per_bit = blast_unary ~cell:cell_inv ~out_name ~width:w
-             ~a_name:an ~a_w:(width arg) in
-           ctx.insts <- inst_list @ ctx.insts;
-           if per_bit <> [] then begin
-             List.iter (fun b -> ctx.wires <- (b, 1) :: ctx.wires) per_bit;
-             ctx.assigns <- (out_name,
-               "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
-           end
-       | Mux { select; cases; _ } ->
+           ctx.insts <-
+             blast_unary ~cell:cell_inv ~out_name ~width:w
+               ~a_name:an ~a_w:(width arg) @ ctx.insts
+       | Mux { select; cases = [a; b]; _ } ->
            let sn = walk ctx select in
-           let case_names = List.map (walk ctx) cases in
-           let n = List.length case_names in
+           let an = walk ctx a and bn = walk ctx b in
            ctx.wires <- (out_name, w) :: ctx.wires;
-           if n = 2 then begin
-             (* Fast path: hardcaml MUX with 1-bit select. *)
-             let an = List.nth case_names 0 in
-             let bn = List.nth case_names 1 in
-             let inst_list, per_bit = blast_mux ~out_name ~width:w
-               ~sel_name:sn ~a_name:an ~b_name:bn in
-             ctx.insts <- inst_list @ ctx.insts;
-             if per_bit <> [] then begin
-               List.iter (fun b -> ctx.wires <- (b, 1) :: ctx.wires) per_bit;
-               ctx.assigns <- (out_name,
-                 "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
-             end
-           end
-           else begin
-             (* N-way mux: build a tree of 2:1 muxes, one level per
-                select bit.  Hardcaml's [Signal.mux] treats over-range
-                select values as picking the LAST case, so we pad odd
-                groups with the last case to mirror that. *)
-             let sel_w = width select in
-             let mux2 ~level ~sel_bit a_net b_net =
-               let mid = mint "muxw" in
-               ctx.wires <- (mid, w) :: ctx.wires;
-               let inst_list, per_bit = blast_mux ~out_name:mid ~width:w
-                 ~sel_name:sel_bit ~a_name:a_net ~b_name:b_net in
-               ctx.insts <- inst_list @ ctx.insts;
-               if per_bit <> [] then begin
-                 List.iter (fun b -> ctx.wires <- (b, 1) :: ctx.wires) per_bit;
-                 ctx.assigns <- (mid,
-                   "{" ^ String.concat ", " per_bit ^ "}") :: ctx.assigns
-               end;
-               let _ = level in
-               mid in
-             let rec reduce level lst =
-               match lst with
-               | [] -> "1'b0"
-               | [x] -> x
-               | _ ->
-                   let sel_bit = if sel_w = 1 then sn
-                                 else Printf.sprintf "%s[%d]" sn level in
-                   let rec pair = function
-                     | [] -> []
-                     | [a] -> [a]  (* odd: leave alone, will appear at next level *)
-                     | a :: b :: rest -> mux2 ~level ~sel_bit a b :: pair rest in
-                   reduce (level + 1) (pair lst)
-             in
-             let result = reduce 0 case_names in
-             if result <> out_name then
-               ctx.assigns <- (out_name, result) :: ctx.assigns
-           end
+           ctx.insts <-
+             blast_mux ~out_name ~width:w
+               ~sel_name:sn ~a_name:an ~b_name:bn @ ctx.insts
+       | Mux _ ->
+           (* N-way mux: fall through to assign — uncommon in the
+              kind of netlist hardcaml emits for our designs. *)
+           ()
        | Wire { driver; _ } ->
            (* For input ports, the wire's driver is Empty — leave
               the wire alone, it's driven externally.  Otherwise
@@ -692,40 +623,20 @@ let alias_resolve ~outputs (nl : netlist) : netlist =
   let aliases = Hashtbl.create 16 in
   let out_set = Hashtbl.create 16 in
   List.iter (fun (n, _) -> Hashtbl.replace out_set n ()) outputs;
-  (* Iterate to fixed point: each pass discovers `lhs = rhs` assigns
-     where lhs is a port (or already aliased to one) and rhs is a
-     bare identifier; record [aliases.{rhs} = lhs's resolved name]
-     and drop the assign.  Subsequent passes pick up the chain via
-     dependents like `_n_1_ = _n_2_` which, once `_n_1_` aliases to
-     `out`, become `out = _n_2_` and themselves drop. *)
-  let bare_id_re = Str.regexp "^[_$a-zA-Z][_$a-zA-Z0-9]*$" in
-  let resolve_chain x =
-    let rec loop x = match Hashtbl.find_opt aliases x with
-      | Some y when y <> x -> loop y
-      | _ -> x in
-    loop x in
-  let rec sweep assigns =
-    let progressed = ref false in
-    let kept = List.filter (fun (lhs, rhs) ->
-      let lhs_resolved = resolve_chain lhs in
-      let is_port = Hashtbl.mem out_set lhs_resolved in
-      if is_port && Str.string_match bare_id_re rhs 0
-         && rhs <> lhs_resolved
-         && not (Hashtbl.mem aliases rhs) then begin
-        Hashtbl.replace aliases rhs lhs_resolved;
-        progressed := true;
-        false
-      end else true
-    ) assigns in
-    if !progressed then sweep kept else kept
-  in
-  let kept_assigns = sweep nl.assigns in
+  let kept_assigns = List.filter (fun (lhs, rhs) ->
+    if Hashtbl.mem out_set lhs
+       (* RHS must be a single bare identifier — not a slice, concat,
+          or constant.  Use a strict regex to avoid catching e.g.
+          `assign out = {a, b};`. *)
+       && Str.string_match
+            (Str.regexp "^[_$a-zA-Z][_$a-zA-Z0-9]*$") rhs 0
+    then begin
+      Hashtbl.replace aliases rhs lhs;
+      false
+    end else true
+  ) nl.assigns in
   if Hashtbl.length aliases = 0 then nl
-  else begin
-    if Sys.getenv_opt "ALIAS_DEBUG" <> None then begin
-      Hashtbl.iter (fun k v -> Printf.eprintf "[alias] %s -> %s\n" k v) aliases;
-      List.iter (fun (l, r) -> Printf.eprintf "[before] %s = %s\n" l r) nl.assigns
-    end;
+  else
     let rewrite_id id =
       (* Match `name` or `name[i]` / `name[hi:lo]` and rewrite name. *)
       try
@@ -770,7 +681,6 @@ let alias_resolve ~outputs (nl : netlist) : netlist =
       assigns = List.map rewrite_assign kept_assigns;
       wires   = List.filter (fun (n, _) -> not (Hashtbl.mem aliases n)) nl.wires;
     }
-  end
 
 let map_circuit (circuit : Hardcaml.Circuit.t) =
   next_id := 0;

@@ -968,27 +968,10 @@ let extract_port_decl ~pkgs ~params tok =
     walk_loose tok
   end;
   let w = width_of ~pkgs ~params tok in
-  (* Detect unpacked-array decl: `wire [W:0] arr[D:0]` carries TWO
-     decl_variable_dimensions in the net_declaration subtree.  Treat
-     the FIRST as the per-element width (packed) and the SECOND as
-     the array depth (unpacked).  Without this, the unpacked dim is
-     silently lost and downstream lowering can't recognise the array
-     pattern.  Single-dim case remains BInt. *)
-  let dims = extract_packed_dims ~pkgs ~params tok in
-  let stype =
-    match dims with
-    | [(im, il); (om, ol)] ->
-        let elem_w = abs (im - il) + 1 in
-        let size   = abs (om - ol) + 1 in
-        BArray { element = BInt { width = elem_w; signed = Unsigned };
-                 size }
-    | _ ->
-        BInt { width = w; signed = Unsigned }
-  in
   List.rev !names |> List.sort_uniq compare |> List.map (fun n ->
     {
       name = n;
-      stype;
+      stype = BInt { width = w; signed = Unsigned };
       direction = !dir;
       initial_value = None; attrs = [];
     })
@@ -1808,22 +1791,20 @@ let convert_module ~pkgs (mdecl : module_decl)
         | None -> None
       ) var_nodes
   ) instbase_nodes in
-  let internal_signals =
-    (List.concat_map (extract_port_decl ~pkgs ~params) net_nodes
-     |> List.map (fun s -> { s with direction = `Internal }))
-    @ reg_var_signals
-  in
   (* Names of memory-array signals — used by the assign/always
    * handlers below to switch indexed lhs to `@mem_write` and indexed
-   * rhs to BSelect.  Picks up both reg-style declarations and
-   * net-style ones (`wire [W:0] arr[D:0]`) once
-   * extract_port_decl emits BArray for the latter. *)
+   * rhs to BSelect. *)
   let array_names =
     List.filter_map (fun (s : bsignal) ->
       match s.stype with
       | BArray _ -> Some s.name
       | _ -> None
-    ) internal_signals
+    ) reg_var_signals
+  in
+  let internal_signals =
+    (List.concat_map (extract_port_decl ~pkgs ~params) net_nodes
+     |> List.map (fun s -> { s with direction = `Internal }))
+    @ reg_var_signals
   in
   (* Merge by name. When the same signal appears twice (bare name from
    * the port-list AND an explicit K&R `output [W:0] X;` decl), the

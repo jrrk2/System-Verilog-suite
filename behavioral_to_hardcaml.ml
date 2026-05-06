@@ -14,10 +14,6 @@ type conv_context = {
   scope: Scope.t;
   mutable clock: Signal.t option;
   mutable reset: Signal.t option;
-  (* Per-element width for BArray signals — populated by the pre-pass
-     in [create_circuit] from each bsignal's stype.  Lets BSelect
-     compute the right slice for dynamic indexing. *)
-  array_elem_w: (string, int) Hashtbl.t;
 }
 
 (* Get width from behavioral IR type *)
@@ -172,28 +168,8 @@ let rec expr_to_signal ctx = function
   | BSelect { array; index } ->
       let s_array = expr_to_signal ctx array in
       let s_index = expr_to_signal ctx index in
-      (* Need the per-element width to know how many bits to peel off
-         per index value.  Look it up from [ctx.array_elem_w] when
-         the array root is a BVar; otherwise fall back to width-1
-         bit-select (legacy behaviour). *)
-      let elem_w =
-        match array with
-        | BVar n -> Hashtbl.find_opt ctx.array_elem_w n
-        | _ -> None in
-      (match elem_w with
-       | None -> s_array
-       | Some elem_w ->
-           let total_w = Signal.width s_array in
-           let size = total_w / elem_w in
-           if size <= 1 then s_array
-           else
-             (* Build a mux: for each index value k, the slice
-                array[(k+1)*elem_w - 1 : k*elem_w]. *)
-             let cases = List.init size (fun k ->
-               let hi = (k + 1) * elem_w - 1 in
-               let lo = k * elem_w in
-               Signal.select s_array hi lo) in
-             Signal.mux s_index cases)
+      (* Simplified: treat as direct selection *)
+      s_array
 
   | BSlice { signal; msb; lsb } ->
       let s = expr_to_signal ctx signal in
@@ -335,7 +311,6 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
     scope;
     clock = None;
     reset = None;
-    array_elem_w = Hashtbl.create 8;
   } in
   (* Clock/reset get bound by [process_to_always] when each
      BSequential block tells us its clock and reset signal names
@@ -370,7 +345,6 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     scope;
     clock = None;
     reset = None;
-    array_elem_w = Hashtbl.create 8;
   } in
 
   (* Clock/reset get bound by [process_to_always] when each
@@ -420,12 +394,6 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     bmod.processes;
 
   List.iter (fun (s : Behavioral_ir.bsignal) ->
-    (* Record per-element width for BArray signals so [BSelect] can
-       slice the flat representation correctly. *)
-    (match s.stype with
-     | BArray { element; _ } ->
-         Hashtbl.replace ctx.array_elem_w s.name (width_of_btype element)
-     | _ -> ());
     if s.direction <> `Input
        && not (List.mem_assoc s.name ctx.variables) then begin
       let w = width_of_btype s.stype in
