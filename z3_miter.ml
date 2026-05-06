@@ -28,6 +28,11 @@ let ctx = Z3.mk_context [
 (* Signal cache for Z3 variables *)
 let signal_cache : (string, Z3.Expr.expr) Hashtbl.t = Hashtbl.create 256
 
+(* Per-array elem_w table — populated from BArray bsignals so
+   BSelect with a dynamic index can pick the right elem_w-bit slice
+   instead of defaulting to a single-bit extract. *)
+let array_elem_w_table : (string, int) Hashtbl.t = Hashtbl.create 16
+
 (* Create or lookup a bitvector variable *)
 let bv_var name width suffix =
   let full_name = name ^ suffix in
@@ -335,30 +340,43 @@ let rec expr_to_z3 suffix ctx_sigs = function
              | None -> None)
         | _ -> None
       in
+      let elem_w =
+        match array with
+        | BVar n -> Hashtbl.find_opt array_elem_w_table n
+        | _ -> None in
+      let z3_array = expr_to_z3 suffix ctx_sigs array in
+      let arr_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
+      let elem_w = match elem_w with Some w -> w | None -> 1 in
+      let size = arr_w / elem_w in
       (match eval_const index with
        | Some value ->
-           let z3_array = expr_to_z3 suffix ctx_sigs array in
-           let arr_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
-           if value >= arr_w then
-             Z3.BitVector.mk_numeral ctx "0" 1
+           if value >= size then
+             Z3.BitVector.mk_numeral ctx "0" elem_w
            else
-             Z3.BitVector.mk_extract ctx value value z3_array
+             let hi = (value + 1) * elem_w - 1 in
+             let lo = value * elem_w in
+             Z3.BitVector.mk_extract ctx hi lo z3_array
        | None ->
-           (* Variable index: `array >> idx` then take low bit. The
-            * shift is at the array's width; widen the index to match. *)
-           let z3_array = expr_to_z3 suffix ctx_sigs array in
            let z3_idx = expr_to_z3 suffix ctx_sigs index in
-           let aw = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
-           let iw = Z3.BitVector.get_size (Z3.Expr.get_sort z3_idx) in
-           let z3_idx =
-             if iw = aw then z3_idx
-             else if iw < aw then
-               Z3.BitVector.mk_zero_ext ctx (aw - iw) z3_idx
-             else
-               Z3.BitVector.mk_extract ctx (aw - 1) 0 z3_idx
-           in
-           let shifted = Z3.BitVector.mk_lshr ctx z3_array z3_idx in
-           Z3.BitVector.mk_extract ctx 0 0 shifted)
+           if size <= 1 then
+             Z3.BitVector.mk_extract ctx (elem_w - 1) 0 z3_array
+           else
+             (* Build a Z3 ITE chain: index == k → array[(k+1)*elem_w-1 :
+                k*elem_w] for k = 0..size-1, falling back to k=size-1. *)
+             let iw = Z3.BitVector.get_size (Z3.Expr.get_sort z3_idx) in
+             let mk_idx_const k =
+               Z3.BitVector.mk_numeral ctx (string_of_int k) iw in
+             let mk_slice k =
+               let hi = (k + 1) * elem_w - 1 in
+               let lo = k * elem_w in
+               Z3.BitVector.mk_extract ctx hi lo z3_array in
+             let rec build k =
+               if k >= size - 1 then mk_slice (size - 1)
+               else
+                 let cond = Z3.Boolean.mk_eq ctx z3_idx (mk_idx_const k) in
+                 Z3.Boolean.mk_ite ctx cond (mk_slice k) (build (k + 1))
+             in
+             build 0)
   | BCall _ ->
       (* Unsupported for now *)
       Z3.BitVector.mk_numeral ctx "0" 32
@@ -552,6 +570,14 @@ let infer_widths_from_module bmod =
 
 (* Build signal width context from module *)
 let build_signal_context bmod =
+  Hashtbl.clear array_elem_w_table;
+  List.iter (fun (s : Behavioral_ir.bsignal) ->
+    match s.stype with
+    | BArray { element; _ } ->
+        Hashtbl.replace array_elem_w_table s.name
+          (width_of_btype element)
+    | _ -> ()
+  ) bmod.signals;
   let widths = infer_widths_from_module bmod in
   Hashtbl.fold (fun name width acc -> (name, width) :: acc) widths []
 

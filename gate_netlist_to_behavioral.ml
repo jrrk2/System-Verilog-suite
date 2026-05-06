@@ -345,14 +345,18 @@ let ansi_rewrite src =
   let module_re = Str.regexp
     "module[ \t\n]+\\([A-Za-z_][A-Za-z0-9_]*\\)[ \t\n]*(\
      \\([^)]*\\))[ \t\n]*;" in
+  (* Identifier class includes `$` because PYMTL-generated SV uses
+     names like `in_$002`.  Without the `$`, the regex fails to
+     match port-decl lines for those names and the ANSI rewrite
+     drops their width — giving 1-bit ports in BIR. *)
   let port_decl_re = Str.regexp
     "[ \t]*\\(input\\|output\\|inout\\)[ \t]*\
      \\(\\[[^]]*\\][ \t]*\\)?\
-     \\([A-Za-z_][A-Za-z0-9_]*\\)[ \t]*;" in
+     \\([A-Za-z_$][A-Za-z0-9_$]*\\)[ \t]*;" in
   let wire_decl_re = Str.regexp
     "[ \t]*wire[ \t]*\
      \\(\\[[^]]*\\][ \t]*\\)?\
-     \\([A-Za-z_][A-Za-z0-9_]*\\)[ \t]*;" in
+     \\([A-Za-z_$][A-Za-z0-9_$]*\\)[ \t]*;" in
   let m =
     try Some (Str.search_forward module_re src 0) with Not_found -> None in
   if m = None then src
