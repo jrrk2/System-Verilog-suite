@@ -612,6 +612,76 @@ let dce ~root_nets (nl : netlist) : netlist =
     wires   = List.filter wire_alive nl.wires;
   }
 
+(* When the netlist contains `assign port = _n_X_;` where `port` is
+   a real output and `_n_X_` is an internal hardcaml-minted alias,
+   rewrite all references to `_n_X_` (including per-bit slices) to
+   reference `port` directly, then drop the assign.  This makes the
+   FF's Q net carry the port name — required by the Z3 miter, which
+   matches registers across designs by name.  Inert for other
+   downstream tools. *)
+let alias_resolve ~outputs (nl : netlist) : netlist =
+  let aliases = Hashtbl.create 16 in
+  let out_set = Hashtbl.create 16 in
+  List.iter (fun (n, _) -> Hashtbl.replace out_set n ()) outputs;
+  let kept_assigns = List.filter (fun (lhs, rhs) ->
+    if Hashtbl.mem out_set lhs
+       (* RHS must be a single bare identifier — not a slice, concat,
+          or constant.  Use a strict regex to avoid catching e.g.
+          `assign out = {a, b};`. *)
+       && Str.string_match
+            (Str.regexp "^[_$a-zA-Z][_$a-zA-Z0-9]*$") rhs 0
+    then begin
+      Hashtbl.replace aliases rhs lhs;
+      false
+    end else true
+  ) nl.assigns in
+  if Hashtbl.length aliases = 0 then nl
+  else
+    let rewrite_id id =
+      (* Match `name` or `name[i]` / `name[hi:lo]` and rewrite name. *)
+      try
+        let bracket = String.index id '[' in
+        let bare = String.sub id 0 bracket in
+        let suffix = String.sub id bracket (String.length id - bracket) in
+        match Hashtbl.find_opt aliases bare with
+        | Some new_name -> new_name ^ suffix
+        | None -> id
+      with Not_found ->
+        (match Hashtbl.find_opt aliases id with
+         | Some new_name -> new_name
+         | None -> id) in
+    let rewrite_net s =
+      (* Replace each bare identifier matched by id_re with its
+         alias rewrite. *)
+      let buf = Buffer.create (String.length s) in
+      let pos = ref 0 in
+      let len = String.length s in
+      let rec loop () =
+        if !pos >= len then ()
+        else
+          try
+            let mstart = Str.search_forward id_re s !pos in
+            Buffer.add_substring buf s !pos (mstart - !pos);
+            let full = Str.matched_string s in
+            Buffer.add_string buf (rewrite_id full);
+            pos := Str.match_end ();
+            loop ()
+          with Not_found ->
+            Buffer.add_substring buf s !pos (len - !pos)
+      in
+      loop ();
+      Buffer.contents buf in
+    let rewrite_inst (i : instance) =
+      { i with conns = List.map (fun c ->
+          { c with net = rewrite_net c.net }) i.conns } in
+    let rewrite_assign (lhs, rhs) = (rewrite_id lhs, rewrite_net rhs) in
+    {
+      nl with
+      insts   = List.map rewrite_inst nl.insts;
+      assigns = List.map rewrite_assign kept_assigns;
+      wires   = List.filter (fun (n, _) -> not (Hashtbl.mem aliases n)) nl.wires;
+    }
+
 let map_circuit (circuit : Hardcaml.Circuit.t) =
   next_id := 0;
   let ctx = {
@@ -629,14 +699,14 @@ let map_circuit (circuit : Hardcaml.Circuit.t) =
   let raw_assigns = List.rev ctx.assigns in
   let final_insts, final_assigns, tie_wires =
     tie_resolve (raw_insts, raw_assigns) in
-  {
+  let pre_alias = {
     inputs;
     outputs;
-    (* Drop wires that are also ports (avoid duplicate decls). *)
     wires =
       List.filter (fun (n, _) ->
         not (List.mem_assoc n inputs) && not (List.mem_assoc n outputs))
         (ctx.wires @ tie_wires);
     insts = final_insts;
     assigns = final_assigns;
-  }
+  } in
+  alias_resolve ~outputs pre_alias

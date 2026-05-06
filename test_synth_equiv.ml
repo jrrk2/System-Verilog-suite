@@ -22,6 +22,53 @@
 
 open Behavioral_ir
 
+(* Verible's BIR converter only records instances of modules it has
+   seen in its compilation unit (the call to specialise_design
+   filters unknown ones).  For our cell-mapped output the cells are
+   library primitives whose Verilog bodies aren't part of the file —
+   so without stub modules, every cell instance is silently dropped.
+
+   We synthesise empty-body stubs from the Liberty file so Verible
+   counts each cell instance as a real instantiation, then
+   gate_netlist_to_behavioral expands them using the Liberty
+   function expressions. *)
+let generate_cell_stubs lib_file cell_file =
+  let lib = Sv_liberty.parse_liberty_file lib_file in
+  (* Find every cell type used in the cell-mapped file by simple
+     line scan: `CELLNAME instance_name ( ... )`. *)
+  let used = Hashtbl.create 16 in
+  let ic = open_in cell_file in
+  (try
+    while true do
+      let line = input_line ic in
+      let trimmed = String.trim line in
+      let re = Str.regexp "^\\([A-Z][A-Z0-9_]*\\) +[_A-Za-z]" in
+      if Str.string_match re trimmed 0 then begin
+        let cell_name = Str.matched_group 1 trimmed in
+        if Hashtbl.mem lib.cells cell_name then
+          Hashtbl.replace used cell_name ()
+      end
+    done
+  with End_of_file -> ());
+  close_in ic;
+
+  let stubs_path = Filename.temp_file "cell_stubs_" ".v" in
+  let oc = open_out stubs_path in
+  Hashtbl.iter (fun name () ->
+    let cell = Hashtbl.find lib.cells name in
+    let port_list =
+      List.map (fun (p : Sv_liberty.pin_info) ->
+        let dir = match p.direction with
+          | Input -> "input" | Output -> "output"
+          | Inout -> "inout" | Internal -> "input" in
+        Printf.sprintf "%s %s" dir p.name
+      ) cell.pins in
+    Printf.fprintf oc "module %s (%s);\nendmodule\n\n"
+      name (String.concat ", " port_list)
+  ) used;
+  close_out oc;
+  stubs_path
+
 let usage () =
   Printf.eprintf
     "usage: %s <top> <source.sv> <cellmapped.v> <liberty.lib>\n"
@@ -52,11 +99,20 @@ let () =
   Printf.printf "Source: %d module(s)\n" (List.length src_prog.modules);
 
   (* Cell-mapped Verilog: pre-process via the gate-netlist text
-     normaliser, then run through Verible to get a bprogram with
-     binstances, then expand cells using the Liberty function
-     expressions. *)
+     normaliser, generate stub `module CELL (...)` decls for every
+     cell instantiated in the file (Verible refuses to record
+     instantiations of modules it can't see in the same compilation
+     unit), concatenate stubs + cell-mapped Verilog into one file,
+     then run Verible. *)
   let normalised_path = Gate_netlist_to_behavioral.preprocess_gate_file cell_file in
-  let cell_raw = Verible_to_behavioral.convert_files ~top [normalised_path] in
+  let stubs_path = generate_cell_stubs lib_file normalised_path in
+  let cell_raw =
+    Verible_to_behavioral.convert_files ~top [stubs_path; normalised_path] in
+  if Sys.getenv_opt "DUMP_PRE_EXPAND" <> None then
+    List.iter (fun (m : bmodule) ->
+      Printf.printf "  raw     %s: %d signals %d processes %d instances\n"
+        m.name (List.length m.signals) (List.length m.processes) (List.length m.instances)
+    ) cell_raw.modules;
   if cell_raw.modules = [] then begin
     Printf.eprintf "FATAL: Verible couldn't parse the cell-mapped file %s\n"
       cell_file;
@@ -64,11 +120,23 @@ let () =
   end;
   Printf.printf "Cells : %d module(s) before expand\n"
     (List.length cell_raw.modules);
+  if Sys.getenv_opt "DUMP_PRE_EXPAND" <> None then
+    List.iter (fun (m : bmodule) ->
+      Printf.printf "  pre-expand %s: %d signals %d processes %d instances\n"
+        m.name (List.length m.signals) (List.length m.processes) (List.length m.instances);
+      List.iter (fun (i : binstance) ->
+        Printf.printf "    inst %s : %s\n" i.inst_name i.module_name
+      ) m.instances
+    ) cell_raw.modules;
 
   let cell_behav =
     Gate_netlist_to_behavioral.expand_program_with_liberty lib_file cell_raw in
   Printf.printf "Cells : %d module(s) after  expand\n"
     (List.length cell_behav.modules);
+  if Sys.getenv_opt "DUMP_EXPAND" <> None then
+    List.iter (fun m ->
+      Printf.printf "\n%s\n" (Behavioral_ir.string_of_bmodule m)
+    ) cell_behav.modules;
   Printf.printf "\n";
 
   let by_name (p : bprogram) =
