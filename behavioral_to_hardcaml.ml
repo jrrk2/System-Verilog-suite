@@ -74,12 +74,22 @@ let rec expr_to_signal ctx = function
   | BBinOp { op; lhs; rhs; result_type } ->
       let s_lhs0 = expr_to_signal ctx lhs in
       let s_rhs0 = expr_to_signal ctx rhs in
-      (* Width-coerce both operands to a common width before applying
-         hardcaml's binary ops — these all require equal-width inputs.
-         Same root cause as in BCond: BIR width inference still leaks
-         32-bit default constants in places. *)
-      let common_w = max (Signal.width s_lhs0) (Signal.width s_rhs0) in
-      let pad s = if Signal.width s = common_w then s else Signal.uresize s common_w in
+      (* Width-coerce both operands to a common width.  Same const-
+         narrowing trick as BCond: if one operand is a BConst and the
+         other isn't, use the non-constant's width and truncate the
+         constant.  Otherwise fall back to max-width zero-extension. *)
+      let is_const = function BConst _ -> true | _ -> false in
+      let wl = Signal.width s_lhs0 and wr = Signal.width s_rhs0 in
+      let common_w =
+        match is_const lhs, is_const rhs with
+        | true,  false -> wr
+        | false, true  -> wl
+        | _ -> max wl wr in
+      let pad s =
+        let sw = Signal.width s in
+        if sw = common_w then s
+        else if sw > common_w then Signal.select s (common_w - 1) 0
+        else Signal.uresize s common_w in
       let s_lhs = pad s_lhs0 and s_rhs = pad s_rhs0 in
       let result_width = width_of_btype result_type in
       (match op with
@@ -132,15 +142,28 @@ let rec expr_to_signal ctx = function
       let s_cond = expr_to_signal ctx condition in
       let s_then = expr_to_signal ctx then_val in
       let s_else = expr_to_signal ctx else_val in
-      (* Width-coerce the two arms so [Signal.mux2] doesn't choke on
-         BIR mismatches — common cause is a default-32-bit localparam
-         constant feeding one arm while the other is a narrower
-         declared signal.  Use the wider of the two as the result
-         width and zero-extend the narrower side. *)
       let wt = Signal.width s_then and we = Signal.width s_else in
-      let w = max wt we in
-      let pad s = if Signal.width s = w then s else Signal.uresize s w in
-      Signal.mux2 s_cond (pad s_then) (pad s_else)
+      (* When one arm is a BConst that's wider than the other arm
+         (typical: a default-32-bit localparam reset_value feeding a
+         2-bit register), narrow the constant to match instead of
+         padding the non-constant up.  Without this we'd compute a
+         32-bit mux per output bit and only use the bottom 2 — every
+         bit above gets emitted as cells that downstream
+         [eliminate_dead_logic] sweeps, but only after the route
+         pass already had to handle the inflated wires. *)
+      let is_const = function BConst _ -> true | _ -> false in
+      let w =
+        match is_const then_val, is_const else_val with
+        | true,  false -> we
+        | false, true  -> wt
+        | _ -> max wt we
+      in
+      let coerce s =
+        let sw = Signal.width s in
+        if sw = w then s
+        else if sw > w then Signal.select s (w - 1) 0
+        else Signal.uresize s w in
+      Signal.mux2 s_cond (coerce s_then) (coerce s_else)
 
   | BSelect { array; index } ->
       let s_array = expr_to_signal ctx array in
