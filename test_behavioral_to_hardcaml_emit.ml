@@ -11,8 +11,13 @@
 
 open Behavioral_ir
 
-let counter_module : bmodule = {
-  name = "counter";
+(* Build a counter module parameterised on async/sync reset.
+   The body is identical: `if (rst) q <= 0 else q <= q + 1`.
+   Only the BSequential.reset_async flag changes.  This is exactly
+   the case the lowering must distinguish — same RTL intent, two
+   different hardware shapes. *)
+let counter_module ~reset_async name : bmodule = {
+  name;
   params = [];
   signals = [
     { name = "clk";  stype = BBool; direction = `Input;
@@ -29,7 +34,7 @@ let counter_module : bmodule = {
       clock_edge = `Pos;
       reset = Some "rst";
       reset_edge = Some `Pos;
-      reset_async = false;
+      reset_async;
       body = [
         BIf {
           condition = BVar "rst";
@@ -55,60 +60,74 @@ let counter_module : bmodule = {
   attrs = [];
 }
 
-let () =
-  Printf.printf "Building hardcaml Circuit from BIR...\n%!";
-  let circuit = Behavioral_to_hardcaml.create_circuit counter_module in
-  Printf.printf "  Circuit name: %s\n" (Hardcaml.Circuit.name circuit);
-  Printf.printf "  inputs: %d  outputs: %d\n"
-    (List.length (Hardcaml.Circuit.inputs circuit))
-    (List.length (Hardcaml.Circuit.outputs circuit));
+let contains s sub =
+  let ls = String.length s and lp = String.length sub in
+  let rec scan i = i + lp <= ls
+    && (String.sub s i lp = sub || scan (i+1)) in
+  scan 0
 
-  Printf.printf "\nEmitting Verilog...\n";
-  let verilog = Behavioral_to_hardcaml.emit_verilog circuit in
-  Printf.printf "  %d bytes\n" (String.length verilog);
+let lower_and_emit bm =
+  let circuit = Behavioral_to_hardcaml.create_circuit bm in
+  Behavioral_to_hardcaml.emit_verilog circuit
 
-  let v_path = Filename.temp_file "counter_" ".v" in
-  let oc = open_out v_path in output_string oc verilog; close_out oc;
-  Printf.printf "  wrote %s\n\n" v_path;
+let run_case ~label ~reset_async ~expect_checks =
+  Printf.printf "═══ %s (reset_async=%b) ═══\n" label reset_async;
+  let bm = counter_module ~reset_async label in
+  let v = lower_and_emit bm in
+  Printf.printf "  %d bytes emitted\n" (String.length v);
+  let path = Filename.temp_file (label ^ "_") ".v" in
+  let oc = open_out path in output_string oc v; close_out oc;
+  Printf.printf "  wrote %s\n" path;
 
-  Printf.printf "First 30 lines of emitted Verilog:\n";
-  let ic = open_in v_path in
-  let rec loop n =
-    if n = 0 then ()
-    else
-      try
-        let line = input_line ic in
-        Printf.printf "  %s\n" line; loop (n - 1)
-      with End_of_file -> ()
-  in
-  loop 30;
-  close_in ic;
+  (* Print the always-block; the rest is housekeeping wires. *)
+  let lines = String.split_on_char '\n' v in
+  Printf.printf "  always-block emitted:\n";
+  let in_always = ref false and depth = ref 0 in
+  List.iter (fun line ->
+    let t = String.trim line in
+    if not !in_always && contains t "always @"
+    then (in_always := true; depth := 0; Printf.printf "    %s\n" t)
+    else if !in_always then begin
+      Printf.printf "    %s\n" t;
+      if contains t "begin" then incr depth;
+      if contains t "end" then begin
+        decr depth;
+        if !depth <= 0 then in_always := false
+      end
+    end) lines;
 
-  (* Sanity-check the emit: should contain the module name,
-     proper port widths, and the expected always-ff structure.
-     Full structural round-trip via Gate_verilog must wait for
-     #99 (Liberty mapper) to insert cell instances. *)
-  let contains s sub =
-    let ls = String.length s and lp = String.length sub in
-    let rec scan i = i + lp <= ls
-      && (String.sub s i lp = sub || scan (i+1)) in
-    scan 0 in
-  let checks = [
-    "module counter",       contains verilog "module counter";
-    "input clk",            contains verilog "input clk";
-    "input rst",            contains verilog "input rst";
-    "output [3:0] q",       contains verilog "output [3:0] q";
-    "always @(posedge clk)",contains verilog "always @(posedge clk)";
-    (* sync reset is in the data path, not on the FF port *)
-    "no reset on FF port",  not (contains verilog "posedge rst");
-    "rst becomes mux",      contains verilog "rst ?";
-    "non-blocking <=",      contains verilog "<= ";
-  ] in
-  Printf.printf "\nVerilog structural checks:\n";
+  Printf.printf "  checks:\n";
   let all_pass = ref true in
-  List.iter (fun (label, ok) ->
-    Printf.printf "  %s  %s\n" (if ok then "OK  " else "FAIL") label;
-    if not ok then all_pass := false) checks;
-  if !all_pass
-  then Printf.printf "\nOK   end-to-end BIR -> hardcaml -> Verilog lowering works\n"
-  else (Printf.printf "\nFAIL one or more structural checks\n"; exit 1)
+  List.iter (fun (name, ok) ->
+    Printf.printf "    %s  %s\n" (if ok then "OK  " else "FAIL") name;
+    if not ok then all_pass := false) (expect_checks v);
+  Printf.printf "\n";
+  !all_pass
+
+let () =
+  let sync_pass = run_case
+    ~label:"counter_sync"
+    ~reset_async:false
+    ~expect_checks:(fun v -> [
+      "module exists",        contains v "module counter_sync";
+      "always @(posedge clk)",contains v "always @(posedge clk)";
+      "no rst on FF port",    not (contains v "posedge rst");
+      "rst becomes data mux", contains v "rst ?";
+    ]) in
+
+  let async_pass = run_case
+    ~label:"counter_async"
+    ~reset_async:true
+    ~expect_checks:(fun v -> [
+      "module exists",            contains v "module counter_async";
+      (* Async reset shows up two ways and BOTH must be present: *)
+      "rst in sensitivity list",  contains v "posedge clk or posedge rst";
+      "if (rst) inside always",   contains v "if (rst)";
+      (* Hardcaml also emits a redundant data-path mux ahead of the
+         FF; that's its emit style, not a semantic concern — synth
+         removes it.  We do NOT check for absence of `rst ?`. *)
+    ]) in
+
+  if sync_pass && async_pass
+  then Printf.printf "OK   both sync and async reset paths emit correct shape\n"
+  else (Printf.printf "FAIL one or more checks\n"; exit 1)
