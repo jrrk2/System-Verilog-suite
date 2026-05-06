@@ -154,6 +154,33 @@ let rec body_to_expr fname bindings = function
   | [BReturn (Some rhs)] ->
       Some (List.fold_left (fun e (name, expr, _) ->
         subst_expr_expr name expr e) rhs bindings)
+  | [BCase { selector; cases; default }] ->
+      (* Case statement function body: convert into nested BCond
+         on `selector == case_value`, each branch being the case's
+         assignment to fname.  Default handles the fall-through. *)
+      let subst e =
+        List.fold_left (fun acc (name, expr, _) ->
+          subst_expr_expr name expr acc) e bindings in
+      let default_expr =
+        match body_to_expr fname bindings default with
+        | Some e -> e
+        | None -> BConst { value = 0; width = 1 } in
+      let result = List.fold_right (fun (case_val, case_body) acc ->
+        match body_to_expr fname bindings case_body with
+        | None -> acc  (* skip uninlinable case *)
+        | Some case_expr ->
+            BCond {
+              condition = BBinOp {
+                op = BEq;
+                lhs = subst selector;
+                rhs = subst case_val;
+                result_type = BInt { width = 1; signed = Unsigned };
+              };
+              then_val = case_expr;
+              else_val = acc;
+            }
+      ) cases default_expr in
+      Some result
   | _ -> None
 
 (* Lookup table: function name → bfunc. *)

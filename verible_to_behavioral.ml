@@ -1623,12 +1623,10 @@ let convert_module ~pkgs (mdecl : module_decl)
     else { mdecl with m_body =
       Verible_elaborate.prune_dead_generates int_scope mdecl.m_body }
   in
-  (* Strip function/task subtrees so their internal `logic` decls
-   * don't leak into the module's signal list. specialise_design's
-   * extract_functions consumed the bodies already; by this point
-   * we don't need them at module-extraction. Without this,
-   * e.g. lfsr.sv's `function sbox4_layer` has a 64-bit local `out`
-   * that surfaces as a module-level signal. *)
+  (* Capture the pre-strip body so the function extractor below can
+     walk function_declaration subtrees.  Strip only affects
+     downstream signal/process/instance extraction. *)
+  let mdecl_body = mdecl.m_body in
   let mdecl =
     { mdecl with m_body =
       Verible_elaborate.strip_function_decls mdecl.m_body }
@@ -2158,13 +2156,88 @@ let convert_module ~pkgs (mdecl : module_decl)
     other_procs @ merged
   in
   let processes = merge_array_writes (assign_procs @ always_procs) in
+  let funcs =
+    (* Extract every function_declaration before the strip pass
+       erased its body — using the ORIGINAL mdecl_body we captured.
+       Each function becomes a [bfunc] consumed by behavioral_inline.
+
+       Heuristics over the function_declaration subtree:
+         - return-type packed dim → ftype width
+         - first unqualified_id with `function` keyword nearby → fname
+         - input declarations under the function → params
+         - statements not under input/output decls → body *)
+    let function_decls = collect_by (has_tag (fun t ->
+      prefix_is "function_declaration" t)) mdecl_body in
+    List.filter_map (fun fdecl ->
+      (* Function name: header has `function ... NAME ;`.  The first
+         unqualified_id under the function_declaration whose parent
+         isn't a packed dim, port decl, or statement is the name. *)
+      let names = ref [] in
+      walk (function
+        | TUPLE3 (STRING t, SymbolIdentifier id, _)
+          when prefix_is "unqualified_id" t -> names := id :: !names
+        | _ -> ()) fdecl;
+      let fname =
+        match List.rev !names with
+        | [] -> ""
+        | first :: _ -> first
+      in
+      if fname = "" then None
+      else
+        let return_w = width_of ~pkgs ~params fdecl in
+        let return_w = if return_w <= 0 then 1 else return_w in
+        (* Input declarations: walk for `port_declaration_noattr` or
+           `tf_port_declaration` tags. *)
+        let port_nodes = collect_by (has_tag (fun t ->
+          prefix_is "tf_port_declaration" t
+          || prefix_is "port_declaration_noattr" t
+          || prefix_is "module_port_declaration" t)) fdecl in
+        let func_params =
+          List.concat_map (fun pn ->
+            let signals = extract_port_decl ~pkgs ~params pn in
+            List.filter_map (fun (s : bsignal) ->
+              if s.name = fname then None  (* skip the function name itself *)
+              else
+                let w = match s.stype with
+                  | BInt { width; _ } -> width
+                  | _ -> 1 in
+                Some (s.name, BInt { width = w; signed = Unsigned }, `Input)
+            ) signals
+          ) port_nodes in
+        (* Body: walk the function for statement nodes.  Use the
+           same stmt_to_bstmt the always-block path uses.  This
+           covers BAssign, BIf, BCase (which is what frcon uses). *)
+        let stmt_nodes = collect_by (has_tag (fun t ->
+          prefix_is "case_statement" t
+          || prefix_is "conditional_statement" t
+          || prefix_is "assignment_statement_no_expr" t
+          || prefix_is "nonblocking_assignment" t
+          || prefix_is "seq_block" t)) fdecl in
+        (* Use the outermost statement node (collect_by returns
+           depth-first; the seq_block enclosing case is largest). *)
+        let body =
+          match stmt_nodes with
+          | [] -> []
+          | top :: _ ->
+              [stmt_to_bstmt ~pkgs ~params ~arrays:array_names top]
+        in
+        Some {
+          fname;
+          is_task = false;
+          ftype = BInt { width = return_w; signed = Unsigned };
+          params = func_params;
+          locals = [];
+          body;
+        }
+    ) function_decls
+  in
   {
     name = mdecl.m_name;
     params = [];
     signals;
     processes;
     instances;
-    funcs = [];
+    funcs;
     mems = []; attrs = [];
   }
 
