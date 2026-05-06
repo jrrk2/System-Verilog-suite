@@ -1020,7 +1020,15 @@ let lhs_indexed_of tok =
       when prefix_is "unqualified_id" t && !n = None -> n := Some id
     | TUPLE4 (STRING dt, _, e, _)
       when prefix_is "select_variable_dimension" dt && !idx = None ->
+        (* Single index `[N]`: select_variable_dimension2 = TUPLE4. *)
         idx := Some e
+    | TUPLE6 (STRING dt, _, msb, _, _, _)
+      when prefix_is "select_variable_dimension" dt && !idx = None ->
+        (* Range `[M:N]`: select_variable_dimension1 = TUPLE6.  Use
+           the msb subtree as the "index" — we don't actually need
+           the value here, just to mark this LHS as indexed for the
+           array_names auto-promotion. *)
+        idx := Some msb
     | _ -> ()
   ) tok;
   match !n with
@@ -1879,18 +1887,34 @@ let convert_module ~pkgs (mdecl : module_decl)
      source) need to see. *)
   let cont_assigns =
     collect_by (has_tag (prefix_is "continuous_assign")) mdecl.m_body in
-  let indexed_targets =
-    List.concat_map (fun ca ->
-      collect_by (has_tag (prefix_is "cont_assign")) ca
-      |> List.filter_map (fun a ->
-        match a with
-        | TUPLE4 (_, lhs, _, _) ->
+  let scan_indexed_lhs nodes tag_prefix lhs_pos =
+    List.concat_map (fun n ->
+      let found = collect_by (has_tag (prefix_is tag_prefix)) n in
+      let _ = tag_prefix in
+      List.filter_map (fun a ->
+        let lhs = match a, lhs_pos with
+          | TUPLE4 (_, l, _, _), 1 -> Some l
+          | TUPLE6 (_, l, _, _, _, _), 1 -> Some l
+          | _ -> None in
+        match lhs with
+        | Some lhs ->
             (match lhs_indexed_of lhs with
              | Some (name, Some _) -> Some name
              | _ -> None)
-        | _ -> None)
-    ) cont_assigns
-    |> List.sort_uniq compare in
+        | None -> None) found
+    ) nodes in
+  (* Pre-scan: collect every name that appears with an indexed LHS,
+     across continuous assigns (`assign x[i] = ...`) AND procedural
+     assigns (`x[i] <= ...` inside always_ff / always_comb).  Promote
+     each into array_names so the assign/always handlers route them
+     through the @mem_write path → merge_array_writes consolidates
+     the per-slice drives into a single full-bus assign that both
+     Verible's downstream and OpenROAD's read_verilog handle. *)
+  let indexed_targets =
+    let cont = scan_indexed_lhs cont_assigns "cont_assign" 1 in
+    let blk = scan_indexed_lhs [mdecl.m_body] "assignment_statement_no_expr" 1 in
+    let nb  = scan_indexed_lhs [mdecl.m_body] "nonblocking_assignment" 1 in
+    List.sort_uniq compare (cont @ blk @ nb) in
   let array_names =
     List.sort_uniq compare (array_names @ indexed_targets) in
   let assign_procs = List.concat_map (fun ca ->

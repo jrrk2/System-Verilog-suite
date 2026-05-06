@@ -280,9 +280,12 @@ let rec stmt_to_always ~is_reg ctx alw = function
        | [BVar arr; idx_e; data_e] ->
            (match Hashtbl.find_opt ctx.array_elem_w arr with
             | None ->
-                Printf.eprintf
-                  "[behavioral_to_hardcaml] WARN: @mem_write to %s but no \
-                   array_elem_w entry — dropping\n" arr;
+                (* No BArray type info — caller pre-scan promoted a
+                   sliced-LHS write on a flat BInt signal, which
+                   needs a different translation (read-modify-write
+                   into the underlying bus).  TODO #117: emit that
+                   shape; for now drop silently and the parent
+                   miter / synth will surface the gap. *)
                 alw
             | Some elem_w ->
                 let var = get_or_create_var ctx arr 0 is_reg in
