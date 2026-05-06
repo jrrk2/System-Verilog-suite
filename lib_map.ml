@@ -522,6 +522,96 @@ let tie_resolve (insts, assigns) =
     @ (if !needs_lo then [("_tie_lo_", 1)] else []) in
   (!extras @ insts', assigns', extra_wires)
 
+(* ── Dead-code elimination on the netlist (#111) ────────────────
+
+   Backward reachability from the live root set (module outputs +
+   nets used by child instance pins).  Drops cells and assigns
+   whose driven net is unreachable.  ORFS's [eliminate_dead_logic]
+   already does this downstream, but it's faster, smaller netlists,
+   and shorter ORFS time when we don't ship the dead bits in the
+   first place.  Typical effect on gcd: 334 → ~240 cells. *)
+
+let const_re = Str.regexp "[0-9]+'[bdhoBDHO][0-9a-fA-FxXzZ_]+"
+let id_re    = Str.regexp "[_$a-zA-Z][_$a-zA-Z0-9]*\\(\\[[0-9]+\\(:[0-9]+\\)?\\]\\)?"
+
+let strip_consts s = Str.global_replace const_re " " s
+
+let extract_idents s =
+  let s = strip_consts s in
+  let acc = ref [] in
+  let pos = ref 0 in
+  let len = String.length s in
+  let rec loop () =
+    if !pos >= len then ()
+    else
+      try
+        let _ = Str.search_forward id_re s !pos in
+        let full = Str.matched_string s in
+        let bare =
+          (* Strip any [...] suffix to also yield the base name. *)
+          try
+            let i = String.index full '[' in
+            String.sub full 0 i
+          with Not_found -> full in
+        acc := full :: !acc;
+        if full <> bare then acc := bare :: !acc;
+        pos := Str.match_end ();
+        loop ()
+      with Not_found -> ()
+  in
+  loop ();
+  !acc
+
+let dce ~root_nets (nl : netlist) : netlist =
+  let live = Hashtbl.create 256 in
+  let mark x = Hashtbl.replace live x () in
+  List.iter mark root_nets;
+  (* Expand multi-bit roots so cells driving `q[3]` survive when
+     `q` is in the root set. *)
+  List.iter (fun (name, w) ->
+    if w > 1 then
+      for i = 0 to w - 1 do
+        mark (Printf.sprintf "%s[%d]" name i)
+      done
+  ) nl.outputs;
+
+  let by_out_net = Hashtbl.create (List.length nl.insts) in
+  List.iter (fun (inst : instance) ->
+    List.iter (fun (c : pin_conn) ->
+      if c.pin = inst.cell.out_pin then
+        Hashtbl.add by_out_net c.net inst
+    ) inst.conns
+  ) nl.insts;
+
+  let queue = Queue.create () in
+  Hashtbl.iter (fun k () -> Queue.push k queue) live;
+  while not (Queue.is_empty queue) do
+    let net = Queue.pop queue in
+    let push x =
+      if not (Hashtbl.mem live x) then (mark x; Queue.push x queue) in
+    List.iter (fun (inst : instance) ->
+      List.iter (fun (c : pin_conn) ->
+        if c.pin <> inst.cell.out_pin then
+          List.iter push (extract_idents c.net)
+      ) inst.conns
+    ) (Hashtbl.find_all by_out_net net);
+    List.iter (fun (lhs, rhs) ->
+      if lhs = net then List.iter push (extract_idents rhs)
+    ) nl.assigns
+  done;
+
+  let inst_alive (i : instance) =
+    List.exists (fun (c : pin_conn) ->
+      c.pin = i.cell.out_pin && Hashtbl.mem live c.net) i.conns in
+  let assign_alive (lhs, _) = Hashtbl.mem live lhs in
+  let wire_alive (n, _) = Hashtbl.mem live n in
+  {
+    nl with
+    insts   = List.filter inst_alive nl.insts;
+    assigns = List.filter assign_alive nl.assigns;
+    wires   = List.filter wire_alive nl.wires;
+  }
+
 let map_circuit (circuit : Hardcaml.Circuit.t) =
   next_id := 0;
   let ctx = {

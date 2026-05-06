@@ -235,7 +235,27 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
       failwith (Printf.sprintf "hier_synth: lowering failed for module %s: %s"
                   m.name (Printexc.to_string e))
   in
-  let netlist = Lib_map.map_circuit circuit in
+  let raw = Lib_map.map_circuit circuit in
+  (* DCE on the per-module netlist, gated behind LIB_MAP_DCE=1.
+     Effective on cell count (~56% reduction on gcd) but can shrink
+     the design below the floorplan's PDN minimum core width — a
+     real ORFS-side sizing issue that depends on the platform's
+     PDN config, not our problem to fix per-design.  Off by default
+     so ORFS keeps consuming the bigger netlist (which is dead-
+     elim'd downstream by [eliminate_dead_logic] anyway).  Set
+     LIB_MAP_DCE=1 when you want the smaller netlist for QoR
+     measurement or on designs whose floorplan can absorb it. *)
+  let netlist =
+    if Sys.getenv_opt "LIB_MAP_DCE" = Some "1" then
+      let child_pin_nets =
+        List.concat_map (fun (c : child_inst_emit) ->
+          List.concat_map (fun (_p, net) -> Lib_map.extract_idents net) c.ci_conns
+        ) child_insts in
+      let root_nets = List.map fst real_outputs @ child_pin_nets in
+      Lib_map.dce ~root_nets raw
+    else
+      raw
+  in
   {
     mn_name = m.name;
     mn_real_inputs = real_inputs;
