@@ -224,27 +224,25 @@ let rec expr_to_z3 suffix ctx_sigs = function
         (bump_to z3_a wa target, bump_to z3_b wb target)
       in
       let z3_lhs1, z3_rhs1 = widen z3_lhs0 z3_rhs0 in
+      (* LHS-context width propagation now lives in the Verible
+         converter (#128), so [result_type] already carries the
+         enclosing assignment's width when the BBinOp was inside a
+         BAssign.  Bump operands up to that width before encoding so
+         arithmetic happens at the right bit count.  BAdd still
+         needs the +1 carry-bit widening on top, regardless. *)
+      let declared_w = match result_type with
+        | BInt { width; _ } -> width | _ -> 0 in
+      let cur_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs1) in
+      let z3_lhs1, z3_rhs1 =
+        if declared_w > cur_w then
+          (bump_to z3_lhs1 cur_w declared_w,
+           bump_to z3_rhs1 cur_w declared_w)
+        else (z3_lhs1, z3_rhs1) in
       let z3_lhs, z3_rhs =
         match op with
         | BAdd ->
             let w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs1) in
             (bump_to z3_lhs1 w (w + 1), bump_to z3_rhs1 w (w + 1))
-        | BMul ->
-            (* Verilog's `r = a * b` evaluates the multiplication at
-               max(width(r), width(a), width(b)) bits.  The Verible
-               converter sets [result_type] to max operand widths
-               only — without LHS-context propagation, a 4×4 mul
-               assigned to an 8-bit signal narrows to a 4-bit
-               product (= a*b mod 16).  Hardcaml's [*:] in the
-               behavioral_to_hardcaml lowering does the right thing
-               (full-width product, then BAssign truncates).  Match
-               that here by bumping the operands to wa+wb before
-               mk_mul; downstream BAssign coercion truncates to LHS. *)
-            let wa = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs0) in
-            let wb = Z3.BitVector.get_size (Z3.Expr.get_sort z3_rhs0) in
-            let cur = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs1) in
-            let target = max (wa + wb) cur in
-            (bump_to z3_lhs1 cur target, bump_to z3_rhs1 cur target)
         | _ -> (z3_lhs1, z3_rhs1)
       in
       ignore result_type;

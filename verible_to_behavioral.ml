@@ -2358,6 +2358,101 @@ let convert_module ~pkgs (mdecl : module_decl)
       |> lower_mem_writes_in_seq
       |> lower_slice_writes_in_seq
   in
+  (* LHS-context width propagation (#128).
+     SystemVerilog evaluates `r = a OP b` (and other arithmetic)
+     at width max(width(r), width(a), width(b)).  result_type_for
+     above only sees max(operand widths) and has no LHS context,
+     so an arithmetic op assigned to a wider target ends up
+     truncated mid-expression and the consumer (z3_miter,
+     hardcaml lowering, lib_map) compensates per-op or doesn't.
+     Walk each BAssign here, look up its LHS width, and propagate
+     that down through arithmetic operators in the rhs.  Per the
+     LRM, comparisons / reductions / concat / slice / select are
+     "self-determined" — context width stops there. *)
+  let processes =
+    let lhs_width name =
+      match List.find_opt (fun (s : bsignal) -> s.name = name) signals with
+      | Some s -> width_of_type s.stype
+      | None -> 0 in
+    let rec propagate ctx_w e =
+      match e with
+      | BVar _ | BConst _ | BSelect _ | BSlice _
+      | BConcat _ | BReplicate _ | BCall _ -> e
+      | BBinOp { op; lhs; rhs; result_type } ->
+          let comparison = match op with
+            | BEq | BNe | BLt | BLe | BGt | BGe -> true
+            | _ -> false in
+          if comparison then
+            (* Self-determined: don't propagate. *)
+            BBinOp { op; lhs = propagate 0 lhs;
+                            rhs = propagate 0 rhs;
+                            result_type }
+          else
+            let cur = match result_type with
+              | BInt { width; _ } -> width | _ -> 0 in
+            let target = max ctx_w cur in
+            let result_type' =
+              if target > cur
+              then BInt { width = target; signed = Unsigned }
+              else result_type in
+            BBinOp { op;
+                     lhs = propagate target lhs;
+                     rhs = propagate target rhs;
+                     result_type = result_type' }
+      | BUnOp { op; operand; result_type } ->
+          let reduction = match op with
+            | BRedAnd | BRedOr | BRedXor -> true
+            | _ -> false in
+          if reduction then
+            BUnOp { op; operand = propagate 0 operand; result_type }
+          else
+            let cur = match result_type with
+              | BInt { width; _ } -> width | _ -> 0 in
+            let target = max ctx_w cur in
+            let result_type' =
+              if target > cur
+              then BInt { width = target; signed = Unsigned }
+              else result_type in
+            BUnOp { op; operand = propagate target operand;
+                    result_type = result_type' }
+      | BCond { condition; then_val; else_val } ->
+          BCond {
+            condition = propagate 0 condition;
+            then_val  = propagate ctx_w then_val;
+            else_val  = propagate ctx_w else_val;
+          }
+    in
+    let rec walk_stmt = function
+      | BAssign { lhs; rhs } ->
+          BAssign { lhs; rhs = propagate (lhs_width lhs) rhs }
+      | BIf { condition; then_stmts; else_stmts } ->
+          BIf { condition = propagate 0 condition;
+                then_stmts = List.map walk_stmt then_stmts;
+                else_stmts = List.map walk_stmt else_stmts }
+      | BCase { selector; cases; default } ->
+          BCase { selector = propagate 0 selector;
+                  cases = List.map (fun (k, ss) ->
+                    (k, List.map walk_stmt ss)) cases;
+                  default = List.map walk_stmt default }
+      | BBlock ss -> BBlock (List.map walk_stmt ss)
+      | BWhile { condition; body } ->
+          BWhile { condition = propagate 0 condition;
+                   body = List.map walk_stmt body }
+      | BFor { init; condition; update; body } ->
+          BFor { init = walk_stmt init;
+                 condition = propagate 0 condition;
+                 update = walk_stmt update;
+                 body = List.map walk_stmt body }
+      | other -> other
+    in
+    List.map (fun p ->
+      match p with
+      | BCombinational c ->
+          BCombinational { c with body = List.map walk_stmt c.body }
+      | BSequential s ->
+          BSequential { s with body = List.map walk_stmt s.body }
+    ) processes
+  in
   let funcs =
     (* Extract every function_declaration before the strip pass
        erased its body — using the ORIGINAL mdecl_body we captured.
