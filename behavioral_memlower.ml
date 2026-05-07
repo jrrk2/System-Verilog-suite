@@ -409,7 +409,22 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                word_size = dw;
                num_words = mm.depth;
              } in
-             let art = Mem_macro_resolve.resolve req in
+             (* OpenRAM is sometimes unable to generate a particular
+                shape (e.g. odd word_size, depth not a power of 2,
+                tech-specific bitcell limits).  Fall back to bit-blast
+                rather than crashing — matches the spirit of memlower
+                being best-effort. *)
+             match
+               try Some (Mem_macro_resolve.resolve req)
+               with e ->
+                 Printf.eprintf
+                   "[memlower] %s.%s: macro resolve failed (%s) — \
+                    keeping bit-blast for this memory\n"
+                   m.name mname (Printexc.to_string e);
+                 None
+             with
+             | None -> `Skipped
+             | Some art ->
              let ps = art.port_shape in
              (* Suffix all macro pin names with the memory name so
                 multi-mem lowering doesn't collide. *)
