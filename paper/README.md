@@ -1,14 +1,23 @@
 # Paper draft
 
 `paper.tex` — arxiv-style draft describing the verification-first
-synthesis path. Build with any LaTeX distribution that has
-`amsmath`, `booktabs`, `listings`, `xcolor`, `hyperref`,
-`microtype`. No bibtex run needed (`thebibliography` inline).
+synthesis path. Build with any LaTeX distribution that has `amsmath`, `booktabs`,
+`listings`, `xcolor`, `hyperref`, `microtype`, and `lmodern`. The
+`lmodern` package provides scalable Computer Modern; without it,
+microtype's font-expansion pass aborts with
+"auto expansion is only possible with scalable fonts" on TeX Live
+distributions whose default CM fonts are bitmap-only. No bibtex run
+needed (`thebibliography` inline).
 
 ```sh
 cd paper
 pdflatex paper.tex && pdflatex paper.tex   # twice for cross-refs
 ```
+
+On Debian / Ubuntu the prerequisite packages are
+`texlive-latex-recommended` (article, amsmath, hyperref, lmodern,
+booktabs, caption, xcolor) and `texlive-latex-extra` (microtype,
+listings).
 
 The three contributions claimed:
 
