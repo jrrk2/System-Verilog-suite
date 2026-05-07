@@ -350,6 +350,27 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
     List.filter_map (fun (s : bsignal) ->
       if s.direction = `Output then Some (s.name, signal_width s) else None
     ) m.signals in
+  (* Modules tagged sv_decomp_blackbox=1 (e.g. memlower-emitted
+     OpenRAM macro stubs) have no body to synthesise — return a
+     no-cells netlist with the IO wired through, just enough for
+     parent modules' phantom-IO promotion to find the port shape. *)
+  let is_blackbox =
+    try List.assoc "sv_decomp_blackbox" m.attrs = "1" with Not_found -> false in
+  if is_blackbox then
+    {
+      mn_name = m.name;
+      mn_real_inputs = real_inputs;
+      mn_real_outputs = real_outputs;
+      mn_netlist = Lib_map.{
+        inputs = real_inputs;
+        outputs = real_outputs;
+        wires = [];
+        insts = [];
+        assigns = [];
+      };
+      mn_child_insts = [];
+    }
+  else
   let synth_bmod, child_insts, _phantom_names =
     if m.instances = []
     then m, [], []

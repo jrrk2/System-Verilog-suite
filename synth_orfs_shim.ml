@@ -51,6 +51,25 @@ let () =
     |> Behavioral_blocking_subst.blocking_subst_program
     |> Behavioral_meminfer.infer_program
   in
+  (* Memory-macro lowering: replace bit-blastable BIR memories with
+     instances of OpenRAM-generated SRAM macros.  In-scope (v2): RAM
+     with sync read, 1 write port and 1–2 read ports; mutex if/else
+     write/read sites fold via priority mux.  Out-of-scope memories
+     keep the bit-blast.  Set MEMLOWER=0 to disable.  Generated
+     artifacts are appended to a manifest the caller can use to
+     register .lef/.lib with OpenROAD. *)
+  let prog, mem_arts =
+    if Sys.getenv_opt "MEMLOWER" = Some "0" then prog, []
+    else Behavioral_memlower.lower_program prog
+  in
+  if mem_arts <> [] then begin
+    Printf.eprintf "[synth_orfs_shim] %d memory macro(s) instantiated:\n"
+      (List.length mem_arts);
+    List.iter (fun a ->
+      Printf.eprintf "  %s\n    .v   %s\n    .lib %s\n"
+        a.Mem_macro_resolve.module_name a.verilog_path a.liberty_path
+    ) mem_arts
+  end;
 
   if not (List.exists
             (fun (m : Behavioral_ir.bmodule) -> m.name = top) prog.modules)

@@ -654,12 +654,21 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         | _ -> ()) ref_node;
       (match !fname with
        | Some ("$unsigned" | "$signed") ->
-           (* Find the inner expression argument. *)
+           (* Find the inner expression argument.  `reference` matches
+              indexed/struct/bit-select forms (reference2/3/...), and
+              `reference_or_call_base` matches nested calls — without
+              these the argument's index/slice is silently dropped
+              (e.g. `$signed(x_mem[i])` would collapse to
+              `BVar x_mem` when only `unqualified_id` was matched). *)
            let cands = collect_by (function
              | TUPLE4 (STRING t, _, _, _)
                when prefix_is "range_list_in_braces" t -> true
              | TUPLE4 (STRING t, _, _, _)
                when prefix_is "add_expr" t || prefix_is "mul_expr" t -> true
+             | TUPLE3 (STRING t, _, _)
+               when prefix_is "reference_or_call_base" t -> true
+             | TUPLE3 (STRING t, _, _)
+               when prefix_is "reference" t -> true
              | TUPLE3 (STRING t, _, _) when prefix_is "unqualified_id" t -> true
              | TK_DecNumber _ -> true
              | _ -> false) call_base in

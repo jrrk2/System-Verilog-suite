@@ -55,59 +55,155 @@ open Behavioral_ir
 let bits_needed n = if n <= 1 then 1 else
   let rec loop b m = if m >= n then b else loop (b + 1) (m * 2) in loop 1 2
 
-(* Take the single @mem_write site of m_name in [body] and return
- * (write_predicate, addr_expr, data_expr).  Predicate is the
- * conjunction of `if` conditions on the path to the site (typically
- * just one outer `if (we)`).  Returns None if the body doesn't match
- * v1's shape. *)
-let extract_single_write m_name body =
+(* Walk a stmt list collecting every @mem_write site for [m_name],
+ * each tagged with its accumulated path-predicate (the conjunction
+ * of `if`/`case` guards leading to it).  An empty path means the
+ * site executes unconditionally on every clock edge. *)
+let one_bit = BInt { width = 1; signed = Unsigned }
+
+let bool_and a b = BBinOp { op = BAnd; lhs = a; rhs = b; result_type = one_bit }
+let bool_or  a b = BBinOp { op = BOr;  lhs = a; rhs = b; result_type = one_bit }
+let bool_not a   = BUnOp  { op = BNot; operand = a;     result_type = one_bit }
+let bool_eq  a b = BBinOp { op = BEq; lhs = a; rhs = b; result_type = one_bit }
+
+let cond_and p_opt c = match p_opt with
+  | None -> Some c
+  | Some prev -> Some (bool_and prev c)
+
+(* Returns list of (path_pred_opt, addr_expr, data_expr) in source
+ * order; path_pred_opt = None when the site is unconditional. *)
+let collect_write_sites m_name body =
+  let acc = ref [] in
   let rec walk path = function
     | BCallStmt { func = "@mem_write"; args = [BVar n; addr; data] }
       when n = m_name ->
-        Some (path, addr, data)
-    | BIf { condition; then_stmts; else_stmts = []; _ } ->
-        first_in path condition then_stmts
-    | BIf { condition = _; then_stmts = _; else_stmts = _; _ } ->
-        None  (* if/else mux — out of v1 scope *)
-    | BBlock ss -> first_in_list path ss
-    | _ -> None
-  and first_in path cond ss =
-    let p =
-      match path with
-      | None -> Some cond
-      | Some prev -> Some (BBinOp { op = BAnd; lhs = prev; rhs = cond;
-                                    result_type = BInt { width = 1; signed = Unsigned } })
-    in
-    first_in_list p ss
-  and first_in_list path = function
-    | [] -> None
-    | s :: rest ->
-        (match walk path s with
-         | Some _ as r -> r
-         | None -> first_in_list path rest)
-  in
-  first_in_list None body
-
-(* Find the single BSelect of m_name in [body].  Return Some (lhs, addr)
- * when the only read site is a [BAssign { lhs; rhs = BSelect (BVar m, addr) }]
- * inside the process.  Anything else returns None. *)
-let extract_single_read m_name body =
-  let hits = ref [] in
-  let rec walk = function
-    | BAssign { lhs; rhs = BSelect { array = BVar n; index } } when n = m_name ->
-        hits := (lhs, index) :: !hits
-    | BIf { then_stmts; else_stmts; _ } ->
-        List.iter walk then_stmts; List.iter walk else_stmts
-    | BCase { cases; default; _ } ->
-        List.iter (fun (_, ss) -> List.iter walk ss) cases;
-        List.iter walk default
-    | BBlock ss -> List.iter walk ss
+        acc := (path, addr, data) :: !acc
+    | BIf { condition; then_stmts; else_stmts } ->
+        let pt = cond_and path condition in
+        let pe = cond_and path (bool_not condition) in
+        List.iter (walk pt) then_stmts;
+        List.iter (walk pe) else_stmts
+    | BCase { selector; cases; default } ->
+        let arm_preds =
+          List.map (fun (k, ss) ->
+            let pred = cond_and path (bool_eq selector k) in
+            List.iter (walk pred) ss;
+            bool_eq selector k
+          ) cases
+        in
+        (* default fires when no key matches *)
+        let none_match =
+          match arm_preds with
+          | [] -> BConst { value = 1; width = 1 }
+          | first :: rest ->
+              List.fold_left (fun acc p -> bool_and acc (bool_not p))
+                (bool_not first) rest
+        in
+        List.iter (walk (cond_and path none_match)) default
+    | BBlock ss -> List.iter (walk path) ss
+    | BWhile { body; _ } -> List.iter (walk path) body
+    | BFor   { body; _ } -> List.iter (walk path) body
     | _ -> ()
   in
-  List.iter walk body;
-  match !hits with
-  | [pair] -> Some pair
-  | _ -> None
+  List.iter (walk None) body;
+  List.rev !acc
+
+(* Fold a list of write-sites into a single (write_enable, addr, data)
+ * triple using last-write-wins priority semantics.  For multiple
+ * sequential writes to the same memory in source order, SystemVerilog
+ * non-blocking semantics resolve to the LAST write (by source
+ * position).  We therefore process sites in reverse order, building
+ * a chain of BCond that lets earlier sites be overridden. *)
+let fold_write_sites sites =
+  match sites with
+  | [] -> None
+  | (None, addr, data) :: rest ->
+      (* unconditional first-listed; later sites can override only if
+       * later-listed.  But the unconditional path predicate = 1 means
+       * later mutex branches will only fire when their guard does. *)
+      let init_we = BConst { value = 1; width = 1 } in
+      let init_addr = addr and init_data = data in
+      let we, addr, data = List.fold_left (fun (we, a, d) (p, na, nd) ->
+        let cond = match p with
+          | None -> BConst { value = 1; width = 1 }
+          | Some p -> p in
+        bool_or we cond,
+        BCond { condition = cond; then_val = na; else_val = a },
+        BCond { condition = cond; then_val = nd; else_val = d }
+      ) (init_we, init_addr, init_data) rest in
+      Some (we, addr, data)
+  | (Some p0, addr0, data0) :: rest ->
+      let we, addr, data = List.fold_left (fun (we, a, d) (p, na, nd) ->
+        let cond = match p with
+          | None -> BConst { value = 1; width = 1 }
+          | Some p -> p in
+        bool_or we cond,
+        BCond { condition = cond; then_val = na; else_val = a },
+        BCond { condition = cond; then_val = nd; else_val = d }
+      ) (p0, addr0, data0) rest in
+      Some (we, addr, data)
+
+(* Same shape for reads: every BSelect site in expression position
+ * contributes one (path_pred, addr) entry.  At the macro pin we drive
+ * a priority mux of the addresses; in the original BIR every BSelect
+ * gets replaced by [BVar dout].  The dout is a single value so the
+ * substitution is uniform — only the address pin needs the mux. *)
+let collect_read_sites m_name body =
+  let acc = ref [] in
+  let rec expr path = function
+    | BSelect { array = BVar n; index } when n = m_name ->
+        acc := (path, index) :: !acc;
+        expr path index
+    | BBinOp { lhs; rhs; _ } -> expr path lhs; expr path rhs
+    | BUnOp { operand; _ } -> expr path operand
+    | BSlice { signal; _ } -> expr path signal
+    | BSelect { array; index } -> expr path array; expr path index
+    | BConcat es -> List.iter (expr path) es
+    | BReplicate { value; _ } -> expr path value
+    | BCond { condition; then_val; else_val } ->
+        expr path condition;
+        expr (cond_and path condition) then_val;
+        expr (cond_and path (bool_not condition)) else_val
+    | BCall { args; _ } -> List.iter (expr path) args
+    | _ -> ()
+  in
+  let rec stmt path = function
+    | BAssign { rhs; _ } -> expr path rhs
+    | BIf { condition; then_stmts; else_stmts } ->
+        expr path condition;
+        List.iter (stmt (cond_and path condition)) then_stmts;
+        List.iter (stmt (cond_and path (bool_not condition))) else_stmts
+    | BCase { selector; cases; default } ->
+        expr path selector;
+        let arm_preds = List.map (fun (k, ss) ->
+          List.iter (stmt (cond_and path (bool_eq selector k))) ss;
+          bool_eq selector k) cases in
+        let none =
+          match arm_preds with
+          | [] -> BConst { value = 1; width = 1 }
+          | first :: rest ->
+              List.fold_left (fun acc p -> bool_and acc (bool_not p))
+                (bool_not first) rest in
+        List.iter (stmt (cond_and path none)) default
+    | BBlock ss -> List.iter (stmt path) ss
+    | BCallStmt { args; _ } -> List.iter (expr path) args
+    | BWhile { body; _ } -> List.iter (stmt path) body
+    | BFor   { body; _ } -> List.iter (stmt path) body
+    | _ -> ()
+  in
+  List.iter (stmt None) body;
+  List.rev !acc
+
+let fold_read_sites sites =
+  match sites with
+  | [] -> None
+  | (_, addr0) :: rest ->
+      Some (List.fold_left (fun acc (p, na) ->
+        let cond = match p with
+          | None -> BConst { value = 1; width = 1 }
+          | Some p -> p in
+        BCond { condition = cond; then_val = na; else_val = acc }
+      ) addr0 rest)
 
 (* Make signal of the named width as Internal wire. *)
 let mk_signal name width =
@@ -258,171 +354,195 @@ let rec rewrite_reads_s m_name dout = function
              body = List.map (rewrite_reads_s m_name dout) body }
   | BReturn e -> BReturn (Option.map (rewrite_reads_e m_name dout) e)
 
+(* ──────────── per-memory lowering ──────────── *)
+
+(* Try to lower a single bmem. Returns either:
+ *   `Lowered (m', art) - module with this mem replaced; bmem removed
+ *   `Skipped reason    - keep the bmem as bit-blast (with logged reason) *)
+let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
+  let mname = mm.mname in
+  let skip reason =
+    Printf.eprintf "[memlower] %s.%s: %s — keeping bit-blast\n"
+      m.name mname reason;
+    `Skipped
+  in
+  if mm.kind <> BRam then `Skipped  (* ROM lowering: deferred to phase 4 *)
+  else if not mm.read_is_sync then skip "async read"
+  else if mm.n_write_ports < 1 || mm.n_write_ports > 1 then
+    skip (Printf.sprintf "w_ports=%d (only 1 supported in v2)" mm.n_write_ports)
+  else if mm.n_read_ports < 1 || mm.n_read_ports > 2 then
+    skip (Printf.sprintf "r_ports=%d (only 1–2 supported in v2)" mm.n_read_ports)
+  else
+    let writer = find_writing_process mname m.processes in
+    let reader = find_reading_process mname m.processes in
+    match writer, reader with
+    | None, _ -> skip "no writing process"
+    | _, None -> skip "no reading process"
+    | Some w_idx, Some r_idx ->
+        let w_proc = List.nth m.processes w_idx in
+        let r_proc = List.nth m.processes r_idx in
+        let w_body = match w_proc with
+          | BSequential s -> s.body | _ -> [] in
+        let r_body = match r_proc with
+          | BSequential s -> s.body
+          | BCombinational c -> c.body in
+        let w_sites = collect_write_sites mname w_body in
+        let r_sites = collect_read_sites  mname r_body in
+        (match fold_write_sites w_sites, fold_read_sites r_sites with
+         | None, _ -> skip "no write sites collected"
+         | _, None -> skip "no read sites collected"
+         | Some (we_expr, w_addr, w_data), Some r_addr ->
+             let aw = bits_needed mm.depth in
+             let dw = mm.data_width in
+             let req = Mem_macro_resolve.{
+               tech;
+               kind = Sram { n_rw = 1; n_r = 1; n_w = 0 };
+               word_size = dw;
+               num_words = mm.depth;
+             } in
+             let art = Mem_macro_resolve.resolve req in
+             let ps = art.port_shape in
+             (* Suffix all macro pin names with the memory name so
+                multi-mem lowering doesn't collide. *)
+             let suffix s = s ^ "_" ^ mname in
+             let new_sigs = List.concat [
+               List.map (fun n -> mk_signal (suffix n) 1) ps.clk;
+               List.map (fun n -> mk_signal (suffix n) 1) ps.csb;
+               List.filter_map (fun o ->
+                 Option.map (fun n -> mk_signal (suffix n) 1) o) ps.web;
+               List.filter_map (fun o ->
+                 Option.map (fun n -> mk_signal (suffix n) (max 1 (dw / 8))) o) ps.wmask;
+               List.map (fun n -> mk_signal (suffix n) aw) ps.addr;
+               List.filter_map (fun o ->
+                 Option.map (fun n -> mk_signal (suffix n) dw) o) ps.din;
+               List.map (fun n -> mk_signal (suffix n) dw) ps.dout;
+             ] in
+             let pc = List.concat [
+               List.map (fun n -> (n, BVar (suffix n))) ps.clk;
+               List.map (fun n -> (n, BVar (suffix n))) ps.csb;
+               List.filter_map (fun o ->
+                 Option.map (fun n -> (n, BVar (suffix n))) o) ps.web;
+               List.filter_map (fun o ->
+                 Option.map (fun n -> (n, BVar (suffix n))) o) ps.wmask;
+               List.map (fun n -> (n, BVar (suffix n))) ps.addr;
+               List.filter_map (fun o ->
+                 Option.map (fun n -> (n, BVar (suffix n))) o) ps.din;
+               List.map (fun n -> (n, BVar (suffix n))) ps.dout;
+             ] in
+             let inst = {
+               inst_name = mname ^ "_macro";
+               module_name = ps.module_name;
+               param_values = [];
+               port_connections = pc;
+             } in
+             let clk0   = suffix (List.nth ps.clk 0) in
+             let csb0   = suffix (List.nth ps.csb 0) in
+             let web0   = suffix (match List.nth ps.web 0 with
+                                  | Some n -> n | None -> "web0") in
+             let addr0  = suffix (List.nth ps.addr 0) in
+             let din0   = suffix (match List.nth ps.din 0 with
+                                  | Some n -> n | None -> "din0") in
+             let clk1   = suffix (List.nth ps.clk 1) in
+             let csb1   = suffix (List.nth ps.csb 1) in
+             let addr1  = suffix (List.nth ps.addr 1) in
+             let dout1  = suffix (List.nth ps.dout 1) in
+             let inv_we = bool_not we_expr in
+             let orig_clk = match w_proc with
+               | BSequential s -> s.clock | _ -> "clk" in
+             let read_clk = match r_proc with
+               | BSequential s -> s.clock | _ -> "clk" in
+             let driver_body = List.concat [
+               [ BAssign { lhs = clk0; rhs = BVar orig_clk };
+                 BAssign { lhs = csb0; rhs = inv_we };
+                 BAssign { lhs = web0; rhs = inv_we };
+                 BAssign { lhs = addr0; rhs = w_addr };
+                 BAssign { lhs = din0;  rhs = w_data };
+               ];
+               (match List.nth ps.wmask 0 with
+                | Some wm ->
+                    [ BAssign { lhs = suffix wm;
+                                rhs = one_lit (max 1 (dw / 8)) } ]
+                | None -> []);
+               [ BAssign { lhs = clk1; rhs = BVar read_clk };
+                 BAssign { lhs = csb1; rhs = zero_lit 1 };
+                 BAssign { lhs = addr1; rhs = r_addr };
+               ];
+             ] in
+             let driver = BCombinational {
+               name = mname ^ "_drv";
+               sensitivity = [BAny];
+               body = driver_body;
+             } in
+             let rewrite_body body =
+               let body = strip_mem_writes mname body in
+               List.map (rewrite_reads_s mname dout1) body
+             in
+             let processes' =
+               List.mapi (fun i p ->
+                 if i = w_idx || i = r_idx then
+                   match p with
+                   | BSequential s ->
+                       BSequential { s with body = rewrite_body s.body }
+                   | BCombinational c ->
+                       BCombinational { c with body = rewrite_body c.body }
+                 else p
+               ) m.processes in
+             let signals' =
+               List.filter (fun (s : bsignal) -> s.name <> mname) m.signals
+               @ new_sigs in
+             let m' = {
+               m with
+               signals = signals';
+               processes = processes' @ [driver];
+               instances = inst :: m.instances;
+               mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems;
+             } in
+             `Lowered (m', art))
+
 (* ──────────── per-module pass ──────────── *)
 
 let lower_module ~tech (m : bmodule) =
-  match m.mems with
-  | [] -> m, []
-  | mm :: _ when List.length m.mems > 1 ->
-      Printf.eprintf
-        "[memlower] %s: %d memories, only handling first one — keeping rest as bit-blast\n"
-        m.name (List.length m.mems);
-      ignore mm; m, []
-  | [mm] when mm.kind <> BRam ->
-      m, []  (* ROM lowering deferred *)
-  | [mm] when not mm.read_is_sync ->
-      Printf.eprintf "[memlower] %s.%s: async read — keeping bit-blast\n"
-        m.name mm.mname;
-      m, []
-  | [mm] when mm.n_write_ports <> 1 || mm.n_read_ports < 1 || mm.n_read_ports > 2 ->
-      Printf.eprintf
-        "[memlower] %s.%s: w_ports=%d, r_ports=%d outside v1 scope — keeping bit-blast\n"
-        m.name mm.mname mm.n_write_ports mm.n_read_ports;
-      m, []
-  | [mm] ->
-      let mname = mm.mname in
-      let writer = find_writing_process mname m.processes in
-      let reader = find_reading_process mname m.processes in
-      (match writer, reader with
-       | None, _ | _, None ->
-           Printf.eprintf "[memlower] %s.%s: no writer or reader process found\n"
-             m.name mname;
-           m, []
-       | Some w_idx, Some r_idx ->
-           let w_proc = List.nth m.processes w_idx in
-           let r_proc = List.nth m.processes r_idx in
-           let w_body = match w_proc with
-             | BSequential s -> s.body
-             | _ -> []
-           in
-           let r_body = match r_proc with
-             | BSequential s -> s.body
-             | BCombinational c -> c.body
-           in
-           (match extract_single_write mname w_body,
-                  extract_single_read  mname r_body with
-            | None, _ | _, None ->
-                Printf.eprintf
-                  "[memlower] %s.%s: write/read pattern not single-site — bit-blast\n"
-                  m.name mname;
-                m, []
-            | Some (we_pred, w_addr, w_data), Some (_r_lhs, r_addr) ->
-                let aw = bits_needed mm.depth in
-                let dw = mm.data_width in
-                let req = Mem_macro_resolve.{
-                  tech;
-                  kind = Sram { n_rw = 1; n_r = 1; n_w = 0 };
-                  word_size = dw;
-                  num_words = mm.depth;
-                } in
-                let art = Mem_macro_resolve.resolve req in
-                let ps = art.port_shape in
-                (* Step 2: macro signals.  All Internal wires of the
-                   right width.  Names come from port_shape. *)
-                let new_sigs = List.concat [
-                  List.map (fun n -> mk_signal n 1) ps.clk;
-                  List.map (fun n -> mk_signal n 1) ps.csb;
-                  List.filter_map (fun o ->
-                    Option.map (fun n -> mk_signal n 1) o) ps.web;
-                  List.filter_map (fun o ->
-                    Option.map (fun n -> mk_signal n (max 1 (dw / 8))) o) ps.wmask;
-                  List.map (fun n -> mk_signal n aw) ps.addr;
-                  List.filter_map (fun o ->
-                    Option.map (fun n -> mk_signal n dw) o) ps.din;
-                  List.map (fun n -> mk_signal n dw) ps.dout;
-                ] in
-                (* Step 3: instance. *)
-                let pc = List.concat [
-                  List.map (fun n -> (n, BVar n)) ps.clk;
-                  List.map (fun n -> (n, BVar n)) ps.csb;
-                  List.filter_map (fun o ->
-                    Option.map (fun n -> (n, BVar n)) o) ps.web;
-                  List.filter_map (fun o ->
-                    Option.map (fun n -> (n, BVar n)) o) ps.wmask;
-                  List.map (fun n -> (n, BVar n)) ps.addr;
-                  List.filter_map (fun o ->
-                    Option.map (fun n -> (n, BVar n)) o) ps.din;
-                  List.map (fun n -> (n, BVar n)) ps.dout;
-                ] in
-                let inst = {
-                  inst_name = mname ^ "_macro";
-                  module_name = ps.module_name;
-                  param_values = [];
-                  port_connections = pc;
-                } in
-                (* Step 4: driver process. *)
-                let clk0 = List.nth ps.clk 0 in
-                let csb0 = List.nth ps.csb 0 in
-                let web0 = match List.nth ps.web 0 with
-                  | Some n -> n | None -> "web0" in
-                let addr0 = List.nth ps.addr 0 in
-                let din0 = match List.nth ps.din 0 with
-                  | Some n -> n | None -> "din0" in
-                let clk1 = List.nth ps.clk 1 in
-                let csb1 = List.nth ps.csb 1 in
-                let addr1 = List.nth ps.addr 1 in
-                let dout1 = List.nth ps.dout 1 in
-                let inv_we = match we_pred with
-                  | None -> zero_lit 1   (* always writing → web=0 *)
-                  | Some p -> BUnOp { op = BNot; operand = p;
-                                      result_type = BInt { width = 1; signed = Unsigned } }
-                in
-                let orig_clk = match w_proc with
-                  | BSequential s -> s.clock | _ -> "clk" in
-                let read_clk = match r_proc with
-                  | BSequential s -> s.clock | _ -> "clk" in
-                let driver_body = List.concat [
-                  [ BAssign { lhs = clk0; rhs = BVar orig_clk };
-                    BAssign { lhs = csb0; rhs =
-                      (match we_pred with
-                       | None -> zero_lit 1
-                       | Some _ -> inv_we) };
-                    BAssign { lhs = web0; rhs = inv_we };
-                    BAssign { lhs = addr0; rhs = w_addr };
-                    BAssign { lhs = din0;  rhs = w_data };
-                  ];
-                  (match List.nth ps.wmask 0 with
-                   | Some wm ->
-                       [ BAssign { lhs = wm; rhs = one_lit (max 1 (dw / 8)) } ]
-                   | None -> []);
-                  [ BAssign { lhs = clk1; rhs = BVar read_clk };
-                    BAssign { lhs = csb1; rhs = zero_lit 1 };
-                    BAssign { lhs = addr1; rhs = r_addr };
-                  ];
-                ] in
-                let driver = BCombinational {
-                  name = mname ^ "_drv";
-                  sensitivity = [BAny];
-                  body = driver_body;
-                } in
-                (* Step 5–6: rewrite original processes. *)
-                let rewrite_body body =
-                  let body = strip_mem_writes mname body in
-                  List.map (rewrite_reads_s mname dout1) body
-                in
-                let processes' =
-                  List.mapi (fun i p ->
-                    if i = w_idx || i = r_idx then
-                      match p with
-                      | BSequential s ->
-                          BSequential { s with body = rewrite_body s.body }
-                      | BCombinational c ->
-                          BCombinational { c with body = rewrite_body c.body }
-                    else p
-                  ) m.processes in
-                (* Step 7: drop the BArray signal and the bmem record. *)
-                let signals' =
-                  List.filter (fun (s : bsignal) -> s.name <> mname) m.signals
-                  @ new_sigs in
-                let m' = {
-                  m with
-                  signals = signals';
-                  processes = processes' @ [driver];
-                  instances = inst :: m.instances;
-                  mems = [];
-                } in
-                m', [art]))
-  | _ -> m, []
+  List.fold_left (fun (m, arts) mm ->
+    match try_lower_one_mem ~tech m mm with
+    | `Lowered (m', art) -> m', art :: arts
+    | `Skipped -> m, arts
+  ) (m, []) m.mems
+
+(* Build a tiny bmodule with the macro's IO so [hier_synth] recognises
+ * the binstance.  Body is empty — the macro is a blackbox at our
+ * synth boundary; ORFS picks up the real Verilog via the manifest. *)
+let stub_bmodule_for_art (art : Mem_macro_resolve.artifacts) : bmodule =
+  let ps = art.port_shape in
+  let dw = ps.data_width in
+  let aw = ps.addr_width in
+  let mk dir w name : bsignal =
+    { name; stype = BInt { width = w; signed = Unsigned };
+      direction = dir; initial_value = None; attrs = [] } in
+  let sigs = List.concat [
+    List.map (mk `Input 1) ps.clk;
+    List.map (mk `Input 1) ps.csb;
+    List.filter_map (fun o -> Option.map (mk `Input 1) o) ps.web;
+    List.filter_map (fun o ->
+      Option.map (mk `Input (max 1 (dw / 8))) o) ps.wmask;
+    List.map (mk `Input aw) ps.addr;
+    List.filter_map (fun o -> Option.map (mk `Input dw) o) ps.din;
+    List.map (mk `Output dw) ps.dout;
+  ] in
+  { name = ps.module_name;
+    params = [];
+    signals = sigs;
+    processes = [];
+    instances = [];
+    funcs = [];
+    mems = [];
+    attrs = [("sv_decomp_blackbox", "1");
+             ("sv_decomp_macro_v", art.verilog_path);
+             ("sv_decomp_macro_lib", art.liberty_path);
+             ("sv_decomp_macro_lef",
+              match art.lef_path with Some p -> p | None -> "");
+             ("sv_decomp_macro_gds",
+              match art.gds_path with Some p -> p | None -> "")];
+  }
 
 let lower_program ?tech (p : bprogram) =
   let tech = match tech with
@@ -433,4 +553,12 @@ let lower_program ?tech (p : bprogram) =
       let m', arts = lower_module ~tech m in
       (m' :: acc_m, arts @ acc_a)
     ) ([], []) p.modules in
-  { p with modules = List.rev modules' }, arts
+  let stub_modules =
+    let seen = Hashtbl.create 4 in
+    List.filter_map (fun a ->
+      let n = a.Mem_macro_resolve.module_name in
+      if Hashtbl.mem seen n then None
+      else begin Hashtbl.add seen n (); Some (stub_bmodule_for_art a) end
+    ) arts
+  in
+  { p with modules = stub_modules @ List.rev modules' }, arts
