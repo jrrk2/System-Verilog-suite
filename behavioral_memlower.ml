@@ -366,8 +366,17 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
       m.name mname reason;
     `Skipped
   in
+  let async_ok = Sys.getenv_opt "MEMLOWER_ASYNC_OK" = Some "1" in
   if mm.kind <> BRam then `Skipped  (* ROM lowering: deferred to phase 4 *)
-  else if not mm.read_is_sync then skip "async read"
+  else if not mm.read_is_sync && not async_ok then begin
+    Printf.eprintf
+      "[memlower] %s.%s: async read — keeping bit-blast.  This memory is read \
+       combinationally (e.g. `assign x = mem[idx]`); OpenRAM's behavioural \
+       model is sync-only and would add 1 cycle of read latency vs source.  \
+       Set MEMLOWER_ASYNC_OK=1 to map anyway and accept the timing change.\n"
+      m.name mname;
+    `Skipped
+  end
   else if mm.n_write_ports < 1 || mm.n_write_ports > 1 then
     skip (Printf.sprintf "w_ports=%d (only 1 supported in v2)" mm.n_write_ports)
   else if mm.n_read_ports < 1 || mm.n_read_ports > 2 then
