@@ -1651,17 +1651,27 @@ let extract_body_params ~pkgs ~params tok =
       | _ -> ()) n;
     match !nm, !value_node with
     | Some id, Some v ->
-        if List.mem_assoc id acc then acc
-        else
-          (match eval_int ~pkgs ~params:acc v with
-           | Some i -> (id, string_of_int i) :: acc
-           | None ->
-               (try
-                  match expr_to_bexpr ~pkgs ~params:acc ~arrays:[] v with
-                  | BConst { value; _ } ->
-                      (id, string_of_int value) :: acc
-                  | _ -> acc
-                with _ -> acc))
+        let cur = List.assoc_opt id acc in
+        let new_val =
+          match eval_int ~pkgs ~params:acc v with
+          | Some i -> Some (string_of_int i)
+          | None ->
+              (try
+                 match expr_to_bexpr ~pkgs ~params:acc ~arrays:[] v with
+                 | BConst { value; _ } -> Some (string_of_int value)
+                 | _ -> None
+               with _ -> None)
+        in
+        (match cur, new_val with
+         | None, Some v -> (id, v) :: acc
+         | Some old, Some v when v <> old ->
+             (* Re-bind: a later fixed-point pass found a better value
+                (e.g. ICW=0 from expr_to_bexpr fallback got overridden
+                to ICW=7 once H landed in acc and eval_int's $clog2 path
+                could fire).  Without this, the partial first-pass
+                result stuck and `[ICW-1:0]` widths stayed at 1 bit. *)
+             (id, v) :: List.remove_assoc id acc
+         | _ -> acc)
     | _ -> acc
   in
   (* Verible's parse tree presents parameter declarations in
@@ -1673,9 +1683,17 @@ let extract_body_params ~pkgs ~params tok =
      [List.length nodes] passes per group to guarantee
      termination on any acyclic dependency graph. *)
   let resolve_until_fixed nodes acc =
+    (* Stop only when nothing changes — both length AND values must
+       be stable.  Length-only stop misses cases where a binding
+       improves from a fallback-0 to a real value (e.g. ICW=0 → ICW=7
+       once $clog2's inner H resolves on a later pass). *)
     let rec loop acc passes =
       let acc' = List.fold_left one acc nodes in
-      if List.length acc' = List.length acc || passes <= 0 then acc'
+      if (List.length acc' = List.length acc
+          && List.for_all2 (fun (k1, v1) (k2, v2) -> k1 = k2 && v1 = v2)
+               (List.sort compare acc) (List.sort compare acc'))
+         || passes <= 0
+      then acc'
       else loop acc' (passes - 1)
     in
     loop acc (List.length nodes) in

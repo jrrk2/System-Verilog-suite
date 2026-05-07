@@ -1893,13 +1893,29 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
         | Some n -> (name, n) :: sc
         | None -> sc
     ) scope defaults in
+    (* Localparams from collect_by come in REVERSE parse-tree order
+       (and Verible's parse-tree is itself reverse-of-source-order
+       for child cons-lists), which means the source-order chain
+       `localparam H = ...; localparam H2 = ...; localparam ICW = $clog2(H+1);`
+       processes ICW BEFORE H, leaving ICW unresolved.  Iterate to
+       fixed-point: each pass folds a fresh batch of newly-resolvable
+       params; stop when no new ones bind.  Two passes covers the
+       chain depth in real designs (rope: H→ICW). *)
     let lps = extract_module_internal_params mdecl.m_body in
-    List.fold_left (fun sc (name, rhs_tok) ->
-      let s = resolve_value pkgs rhs_tok in
-      match Eval.eval_string sc s with
-      | Some n -> (name, n) :: sc
-      | None -> sc
-    ) scope lps
+    let rec fixed_point sc remaining =
+      let sc', remaining' = List.fold_left (fun (sc, rem) (name, rhs_tok) ->
+        if List.mem_assoc name sc then (sc, rem)
+        else
+          let s = resolve_value pkgs rhs_tok in
+          match Eval.eval_string sc s with
+          | Some n -> ((name, n) :: sc, rem)
+          | None -> (sc, (name, rhs_tok) :: rem)
+      ) (sc, []) remaining in
+      if List.length sc' > List.length sc && remaining' <> [] then
+        fixed_point sc' remaining'
+      else sc'
+    in
+    fixed_point scope lps
   in
   let resolve_overrides_with scope ovs =
     List.map (fun (name, tok) ->
