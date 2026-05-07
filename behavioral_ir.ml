@@ -323,8 +323,22 @@ let string_of_bmodule bmod =
       ) bmod.mems)
   in
 
-  Printf.sprintf "%smodule %s%s\n%s%s\n\n%s\nend module"
-    (string_of_attrs bmod.attrs) bmod.name params_str signals_str mems_str processes_str
+  let instances_str =
+    if bmod.instances = [] then ""
+    else
+      "\ninstances:\n" ^
+      String.concat "\n" (List.map (fun i ->
+        Printf.sprintf "  %s : %s (%s)"
+          i.inst_name i.module_name
+          (String.concat ", "
+             (List.map (fun (p, e) ->
+                Printf.sprintf ".%s(%s)" p (string_of_bexpr e))
+                i.port_connections))
+      ) bmod.instances)
+  in
+
+  Printf.sprintf "%smodule %s%s\n%s%s%s\n\n%s\nend module"
+    (string_of_attrs bmod.attrs) bmod.name params_str signals_str mems_str instances_str processes_str
 
 let string_of_bprogram prog =
   String.concat "\n\n" (List.map string_of_bmodule prog.modules)
