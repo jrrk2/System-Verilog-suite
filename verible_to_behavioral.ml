@@ -1703,6 +1703,14 @@ let extract_body_params ~pkgs ~params tok =
    * those, we only want the additions. *)
   List.filter (fun (k, _) -> not (List.mem_assoc k params)) acc
 
+(* Auto-discovered list of directories searched by `$readmemh`'s
+ * resolver in addition to MEM_INIT_DIR / cwd / cwd/generated.  We
+ * walk up from each input .sv file looking for sibling `generated/`
+ * directories — the convention used by smollm and other RTL trees
+ * that vendor their hex initialiser files alongside the source.
+ * Populated by [convert_files_inner] before per-module conversion. *)
+let mem_init_search_paths : string list ref = ref []
+
 let convert_module ~pkgs (mdecl : module_decl)
                           (params : (string * string) list) : bmodule =
   (* Merge instance-override params with body-declared defaults; the
@@ -2216,12 +2224,16 @@ let convert_module ~pkgs (mdecl : module_decl)
           | _ -> None
         else None) reg_var_signals in
     let resolve path =
+      let basename = Filename.basename path in
       let candidates =
-        let extra = match Sys.getenv_opt "MEM_INIT_DIR" with
-          | Some d -> [Filename.concat d (Filename.basename path)]
+        let env_dir = match Sys.getenv_opt "MEM_INIT_DIR" with
+          | Some d -> [Filename.concat d basename]
           | None -> [] in
-        path :: extra
-        @ (List.map (fun d -> Filename.concat d (Filename.basename path))
+        let auto_dirs =
+          List.map (fun d -> Filename.concat d basename)
+            !mem_init_search_paths in
+        path :: env_dir @ auto_dirs
+        @ (List.map (fun d -> Filename.concat d basename)
              [Sys.getcwd ();
               Filename.concat (Sys.getcwd ()) "generated";
               Filename.concat (Sys.getcwd ()) "../generated"]) in
@@ -2910,9 +2922,30 @@ let convert_module ~pkgs (mdecl : module_decl)
 
 (* ─── Top-level entry ────────────────────────────────────────────── *)
 
+let discover_init_dirs files =
+  let acc = ref [] in
+  List.iter (fun f ->
+    let dir = ref (Filename.dirname f) in
+    let last = ref "" in
+    while !dir <> !last && !dir <> "/" do
+      let candidate = Filename.concat !dir "generated" in
+      if Sys.file_exists candidate
+         && (try Sys.is_directory candidate with _ -> false)
+         && not (List.mem candidate !acc) then
+        acc := candidate :: !acc;
+      last := !dir;
+      dir := Filename.dirname !dir
+    done
+  ) files;
+  List.rev !acc
+
 (* Parse a list of SV files via Verible, find the top module, and
  * convert it (and its specialised children) to BIR. *)
 let convert_files_inner ~keep_external ~top files : bprogram =
+  mem_init_search_paths := discover_init_dirs files;
+  if Sys.getenv_opt "MEM_INIT_DEBUG" <> None && !mem_init_search_paths <> [] then
+    Printf.eprintf "[mem_init] auto-discovered: %s\n"
+      (String.concat ", " !mem_init_search_paths);
   let mods, pkgs = parse_files_full files in
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
