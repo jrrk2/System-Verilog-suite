@@ -1201,26 +1201,36 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
      | None ->
          (* Single LHS — fall through to the existing range / array /
             plain dispatch. *)
-         let range_endpoints =
-           (* The OUTERMOST select_variable_dimension on the LHS
-              decides whether this is a slice or a mem write.  A
-              naive recursive walk falls through `arr[idx[hi:lo]]`
-              and grabs the inner range, generating a spurious
-              @slice_write where @mem_write is intended.  Walk
-              deliberately: stop at the first select_variable_dimension
-              encountered, then check if it's TUPLE6 (range) or
-              TUPLE4 (single-index). *)
-           let msb = ref None and lsb = ref None in
+         (* Distinguish three select-variable-dimension shapes on the
+            outermost LHS bracket.  All three are TUPLE6 with a
+            "select_variable_dimensionN" tag — N tells us which:
+              N=1: `[m:l]` (range, both literal indices)
+              N=3: `[base +: w]` (indexed-up part-select)
+              N=4: `[base -: w]` (indexed-down part-select)
+            TUPLE4 is the single-index `[i]` shape (mem-write).
+            We walk the LHS deliberately and stop at the first match
+            so a nested inner range like `arr[i[hi:lo]]` doesn't
+            get mistaken for the outer dimension. *)
+         let range_kind =
+           let kind = ref `None in
            let stop = ref false in
            let rec walk_outer t =
              if !stop then ()
              else match t with
                | TUPLE6 (STRING dt, _, m, _, l, _)
                  when prefix_is "select_variable_dimension" dt ->
-                   msb := Some m; lsb := Some l; stop := true
+                   let tag = String.sub dt
+                       (String.length "select_variable_dimension")
+                       (String.length dt
+                        - String.length "select_variable_dimension") in
+                   (match tag with
+                    | "1" -> kind := `Range (m, l); stop := true
+                    | "3" -> kind := `IndexedUp (m, l); stop := true
+                    | "4" -> kind := `IndexedDown (m, l); stop := true
+                    | _   -> stop := true)  (* unknown shape → leave alone *)
                | TUPLE4 (STRING dt, _, _, _)
                  when prefix_is "select_variable_dimension" dt ->
-                   stop := true  (* single-index outer → not a range *)
+                   stop := true
                | TUPLE2 (a, b) -> walk_outer a; walk_outer b
                | TUPLE3 (a, b, c) -> List.iter walk_outer [a; b; c]
                | TUPLE4 (a, b, c, d) ->
@@ -1236,13 +1246,10 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                | TLIST xs -> List.iter walk_outer xs
                | _ -> ()
            in
-           walk_outer lhs;
-           match !msb, !lsb with
-           | Some m, Some l -> Some (m, l)
-           | _ -> None
+           walk_outer lhs; !kind
          in
-         (match lhs_indexed_of lhs, range_endpoints with
-          | Some (name, _), Some (m_node, l_node) ->
+         (match lhs_indexed_of lhs, range_kind with
+          | Some (name, _), `Range (m_node, l_node) ->
               BCallStmt {
                 func = "@slice_write";
                 args = [BVar name;
@@ -1250,12 +1257,35 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                         recurse_e l_node;
                         recurse_e rhs];
               }
-          | Some (name, Some idx_node), None when List.mem name arrays ->
+          | Some (name, _), `IndexedUp (base, width) ->
+              (* `name[base +: width] <= rhs` — indexed part-select up.
+                 base may be dynamic; width is constant.  Lowered by
+                 [lower_part_sel_writes_in_seq] to a full-bus BAssign
+                 that picks rhs into the appropriate slot when
+                 base == k * width, else self-reads. *)
+              BCallStmt {
+                func = "@part_sel_write_up";
+                args = [BVar name;
+                        recurse_e base;
+                        recurse_e width;
+                        recurse_e rhs];
+              }
+          | Some (name, _), `IndexedDown (base, width) ->
+              (* `name[base -: width] <= rhs` — indexed part-select down.
+                 Equivalent to `[base-width+1 +: width]`. *)
+              BCallStmt {
+                func = "@part_sel_write_down";
+                args = [BVar name;
+                        recurse_e base;
+                        recurse_e width;
+                        recurse_e rhs];
+              }
+          | Some (name, Some idx_node), `None when List.mem name arrays ->
               BCallStmt {
                 func = "@mem_write";
                 args = [BVar name; recurse_e idx_node; recurse_e rhs];
               }
-          | Some (name, _), None -> BAssign { lhs = name; rhs = recurse_e rhs }
+          | Some (name, _), `None -> BAssign { lhs = name; rhs = recurse_e rhs }
           | None, _ -> BBlock []))
   in
   match tok with
@@ -2546,6 +2576,61 @@ let convert_module ~pkgs (mdecl : module_decl)
       | other -> other
     ) processes
   in
+  (* Lower @part_sel_write_up calls inside BSequential bodies to a
+     full-bus BAssign per target.  `name[base +: width] <= rhs` (with
+     constant width) becomes
+        name := { … slot[N-1], …, slot[1], slot[0] }
+     where slot[k] = (base == k * width) ? rhs : name[k*w +: w].
+     N = total_width / width.  This mirrors the @mem_write lowering
+     so [behavioral_to_hardcaml]'s downstream BCase / Always handling
+     sees a single full-bus driver (not a partial slice) for the FF
+     pre-pass and downstream encoders. *)
+  let lower_part_sel_writes_in_seq processes =
+    List.map (fun p ->
+      match p with
+      | BSequential ({ body; _ } as s) ->
+          let body' = List.map (fun stmt ->
+            match stmt with
+            | BCallStmt { func = "@part_sel_write_up";
+                          args = [BVar lhs; base; width; data] } ->
+                let const_of = function
+                  | BConst { value; _ } -> Some value
+                  | _ -> None in
+                (match const_of width with
+                 | Some w when w > 0 ->
+                     let total_w =
+                       match List.find_opt
+                               (fun (sg : bsignal) -> sg.name = lhs) signals with
+                       | Some s -> width_of_type s.stype
+                       | None -> 0 in
+                     if total_w = 0 || total_w mod w <> 0 then stmt
+                     else
+                       let n = total_w / w in
+                       let parts = List.init n (fun k ->
+                         let k_const = BConst { value = k * w; width = 32 } in
+                         let cur_slot = BSlice {
+                           signal = BVar lhs;
+                           msb = (k + 1) * w - 1;
+                           lsb = k * w;
+                         } in
+                         BCond {
+                           condition = BBinOp {
+                             op = BEq;
+                             lhs = base;
+                             rhs = k_const;
+                             result_type = BInt { width = 1; signed = Unsigned };
+                           };
+                           then_val = data;
+                           else_val = cur_slot;
+                         }) in
+                       BAssign { lhs;
+                                 rhs = BConcat (List.rev parts) }
+                 | _ -> stmt)
+            | other -> other
+          ) body in
+          BSequential { s with body = body' }
+      | other -> other
+    ) processes in
   let processes =
     let merged = merge_array_writes (assign_procs @ always_procs) in
     if Sys.getenv_opt "DISABLE_MEM_WRITE_LOWER" <> None then merged
@@ -2554,6 +2639,7 @@ let convert_module ~pkgs (mdecl : module_decl)
       |> merge_seq_processes
       |> lower_mem_writes_in_seq
       |> lower_slice_writes_in_seq
+      |> lower_part_sel_writes_in_seq
   in
   (* LHS-context width propagation (#128).
      SystemVerilog evaluates `r = a OP b` (and other arithmetic)

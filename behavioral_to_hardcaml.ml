@@ -365,6 +365,43 @@ let rec stmt_to_always ~is_reg ctx alw = function
                   Signal.concat_msb (List.rev slots) in
                 Always.(var <-- new_val) :: alw)
        | _ -> alw)
+  | BCallStmt { func; args }
+    when func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+      (* `name[base +: width] <= rhs` (up) or `name[base -: width] <= rhs`
+         (down).  width is constant; base may be dynamic.  Translate to a
+         full-bus update of name where the slot whose lsb equals base
+         gets rhs and other slots self-read.  Aligned (base is an integer
+         multiple of width); otherwise fall through and let synth surface
+         the gap. *)
+      (match args with
+       | [BVar lhs; base_e; BConst { value = w; _ }; data_e]
+         when w > 0 ->
+           let var = get_or_create_var ctx lhs 1 is_reg in
+           let total_w = Signal.width (Always.Variable.value var) in
+           if total_w = 0 || total_w mod w <> 0 then alw
+           else
+             let n = total_w / w in
+             let cur = Always.Variable.value var in
+             let s_base = expr_to_signal ctx base_e in
+             let s_data = expr_to_signal ctx data_e in
+             let s_data =
+               let dw = Signal.width s_data in
+               if dw = w then s_data
+               else if dw > w then Signal.select s_data (w - 1) 0
+               else Signal.uresize s_data w in
+             let slots = List.init n (fun k ->
+               let lsb = match func with
+                 | "@part_sel_write_up"   -> k * w
+                 | "@part_sel_write_down" -> (k + 1) * w - 1
+                 | _ -> k * w in
+               let hi = (k + 1) * w - 1 and lo = k * w in
+               let cur_slot = Signal.select cur hi lo in
+               let bw = Signal.width s_base in
+               let k_const = Signal.of_int ~width:bw lsb in
+               Signal.mux2 (Signal.(s_base ==: k_const)) s_data cur_slot) in
+             let new_val = Signal.concat_msb (List.rev slots) in
+             Always.(var <-- new_val) :: alw
+       | _ -> alw)
   | BCallStmt _ | BReturn _ ->
       alw
 
@@ -562,11 +599,14 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     | BAssign { lhs; _ } :: tl ->
         Hashtbl.replace driver_proc lhs ck_rst; scan_lhs ck_rst tl
     | BCallStmt { func = "@mem_write"; args = (BVar arr) :: _ } :: tl
-    | BCallStmt { func = "@slice_write"; args = (BVar arr) :: _ } :: tl ->
-        (* @mem_write / @slice_write inside a BSequential body means
-           [arr] is sequentially driven — pre-pass needs to create
-           it as a register, not a wire, otherwise the resulting
-           translation forms a combinational loop. *)
+    | BCallStmt { func = "@slice_write"; args = (BVar arr) :: _ } :: tl
+    | BCallStmt { func = "@part_sel_write_up"; args = (BVar arr) :: _ } :: tl
+    | BCallStmt { func = "@part_sel_write_down"; args = (BVar arr) :: _ } :: tl ->
+        (* @mem_write / @slice_write / @part_sel_write_* inside a
+           BSequential body means [arr] is sequentially driven — pre-
+           pass needs to create it as a register, not a wire,
+           otherwise the resulting translation forms a combinational
+           loop. *)
         Hashtbl.replace driver_proc arr ck_rst; scan_lhs ck_rst tl
     | BIf { then_stmts; else_stmts; _ } :: tl ->
         scan_lhs ck_rst then_stmts; scan_lhs ck_rst else_stmts; scan_lhs ck_rst tl
