@@ -304,16 +304,74 @@ follow some particular package-constant pattern.
 
 ## Build
 
-Requires:
+### OCaml toolchain
 
-- OCaml 5.3.0 (dune, str, yojson, unix, hardcaml, z3, ppx_deriving_yojson, linenoise)
-- Verilator (any recent — the project targets 5.024+)
-- Vivado 2020.1 (only needed for the CVA6 oracle and sv-tests Vivado column)
-- Yosys (optional, for the four-way miter)
+- OCaml **5.3.0** (older 4.x will not work — uses 5.x effects bindings
+  in hardcaml + 5.x exception payloads).
+- **dune** ≥ 3.0
+- **menhir** ≥ 2.1 (parser generator, used for the OCaml port of
+  Verible's grammar and for the Liberty / LEF / DEF parsers)
+
+### OCaml packages (opam)
+
+| Package | Purpose |
+|---|---|
+| `str` | stdlib regex (POSIX-style) — Verible token tree handling |
+| `yojson` | parsing Verilator's `--json-only` AST dump |
+| `ppx_deriving_yojson` | auto-generate yojson serialisers for BIR types |
+| `unix` | stdlib syscalls (subprocess management for the Verilator/Yosys/Slang frontends) |
+| `hardcaml` | the synthesis lowering target — `Signal.t` graph + `Circuit.create_exn` |
+| `hardcaml_circuits` | upstream Wallace/Dadda multipliers and Kogge-Stone-style adders that hardcaml ships; we exercise these as an alternative to our own bit-blasted gen_mul/gen_add |
+| `z3` | OCaml bindings for the SMT solver — drives every formal-equivalence step |
+| `lua-ml` | scripting layer for the optional `sv_lua.ml` opaque-handle interface (#77) |
+| `linenoise` | line editing for the interactive REPL drivers (`interactive_client*.exe`) |
+
+Install via:
+```sh
+opam switch create 5.3.0       # if not already present
+eval $(opam env --switch=5.3.0 --set-switch)
+opam install dune menhir yojson ppx_deriving_yojson \
+             hardcaml hardcaml_circuits z3 \
+             lua-ml linenoise
+```
+
+The Z3 OCaml binding links against `libz3.so` at runtime; on Debian /
+Ubuntu install `libz3-dev`, on macOS `brew install z3`.
+
+### Vendored sub-libraries (built as part of `dune build`)
+
+- `vhd_libs/` — VHDL front-end (parser + lexer + dump). Used by the
+  Vivado-RTL-VHDL frontend.
+- `ver_libs/` — Verilog front-end alternative parser, kept for the
+  ver_front compatibility test (`test_ver_front_parse.exe`).
+- `lef_def/` — LEF + DEF parsers, the `Synth_mac` cell-level netlist
+  builder, the placement-aware delay model, and `Predict_swap` /
+  `Fanout_cone` for the post-layout resynth path.
+
+These live in-tree; nothing to install separately.
+
+### External tools
+
+Required for the test suites listed alongside each tool:
+
+| Tool | Required for | Optional? |
+|---|---|---|
+| **Verilator** ≥ 5.024 | Verilator JSON frontend; pre-flatten wrapper for the sv-tests integration | required for the four-way miter; otherwise optional |
+| **OpenROAD-flow-scripts** (recent) | layout demos (gcd, MAC), cell-mapped equivalence using Nangate45 cells, post-CTS arrival measurements | required for `test_synth_equiv.exe` against ORFS-emitted netlists; otherwise optional |
+| **Slang** | Slang SystemVerilog frontend (`test_slang_vs_verible.exe`) | optional |
+| **Surelog** | UHDM frontend (leaf-cell pipecleaner, doesn't reach CVA6 scale) | optional |
+| **Yosys** | RTLIL frontend, four-way miter (`test_yosys_vs_verible.exe`), oracle harness (#101 in progress) | optional |
+| **Vivado 2020.1** | CVA6 entity oracle, Vivado column on the sv-tests dashboard | optional |
+
+Verible itself is **not** an external dependency — the SystemVerilog
+parser used by the headline drivers is an OCaml port of Verible's
+grammar (`Source_text_verible_lex` + `Source_text_verible`), built
+from this repo via menhir.
+
+### Building
 
 ```sh
-opam switch 5.3.0
-eval $(opam env)
+eval $(opam env --switch=5.3.0 --set-switch)
 dune build @all
 ```
 
