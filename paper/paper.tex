@@ -615,9 +615,234 @@ all consumers see consistent widths.
 reports BIR-vs-yosys disagreements as part of CI.
 \end{enumerate}
 
-The codebase is open source at \url{https://github.com/jrrk2/System-Verilog-decompiler}; reproduction
-instructions for each result above are in the test directory
-listed alongside each evaluation point.
+The codebase is open source at
+\url{https://github.com/jrrk2/System-Verilog-decompiler}.
+Appendix~\ref{sec:repro} gives full step-by-step instructions to
+install every dependency and reproduce each numbered result above
+on a clean Debian / Ubuntu machine.
+
+\appendix
+
+\section{Reproducing the results}
+\label{sec:repro}
+
+Every measurement in the paper was obtained by running an
+executable at a tagged commit in the open-source repository.  This
+appendix lists the commands to reproduce them on a clean Linux
+machine, including every dependency that has to be installed.  The
+repository's \texttt{README.md} contains a more compact version of
+the same information.
+
+\subsection{System assumptions}
+
+The author's measurement machine: Debian 12 / Ubuntu 24.04 LTS
+class system, x86\_64, 12 hardware threads, 32~GiB RAM, single
+node.  No GPU, no FPGA, no proprietary tools required to reproduce
+the headline numbers (the optional Vivado dependency below is only
+needed for the CVA6 oracle and the Vivado column on the sv-tests
+dashboard, neither of which is claimed in this paper).
+
+\subsection{System packages}
+
+\begin{lstlisting}[language=bash]
+sudo apt-get install \
+  build-essential git curl                 # toolchain
+  m4 pkg-config bubblewrap                 # opam build deps
+  libgmp-dev libffi-dev                    # native lib deps for Z3 binding
+  libz3-dev z3                             # the SMT solver itself
+  texlive-latex-recommended \
+  texlive-latex-extra                      # for paper/paper.tex
+\end{lstlisting}
+
+\subsection{OCaml toolchain via opam}
+
+\begin{lstlisting}[language=bash]
+# opam itself
+sudo apt-get install opam
+opam init --auto-setup --disable-sandboxing
+opam switch create 5.3.0
+eval $(opam env --switch=5.3.0 --set-switch)
+
+# OCaml packages
+opam install dune menhir yojson ppx_deriving_yojson \
+             hardcaml hardcaml_circuits z3 \
+             lua-ml linenoise
+\end{lstlisting}
+
+The Z3 OCaml binding links against \texttt{libz3.so} from the
+system \texttt{libz3-dev} package.  On macOS the equivalent is
+\texttt{brew install z3 opam}.
+
+\subsection{Source checkout and build}
+
+\begin{lstlisting}[language=bash]
+git clone https://github.com/jrrk2/System-Verilog-decompiler.git
+cd System-Verilog-decompiler
+eval $(opam env --switch=5.3.0 --set-switch)
+dune build @all
+\end{lstlisting}
+
+The full build produces approximately 70 executables under
+\texttt{\_build/default/}; the four headline drivers used in this
+paper are
+\texttt{test\_synth\_equiv.exe},
+\texttt{synth\_orfs\_shim.exe},
+\texttt{mac\_synth\_shim.exe}, and
+\texttt{test\_mac\_postlayout.exe}.
+
+\subsection{External tools}
+
+\paragraph{Verilator $\geq$ 5.024} is required for the four-way
+miter and for the pre-flatten wrapper used by the sv-tests
+integration.  On Debian / Ubuntu:
+\begin{lstlisting}[language=bash]
+sudo apt-get install verilator
+\end{lstlisting}
+
+\paragraph{OpenROAD-flow-scripts (ORFS)} is required for the
+post-layout resynth result and for the cell-mapped-equivalence
+results that use Nangate45 cells.  Follow the upstream install
+instructions at
+\url{https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts}.
+The minimal step:
+\begin{lstlisting}[language=bash]
+git clone --recursive \
+   https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts.git \
+   $HOME/OpenROAD-flow-scripts
+cd $HOME/OpenROAD-flow-scripts
+./build_openroad.sh
+\end{lstlisting}
+Adjust \texttt{ORFS\_DIR} via the environment if you install it
+elsewhere.
+
+After ORFS is installed, apply the Makefile patch that lets
+\texttt{USE\_DECOMP\_SYNTH=1} route \texttt{do-yosys} to our shim:
+\begin{lstlisting}[language=bash]
+cd $HOME/System-Verilog-decompiler
+test/orfs/install.sh                  # apply patch
+test/orfs/install.sh --check          # confirm patched
+\end{lstlisting}
+
+\paragraph{Optional} Yosys, Slang, Surelog, and Vivado are
+optional and not needed for any result in this paper.  The
+\texttt{README.md} lists what each of them unlocks.
+
+\subsection{Reproducing each result}
+
+Each block below reproduces one numbered result from the paper.
+All commands assume \texttt{\$PWD} is the repository root and the
+opam switch has been activated.
+
+\paragraph{Section~\ref{sec:cell-equiv}, gcd 10 / 10 modules
+formally equivalent.} The driver runs synthesis with our shim,
+emits the cell-mapped Verilog, and proves cell-mapped
+$\equiv$ source via Z3:
+\begin{lstlisting}[language=bash]
+NAN=$HOME/OpenROAD-flow-scripts/flow/platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib
+GCD=$HOME/OpenROAD-flow-scripts/flow/designs/src/gcd/gcd.v
+_build/default/synth_orfs_shim.exe gcd /tmp/gcd_synth.v $GCD
+_build/default/test_synth_equiv.exe gcd $GCD /tmp/gcd_synth.v $NAN \
+  | grep Summary
+\end{lstlisting}
+Expected output: \texttt{Summary: 10 pass, 0 fail (10 modules total)}.
+
+\paragraph{Section~\ref{sec:eval}, AES core 4 / 4 modules formally
+equivalent.}  AES has deeper boundary cones; bump the per-module
+timeout from the 30 s default:
+\begin{lstlisting}[language=bash]
+AES_DIR=$HOME/OpenROAD-flow-scripts/flow/designs/src/aes
+AES_FILES=$(ls $AES_DIR/*.v | grep -v inv_)
+# Combined source for the source side of the miter
+cat $AES_FILES > /tmp/aes_combined.v
+_build/default/synth_orfs_shim.exe aes_cipher_top \
+  /tmp/aes_synth.v $AES_FILES
+Z3_MITER_TIMEOUT_MS=120000 \
+  _build/default/test_synth_equiv.exe aes_cipher_top \
+    /tmp/aes_combined.v /tmp/aes_synth.v $NAN | grep Summary
+\end{lstlisting}
+Expected output: \texttt{Summary: 4 pass, 0 fail (4 modules
+total)}.
+
+\paragraph{Section~\ref{sec:boundary}, cascade\_mac 24-bit MAC
+3 / 3 formally equivalent.}
+\begin{lstlisting}[language=bash]
+_build/default/synth_orfs_shim.exe cascade_mac \
+  /tmp/cascade_mac_synth.v test/cascade/cascade_mac.sv
+Z3_MITER_TIMEOUT_MS=600000 \
+  _build/default/test_synth_equiv.exe cascade_mac \
+    test/cascade/cascade_mac.sv /tmp/cascade_mac_synth.v $NAN \
+  | grep -E '^\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80| Summary| seconds'
+\end{lstlisting}
+Expected output (single core, $\sim$5 minutes wall-clock):
+\texttt{Summary: 3 pass, 0 fail (3 modules total)}, with
+\texttt{add48} at $\sim$0.16 s, \texttt{mul8} at $\sim$140 s, and
+\texttt{cascade\_mac} at $\sim$180 s.
+
+\paragraph{Section~\ref{sec:resynth}, 8-bit MAC layout +
+post-CTS ripple $\to$ Sklansky swap.}
+The \texttt{mac\_synth\_shim} reads the chosen architecture from
+environment variables and emits a Synth\_mac netlist directly into
+the slot ORFS expects:
+\begin{lstlisting}[language=bash]
+mkdir -p $HOME/OpenROAD-flow-scripts/flow/designs/nangate45/mac
+cat > $HOME/OpenROAD-flow-scripts/flow/designs/nangate45/mac/config.mk <<'EOF'
+export DESIGN_NICKNAME = mac
+export DESIGN_NAME     = mac
+export PLATFORM        = nangate45
+export VERILOG_FILES   = $(DESIGN_HOME)/nangate45/mac/dummy.v
+export SDC_FILE        = $(DESIGN_HOME)/nangate45/mac/constraint.sdc
+export CORE_UTILIZATION = 30
+export CORE_ASPECT_RATIO = 1
+export CORE_MARGIN     = 2
+export PLACE_DENSITY_LB_ADDON = 0.20
+export TNS_END_PERCENT = 100
+EOF
+echo "// dummy" > $HOME/OpenROAD-flow-scripts/flow/designs/nangate45/mac/dummy.v
+echo "create_clock -period 4.0 -name clk [get_ports clk]" > \
+  $HOME/OpenROAD-flow-scripts/flow/designs/nangate45/mac/constraint.sdc
+
+# Baseline: Array x Ripple
+cd $HOME/OpenROAD-flow-scripts/flow
+env USE_DECOMP_SYNTH=1 \
+    DECOMP_SHIM=$HOME/System-Verilog-decompiler/_build/default/mac_synth_shim.exe \
+    MAC_WIDTH=8 MAC_MUL=array MAC_ADD=ripple MAC_CLK_NS=4.0 \
+  make DESIGN_CONFIG=designs/nangate45/mac/config.mk
+
+# Extract DEF and analyse
+$HOME/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/openroad \
+  -no_init -exit results/nangate45/mac/base/4_cts.odb -tcl \
+  results/nangate45/mac/base/4_cts.def
+cd $HOME/System-Verilog-decompiler
+_build/default/test_mac_postlayout.exe \
+  $HOME/OpenROAD-flow-scripts/flow/results/nangate45/mac/base/4_cts.def \
+  $HOME/OpenROAD-flow-scripts/flow/results/nangate45/mac/base/1_2_yosys.v 8
+\end{lstlisting}
+Expected baseline output: \texttt{worst endpoint @ 917.31 ps}, with
+\texttt{u\_add ripple $\to$ sklansky} as the cert-gated best pick
+predicted to land at \texttt{592.7 ps}.
+
+To measure the prediction, repeat the layout with
+\texttt{MAC\_ADD=sklansky} (and a different sub-directory if you
+want to keep the baseline available):
+\begin{lstlisting}[language=bash]
+env USE_DECOMP_SYNTH=1 \
+    DECOMP_SHIM=$HOME/System-Verilog-decompiler/_build/default/mac_synth_shim.exe \
+    MAC_WIDTH=8 MAC_MUL=array MAC_ADD=sklansky MAC_CLK_NS=4.0 \
+    FLOW_VARIANT=sklansky \
+  make DESIGN_CONFIG=designs/nangate45/mac/config.mk
+\end{lstlisting}
+The post-CTS analysis on the swapped variant reports
+\texttt{worst endpoint @ 592.67 ps} --- a 0.005\,\% deviation from
+the prediction.
+
+\subsection{Tagged commit}
+
+The numbers in this paper match the repository at the tag
+\texttt{paper-v1} (created at the time of this draft).  All later
+commits land on \texttt{main} and are listed in
+\texttt{git log paper-v1..main}; if any subsequent change
+materially affects the numbers it will be called out in the
+release-notes file \texttt{paper/CHANGELOG.md}.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{9}
