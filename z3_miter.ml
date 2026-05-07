@@ -229,6 +229,22 @@ let rec expr_to_z3 suffix ctx_sigs = function
         | BAdd ->
             let w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs1) in
             (bump_to z3_lhs1 w (w + 1), bump_to z3_rhs1 w (w + 1))
+        | BMul ->
+            (* Verilog's `r = a * b` evaluates the multiplication at
+               max(width(r), width(a), width(b)) bits.  The Verible
+               converter sets [result_type] to max operand widths
+               only — without LHS-context propagation, a 4×4 mul
+               assigned to an 8-bit signal narrows to a 4-bit
+               product (= a*b mod 16).  Hardcaml's [*:] in the
+               behavioral_to_hardcaml lowering does the right thing
+               (full-width product, then BAssign truncates).  Match
+               that here by bumping the operands to wa+wb before
+               mk_mul; downstream BAssign coercion truncates to LHS. *)
+            let wa = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs0) in
+            let wb = Z3.BitVector.get_size (Z3.Expr.get_sort z3_rhs0) in
+            let cur = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs1) in
+            let target = max (wa + wb) cur in
+            (bump_to z3_lhs1 cur target, bump_to z3_rhs1 cur target)
         | _ -> (z3_lhs1, z3_rhs1)
       in
       ignore result_type;

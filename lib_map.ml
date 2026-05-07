@@ -302,6 +302,68 @@ let gen_add ~a_name ~a_w ~b_name ~b_w =
   done;
   (List.rev !sums, !cin, List.rev !insts, !wires)
 
+(* Like [gen_add] but takes pre-built bit lists (LSB-first) instead
+   of named-bus operands.  Used by [gen_mul] — partial-product rows
+   are sets of fresh 1-bit nets, not bit-selects of a declared bus.
+   Returns (sum_bits_lsb_first, final_cout, insts, wires). *)
+let gen_add_bits ~(a_bits : string list) ~(b_bits : string list) =
+  let w = max (List.length a_bits) (List.length b_bits) in
+  let pad bits =
+    let n = List.length bits in
+    if n >= w then List.filteri (fun i _ -> i < w) bits
+    else bits @ List.init (w - n) (fun _ -> "1'b0") in
+  let a = Array.of_list (pad a_bits) in
+  let b = Array.of_list (pad b_bits) in
+  let insts = ref [] and wires = ref [] in
+  let sums = ref [] and cin = ref "1'b0" in
+  for i = 0 to w - 1 do
+    let s, co, fa_insts, fa_wires = gen_fa ~a:a.(i) ~b:b.(i) ~cin:!cin in
+    sums := s :: !sums;
+    insts := List.rev_append fa_insts !insts;
+    wires := !wires @ fa_wires;
+    cin := co
+  done;
+  (List.rev !sums, !cin, List.rev !insts, !wires)
+
+(* Array multiplier: out = a * b, output width = a_w + b_w.  Builds
+   the b_w partial-product rows via AND gates then sums them with
+   repeated [gen_add_bits].  Linear-depth (O(b_w)) — the Wallace and
+   Dadda alternates reduce that to O(log b_w) and are gated by the
+   verify-arch certificates that arch_verify lays down (#80).
+
+   Returns (out_bits_msb_first, ignored_final_cout, insts, wires) so
+   the call site can splice it in alongside [gen_add] / [gen_sub]
+   without special-casing widths.  The "ignored cout" is always 0 in
+   a well-formed multiplier (a*b < 2^(a_w+b_w)). *)
+let gen_mul ~a_name ~a_w ~b_name ~b_w =
+  let out_w = a_w + b_w in
+  let insts = ref [] and wires = ref [] in
+  (* Build the b_w partial-product rows, each a list of out_w bit
+     names LSB-first.  For row i: bits [i, i + a_w) carry
+     (a[k-i] AND b[i]); the rest are tied to 1'b0. *)
+  let pps = List.init b_w (fun i ->
+    let bi = bit_at b_name b_w i in
+    List.init out_w (fun j ->
+      if j < i || j >= i + a_w then "1'b0"
+      else
+        let aj = bit_at a_name a_w (j - i) in
+        let pij = mint "pp" in
+        wires := (pij, 1) :: !wires;
+        insts := gate_inst ~cell:cell_and ~ipins:cell_and.in_pins
+                   ~ins:[aj; bi] ~out:pij :: !insts;
+        pij)
+  ) in
+  (* Accumulate: start with pp[0], add each subsequent pp.  Each
+     gen_add_bits call discards the carry-out — the math guarantees
+     the running sum stays below 2^out_w. *)
+  let acc = ref (List.hd pps) in
+  List.iter (fun pp ->
+    let s, _co, ai, aw = gen_add_bits ~a_bits:!acc ~b_bits:pp in
+    insts := !insts @ ai;
+    wires := !wires @ aw;
+    acc := s) (List.tl pps);
+  (List.rev !acc, "1'b0", List.rev !insts, !wires)
+
 (* DFF mapping.  hardcaml's Reg has a [register] record with
    clock, optional reset, optional clear, optional enable.  For
    our subset:
@@ -418,16 +480,35 @@ let rec walk ctx sig_ =
                        gen_lt ~a_name:an ~a_w ~b_name:bn ~b_w in
                      absorb_helper insts wires_;
                      ctx.assigns <- (out_name, res) :: ctx.assigns
+                 | Signal_mulu | Signal_muls ->
+                     (* Array multiplier — Wallace/Dadda are the
+                        cert-gated swap targets sitting on top of
+                        the same partial-product + gen_add primitives. *)
+                     let sums, _co, insts, wires_ =
+                       gen_mul ~a_name:an ~a_w ~b_name:bn ~b_w in
+                     absorb_helper insts wires_;
+                     (* gen_mul returns msb-first; truncate to LHS w. *)
+                     let sums =
+                       let n = List.length sums in
+                       if n <= w then sums
+                       else List.filteri (fun i _ -> i >= n - w) sums in
+                     if w = 1 then
+                       (match sums with
+                        | [s] -> ctx.assigns <- (out_name, s) :: ctx.assigns
+                        | _ -> ())
+                     else begin
+                       List.iter (fun s ->
+                         ctx.wires <- (s, 1) :: ctx.wires) sums;
+                       let concat_rhs =
+                         "{" ^ String.concat ", " sums ^ "}" in
+                       ctx.assigns <- (out_name, concat_rhs) :: ctx.assigns
+                     end
                  | _ ->
-                     (* Mul still raw — needs a multiplier tree. *)
-                     let op_str = match op with
-                       | Signal_mulu | Signal_muls -> "*"
-                       | _ -> "/* op? */" in
                      Printf.eprintf
-                       "[lib_map] WARN: unmapped op %s — emitting raw \
-                        Verilog (read_verilog will reject)\n" op_str;
+                       "[lib_map] WARN: unmapped op — emitting raw \
+                        Verilog (read_verilog will reject)\n";
                      ctx.assigns <- (out_name,
-                       Printf.sprintf "%s %s %s" an op_str bn) :: ctx.assigns))
+                       Printf.sprintf "%s %s" an bn) :: ctx.assigns))
        | Not { arg; _ } ->
            let an = walk ctx arg in
            ctx.wires <- (out_name, w) :: ctx.wires;
