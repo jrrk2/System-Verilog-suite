@@ -247,7 +247,18 @@ let rec body_to_expr fname bindings = function
                    match stmt with
                    | BAssign { lhs; rhs } -> subst_expr_expr lhs rhs e
                    | _ -> e) intermediates final_expr in
-               Some with_locals)
+               (* Apply call-site bindings (a, p, b, q, sign_neg etc.)
+                  AFTER intermediate-locals substitution.  The locals'
+                  RHS expressions reference function parameters; once
+                  the locals are inlined into final_expr, those
+                  parameter refs surface and need binding to call-
+                  site argument expressions.  Without this step the
+                  inlined body has free BVars and downstream
+                  expr_to_signal mints unassigned wires. *)
+               let with_bindings =
+                 List.fold_left (fun e (name, expr, _) ->
+                   subst_expr_expr name expr e) with_locals bindings in
+               Some with_bindings)
   | _ -> None
 
 (* Lookup table: function name → bfunc. *)

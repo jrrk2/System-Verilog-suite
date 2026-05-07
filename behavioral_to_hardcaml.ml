@@ -32,9 +32,23 @@ let get_signal ctx name =
   match List.assoc_opt name ctx.signals with
   | Some s -> s
   | None ->
-      (* Create wire if not found *)
-      let width = 32 in  (* Default width *)
+      (* Unknown name — mint a 32-bit unassigned wire so downstream
+         lowering doesn't crash mid-expression.  This is ALMOST always
+         a bug upstream (missing input port, missing variable in
+         pre-pass, expression referencing a free identifier).  Hardcaml
+         will reject the resulting circuit later with the cryptic
+         "circuit input signal must have a port name" error.  Tag the
+         wire with the name so the failure points at the right
+         identifier, and emit a one-time diagnostic when a debug env
+         flag is set. *)
+      let width = 32 in
       let wire = Signal.wire width in
+      let _ = Signal.(--) wire ("__unbound_" ^ name) in
+      if Sys.getenv_opt "BIR_NAME_WIRES" <> None
+      || Sys.getenv_opt "BIR_GET_SIGNAL_DEBUG" <> None then
+        Printf.eprintf
+          "[expr_to_signal] unbound identifier %s — minting 32-bit unassigned wire\n%!"
+          name;
       ctx.signals <- (name, wire) :: ctx.signals;
       wire
 
