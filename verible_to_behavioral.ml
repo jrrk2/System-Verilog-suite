@@ -918,6 +918,15 @@ let extract_port_decl ~pkgs ~params tok =
     | TUPLE4 (STRING t', _, _, _)
       when prefix_is "decl_variable_dimension" t'
         || prefix_is "select_variable_dimension" t' -> ()
+    (* `wire [W:0] foo = expr;` parses as net_declaration2 holding a
+       net_decl_assign1 whose first SymbolIdentifier is the LHS name
+       and whose third slot is the RHS expression.  Take the LHS,
+       skip the RHS — without this every identifier appearing inside
+       the initialiser would be wrongly promoted to a declaration with
+       the enclosing wire's width. *)
+    | TUPLE4 (STRING t', SymbolIdentifier id, _, _)
+      when prefix_is "net_decl_assign" t' ->
+        names := id :: !names
     | TUPLE3 (STRING t', SymbolIdentifier id, _)
       when prefix_is "unqualified_id" t' ->
         names := id :: !names
@@ -951,6 +960,13 @@ let extract_port_decl ~pkgs ~params tok =
     | TUPLE4 (STRING t', _, _, _)
       when prefix_is "decl_variable_dimension" t'
         || prefix_is "select_variable_dimension" t' -> ()
+    (* As walk_skip: take the LHS of net_decl_assign, skip the RHS.
+       Without this, identifiers inside the initialiser
+       (`wire [W:0] foo = mem[i];` → `mem`, `i`) are wrongly added
+       as declaration names with the wrapping wire's width. *)
+    | TUPLE4 (STRING t', SymbolIdentifier id, _, _)
+      when prefix_is "net_decl_assign" t' ->
+        names := id :: !names
     | SymbolIdentifier id -> names := id :: !names
     | TUPLE2 (a, b) -> walk_loose a; walk_loose b
     | TUPLE3 (a, b, c) -> walk_loose a; walk_loose b; walk_loose c
@@ -1956,7 +1972,7 @@ let convert_module ~pkgs (mdecl : module_decl)
             name = id;
             stype;
             direction = `Internal;
-            initial_value = None; attrs = []; 
+            initial_value = None; attrs = [];
           }
         | None -> None
       ) var_nodes

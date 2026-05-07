@@ -49,11 +49,15 @@ let () =
     List.iter (fun (s : Behavioral_ir.bsignal) ->
       let dir = match s.direction with
         | `Input -> "input" | `Output -> "output" | `Internal -> "wire" in
-      let w = match s.stype with
-        | BInt { width; _ } -> width
-        | _ -> 1
+      let w_str = match s.stype with
+        | BInt { width; _ } -> Printf.sprintf "[w=%d]" width
+        | BBool -> "[w=1]"
+        | BArray { size; element = BInt { width; _ } } ->
+            Printf.sprintf "[%d x w=%d]" size width
+        | BArray _ -> "[array]"
+        | _ -> "[?]"
       in
-      Printf.printf "    %-10s %-6s [w=%d]\n" dir s.name w
+      Printf.printf "    %-10s %-6s %s\n" dir s.name w_str
     ) m.signals;
     if Sys.getenv_opt "BIR_FULL" <> None then
       Printf.printf "\n%s\n\n" (Behavioral_ir.string_of_bmodule m)
