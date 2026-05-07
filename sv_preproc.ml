@@ -15,8 +15,6 @@
  * `assert(cond)` in FORMAL mode) now expand instead of being elided.
  *
  * Constraints / known gaps:
- *   - Multi-line `define continuations (trailing `\`) not supported
- *     yet — picorv32 doesn't use them, but cva6 might.
  *   - String comparison in `ifdef NAME is text-only — no `nettype-
  *     style numeric arguments. *)
 
@@ -268,17 +266,80 @@ let strip_line_comment s =
   done;
   if !cut = n then s else String.sub s 0 !cut
 
-(* Main entry: read file, return preprocessed string. We preserve line
- * counts (blank lines for skipped sections / directives) so any later
- * error messages still point to roughly the right source line. *)
-let preprocess_file filename =
-  reset ();
-  let ic = open_in filename in
-  let lines = ref [] in
-  (try while true do lines := input_line ic :: !lines done
-   with End_of_file -> ());
-  close_in ic;
-  let raw = List.rev !lines in
+(* Fold SystemVerilog line continuations: `\` at end of line joins
+ * the next line into the same logical line.  Per IEEE 1800-2017,
+ * this is specifically for multi-line `define bodies, e.g.
+ *   `define MACRO(args) \
+ *     body_part_1 \
+ *     body_part_2
+ * The rule is text-level: any line whose last non-whitespace char is
+ * `\` continues.  We replace the trailing `\` with a single space and
+ * concatenate, then EMIT BLANK lines at the joined positions so
+ * downstream error reporting still maps to the right source line.
+ * Robust against trailing whitespace after the backslash; doesn't
+ * split escaped names like `\identifier` (those would have a space
+ * before the next token, never end-of-line). *)
+let fold_continuations lines =
+  let out = ref [] in
+  let pending = Buffer.create 64 in
+  let blanks_after = ref 0 in
+  List.iter (fun line ->
+    let trimmed_r =
+      let n = String.length line in
+      let p = ref n in
+      while !p > 0 && (let c = line.[!p - 1] in c = ' ' || c = '\t') do
+        decr p
+      done;
+      !p in
+    if trimmed_r > 0 && line.[trimmed_r - 1] = '\\' then begin
+      (* Continuation: append everything up to (but not including)
+         the backslash, then a space.  Track that this line shouldn't
+         emit its own blank — the joined line will emit later. *)
+      Buffer.add_string pending (String.sub line 0 (trimmed_r - 1));
+      Buffer.add_char pending ' ';
+      incr blanks_after
+    end else begin
+      Buffer.add_string pending line;
+      out := Buffer.contents pending :: !out;
+      Buffer.clear pending;
+      (* Emit blank-line placeholders for the lines we consumed,
+         so the parser's line numbers still match the source. *)
+      for _ = 1 to !blanks_after do out := "" :: !out done;
+      blanks_after := 0
+    end
+  ) lines;
+  (* If the file ends mid-continuation, flush. *)
+  if Buffer.length pending > 0 then begin
+    out := Buffer.contents pending :: !out;
+    for _ = 1 to !blanks_after do out := "" :: !out done
+  end;
+  List.rev !out
+
+(* Split a string on newlines into a list of lines (no trailing
+ * newline retained on each line). *)
+let lines_of_string s =
+  let n = String.length s in
+  let out = ref [] in
+  let start = ref 0 in
+  for i = 0 to n - 1 do
+    if s.[i] = '\n' then begin
+      out := String.sub s !start (i - !start) :: !out;
+      start := i + 1
+    end
+  done;
+  if !start < n then out := String.sub s !start (n - !start) :: !out;
+  List.rev !out
+
+(* Main entry — string in, preprocessed string out.  Suitable as a
+ * `parse-from-string` style hook for callers that already have the
+ * source text in memory (tests, embedded library use, the Lua glue,
+ * any pipeline that doesn't want a temp-file round-trip).  Resets
+ * the macro table on entry; pass `~keep_defines:true` to preserve
+ * the table built from a previous call (handy when feeding several
+ * fragments through with a shared preamble). *)
+let preprocess_string ?(keep_defines = false) text =
+  if not keep_defines then reset ();
+  let raw = fold_continuations (lines_of_string text) in
   let ifdef_stk = ref [] in
   let out = Buffer.create 8192 in
   List.iter (fun line ->
@@ -294,3 +355,14 @@ let preprocess_file filename =
     end
   ) raw;
   Buffer.contents out
+
+(* File-level convenience: read into a string, then funnel through
+ * preprocess_string.  Preserves the previous external behaviour for
+ * any caller that already invokes this. *)
+let preprocess_file filename =
+  let ic = open_in filename in
+  let n = in_channel_length ic in
+  let buf = Bytes.create n in
+  really_input ic buf 0 n;
+  close_in ic;
+  preprocess_string (Bytes.unsafe_to_string buf)
