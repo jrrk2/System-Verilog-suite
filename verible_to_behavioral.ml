@@ -2064,6 +2064,33 @@ let convert_module ~pkgs (mdecl : module_decl)
   let assign_procs = List.concat_map (fun ca ->
     extract_assign ~pkgs ~params ~arrays:array_names ca
   ) cont_assigns in
+  (* Wire-with-initialiser shape: `wire [W:0] foo = expr;` parses
+     as a [net_declaration*] containing a [net_decl_assign1] subnode
+     that carries the RHS expression.  Treat each one as an extra
+     continuous assign — without this the wire is declared but never
+     driven, and Hardcaml rejects the parent module with "circuit
+     input signal must have a port name (unassigned wire?)".  Common
+     in the SmolLM rtl (swiglu, matvec_int8_engine) and elsewhere. *)
+  let net_decl_assigns =
+    let nodes = collect_by (has_tag
+      (fun t -> prefix_is "net_decl_assign1" t)) mdecl.m_body in
+    List.filter_map (function
+      | TUPLE4 (STRING tag, SymbolIdentifier name, _eq, rhs)
+        when prefix_is "net_decl_assign" tag ->
+          let rhs_e =
+            try Some (expr_to_bexpr ~pkgs ~params
+                        ~arrays:array_names rhs)
+            with _ -> None in
+          (match rhs_e with
+           | None -> None
+           | Some rhs_e ->
+               Some (BCombinational {
+                 name = "net_assign_" ^ name;
+                 sensitivity = [BAny];
+                 body = [BAssign { lhs = name; rhs = rhs_e }];
+               }))
+      | _ -> None) nodes in
+  let assign_procs = assign_procs @ net_decl_assigns in
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params mdecl.m_body in
   (* Post-pass: merge combinational @mem_write groups targeting the
