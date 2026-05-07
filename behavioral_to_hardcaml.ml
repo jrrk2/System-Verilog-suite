@@ -648,7 +648,7 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
          REGISTERS — naming combinational wires can collide when
          hier_synth's phantom-IO promotion brings names from child
          instance connections into the parent's variable list. *)
-      if is_reg then
+      if is_reg || Sys.getenv_opt "BIR_NAME_WIRES" <> None then
         (let _ = Signal.(--) (Always.Variable.value var) s.name in ());
       ctx.variables <- (s.name, var) :: ctx.variables
     end) bmod.signals;

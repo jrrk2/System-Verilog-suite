@@ -204,6 +204,50 @@ let rec body_to_expr fname bindings = function
             }
       ) cases default_expr in
       Some result
+  | [BIf { condition; then_stmts; else_stmts }] ->
+      (* `if (c) fname = a; else fname = b;` (and nested else-if
+         chains like mac_q15) — fold into a BCond expression. *)
+      let subst e =
+        List.fold_left (fun acc (name, expr, _) ->
+          subst_expr_expr name expr acc) e bindings in
+      (match body_to_expr fname bindings then_stmts,
+             body_to_expr fname bindings else_stmts with
+       | Some t, Some e ->
+           Some (BCond { condition = subst condition;
+                         then_val = t; else_val = e })
+       | _ -> None)
+  | stmts when stmts <> [] ->
+      (* Last shot: a sequence of intermediate `local = expr;`
+         BAssigns followed by a single fname-yielding stmt (BAssign
+         to fname, or BIf/BCase whose leaves all assign fname).
+         Substitute the locals into the final expression so the
+         function inlines as one big BCond/BBinOp tree.  This is
+         what mac_q15-style functions look like — pa/qb/sum/sh
+         intermediate computations followed by a saturating if/else. *)
+      let rec split_intermediates acc = function
+        | [] -> None
+        | [last] -> Some (List.rev acc, last)
+        | (BAssign { lhs; _ } as s) :: rest when lhs <> fname ->
+            split_intermediates (s :: acc) rest
+        | _ -> None
+      in
+      (match split_intermediates [] stmts with
+       | None -> None
+       | Some (intermediates, last) ->
+           match body_to_expr fname bindings [last] with
+           | None -> None
+           | Some final_expr ->
+               (* Substitute locals from LAST to FIRST so each later
+                  local can reference earlier ones (e.g.
+                  sh = sum >>> 15 comes after sum = ... ; we want
+                  sh substituted first, then sum, then sum's own
+                  pa/qb dependencies). *)
+               let with_locals =
+                 List.fold_right (fun stmt e ->
+                   match stmt with
+                   | BAssign { lhs; rhs } -> subst_expr_expr lhs rhs e
+                   | _ -> e) intermediates final_expr in
+               Some with_locals)
   | _ -> None
 
 (* Lookup table: function name → bfunc. *)

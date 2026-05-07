@@ -2775,40 +2775,100 @@ let convert_module ~pkgs (mdecl : module_decl)
       else
         let return_w = width_of ~pkgs ~params fdecl in
         let return_w = if return_w <= 0 then 1 else return_w in
-        (* Input declarations: walk for `port_declaration_noattr` or
-           `tf_port_declaration` tags. *)
+        (* Input declarations: walk for `port_declaration_noattr`,
+           `tf_port_declaration`, `tf_port_item`, or `module_port_declaration`
+           tags.  SystemVerilog `function f (input X, Y, Z);` ports
+           parse as `tf_port_item1` — the extractor used to miss
+           these and produced 0-param functions, blocking inline. *)
         let port_nodes = collect_by (has_tag (fun t ->
           prefix_is "tf_port_declaration" t
+          || prefix_is "tf_port_item" t
           || prefix_is "port_declaration_noattr" t
           || prefix_is "module_port_declaration" t)) fdecl in
+        (* In SV `input logic [15:0] a, p, b, q;` the `[15:0]` precedes
+           a list of names — and Verible attaches the type info only to
+           the FIRST tf_port_item.  Subsequent items (like p, b, q) get
+           a `type_identifier_or_implicit_basic_followed_by_id_and_dimensions_opt4`
+           wrapper without the packed dim, so extract_port_decl reports
+           them as 1-bit.  Sweep through and propagate the most-recently
+           seen explicit width forward. *)
+        let last_w = ref 1 in
         let func_params =
           List.concat_map (fun pn ->
             let signals = extract_port_decl ~pkgs ~params pn in
             List.filter_map (fun (s : bsignal) ->
               if s.name = fname then None  (* skip the function name itself *)
               else
-                let w = match s.stype with
+                let w =
+                  match s.stype with
+                  | BInt { width; _ } when width > 1 ->
+                      last_w := width; width
                   | BInt { width; _ } -> width
-                  | _ -> 1 in
+                  | _ -> 1
+                in
+                let w = if w = 1 then !last_w else w in
                 Some (s.name, BInt { width = w; signed = Unsigned }, `Input)
             ) signals
           ) port_nodes in
-        (* Body: walk the function for statement nodes.  Use the
-           same stmt_to_bstmt the always-block path uses.  This
-           covers BAssign, BIf, BCase (which is what frcon uses). *)
-        let stmt_nodes = collect_by (has_tag (fun t ->
+        (* Body: walk the function looking for statement nodes, but
+           STOP at the outermost matching node — don't descend into
+           it.  Otherwise a function with `if(c) x = a; else x = b;`
+           collects both the conditional_statement AND its inner
+           assignment_statements as sibling top-level body stmts.
+           Same hazard for a function with multiple top-level
+           assigns followed by an if: collect_by returns depth-first,
+           so the inner assigns of the if come BEFORE the standalone
+           assigns, and `top :: _` previously took the wrong one. *)
+        let is_stmt_tag t =
           prefix_is "case_statement" t
           || prefix_is "conditional_statement" t
           || prefix_is "assignment_statement_no_expr" t
           || prefix_is "nonblocking_assignment" t
-          || prefix_is "seq_block" t)) fdecl in
-        (* Use the outermost statement node (collect_by returns
-           depth-first; the seq_block enclosing case is largest). *)
+          || prefix_is "seq_block" t in
+        let stmt_nodes =
+          let acc = ref [] in
+          let rec walk_outer t =
+            if has_tag is_stmt_tag t then acc := t :: !acc
+            else match t with
+              | TUPLE2 (a, b) -> List.iter walk_outer [a; b]
+              | TUPLE3 (a, b, c) -> List.iter walk_outer [a; b; c]
+              | TUPLE4 (a, b, c, d) -> List.iter walk_outer [a; b; c; d]
+              | TUPLE5 (a, b, c, d, e) -> List.iter walk_outer [a; b; c; d; e]
+              | TUPLE6 (a, b, c, d, e, f) ->
+                  List.iter walk_outer [a; b; c; d; e; f]
+              | TUPLE7 (a, b, c, d, e, f, g) ->
+                  List.iter walk_outer [a; b; c; d; e; f; g]
+              | TUPLE8 (a, b, c, d, e, f, g, h) ->
+                  List.iter walk_outer [a; b; c; d; e; f; g; h]
+              | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+                  List.iter walk_outer [a; b; c; d; e; f; g; h; i]
+              | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+                  List.iter walk_outer [a; b; c; d; e; f; g; h; i; j]
+              | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+                  List.iter walk_outer [a; b; c; d; e; f; g; h; i; j; k]
+              | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+                  List.iter walk_outer [a; b; c; d; e; f; g; h; i; j; k; l]
+              | TLIST xs -> List.iter walk_outer xs
+              | _ -> ()
+          in
+          walk_outer fdecl;
+          List.rev !acc
+        in
+        (* Verible's parse tree returns top-level function body
+           statements in REVERSE source order (cons-list build-up).
+           Source order matters because behavioral_inline's body_to_expr
+           treats the LAST statement as the fname-yielding one and
+           substitutes earlier locals into it. *)
+        let stmt_nodes = List.rev stmt_nodes in
         let body =
           match stmt_nodes with
           | [] -> []
-          | top :: _ ->
+          | [top] ->
               [stmt_to_bstmt ~pkgs ~params ~arrays:array_names top]
+          | many ->
+              [BBlock (List.map
+                (fun n -> stmt_to_bstmt ~pkgs ~params ~arrays:array_names n)
+                many)]
         in
         Some {
           fname;

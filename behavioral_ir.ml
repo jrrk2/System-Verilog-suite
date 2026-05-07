@@ -337,8 +337,22 @@ let string_of_bmodule bmod =
       ) bmod.instances)
   in
 
-  Printf.sprintf "%smodule %s%s\n%s%s%s\n\n%s\nend module"
-    (string_of_attrs bmod.attrs) bmod.name params_str signals_str mems_str instances_str processes_str
+  let funcs_str =
+    if bmod.funcs = [] then ""
+    else
+      "\nfuncs:\n" ^
+      String.concat "\n" (List.map (fun (f : bfunc) ->
+        Printf.sprintf "  %s%s : %d params, %d locals, %d body stmts"
+          (if f.is_task then "task " else "function ")
+          f.fname
+          (List.length f.params)
+          (List.length f.locals)
+          (List.length f.body)
+      ) bmod.funcs)
+  in
+
+  Printf.sprintf "%smodule %s%s\n%s%s%s%s\n\n%s\nend module"
+    (string_of_attrs bmod.attrs) bmod.name params_str signals_str mems_str funcs_str instances_str processes_str
 
 let string_of_bprogram prog =
   String.concat "\n\n" (List.map string_of_bmodule prog.modules)

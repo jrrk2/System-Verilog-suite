@@ -380,6 +380,17 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
     try Behavioral_to_hardcaml.create_circuit synth_bmod
     with e ->
       let bt = Printexc.get_backtrace () in
+      if Sys.getenv_opt "HIER_SYNTH_DUMP_SIGS" <> None then begin
+        Printf.eprintf "[hier_synth] %s signals at failure:\n" m.name;
+        List.iter (fun (s : bsignal) ->
+          Printf.eprintf "  %s : %s w=%d %s\n"
+            (match s.direction with `Input -> "in"
+             | `Output -> "out" | `Internal -> "int")
+            s.name (signal_width s)
+            (String.concat " "
+               (List.map (fun (k, v) -> k ^ "=" ^ v) s.attrs))
+        ) synth_bmod.signals
+      end;
       failwith (Printf.sprintf "hier_synth: lowering failed for module %s: %s\n%s"
                   m.name (Printexc.to_string e) bt)
   in
