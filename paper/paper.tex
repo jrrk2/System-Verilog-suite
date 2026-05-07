@@ -1,0 +1,655 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{microtype}
+\usepackage[T1]{fontenc}
+
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=true,
+  showstringspaces=false,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{gray!50},
+  numberstyle=\tiny\color{gray}
+}
+
+\title{Verification-First RTL Synthesis:\\
+       Compositional SMT Equivalence from SystemVerilog to Routed Netlist}
+\author{J.~R.~R.~Kimmitt\\
+        \texttt{jonathan@kimmitt.co.uk}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe an open-source synthesis-and-equivalence pipeline that
+treats correctness as a first-class output alongside the gate-level
+netlist.  A multi-frontend SystemVerilog elaborator lowers source
+RTL through a Behavioral IR (BIR) into hardcaml, which we tech-map
+to a Liberty cell library and emit as structural Verilog readable by
+OpenROAD-flow-scripts.  Three SMT-driven contributions distinguish
+the pipeline from conventional yosys+ABC flows.
+
+First, we close the loop with a \emph{cell-mapped equivalence
+miter}: the cell-mapped Verilog is parsed back through Verible,
+each Liberty cell is expanded into a BIR expression using the
+cell's own \texttt{function} and \texttt{next\_state} strings, and
+the resulting BIR is paired by module name with the source and
+proved equivalent in Z3.  No silent fallback to a different tool
+hides synthesis bugs.
+
+Second, we introduce \emph{compositional verification by boundary
+substitution}: at parent-module miter time each child instance is
+replaced with a Z3 uninterpreted-function call whose name encodes
+the (child module, output port) pair.  Identical names and
+arguments on both sides of the miter make the leaf trivially equal
+in the parent's logical context, so a wide design verifies once a
+small set of leaves is independently proven.  We use the
+construction to verify a 24-bit multiply-accumulate built from
+8-bit multiplier and 48-bit adder leaves in five minutes
+end-to-end; the equivalent monolithic check fails to converge in
+fifteen.
+
+Third, we drive a \emph{cert-gated post-layout architecture swap}:
+analytical depth ratios for arithmetic alternates (Wallace, Dadda,
+Brent--Kung, Sklansky, Kogge--Stone) project a critical-path delay
+that is honoured only when a Z3 leaf certificate is on file for the
+target architecture and width.  On an 8-bit MAC laid out through
+OpenROAD-flow-scripts, the predicted post-swap arrival of a ripple
+$\rightarrow$ Sklansky adder swap matches the measured post-CTS
+arrival within 0.005\,\%, a 35.4\,\% latency reduction with the
+swap fully backed by leaf cert.
+
+The pipeline is in OCaml and proves equivalence on industry-grade
+designs: gcd (10 / 10 modules), the AES core (4 / 4 modules
+including \texttt{aes\_cipher\_top} and \texttt{aes\_key\_expand\_128}),
+and the cascaded MAC.
+\end{abstract}
+
+\section{Introduction}
+
+Conventional open-source RTL synthesis flows
+\cite{wolf2013yosys,brayton2010abc,ajayi2019openroad} treat the
+gate-level netlist as the only artefact crossing tool boundaries.
+Correctness is an external concern: the user runs equivalence
+checking afterwards if at all, often against a sequential simulation
+that flags discrepancies as test failures rather than as logical
+counterexamples.  When wide arithmetic is involved the equivalence
+checkers themselves are a bottleneck --- monolithic SMT
+verification of multipliers wider than ten bits is famously hard
+\cite{kaivola2009replacing}.
+
+This paper describes a synthesis pipeline built around the opposite
+choice: every step that lowers the design either preserves a Z3 SMT
+proof of equivalence with its input, or reports an explicit error.
+The pipeline lives behind \texttt{USE\_DECOMP\_SYNTH=1} in
+OpenROAD-flow-scripts and produces post-CTS layouts on industry
+designs while preserving formal correctness across the synthesis
+boundary.
+
+The paper makes three principal contributions:
+
+\begin{itemize}
+\item A cell-mapped equivalence miter (Section~\ref{sec:cell-equiv})
+that proves the gate-level Verilog we emit is logically
+equivalent to the source RTL, by parsing the cell-mapped output
+back through the same SystemVerilog frontend and expanding each
+Liberty cell using its function strings.  The miter requires no
+synthesis-tool-specific oracle.
+\item A compositional verification scheme based on boundary
+substitution (Section~\ref{sec:boundary}) that turns wide
+designs into small SMT problems by replacing instance boundaries
+with Z3 uninterpreted functions.  The same construction handles
+sequential-child boundaries by promoting their outputs to primary
+inputs of the parent miter, giving a depth-1 sequential check
+without flattening.
+\item A cert-gated post-layout resynthesis path
+(Section~\ref{sec:resynth}) where an analytical placement-aware
+delay model predicts the savings of an arithmetic-architecture
+swap, and a Z3-backed leaf certificate is required for the swap
+to be reported.  We measure the prediction against ORFS post-CTS
+arrival on an 8-bit MAC.
+\end{itemize}
+
+Sections~\ref{sec:bir}--\ref{sec:eval} cover the BIR scaffolding,
+the synthesis lowering, evaluation results, and related work.
+
+\section{Behavioral IR and multi-frontend lowering}
+\label{sec:bir}
+
+The pipeline ingests SystemVerilog from five distinct parsers ---
+an OCaml port of Verible's grammar, Verilator's JSON dump, Yosys
+RTLIL, Surelog UHDM, and Vivado's structural-VHDL emission of
+\texttt{synth\_design -rtl} --- and lowers each into a common
+Behavioral IR (BIR).  A \texttt{bmodule} is a record of declared
+signals, parameter bindings, sequential and combinational
+processes, sub-instance bindings, and function declarations.
+\texttt{bstmt} is a tree of assignments, blocks, conditionals,
+case statements, loops, and call statements over \texttt{bexpr},
+which is in turn a tree of variable references, constants, binary
+and unary operators, slices, concatenations, conditional
+expressions, and function calls.
+
+Common BIR-level passes apply uniformly across frontends.  The
+synthesis pipeline composes them in this order:
+\texttt{unroll}, \texttt{inline}, \texttt{iflift},
+\texttt{blocking\_subst}, \texttt{meminfer}, optional
+\texttt{flatten}, then \texttt{ffrip} + \texttt{share} for
+equivalence checking.  Each pass is an
+\texttt{bprogram $\to$ bprogram} function with no global state.
+
+\paragraph{ffrip.} The flip-flop ripping pass converts a
+\texttt{BSequential} block into an equivalent combinational form
+where each FF $Q$ becomes a primary input \texttt{<Q>\_\_Q} (the
+current state) and an associated primary output \texttt{<Q>\_\_D}
+carrying the next-state expression.  After ripping, two BIR
+modules are equivalent at depth-1 sequential level iff their
+combinational miter is unsatisfiable.  This avoids the special
+casing typically needed for sequential-equivalence and works
+correctly for any clock domain that the FF-set comparator first
+matches by name.
+
+\section{Synthesis lowering}
+\label{sec:synth}
+
+\subsection{From BIR to hardcaml}
+
+\texttt{Behavioral\_to\_hardcaml.create\_circuit} maps each BIR
+operator onto a hardcaml \texttt{Signal} primitive.  Multi-bit
+selects, slice writes, and indexed mem-writes are coalesced before
+lowering: the converter pre-merges \texttt{@slice\_write} and
+\texttt{@mem\_write} pseudo-statements within the same clock
+domain so that 16 separate
+\texttt{always @(posedge clk) text\_out[hi:lo] <= byte} blocks in
+AES become a single \texttt{BConcat} bus update, preserving
+non-blocking semantics through the FF-rip pass without losing
+slice writes to last-write-wins.
+
+\subsection{From hardcaml to Liberty cells}
+
+\texttt{Lib\_map.map\_circuit} tech-maps hardcaml's \texttt{Op2},
+\texttt{Mux}, \texttt{Eq}, \texttt{Add}, \texttt{Sub},
+\texttt{Mul}, \texttt{Lt} nodes to Liberty cells from a parsed
+\texttt{nangate.lib}, bit-blasting wide arithmetic into AND/OR/XOR
+ladders.  The ripple-carry adder \texttt{gen\_add} is a chain of
+full adders \texttt{gen\_fa}, each implemented as two XOR + two
+AND + one OR.  The Array multiplier \texttt{gen\_mul} reduces
+$a\!\times\!b$ to $b\_w$ iterations of \texttt{gen\_add\_bits} over
+shifted partial-product rows, mirroring the
+\texttt{Hardcaml\_circuits.Mul.create} construction in upstream
+hardcaml-circuits.  Wallace and Dadda alternates ride on top of
+the same primitives.
+
+\subsection{Hierarchical synth and the dual hier/flat netlist}
+
+\texttt{Hier\_synth.synth\_program} synthesises one BIR module at
+a time in dependency order: leaves first, parents last.  Hardcaml
+never sees a parent's instances; instead, for each child instance
+encountered in a parent module, we add phantom IO to the parent's
+hardcaml view (a child output becomes a phantom input on the
+parent, a child input becomes a phantom output) so hardcaml can
+synthesise the parent in isolation.  At cell-Verilog emit time
+the original child-instance lines are spliced back in alongside
+the parent's bit-blasted gates.
+
+This preserves the dual hier/flat representation: ORFS sees a
+hierarchical Verilog with module boundaries intact (good for
+SDC-driven timing and module-level reports) while the gate-level
+content per-module is also fully visible (good for placement-aware
+analysis).
+
+\section{Cell-mapped equivalence}
+\label{sec:cell-equiv}
+
+The synthesis pipeline is correct iff, for every source SystemVerilog
+module $M$, the cell-mapped Verilog module $M'$ that we emit
+implements the same logical function.  Existing flows leave this
+property to user-side equivalence checking after the fact.  We
+prove it as part of the pipeline.
+
+\subsection{Liberty function expansion}
+
+The cell-mapped Verilog references Liberty cells like
+\texttt{AND2\_X1}, \texttt{XOR2\_X1}, \texttt{DFF\_X1},
+\texttt{MUX2\_X1}.  Each cell's logical function is encoded in the
+Liberty file as a string expression on its output pin --- e.g.
+\texttt{function : "(A1 \& A2)"} for an AND gate, or a
+sequential cell's \texttt{ff} group with \texttt{clocked\_on},
+\texttt{next\_state}, and \texttt{clear} / \texttt{preset} fields.
+
+\texttt{Gate\_netlist\_to\_behavioral.expand\_program} reads a BIR
+that contains cell instances (parsed from cell-mapped Verilog) and
+replaces each cell with a BIR fragment derived from its Liberty
+function.  Combinational cells become \texttt{BCombinational}
+processes; sequential cells become \texttt{BSequential} processes
+with the appropriate clock and reset semantics.  The result is a
+BIR that \emph{describes the same function} as the cell-mapped
+Verilog --- not by simulation, but by definition.
+
+\subsection{The miter}
+
+\texttt{test\_synth\_equiv.exe} ties the pieces together:
+
+\begin{enumerate}
+\item Parse source SV via Verible into BIR$_{\textrm{src}}$.
+\item Pre-process the cell-mapped Verilog and parse it (with
+auto-generated empty stubs for each Liberty cell so Verible's
+elaborator records the instances) into BIR$_{\textrm{cells}}$.
+\item Expand BIR$_{\textrm{cells}}$ via Liberty function strings
+to produce a fully behavioural cell-equivalent BIR.
+\item Pair modules by name across the two programs and run
+\texttt{Z3\_miter.check\_miter\_equivalence} per-pair.
+\end{enumerate}
+
+The construction makes no assumption about which synthesis tool
+produced the cell-mapped Verilog --- as long as the cells are in
+the Liberty file and the Verilog parses, equivalence is provable.
+We have shipped it for our own \texttt{synth\_orfs\_shim} output
+but the same driver verifies arbitrary post-synth netlists.
+
+\section{Compositional verification by boundary substitution}
+\label{sec:boundary}
+
+A 24-bit multiplier has approximately $24 \times 24 = 576$ partial
+products and an adder tree of depth $\Theta(24)$ in the Array
+form.  Bit-vector SMT solvers struggle with this scale: in our
+measurements (Z3 4.13, single core) the equivalence check between
+a hand-written multiplier and our \texttt{gen\_mul} output
+saturates at the 8-bit width:
+
+\begin{center}
+\begin{tabular}{r r l}
+\toprule
+width & cells in \texttt{gen\_mul} & Z3 time \\
+\midrule
+6  & 349  & 4.2 s     \\
+8  & 641  & 144 s     \\
+10 & 1021 & timeout   \\
+12 & 1489 & timeout   \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The conventional response is to pick a more specialised
+verification engine for arithmetic
+\cite{ciesielski2017verifying}.  We take a different approach:
+keep Z3 and reduce the verification problem.
+
+\subsection{Boundary substitution}
+
+\texttt{Behavioral\_boundary.substitute\_program} rewrites every
+\texttt{binstance} into a set of \texttt{BCombinational} processes
+that drive the parent-side wires connected to each child output
+port using a \texttt{BCall} expression of the form
+\[
+  \texttt{BCall \{ func = M\_p; args = [a_1, \ldots, a_n] \}}
+\]
+where $M\_p$ encodes the (child module, output port) pair and the
+$a_i$ are the parent-side expressions connected to the child's
+input ports, sorted alphabetically by port name for canonical
+ordering across designs.
+
+In \texttt{z3\_miter} a \texttt{BCall} encodes as a Z3
+uninterpreted function declaration: the first occurrence creates
+a \texttt{FuncDecl} with domain matching the args' bit-vector
+sorts and range matching the output port's declared width; later
+occurrences with the same name reuse the same decl from a cache.
+Both designs in the miter share the same Z3 context and the same
+cache, so the same \texttt{(M\_p, args)} pair produces literally
+the same \texttt{Z3.FuncDecl.apply} term on both sides.  Z3's
+congruence rule then makes the BCall outputs equal whenever the
+arguments are.
+
+\subsection{Sequential children}
+
+A sequential child's output is a function of its inputs
+\emph{and} its hidden state, which the parent does not see.
+Treating it as a pure uninterpreted function would create
+spurious combinational fixed-point loops (a $\to$ mux $\to$ a via
+the BCall) that Z3 satisfies freely.  We detect sequential
+children by walking the transitive instance closure for any
+\texttt{BSequential} process and, for each output of a sequential
+child, promote the parent-side connection to a primary input of
+the parent miter (matched across designs by name).  This is the
+depth-1 sequential check applied at the parent level without
+needing flattening.
+
+\subsection{Cascade construction}
+
+To verify wide arithmetic we build it as a cascade of
+Z3-tractable leaves.  The 24-bit multiply-accumulate
+\texttt{cascade\_mac} (Figure~\ref{fig:cascade}) splits each
+24-bit operand into three 8-bit chunks and instantiates nine
+\texttt{mul8} leaves to produce all $a_i \times b_j$ partial
+products, then an eight-stage chain of \texttt{add48} leaves
+sums the shifted products, with a final accumulator register.
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}[language=Verilog]
+module mul8 (input [7:0] a, input [7:0] b, output [15:0] y);
+  assign y = a * b;
+endmodule
+
+module add48 (input [47:0] a, input [47:0] b, output [47:0] y);
+  assign y = a + b;
+endmodule
+
+module cascade_mac (
+  input clk, ena, dclr,
+  input  [23:0] din, coef,
+  output reg [50:0] result);
+  // ... 9 mul8 instances + 8 add48 chain + accumulator FF
+endmodule
+\end{lstlisting}
+\caption{The cascaded 24-bit MAC.  Each off-module wire goes
+through an explicit \texttt{assign w\_buf = w\_q;} so that
+\texttt{hier\_synth}'s phantom-IO promotion has unambiguous
+direction per net.}
+\label{fig:cascade}
+\end{figure}
+
+The miter result on a single core:
+
+\begin{center}
+\begin{tabular}{l r l}
+\toprule
+module & Z3 time & verdict \\
+\midrule
+\texttt{add48} & 0.16 s & equivalent \\
+\texttt{mul8}  & 137 s  & equivalent \\
+\texttt{cascade\_mac} & 178 s & equivalent \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The parent miter reduces to bookkeeping over the ena/dclr/accumulator
+FSM because \texttt{mul8} and \texttt{add48} appear identically as
+uninterpreted functions on both sides.  Total verification time
+for the fully-proven 24-bit MAC is approximately five minutes ---
+where the monolithic 24-bit multiplier check does not converge in
+fifteen.
+
+\subsection{Buffering convention}
+
+Boundary substitution requires that each off-module wire have a
+single direction in the parent's hardcaml view.  When a wire is
+the output of one child and the input of another (an adder
+chain), \texttt{hier\_synth} cannot decide whether to mark it as
+phantom input or phantom output.  We resolve this with a one-line
+buffering convention: every chain wire is split into producer-side
+\texttt{w\_q} and consumer-side \texttt{w\_buf} with an explicit
+\texttt{assign w\_buf = w\_q;} in the parent.  Each net then has
+unambiguous direction and the construction is mechanical.  This
+matches good design practice anyway; users get verifiability for
+free.
+
+\section{Cert-gated post-layout resynthesis}
+\label{sec:resynth}
+
+After ORFS lays out a design we want to know whether replacing one
+arithmetic operator with a faster architecture would meet timing.
+Conventional flows answer with another full layout cycle.  We
+answer in seconds with a placement-aware delay projection that is
+gated on a Z3 leaf certificate.
+
+\subsection{Architectural depth ratios}
+
+For each (kind, architecture, width) tuple the converter knows the
+combinational depth.  For adders:
+\begin{itemize}
+\item Ripple: $W$
+\item Sklansky / Kogge--Stone: $\lceil \log_2 W \rceil$
+\item Brent--Kung: $\max(1, 2\lceil \log_2 W \rceil - 1)$
+\end{itemize}
+For multipliers (all output-width $2W$):
+\begin{itemize}
+\item Array: $2W$
+\item Wallace / Dadda: $\lceil \log_2 W \rceil + W$
+\end{itemize}
+The depth ratio between two architectures is the ratio of their
+combinational depths; we use it as the projection factor on the
+fanout cone delay of a baseline arrival.
+
+\subsection{Predict-only flow}
+
+Given a placed netlist (DEF + Liberty-derived per-cell delay
+function), \texttt{Predict\_swap} identifies the worst endpoint,
+extracts its fanout cone with \texttt{Fanout\_cone}, computes the
+cone delay as the sum of forward-Elmore arcs, and for each
+binding-to-arch substitution scales the cone delay by the
+architectural depth ratio.  The new arrival is the baseline minus
+the saved cone delay.  Every prediction is reported with a cert
+status:
+
+\begin{itemize}
+\item \textbf{proven}: a Z3 leaf certificate is on file for
+(kind, target architecture, width) --- the swap is recommended.
+\item \textbf{no-cert}: the projection is reported but excluded
+from the cert-gated best-pick; the user is told which
+\texttt{verify-arch} command to run to unlock it.
+\end{itemize}
+
+\subsection{Measured prediction error on an 8-bit MAC}
+
+We synthesised an 8-bit Array$\times$Ripple MAC, ran it through
+ORFS to post-CTS, ran the predictor, applied the recommended swap
+(Sklansky adder), re-ran ORFS to post-CTS, and measured the actual
+critical-path arrival.
+
+\begin{center}
+\begin{tabular}{l r r}
+\toprule
+& baseline & swapped \\
+\midrule
+arch (mul $\times$ add) & Array $\times$ Ripple & Array $\times$ Sklansky \\
+post-CTS cell count & 535 & 343 \\
+critical-path arrival & 917.31 ps & 592.67 ps \\
+predicted arrival & --- & 592.7 ps \\
+prediction error & --- & $-0.005$\,\% \\
+cert status & --- & proven \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The next-most-attractive swap (\texttt{u\_mul} array $\to$
+Wallace, predicted savings 151 ps, also cert-proven) becomes the
+head of the recommendation list after the adder swap is applied.
+
+\section{ORFS substitution}
+\label{sec:orfs}
+
+OpenROAD-flow-scripts orchestrates the open-source RTL-to-GDSII
+flow: yosys for synthesis, ABC for technology mapping, OpenROAD
+for floorplan / place / route / CTS, and KLayout for finishing.
+Our synthesis pipeline replaces the yosys+ABC steps when invoked
+with \texttt{USE\_DECOMP\_SYNTH=1}.  The mechanism is a small
+patch to the ORFS Makefile:
+
+\begin{lstlisting}[language=make]
+ifeq ($(USE_DECOMP_SYNTH),1)
+do-yosys:
+    $(DECOMP_SHIM) $(DESIGN_NAME) \
+        $(RESULTS_DIR)/1_2_yosys.v $(VERILOG_FILES)
+    cp $(SDC_FILE) $(RESULTS_DIR)/1_2_yosys.sdc
+endif
+\end{lstlisting}
+
+The shim is a single binary that runs the Verible
+$\to$ BIR $\to$ hardcaml $\to$ Liberty pipeline and writes the
+cell-mapped Verilog directly into the location ORFS expects.
+There is no silent fallback: any failure of the pipeline aborts
+the make target.  Yosys remains available for explicit
+oracle / comparison runs but never as a hidden fallback that masks
+a synthesis bug.
+
+The same patch generalises: for the multiplier-architecture demos
+we provide a second shim, \texttt{mac\_synth\_shim}, that emits a
+\texttt{Synth\_mac} netlist directly with the chosen multiplier
+and adder architectures read from environment variables.  Both
+shims emit the \texttt{1\_2\_yosys.v} and \texttt{1\_2\_yosys.sdc}
+files in the same way.
+
+\section{Evaluation}
+\label{sec:eval}
+
+We exercise the pipeline on three classes of design:
+
+\paragraph{gcd (10 modules).} The standard ORFS demo.  10 / 10
+modules formally equivalent at module level (each leaf and the
+top), full ORFS run produces post-route DEF and final Verilog
+unchanged from the stock yosys+ABC flow.
+
+\paragraph{AES core (4 modules).} Verilog-2001 implementation with
+\texttt{aes\_sbox} (256-entry case statement), \texttt{aes\_rcon}
+(state machine), \texttt{aes\_key\_expand\_128} (state-array
+register, mix\_col function), and \texttt{aes\_cipher\_top}
+(round-state matrix, slice-LHS register writes).  4 / 4 modules
+formally equivalent under
+\texttt{Z3\_MITER\_TIMEOUT\_MS=120000}.  AES exercises the harder
+parts of the BIR pipeline: function inlining for \texttt{mix\_col}
+(which writes four byte-slices of a 32-bit return value across
+four \texttt{@slice\_write} calls and must coalesce into a single
+\texttt{BConcat}); cross-domain BSequential merging (16 separate
+\texttt{always} blocks driving \texttt{text\_out} bytes coalesce
+into one BSequential with a per-slot \texttt{BConcat} update);
+and parameter-resolution iteration (Verible's reverse parse
+order forces a fixed-point sweep to resolve derived parameters
+like \texttt{mwidth = dwidth + cwidth}).
+
+\paragraph{Cascaded MAC (3 modules).} Detailed in
+Section~\ref{sec:boundary}.  3 / 3 formally equivalent in
+$\sim$5 min on a single core.  The compositional structure
+generalises: a 32-bit MAC built as 16 \texttt{mul8} + 15
+\texttt{add64} leaves would verify by the same pattern with
+roughly the same wall-clock cost as the multiplication count
+times the per-leaf cost, since leaf verifications are mutually
+independent and trivially parallelisable.
+
+\paragraph{Post-layout resynth.} Detailed in
+Section~\ref{sec:resynth}.  Predicted vs.\ measured prediction
+error of 0.005\,\% on an 8-bit MAC, with the swap fully backed by
+a Z3 leaf certificate.
+
+\section{Related work}
+
+Yosys + ABC \cite{wolf2013yosys,brayton2010abc} is the
+predominant open-source synthesis chain.  Yosys offers an
+\texttt{equiv\_*} family of commands that compares two RTLIL
+designs at the SAT level, and Berkeley ABC ships a combinational
+equivalence checker (CEC).  Both depend on the synthesis tool
+itself producing the netlists they verify, with no
+multi-frontend reach.  Our pipeline instead treats Yosys as a
+parallel oracle (work item, not a dependency) and produces an
+SMT proof against the source SV without going through a yosys
+intermediate.
+
+\paragraph{Specialised arithmetic verification.} Gr\"obner-basis
+methods \cite{ciesielski2017verifying} verify multipliers up to
+several hundred bits but require non-SMT machinery.  Our cascade
+construction trades off generality for SMT-only tooling: any
+BIR-expressible boundary works, including non-arithmetic ones.
+
+\paragraph{Cell-mapped equivalence.} Commercial tools
+(Synopsys Formality, Cadence Conformal) read the cell-mapped
+Verilog and prove it equivalent to source RTL using
+proprietary engines.  \texttt{test\_synth\_equiv.exe} is, as far
+as we know, the first open-source equivalence checker that
+expands Liberty function strings directly into a behavioural
+form for SMT comparison against the source.
+
+\paragraph{Hierarchical equivalence.}  ABC's \texttt{cec}
+supports compositional checking via miter cones.  We push
+further: the boundary becomes an uninterpreted function
+\emph{at the SMT layer}, not a structural cone substitution,
+which is what allows Z3 to reduce a 24-bit cascade-MAC parent to
+the surrounding bookkeeping in 178 s.
+
+\paragraph{Cert-gated optimisations.}  EQy \cite{eqy} from the
+yosys ecosystem performs equivalence-driven swaps for known
+mux / gate optimisations.  We add the prediction step --- the user
+sees \emph{which} swap is worth doing before paying for the
+verification cycles --- and require that the cert exist before
+the swap is recommended.
+
+\paragraph{OpenROAD-flow-scripts.}  ORFS is the orchestrator we
+plug into.  Our patch is mechanical, leaves the rest of the flow
+untouched, and is auditable.
+
+\section{Conclusion and future work}
+
+A multi-frontend SystemVerilog elaborator combined with a
+Liberty-aware tech mapper, an SMT miter, and a boundary-substitution
+construction yields a synthesis pipeline that proves correctness
+at every step it lowers the design.  The same construction makes
+wide arithmetic tractable for SMT and grounds an analytical
+post-layout resynth predictor in Z3-verified leaves.
+
+Open work, in roughly the order we expect to take it:
+
+\begin{enumerate}
+\item Auto-cascade for \texttt{gen\_mul} above the SMT
+threshold, lifting the manual buffering convention into the
+lib\_map output so any wide multiplier inherits the cascade
+verification path.
+\item Push the cascaded MAC through ORFS layout to close the
+loop on multiplier-bound architecture swaps.
+\item LHS-context width propagation in the Verible converter ---
+currently worked-around per operator in z3\_miter --- so that
+all consumers see consistent widths.
+\item A yosys-as-oracle parallel-correctness harness that
+reports BIR-vs-yosys disagreements as part of CI.
+\end{enumerate}
+
+The codebase is open source at \url{https://github.com/jrrk2/System-Verilog-decompiler}; reproduction
+instructions for each result above are in the test directory
+listed alongside each evaluation point.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{wolf2013yosys}
+C.~Wolf.
+\newblock Yosys --- a free Verilog synthesis suite.
+\newblock In \emph{Proc.\ Austrochip}, 2013.
+
+\bibitem{brayton2010abc}
+R.~Brayton and A.~Mishchenko.
+\newblock ABC: An Academic Industrial-Strength Verification Tool.
+\newblock In \emph{Computer Aided Verification (CAV)}, pages 24--40, 2010.
+
+\bibitem{ajayi2019openroad}
+T.~Ajayi et al.
+\newblock OpenROAD: Toward a Self-Driving, Open-Source Digital Layout Implementation Tool Chain.
+\newblock In \emph{GOMACTech}, 2019.
+
+\bibitem{kaivola2009replacing}
+R.~Kaivola, R.~Ghughal, et al.
+\newblock Replacing Testing with Formal Verification in Intel CoreTM i7 Processor Execution Engine Validation.
+\newblock In \emph{CAV}, pages 414--429, 2009.
+
+\bibitem{ciesielski2017verifying}
+M.~Ciesielski, C.~Yu, W.~Brown, D.~Liu, A.~Rossi.
+\newblock Verification of Gate-Level Arithmetic Circuits by Function Extraction.
+\newblock In \emph{DAC}, 2015.
+
+\bibitem{eqy}
+YosysHQ.
+\newblock EQy --- equivalence checking driver.
+\newblock \url{https://github.com/YosysHQ/eqy}, 2024.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,13 +1,25 @@
 # System-Verilog-decompiler
 
-A multi-frontend SystemVerilog elaborator and equivalence-checking pipeline,
-written in OCaml. Pulls SV/Verilog/RTLIL/UHDM and Vivado's
-post-elaboration structural VHDL through five distinct parsers into a
-common Behavioral IR (BIR), runs SV-elaboration and post-elaboration
-optimisation passes on it, and proves equivalence between any two BIR
-modules via Z3 SMT. Originally built to recover behavioural Verilog from
-synthesised netlists; grown into a side-by-side correctness checker for
-SV elaboration, with Vivado's elaborated form as the oracle.
+A multi-frontend SystemVerilog elaborator, **proof-driven synthesiser**, and
+equivalence-checking pipeline written in OCaml. Pulls SV/Verilog/RTLIL/UHDM
+and Vivado's post-elaboration structural VHDL through five distinct parsers
+into a common Behavioral IR (BIR), runs SV-elaboration and post-elaboration
+optimisation passes on it, lowers BIR through a hardcaml + Liberty-driven
+tech mapper to ORFS-compatible cell-mapped Verilog, and proves equivalence
+between any two BIR modules via Z3 SMT — including against its *own*
+gate-level output and after cell-level architecture swaps in the placed
+netlist.
+
+Originally built to recover behavioural Verilog from synthesised netlists;
+grown into a side-by-side correctness checker for SV elaboration, with
+Vivado's elaborated form as the oracle; now also a verification-first
+alternative to yosys+ABC inside OpenROAD-flow-scripts. The headline
+result: a 24-bit MAC built from formally-verified 8-bit multiplier and
+48-bit adder leaves verifies end-to-end against its cell-mapped output in
+~5 min, where the monolithic 24-bit equivalence check doesn't converge.
+On a smaller MAC laid out through ORFS, an analytical predict-swap
+recommendation (ripple → sklansky adder, leaf-cert-gated) lands within
+0.005 % of the measured post-CTS arrival.
 
 Vivado is an SV consumer in this pipeline, not a VHDL consumer: we
 feed it SystemVerilog, run `synth_design -rtl`, and use the
@@ -128,6 +140,86 @@ identical outputs (and identical D-pin next states for every shared FF
 name). Fast path for combinational designs; for sequential designs the
 state correspondence is via Q-name matching — a precondition the FF-set
 comparator (#63) is responsible for verifying first.
+
+`Z3_MITER_TIMEOUT_MS=<ms>` overrides the default 30 s budget. Set
+higher when checking parent modules with deep boundary cones.
+
+### Compositional / hierarchical miter
+
+`behavioral_boundary.ml` lets a parent module's miter substitute every
+child instance with an uninterpreted-function `BCall`:
+`BCall { func = "<child_module>__<port>"; args = input_ports }`. Both
+sides of the parent miter encode the same Z3 `FuncDecl` (same name +
+same args → same value), so the child becomes opaque without losing
+soundness — the leaf certificate (proved separately) carries the
+correctness obligation. Sequential children's outputs are promoted to
+primary inputs instead, matching across designs by name (depth-1
+sequential check).
+
+This is what makes wide multipliers tractable. Z3 hits a wall around
+10-bit raw multiplier equivalence (8-bit ≈ 144 s, 10-bit no-converge).
+A 24-bit MAC built from 9 × `mul8` + 8 × `add48` + accumulator
+verifies in ~5 min — each leaf is independently Z3-tractable, and
+the parent miter only handles the surrounding bookkeeping.
+
+The construction requires a buffering convention: every off-module
+wire (instance output, instance input) goes through an explicit
+single-driver `assign` so `hier_synth`'s phantom-IO promotion sees
+unambiguous direction per net. See `test/cascade/cascade_mac.sv` for
+the worked example.
+
+## Synth pipeline (BIR → cell-mapped Verilog)
+
+| Stage | Module | Purpose |
+|---|---|---|
+| `Behavioral_to_hardcaml.create_circuit` | `behavioral_to_hardcaml.ml` | Lower a `bmodule` to a hardcaml `Circuit.t` — operators map to `Signal` ops, `BSequential` blocks to `Reg_spec`-clocked registers |
+| `Lib_map.map_circuit` | `lib_map.ml` | Tech-map hardcaml's `Comb_op` / `Mux` / `Eq` / `Add` / `Sub` / `Mul` / `Lt` nodes onto Liberty cells. Bit-blasts adders/subtractors as ripple-carry, multipliers as Array (b_w iterations of `gen_add`), gates as `AND2_X1`/`OR2_X1`/`XOR2_X1`/`INV_X1`/`MUX2_X1`. Set `LIB_MAP_DCE=1` for dead-code elimination |
+| `Hier_synth.synth_program` | `hier_synth.ml` | Per-module gate-level synth in dependency order. Children get phantom IO at their parent so each module synthesises standalone, while the cell-Verilog emit step splices each instance line back in alongside the parent's cells. Preserves both hier (instance lines) and flat (gate cells) views |
+| `Cell_verilog_emit` | `cell_verilog_emit.ml` | Write OpenROAD-readable structural Verilog: bus reconstruction emitted as `assign bus = {bit_w-1, …, 1, 0};` so OpenSTA can trace each gate's full bus driver |
+
+### `synth_orfs_shim.exe`
+
+Drop-in replacement for the yosys+ABC step in OpenROAD-flow-scripts.
+The patched ORFS Makefile (`test/orfs/decomp_synth.patch` — apply via
+`test/orfs/install.sh`) routes `do-yosys` and `do-yosys-canonicalize`
+to our shim when `USE_DECOMP_SYNTH=1`. No silent fallback to yosys —
+on any failure the make target fails, and yosys remains available
+only for explicit oracle/comparison runs (#101 in progress).
+
+```sh
+test/orfs/install.sh                                  # patch ORFS Makefile
+cd $HOME/OpenROAD-flow-scripts/flow
+USE_DECOMP_SYNTH=1 make DESIGN_CONFIG=designs/nangate45/gcd/config.mk
+```
+
+The companion `mac_synth_shim.exe` reads `MAC_WIDTH` / `MAC_MUL` /
+`MAC_ADD` env vars and emits a `Synth_mac` netlist (used for the
+multiplier-architecture demos — Wallace, Dadda, Brent-Kung,
+Sklansky, Kogge-Stone alternates). All five arches sit on top of
+the same bit-blasting primitives in `lib_map`; per-(arch, width)
+correctness is proved standalone via `verify-arch`.
+
+## Cell-mapped equivalence (`test_synth_equiv.exe`)
+
+Closes the verification loop: prove that the cell-mapped Verilog we
+just emitted means the same thing as the source SV. The cell file
+goes back through Verible into BIR (with auto-generated module stubs
+for each Liberty cell so Verible's elaborator counts them as
+instances), then `Gate_netlist_to_behavioral` expands each cell
+using the Liberty `function` / `next_state` strings into BIR
+expressions. The result is paired by module name with the source
+BIR and run through `Z3_miter`. With boundary substitution applied
+to both sides, parent modules verify by composition over their
+already-proven leaves.
+
+Headline numbers (single laptop, NangateOpenCellLibrary_typical):
+
+| Design | Modules | Result |
+|---|---|---|
+| `gcd` (10 modules incl. RegEn / RegRst / Subtractor / Mux / LtComparator / ZeroComparator / Dpath / Ctrl / top) | 10 | 10 / 10 formally equivalent |
+| AES (`aes_sbox`, `aes_rcon`, `aes_key_expand_128`, `aes_cipher_top`) | 4 | 4 / 4 formally equivalent (`Z3_MITER_TIMEOUT_MS=120000`) |
+| `cascade_mac` (24-bit MAC = 9 × mul8 + 8 × add48 + 51-bit accumulator) | 3 | 3 / 3 formally equivalent in 5 min |
+| 8-bit MAC through ORFS to post-CTS, then ripple → sklansky swap | n/a | predicted 592.7 ps · measured 592.67 ps · error -0.005 % · cert OK |
 
 ## Tools and entry points
 
@@ -255,15 +347,21 @@ frontends and (for elaboration) inside `verible_elaborate.ml`.
 
 Pending in the task tracker, in rough priority order:
 
-1. CVA6 popcount Z3 — the converter now flattens the recursive tower
-   correctly, but the body-level logic still diverges from Vivado on
-   specific bit-positions. Likely a port-connection-expression issue
-   the random fuzzer doesn't currently catch
-2. ct_vfdsu_* width mismatches — 4 entities Z3-error on bitvec sort
-   conflicts; the strict-pairing change shifted them from silent
-   passes to explicit errors, next is to find the one signal whose
-   width derivation differs
-3. RTL_REG with CE pin support
-4. Full-synthesis (post-synth_design) equivalence path
-5. Surelog: extract widths, processes, instances (currently leaf-cell
-   only; widening to support type parameters would unblock CVA6)
+1. **Push `cascade_mac` through ORFS layout** — verified compositionally
+   end-to-end; the multiplier-heavy P&R pass closes the loop on the
+   arch-swap demo for multiplier-bound paths (#125)
+2. **Auto-cascade `gen_mul`** for widths beyond Z3's monolithic ceiling
+   (~10-bit) — emit hierarchical mul-leaves + adder-leaves automatically
+   so any wide multiplier inherits the cascade verification path (#126)
+3. **`hier_synth` chain-wire phantom direction** — auto-insert the
+   single-driver buffer so users don't have to spell out
+   `assign w_buf = w_q;` between chained instances (#127)
+4. **Verible LHS-context width propagation** — propagate the assignment
+   target width into `BBinOp.result_type` so all consumers see consistent
+   widths (currently worked-around per-op in `z3_miter`) (#128)
+5. **Carry-lookahead subtractor for `gen_sub`** — mirror `gen_add`'s
+   ripple-carry baseline with an alternative (#112)
+6. CVA6 popcount Z3, `ct_vfdsu_*` width mismatches, `RTL_REG` with CE,
+   full-synthesis equivalence path, Surelog widening for type params,
+   yosys-as-oracle parallel-correctness harness (#101), kepler-formal as
+   second oracle (#105), Naja interchange for cert caching (#106).
