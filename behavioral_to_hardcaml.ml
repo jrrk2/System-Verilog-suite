@@ -687,6 +687,21 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
     if s.direction <> `Input
        && not (List.mem_assoc s.name ctx.variables) then begin
       let w = width_of_btype s.stype in
+      (* If this signal is never written by ANY process — outputs left
+         dangling by the source RTL (gqa_attention's kv_wr_addr,
+         kv_rd_addr), or signals that only appear on the RHS of reads
+         in modules-under-construction — skip the Always.Variable
+         dance entirely.  Always.Variable.wire's default-on-no-write
+         only kicks in when at least one Always.compile runs against
+         it, so a wire that never gets a `<--` ends up with empty
+         data_in and hardcaml rejects the resulting circuit.  Just
+         park a constant zero in ctx.signals; the Output handler
+         later reads it via the ctx.signals fallback. *)
+      let never_written = not (Hashtbl.mem driver_proc s.name) in
+      if never_written then begin
+        ctx.signals <- (s.name, Signal.zero w) :: ctx.signals;
+        ()
+      end else
       let is_reg, var =
         match Hashtbl.find_opt driver_proc s.name with
         | Some (Some (clock, reset)) ->
