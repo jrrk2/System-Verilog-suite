@@ -169,11 +169,137 @@ let child_inst_phantoms
     ) ci_conns_with_deps in
   { ci_module = i.module_name; ci_inst = i.inst_name; ci_conns }, phantoms
 
+(* When a wire is the OUTPUT of one child instance and the INPUT of
+   another within the same parent (an adder chain, a multiplier
+   reduction, etc.), [child_inst_phantoms] computes both [`In] and
+   [`Out] phantom directions for it and the downstream
+   [find_opt] in [prepare_parent] picks only the first.  Hardcaml
+   then either rejects the inconsistent declaration or silently
+   miswires the second consumer.
+
+   The fix is the same buffering convention that production hier
+   flows use anyway: split the chain wire into producer-side [w]
+   and consumer-side [w__hb] with an explicit pass-through assign
+   in the parent, so each net has a single phantom direction.  We
+   detect the bidirectional pattern here and rewrite the consuming
+   instances' [port_connections] before phantom IO is computed.
+   The buffer assign process is added to the parent's body so the
+   parent's hardcaml view sees [w__hb] as a regular driven wire. *)
+let auto_buffer_chain_wires
+    (parent : bmodule) (modules : bmodule list) : bmodule =
+  (* For each instance and each connection-dep, decide whether the
+     dep is the producer (child output) or consumer (child input)
+     side. *)
+  let role_at_dep =
+    List.concat_map (fun (i : binstance) ->
+      match lookup_module i.module_name modules with
+      | None -> []
+      | Some child ->
+          List.concat_map (fun (port, expr) ->
+            let _txt, deps = render_conn_expr parent.name port expr in
+            let cs =
+              try Some (List.find
+                          (fun (s : bsignal) -> s.name = port)
+                          child.signals)
+              with Not_found -> None in
+            match cs with
+            | None -> []
+            | Some cs ->
+                let role =
+                  match cs.direction with
+                  | `Output -> `Producer
+                  | `Input  -> `Consumer
+                  | `Internal -> `Other in
+                List.map (fun d -> (d, role, i.inst_name, port)) deps
+          ) i.port_connections) parent.instances in
+  (* Bidirectional names: appear as both Producer and Consumer. *)
+  let bidir =
+    let producers = List.filter_map (fun (n, r, _, _) ->
+      if r = `Producer then Some n else None) role_at_dep in
+    let consumers = List.filter_map (fun (n, r, _, _) ->
+      if r = `Consumer then Some n else None) role_at_dep in
+    List.filter (fun n -> List.mem n consumers) producers
+    |> List.sort_uniq compare in
+  if bidir = [] then parent
+  else begin
+    let buf_name n = n ^ "__hb" in
+    (* Rewrite consumer-side instance port connections: any occurrence
+       of [BVar n] (or BSlice/BConcat referencing [n]) on a consumer
+       port gets [n] replaced by [buf_name n].  Producer ports are
+       untouched. *)
+    let rec rewrite_expr e =
+      match e with
+      | BVar n when List.mem n bidir -> BVar (buf_name n)
+      | BVar _ | BConst _ -> e
+      | BSlice { signal; msb; lsb } ->
+          BSlice { signal = rewrite_expr signal; msb; lsb }
+      | BConcat es -> BConcat (List.map rewrite_expr es)
+      | BSelect { array; index } ->
+          BSelect { array = rewrite_expr array;
+                    index = rewrite_expr index }
+      | BBinOp r -> BBinOp { r with lhs = rewrite_expr r.lhs;
+                                    rhs = rewrite_expr r.rhs }
+      | BUnOp r -> BUnOp { r with operand = rewrite_expr r.operand }
+      | BCond { condition; then_val; else_val } ->
+          BCond { condition = rewrite_expr condition;
+                  then_val = rewrite_expr then_val;
+                  else_val = rewrite_expr else_val }
+      | BReplicate r -> BReplicate { r with value = rewrite_expr r.value }
+      | BCall r -> BCall { r with args = List.map rewrite_expr r.args }
+    in
+    let new_instances = List.map (fun (i : binstance) ->
+      match lookup_module i.module_name modules with
+      | None -> i
+      | Some child ->
+          let port_connections' = List.map (fun (port, expr) ->
+            let cs =
+              try Some (List.find
+                          (fun (s : bsignal) -> s.name = port)
+                          child.signals)
+              with Not_found -> None in
+            match cs with
+            | Some cs when cs.direction = `Input ->
+                (port, rewrite_expr expr)
+            | _ -> (port, expr)
+          ) i.port_connections in
+          { i with port_connections = port_connections' }
+    ) parent.instances in
+    (* Add a buffer signal + pass-through process per bidir wire. *)
+    let new_sigs =
+      List.map (fun n ->
+        let cur =
+          try Some (List.find (fun (s : bsignal) -> s.name = n)
+                      parent.signals)
+          with Not_found -> None in
+        match cur with
+        | Some s -> { s with name = buf_name n; direction = `Internal }
+        | None ->
+            (* Fall back to a 1-bit wire if the source bmodule didn't
+               declare the wire — caller's bug we shouldn't paper over,
+               but a 1-bit fallback is the existing convention in
+               [child_inst_phantoms]. *)
+            { name = buf_name n; stype = BBool; direction = `Internal;
+              initial_value = None; attrs = [] }
+      ) bidir in
+    let buffer_procs =
+      List.map (fun n ->
+        BCombinational {
+          name = "auto_buffer_" ^ n;
+          sensitivity = [BAny];
+          body = [BAssign { lhs = buf_name n; rhs = BVar n }];
+        }) bidir in
+    { parent with
+      signals  = parent.signals @ new_sigs;
+      instances = new_instances;
+      processes = parent.processes @ buffer_procs }
+  end
+
 (* Take a parent's bmodule, fold in phantom ports for child instances,
    and return: (synth-able bmodule, child instance splice list,
    set of phantom-IO names).  The synth-able view has m.instances=[]
    so [Behavioral_to_hardcaml.create_circuit] doesn't choke. *)
 let prepare_parent (parent : bmodule) (modules : bmodule list) =
+  let parent = auto_buffer_chain_wires parent modules in
   let child_results =
     List.map (child_inst_phantoms ~parent ~modules) parent.instances in
   let child_insts  = List.map fst child_results in
