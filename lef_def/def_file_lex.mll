@@ -283,7 +283,12 @@
     arg
 }
 
-let ident   = ['a'-'z' 'A'-'Z' '_'] ['a'-'z' 'A'-'Z' '_' '0'-'9']*
+(* Identifiers can include '/' as the hierarchy separator (the
+   value of DIVIDERCHAR is conventionally '/' but we don't track
+   redefinitions — ORFS / OpenROAD use '/' by default).  '$' shows
+   up inside hierarchical elaborated names emitted by Chisel /
+   PyMTL flows. *)
+let ident   = ['a'-'z' 'A'-'Z' '_'] ['a'-'z' 'A'-'Z' '_' '0'-'9' '/' '$']*
 let digit   = ['0'-'9']
 let int     = ['-' '+']? digit+
 let fltnum  = ['-' '+']? digit+ ('.' digit*)? (['e' 'E'] ['-' '+']? digit+)?
