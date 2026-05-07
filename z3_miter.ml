@@ -18,12 +18,17 @@
 open Behavioral_ir
 open Behavioral_optimize
 
-(* Z3 context *)
-let ctx = Z3.mk_context [
-  ("model", "true");
-  ("proof", "true");
-  ("timeout", "30000");  (* 30 second timeout *)
-]
+(* Z3 context.  Timeout overridable via Z3_MITER_TIMEOUT_MS env var
+   (default 30 s).  Some parent miters with deeply-nested boundary
+   BCalls + ffrip cones (e.g. AES's aes_cipher_top after mix_col gets
+   inlined into 16 byte slices fed by 16 sboxes) need more than 30 s. *)
+let ctx =
+  let t = try Sys.getenv "Z3_MITER_TIMEOUT_MS" with Not_found -> "30000" in
+  Z3.mk_context [
+    ("model", "true");
+    ("proof", "true");
+    ("timeout", t);
+  ]
 
 (* Signal cache for Z3 variables *)
 let signal_cache : (string, Z3.Expr.expr) Hashtbl.t = Hashtbl.create 256

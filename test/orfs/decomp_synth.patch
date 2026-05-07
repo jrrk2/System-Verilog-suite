@@ -1,6 +1,6 @@
 --- a/flow/Makefile
 +++ b/flow/Makefile
-@@ -263,10 +263,30 @@
+@@ -263,14 +263,45 @@
  .PHONY: yosys-dependencies
  yosys-dependencies: $(YOSYS_DEPENDENCIES)
  
@@ -22,7 +22,11 @@
 +	@if ! grep -q '^\[synth_orfs_shim\] OK' $(LOG_DIR)/1_2_decomp_synth.log; then \
 +	  echo "ERROR: decomp synth shim did not report OK — failing"; exit 1; \
 +	fi
-+	cp $(SDC_FILE) $(RESULTS_DIR)/1_2_yosys.sdc
++	@if [ -f $(RESULTS_DIR)/1_2_yosys.v.sdc ]; then \
++	  cp $(RESULTS_DIR)/1_2_yosys.v.sdc $(RESULTS_DIR)/1_2_yosys.sdc; \
++	else \
++	  cp $(SDC_FILE) $(RESULTS_DIR)/1_2_yosys.sdc; \
++	fi
 +else
  do-yosys: yosys-dependencies
  	$(SCRIPTS_DIR)/synth.sh $(SYNTH_SCRIPT) $(LOG_DIR)/1_2_yosys.log
@@ -30,4 +34,15 @@
 +endif
  
  .PHONY: do-yosys-canonicalize
++ifeq ($(USE_DECOMP_SYNTH),1)
++do-yosys-canonicalize:
++	@echo "[USE_DECOMP_SYNTH=1] skipping yosys canonicalize (shim writes 1_2_yosys.v directly)"
++	mkdir -p $(RESULTS_DIR)
++	@touch $(RESULTS_DIR)/1_1_yosys_canonicalize.rtlil
++else
  do-yosys-canonicalize: yosys-dependencies
+ 	$(SCRIPTS_DIR)/synth.sh $(SCRIPTS_DIR)/synth_canonicalize.tcl $(LOG_DIR)/1_1_yosys_canonicalize.log
++endif
+ 
+ $(RESULTS_DIR)/1_1_yosys_canonicalize.rtlil: $(YOSYS_DEPENDENCIES)
+ 	$(UNSET_AND_MAKE) do-yosys-canonicalize
