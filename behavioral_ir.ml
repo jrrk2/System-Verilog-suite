@@ -311,8 +311,20 @@ let string_of_bmodule bmod =
 
   let processes_str = String.concat "\n\n" (List.map string_of_bprocess bmod.processes) in
 
-  Printf.sprintf "%smodule %s%s\n%s\n\n%s\nend module"
-    (string_of_attrs bmod.attrs) bmod.name params_str signals_str processes_str
+  let mems_str =
+    if bmod.mems = [] then ""
+    else
+      "\nmems:\n" ^
+      String.concat "\n" (List.map (fun m ->
+        Printf.sprintf "  %s: %s [%dx%d, w_ports=%d, r_ports=%d, sync_read=%b]"
+          m.mname
+          (match m.kind with BRam -> "RAM" | BRom -> "ROM")
+          m.depth m.data_width m.n_write_ports m.n_read_ports m.read_is_sync
+      ) bmod.mems)
+  in
+
+  Printf.sprintf "%smodule %s%s\n%s%s\n\n%s\nend module"
+    (string_of_attrs bmod.attrs) bmod.name params_str signals_str mems_str processes_str
 
 let string_of_bprogram prog =
   String.concat "\n\n" (List.map string_of_bmodule prog.modules)

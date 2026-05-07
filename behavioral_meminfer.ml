@@ -280,75 +280,99 @@ let rewrite_process_for_rom = function
  * expressions are structurally identical AND the surrounding process
  * is the same one — the conservative choice is to treat every distinct
  * (process_name, index_expr) tuple as a separate port. *)
-let count_read_ports m_name processes =
-  let ports = ref [] in
-  let add proc_name idx =
-    let key = (proc_name, idx) in
-    if not (List.mem key !ports) then ports := key :: !ports
-  in
-  let rec walk_e proc_name = function
+(* Logical read-port count.  Same shape as writes (sites along a
+ * concurrent path SUM; mutex branches MAX), only the leaf changes:
+ * a [BSelect { array = BVar m_name; _ }] site adds one read,
+ * regardless of where in the expression tree it appears.  Conditional
+ * expressions (BCond) treat then/else as mutex like BIf does. *)
+let count_read_sites_in_body m_name body =
+  let rec expr = function
     | BSelect { array = BVar n; index } when n = m_name ->
-        add proc_name index;
-        walk_e proc_name index
-    | BBinOp { lhs; rhs; _ } -> walk_e proc_name lhs; walk_e proc_name rhs
-    | BUnOp { operand; _ } -> walk_e proc_name operand
-    | BSlice { signal; _ } -> walk_e proc_name signal
-    | BSelect { array; index } -> walk_e proc_name array; walk_e proc_name index
-    | BConcat es -> List.iter (walk_e proc_name) es
-    | BReplicate { value; _ } -> walk_e proc_name value
+        1 + expr index
+    | BBinOp { lhs; rhs; _ } -> expr lhs + expr rhs
+    | BUnOp { operand; _ } -> expr operand
+    | BSlice { signal; _ } -> expr signal
+    | BSelect { array; index } -> expr array + expr index
+    | BConcat es -> List.fold_left (fun a e -> a + expr e) 0 es
+    | BReplicate { value; _ } -> expr value
     | BCond { condition; then_val; else_val } ->
-        walk_e proc_name condition;
-        walk_e proc_name then_val;
-        walk_e proc_name else_val
-    | BCall { args; _ } -> List.iter (walk_e proc_name) args
-    | _ -> ()
+        expr condition + max (expr then_val) (expr else_val)
+    | BCall { args; _ } ->
+        List.fold_left (fun a e -> a + expr e) 0 args
+    | _ -> 0
   in
-  let rec walk_s proc_name = function
-    | BAssign { rhs; _ } -> walk_e proc_name rhs
+  let rec stmt = function
+    | BAssign { rhs; _ } -> expr rhs
     | BIf { condition; then_stmts; else_stmts } ->
-        walk_e proc_name condition;
-        List.iter (walk_s proc_name) then_stmts;
-        List.iter (walk_s proc_name) else_stmts
+        expr condition + max (stmts then_stmts) (stmts else_stmts)
     | BCase { selector; cases; default } ->
-        walk_e proc_name selector;
-        List.iter (fun (k, ss) ->
-          walk_e proc_name k; List.iter (walk_s proc_name) ss) cases;
-        List.iter (walk_s proc_name) default
-    | BBlock ss -> List.iter (walk_s proc_name) ss
-    | BWhile { condition; body } ->
-        walk_e proc_name condition; List.iter (walk_s proc_name) body
-    | BFor { condition; body; _ } ->
-        walk_e proc_name condition; List.iter (walk_s proc_name) body
-    | BCallStmt { args; _ } -> List.iter (walk_e proc_name) args
-    | _ -> ()
+        let sel = expr selector in
+        let arm_counts =
+          List.map (fun (k, ss) -> expr k + stmts ss) cases in
+        let d = stmts default in
+        sel + List.fold_left max d arm_counts
+    | BBlock ss -> stmts ss
+    | BWhile { condition; body } -> expr condition + stmts body
+    | BFor   { condition; body; _ } -> expr condition + stmts body
+    | BCallStmt { args; _ } ->
+        List.fold_left (fun a e -> a + expr e) 0 args
+    | _ -> 0
+  and stmts ss = List.fold_left (fun acc s -> acc + stmt s) 0 ss
   in
-  List.iter (function
-    | BCombinational c -> List.iter (walk_s c.name) c.body
-    | BSequential s -> List.iter (walk_s s.name) s.body
-  ) processes;
-  List.length !ports
+  stmts body
 
-(* Distinct write addresses for memory `m`, counted across all
- * BSequential bodies (the only place @mem_write should appear). *)
-let count_write_ports m_name processes =
-  let ports = ref [] in
-  let rec walk = function
-    | BCallStmt { func = "@mem_write"; args = [BVar n; addr; _] }
-      when n = m_name ->
-        if not (List.mem addr !ports) then ports := addr :: !ports
+let count_read_ports m_name processes =
+  List.fold_left (fun acc p ->
+    let body = match p with
+      | BCombinational c -> c.body
+      | BSequential s -> s.body
+    in
+    acc + count_read_sites_in_body m_name body
+  ) 0 processes
+
+(* Logical write-port count.
+ *
+ * The number of physical ports a memory needs is the **maximum number
+ * of concurrent writes** that can happen on a single clock edge.  We
+ * count it per process by walking the AST:
+ *
+ *   - Sequential statements (siblings at the same nesting level, OR
+ *     N sibling always blocks merged by [merge_seq_processes] into a
+ *     single body) all fire concurrently under non-blocking semantics
+ *     ⇒ their write counts SUM.
+ *   - if/else and case arms are mutually exclusive at runtime ⇒ their
+ *     write counts MAX.
+ *
+ * Then sum across processes.  Sites within mutex branches still get
+ * collapsed to 1 port at lowering time (enable=OR, addr/data=priority
+ * mux); sibling sites become independent ports.
+ *
+ * Reads use the same shape (see [count_read_ports] below).
+ *)
+let count_write_sites_in_body m_name body =
+  let rec stmt = function
+    | BCallStmt { func = "@mem_write"; args = (BVar n) :: _ }
+      when n = m_name -> 1
     | BIf { then_stmts; else_stmts; _ } ->
-        List.iter walk then_stmts; List.iter walk else_stmts
+        max (stmts then_stmts) (stmts else_stmts)
     | BCase { cases; default; _ } ->
-        List.iter (fun (_, ss) -> List.iter walk ss) cases;
-        List.iter walk default
-    | BBlock ss -> List.iter walk ss
-    | _ -> ()
+        let arms = List.map (fun (_, ss) -> stmts ss) cases in
+        let d = stmts default in
+        List.fold_left max d arms
+    | BBlock ss -> stmts ss
+    | BWhile { body; _ } -> stmts body
+    | BFor   { body; _ } -> stmts body
+    | _ -> 0
+  and stmts ss = List.fold_left (fun acc s -> acc + stmt s) 0 ss
   in
-  List.iter (function
-    | BSequential s -> List.iter walk s.body
-    | _ -> ()
-  ) processes;
-  List.length !ports
+  stmts body
+
+let count_write_ports m_name processes =
+  List.fold_left (fun acc p ->
+    match p with
+    | BSequential s -> acc + count_write_sites_in_body m_name s.body
+    | _ -> acc
+  ) 0 processes
 
 (* True if any read of `m_name` lives inside a BCombinational process —
  * that's the distributed/async-RAM pattern (Vivado infers LUT RAM).
@@ -443,7 +467,19 @@ let infer_module (m : bmodule) =
     | Some { stype = BArray { size; _ }; _ } -> Some size
     | _ -> None
   in
-  let ram_writes = find_ram_writes processes in
+  (* find_ram_writes returns one (name, aw, dw) tuple per @mem_write
+     site, so the same memory shows up N times after generate-unroll
+     etc.  Dedup by name, keeping the widest seen data width. *)
+  let ram_writes =
+    let h = Hashtbl.create 8 in
+    List.iter (fun (n, aw, dw) ->
+      match Hashtbl.find_opt h n with
+      | None -> Hashtbl.add h n (n, aw, dw)
+      | Some (_, aw', dw') ->
+          Hashtbl.replace h n (n, max aw aw', max dw dw')
+    ) (find_ram_writes processes);
+    Hashtbl.fold (fun _ v acc -> v :: acc) h []
+  in
   let ram_mems = List.map (fun (n, _aw, dw) ->
     let data_w = match signal_data_width n with
       | Some w -> w
