@@ -111,9 +111,19 @@ let rec expr_to_signal ctx = function
        | BAnd -> Signal.(s_lhs &: s_rhs)
        | BOr -> Signal.(s_lhs |: s_rhs)
        | BXor -> Signal.(s_lhs ^: s_rhs)
-       | BShl -> Signal.(sll s_lhs (Signal.to_int s_rhs))
-       | BShr -> Signal.(srl s_lhs (Signal.to_int s_rhs))
-       | BAshr -> Signal.(sra s_lhs (Signal.to_int s_rhs))
+       (* Shifts: use [Signal.sll]/[srl]/[sra] (which take an int) when
+          the amount is a constant; otherwise fall back to
+          [Signal.log_shift] which accepts a dynamic amount.  cordic_sincos
+          and similar shift-add iterative designs need dynamic shifts. *)
+       | BShl ->
+           (try Signal.(sll s_lhs (Signal.to_int s_rhs))
+            with _ -> Signal.log_shift Signal.sll s_lhs s_rhs)
+       | BShr ->
+           (try Signal.(srl s_lhs (Signal.to_int s_rhs))
+            with _ -> Signal.log_shift Signal.srl s_lhs s_rhs)
+       | BAshr ->
+           (try Signal.(sra s_lhs (Signal.to_int s_rhs))
+            with _ -> Signal.log_shift Signal.sra s_lhs s_rhs)
        | BEq -> Signal.(s_lhs ==: s_rhs)
        | BNe -> Signal.(s_lhs <>: s_rhs)
        | BLt -> Signal.(s_lhs <: s_rhs)
@@ -167,7 +177,16 @@ let rec expr_to_signal ctx = function
         if sw = w then s
         else if sw > w then Signal.select s (w - 1) 0
         else Signal.uresize s w in
-      Signal.mux2 s_cond (coerce s_then) (coerce s_else)
+      (* mux2 needs a 1-bit selector.  Verilog's `cond ? a : b` accepts
+         any width and treats non-zero as true; reduce a wider cond to
+         OR-of-bits before muxing. *)
+      let cond_w = Signal.width s_cond in
+      let s_cond1 =
+        if cond_w = 1 then s_cond
+        else
+          let bits = List.init cond_w (fun i -> Signal.bit s_cond i) in
+          Signal.reduce ~f:(Signal.(|:)) bits in
+      Signal.mux2 s_cond1 (coerce s_then) (coerce s_else)
 
   | BSelect { array; index } ->
       let s_array = expr_to_signal ctx array in
@@ -191,6 +210,19 @@ let rec expr_to_signal ctx = function
                let hi = (k + 1) * elem_w - 1 in
                let lo = k * elem_w in
                Signal.select s_array hi lo) in
+             (* Hardcaml's [mux] requires 2^width(sel) >= |cases|.
+                The BIR index is often narrower than ceil_log2(size)
+                (a 2-bit `i` reading a 64-entry array because i comes
+                from a smaller iteration or dimension).  Pad the
+                index up; out-of-range values get the highest case
+                (Verilog spec: `arr[i]` with i out of range is x). *)
+             let need_w =
+               let rec lg n = if n <= 1 then 0 else 1 + lg ((n + 1) / 2) in
+               lg size in
+             let s_index =
+               let iw = Signal.width s_index in
+               if iw >= need_w then s_index
+               else Signal.uresize s_index need_w in
              Signal.mux s_index cases)
 
   | BSlice { signal; msb; lsb } ->
@@ -243,14 +275,34 @@ let rec stmt_to_always ~is_reg ctx alw = function
 
   | BIf { condition; then_stmts; else_stmts } ->
       let cond_signal = expr_to_signal ctx condition in
+      (* Always.if_ needs a 1-bit guard; Verilog `if (cond)` accepts
+         any width with non-zero meaning true.  Reduce wider conds. *)
+      let cond_w = Signal.width cond_signal in
+      let cond_signal =
+        if cond_w = 1 then cond_signal
+        else
+          let bits = List.init cond_w (fun i -> Signal.bit cond_signal i) in
+          Signal.reduce ~f:(Signal.(|:)) bits in
       let then_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] then_stmts in
       let else_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] else_stmts in
       Always.(if_ cond_signal then_alw else_alw) :: alw
 
   | BCase { selector; cases; default } ->
       let sel_signal = expr_to_signal ctx selector in
+      let sel_w = Signal.width sel_signal in
+      (* Coerce each case-key to the selector's width.  Verible-derived
+         BIR routinely tags case constants with the largest BInt width
+         in scope (commonly 32) even when the selector is much narrower
+         (e.g. a 2-bit state register), and Hardcaml's [==:] rejects
+         operand-width mismatches.  Truncate the constant if it's
+         wider, zero-extend if narrower. *)
+      let coerce_to_sel s =
+        let w = Signal.width s in
+        if w = sel_w then s
+        else if w > sel_w then Signal.select s (sel_w - 1) 0
+        else Signal.uresize s sel_w in
       let case_list = List.map (fun (value, stmts) ->
-        let val_signal = expr_to_signal ctx value in
+        let val_signal = coerce_to_sel (expr_to_signal ctx value) in
         let case_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] stmts in
         (val_signal, case_alw)
       ) cases in

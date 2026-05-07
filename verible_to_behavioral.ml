@@ -1202,13 +1202,41 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
          (* Single LHS — fall through to the existing range / array /
             plain dispatch. *)
          let range_endpoints =
+           (* The OUTERMOST select_variable_dimension on the LHS
+              decides whether this is a slice or a mem write.  A
+              naive recursive walk falls through `arr[idx[hi:lo]]`
+              and grabs the inner range, generating a spurious
+              @slice_write where @mem_write is intended.  Walk
+              deliberately: stop at the first select_variable_dimension
+              encountered, then check if it's TUPLE6 (range) or
+              TUPLE4 (single-index). *)
            let msb = ref None and lsb = ref None in
-           walk (function
-             | TUPLE6 (STRING dt, _, m, _, l, _)
-               when prefix_is "select_variable_dimension" dt
-                 && !msb = None ->
-                 msb := Some m; lsb := Some l
-             | _ -> ()) lhs;
+           let stop = ref false in
+           let rec walk_outer t =
+             if !stop then ()
+             else match t with
+               | TUPLE6 (STRING dt, _, m, _, l, _)
+                 when prefix_is "select_variable_dimension" dt ->
+                   msb := Some m; lsb := Some l; stop := true
+               | TUPLE4 (STRING dt, _, _, _)
+                 when prefix_is "select_variable_dimension" dt ->
+                   stop := true  (* single-index outer → not a range *)
+               | TUPLE2 (a, b) -> walk_outer a; walk_outer b
+               | TUPLE3 (a, b, c) -> List.iter walk_outer [a; b; c]
+               | TUPLE4 (a, b, c, d) ->
+                   List.iter walk_outer [a; b; c; d]
+               | TUPLE5 (a, b, c, d, e) ->
+                   List.iter walk_outer [a; b; c; d; e]
+               | TUPLE6 (a, b, c, d, e, f) ->
+                   List.iter walk_outer [a; b; c; d; e; f]
+               | TUPLE7 (a, b, c, d, e, f, g) ->
+                   List.iter walk_outer [a; b; c; d; e; f; g]
+               | TUPLE8 (a, b, c, d, e, f, g, h) ->
+                   List.iter walk_outer [a; b; c; d; e; f; g; h]
+               | TLIST xs -> List.iter walk_outer xs
+               | _ -> ()
+           in
+           walk_outer lhs;
            match !msb, !lsb with
            | Some m, Some l -> Some (m, l)
            | _ -> None
