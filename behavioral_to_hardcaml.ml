@@ -110,10 +110,51 @@ let rec expr_to_signal ctx = function
         else Signal.uresize s common_w in
       let s_lhs = pad s_lhs0 and s_rhs = pad s_rhs0 in
       let result_width = width_of_btype result_type in
+      (* Optional dispatch to Hardcaml_circuits prefix-sum / Wallace
+         trees when LIB_MAP_ADDER / LIB_MAP_MUL is set.  Default falls
+         back to Hardcaml's `+:` / `*:` which `lib_map.gen_add` /
+         `gen_mul` then bit-blast as ripple / Array.  The CLA path
+         emits the explicit prefix-sum tree at the hardcaml level, so
+         lib_map sees individual gates and the overall depth is O(log N)
+         instead of O(N).  Trades ~10% area for ~30-40% adder delay. *)
+      let prefix_sum_config () =
+        match Sys.getenv_opt "LIB_MAP_ADDER" with
+        | Some "sklansky"    -> Some Hardcaml_circuits.Prefix_sum.Config.Sklansky
+        | Some "brent_kung"  -> Some Hardcaml_circuits.Prefix_sum.Config.Brent_kung
+        | Some "kogge_stone" -> Some Hardcaml_circuits.Prefix_sum.Config.Kogge_stone
+        | _ -> None
+      in
+      let mul_config () =
+        match Sys.getenv_opt "LIB_MAP_MUL" with
+        | Some "wallace" -> Some Hardcaml_circuits.Mul.Config.Wallace
+        | Some "dadda"   -> Some Hardcaml_circuits.Mul.Config.Dadda
+        | _ -> None
+      in
       (match op with
-       | BAdd -> Signal.(s_lhs +: s_rhs)
-       | BSub -> Signal.(s_lhs -: s_rhs)
-       | BMul -> Signal.(s_lhs *: s_rhs)
+       | BAdd ->
+           (match prefix_sum_config () with
+            | None -> Signal.(s_lhs +: s_rhs)
+            | Some config ->
+                let s_full = Hardcaml_circuits.Prefix_sum.create
+                  (module Signal) ~config
+                  ~input1:s_lhs ~input2:s_rhs ~carry_in:Signal.gnd in
+                Signal.select s_full (common_w - 1) 0)
+       | BSub ->
+           (match prefix_sum_config () with
+            | None -> Signal.(s_lhs -: s_rhs)
+            | Some config ->
+                (* a - b = a + ~b + 1, via prefix-sum with carry_in=1 *)
+                let s_full = Hardcaml_circuits.Prefix_sum.create
+                  (module Signal) ~config
+                  ~input1:s_lhs ~input2:Signal.(~: s_rhs) ~carry_in:Signal.vdd in
+                Signal.select s_full (common_w - 1) 0)
+       | BMul ->
+           (match mul_config () with
+            | None -> Signal.(s_lhs *: s_rhs)
+            | Some config ->
+                let s_full = Hardcaml_circuits.Mul.create ~config
+                  (module Signal) s_lhs s_rhs in
+                Signal.select s_full (common_w - 1) 0)
        | BDiv ->
            (* Division not synthesizable in HardCaml - use placeholder *)
            Printf.eprintf "Warning: Division not synthesizable, using zero\n";
