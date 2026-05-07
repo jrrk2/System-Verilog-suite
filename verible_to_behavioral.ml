@@ -1581,8 +1581,23 @@ let extract_body_params ~pkgs ~params tok =
                 with _ -> acc))
     | _ -> acc
   in
-  let acc = List.fold_left one params port_nodes in
-  let acc = List.fold_left one acc local_nodes in
+  (* Verible's parse tree presents parameter declarations in
+     reverse source order, so a derived param like
+       parameter mwidth = dwidth + cwidth;
+     gets visited before its operands resolve.  Iterate to fixed
+     point: after each pass, retry the unresolved ones; stop when
+     no new bindings appear (cycle or all done).  Bound at
+     [List.length nodes] passes per group to guarantee
+     termination on any acyclic dependency graph. *)
+  let resolve_until_fixed nodes acc =
+    let rec loop acc passes =
+      let acc' = List.fold_left one acc nodes in
+      if List.length acc' = List.length acc || passes <= 0 then acc'
+      else loop acc' (passes - 1)
+    in
+    loop acc (List.length nodes) in
+  let acc = resolve_until_fixed port_nodes  params in
+  let acc = resolve_until_fixed local_nodes acc in
   (* Drop the original `params` we seeded with — caller already has
    * those, we only want the additions. *)
   List.filter (fun (k, _) -> not (List.mem_assoc k params)) acc
