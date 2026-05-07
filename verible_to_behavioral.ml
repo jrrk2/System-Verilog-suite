@@ -2107,6 +2107,132 @@ let convert_module ~pkgs (mdecl : module_decl)
                }))
       | _ -> None) nodes in
   let assign_procs = assign_procs @ net_decl_assigns in
+  (* `initial $readmemh("file.hex", mem);` ROM initialiser (#132).
+     Hardcaml has no concept of an initial block, so a memory whose
+     content comes from $readmemh has no driver at the IR level and
+     synthesis aborts ("circuit input signal must have a port name
+     (unassigned wire?)").  Translate the call into a constant
+     driver: read the hex file at convert time, build a BConcat of
+     element-wide BConsts (MSB-first), and emit a BCombinational
+     that drives the target memory with that BConcat.
+
+     Path resolution: try the path verbatim, then relative to the
+     directory of every input .sv (the converter doesn't see the
+     file path here, so we use $MEM_INIT_DIR if set, plus PWD).
+     Errors are non-fatal — we log to stderr and skip; the synth
+     will then surface the unassigned-wire error and the user can
+     point MEM_INIT_DIR at the correct directory. *)
+  let mem_init_procs =
+    let mem_shape name =
+      List.find_map (fun (s : bsignal) ->
+        if s.name = name then
+          match s.stype with
+          | BArray { size; element = BInt { width; _ } } -> Some (size, width)
+          | _ -> None
+        else None) reg_var_signals in
+    let resolve path =
+      let candidates =
+        let extra = match Sys.getenv_opt "MEM_INIT_DIR" with
+          | Some d -> [Filename.concat d (Filename.basename path)]
+          | None -> [] in
+        path :: extra
+        @ (List.map (fun d -> Filename.concat d (Filename.basename path))
+             [Sys.getcwd ();
+              Filename.concat (Sys.getcwd ()) "generated";
+              Filename.concat (Sys.getcwd ()) "../generated"]) in
+      List.find_opt Sys.file_exists candidates in
+    let read_hex elem_w n_words path =
+      try
+        let ic = open_in path in
+        let words = ref [] in
+        let count = ref 0 in
+        (try
+          while !count < n_words do
+            let line = input_line ic in
+            (* Trim and strip Verilog `//` comments. *)
+            let trim_at s c =
+              try String.sub s 0 (String.index s c)
+              with Not_found -> s in
+            let line = trim_at line '/' in
+            let line = String.trim line in
+            if line <> "" then begin
+              let v = int_of_string ("0x" ^ line) in
+              let mask =
+                if elem_w >= 63 then -1
+                else (1 lsl elem_w) - 1 in
+              words := (v land mask) :: !words;
+              incr count
+            end
+          done
+        with End_of_file -> ());
+        close_in ic;
+        (* Pad with zero if file shorter than memory. *)
+        while !count < n_words do
+          words := 0 :: !words; incr count
+        done;
+        Some (List.rev !words)
+      with _ -> None in
+    let initial_nodes =
+      collect_by (has_tag (prefix_is "initial_construct")) mdecl.m_body in
+    List.filter_map (fun init ->
+      let saw_readmemh = ref false in
+      let str = ref None in
+      let target = ref None in
+      walk (function
+        | SymbolIdentifier id when id = "$readmemh" -> saw_readmemh := true
+        | TK_StringLiteral s when !str = None -> str := Some s
+        | SymbolIdentifier id
+          when !saw_readmemh && !str <> None && id <> "$readmemh"
+               && !target = None -> target := Some id
+        | _ -> ()) init;
+      match !saw_readmemh, !str, !target with
+      | true, Some path, Some tgt ->
+          let path =
+            (* Strip surrounding quotes if Verible kept them. *)
+            let n = String.length path in
+            if n >= 2 && path.[0] = '"' && path.[n - 1] = '"'
+            then String.sub path 1 (n - 2) else path in
+          (match mem_shape tgt with
+           | None ->
+               Printf.eprintf
+                 "[verible_to_bir] WARNING: $readmemh target %s is not a \
+                  recognised BArray; skipping ROM init from %s\n%!" tgt path;
+               None
+           | Some (size, elem_w) ->
+               (match resolve path with
+                | None ->
+                    Printf.eprintf
+                      "[verible_to_bir] WARNING: $readmemh hex file not \
+                       found: %s (set MEM_INIT_DIR or run from the \
+                       directory containing %s)\n%!"
+                      path (Filename.basename path);
+                    None
+                | Some p ->
+                    (match read_hex elem_w size p with
+                     | None ->
+                         Printf.eprintf
+                           "[verible_to_bir] WARNING: failed to read %s\n%!" p;
+                         None
+                     | Some words ->
+                         (* MSB-first BConcat: words[size-1] is the high
+                            slot, words[0] is the low.  Match the layout
+                            used by the @mem_write lowering in
+                            behavioral_to_hardcaml so reads via BSelect
+                            land on the same slot the file declared. *)
+                         let parts = List.rev_map (fun v ->
+                           BConst { value = v; width = elem_w }) words in
+                         Some (BCombinational {
+                           name = "mem_init_" ^ tgt;
+                           sensitivity = [BAny];
+                           body = [BAssign {
+                             lhs = tgt;
+                             rhs = BConcat parts;
+                           }];
+                         })))
+           )
+      | _ -> None) initial_nodes
+  in
+  let assign_procs = assign_procs @ mem_init_procs in
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params mdecl.m_body in
   (* Post-pass: merge combinational @mem_write groups targeting the
