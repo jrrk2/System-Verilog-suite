@@ -193,11 +193,28 @@ let resolved_sram_compiler () =
         ("mem_macro_resolve: cannot find sram_compiler.py — set \
           OPENRAM_HOME or install OpenRAM at ~/OpenRAM")
 
+(* OpenRAM crashes during delay characterization for non-power-of-2
+ * num_words (its bitline-net probe lookup assumes the natural
+ * row × col split for a clean shape).  Round up to the next pow2
+ * for the OpenRAM call: the decoder then addresses 2^k rows, the
+ * upper rows are physically present but never accessed by caller
+ * RTL (whose addr bus is bits_needed(num_words) wide and is
+ * already valid for the rounded depth — bits_needed(576) ==
+ * bits_needed(1024) == 10).  Trades up to ~50% area for shape
+ * coverage; a future OpenRAM patch could omit the unused rows
+ * physically. *)
+let next_pow2 n =
+  let rec loop p = if p >= n then p else loop (p * 2) in
+  loop 1
+
+let openram_num_words r = next_pow2 r.num_words
+
 let emit_openram_config r =
   match r.kind with
   | Rom _ -> failwith "emit_openram_config: not for ROM"
   | Sram { n_rw; n_r; n_w } ->
       let tech_s = string_of_tech r.tech in
+      let depth = openram_num_words r in
       Printf.sprintf {|word_size = %d
 num_words = %d
 num_rw_ports = %d
@@ -215,7 +232,7 @@ check_lvsdrc = False
 output_name = "%s"
 output_path = "."
 |}
-        r.word_size r.num_words n_rw n_r n_w tech_s
+        r.word_size depth n_rw n_r n_w tech_s
         (match r.tech with
          | Scn4m_subm -> "supply_voltages = [5.0]"
          | Sky130 -> "supply_voltages = [1.8]"
