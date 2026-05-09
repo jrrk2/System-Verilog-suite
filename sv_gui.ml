@@ -548,6 +548,31 @@ let pow2_ceiling ?(floor = 4096) n =
   while !p < n do p := !p * 2 done;
   !p
 
+(* Heuristic: the most likely top is a module that nobody instantiates
+   AND has the most stuff in it.  "Stuff" = total signal bits + heavy
+   weight per instance + medium weight per process.  Falls back to the
+   biggest overall module if every module is instantiated somewhere
+   (e.g. cyclic submodule reference).                                  *)
+let pick_default_top (p : Behavioral_ir.bprogram) =
+  let instantiated =
+    List.fold_left (fun acc (m : Behavioral_ir.bmodule) ->
+      List.fold_left (fun acc (i : Behavioral_ir.binstance) ->
+        i.module_name :: acc) acc m.instances) [] p.modules in
+  let score (m : Behavioral_ir.bmodule) =
+    let sig_bits = List.fold_left (fun acc (s : Behavioral_ir.bsignal) ->
+      acc + btype_bits s.stype) 0 m.signals in
+    sig_bits
+    + 50 * List.length m.instances
+    + 10 * List.length m.processes
+  in
+  let candidates =
+    List.filter (fun (m : Behavioral_ir.bmodule) ->
+      not (List.mem m.name instantiated)) p.modules in
+  let pool = if candidates = [] then p.modules else candidates in
+  match List.sort (fun a b -> compare (score b) (score a)) pool with
+  | m :: _ -> m.name
+  | []     -> ""
+
 let orfs_dir () =
   try Sys.getenv "ORFS_DIR"
   with Not_found ->
@@ -682,9 +707,9 @@ let show_orfs_run_dialog () =
 
   let default_top, default_file = match !current_prog with
     | Some (path, p) ->
-        let top = match p.modules with
-          | (m : Behavioral_ir.bmodule) :: _ -> m.name
-          | [] -> Filename.chop_extension (Filename.basename path)
+        let top = match pick_default_top p with
+          | "" -> Filename.chop_extension (Filename.basename path)
+          | n  -> n
         in (top, path)
     | None -> ("", "")
   in
