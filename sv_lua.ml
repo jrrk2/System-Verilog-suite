@@ -140,6 +140,19 @@ let load_frontend ~frontend ~top ~files : bprogram =
             | Some p -> p
             | None -> failwith "vhdl frontend failed")
        | _ -> failwith "vhdl frontend takes a single .vhd")
+  | "surelog" ->
+      (* Surelog UHDM dump path.  The frontend currently extracts
+         module-level port surface only; processes/cont_assigns are
+         the open task #50.  Useful as an interface-shape oracle and
+         as a pipecleaner for leaf cells, but not yet a full Z3
+         miter peer.  Argument is a path to a pre-captured
+         uhdm-dump text file. *)
+      (match files with
+       | [f] when Filename.check_suffix f ".dump" ->
+           Surelog_to_behavioral.convert_dump_file f
+       | _ -> failwith
+                "surelog frontend takes a single .dump (run \
+                 `surelog -parse -sverilog FILE.sv && uhdm-dump …` first)")
   | other -> failwith ("unknown frontend: " ^ other)
 
 (* ──────────────────────────────────────────────────────────────────
@@ -256,6 +269,123 @@ let lname h =
   | Some (Prog (n, _)) | Some (Mod (n, _, _)) | Some (Lib (n, _)) -> n
   | None -> failwith ("unknown handle " ^ h)
 
+(* ──────────────────────────────────────────────────────────────────
+ * HDL emit + cross-translate.  These expose the BIR→Verilog and
+ * BIR→VHDL emitters plus the convert_hdl pipeline (license-header
+ * preserving, language-detected by extension). *)
+
+let lemit_verilog h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Prog (_, p)) -> Behavioral_to_verilog.verilog_of_program p
+  | Some (Mod  (_, m, _)) ->
+      Behavioral_to_verilog.verilog_of_program
+        { modules=[m]; library_cells=[] }
+  | _ -> failwith ("emit_verilog: not a program/module handle: " ^ h)
+
+let lemit_vhdl h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Prog (_, p)) -> Behavioral_to_vhdl.vhdl_of_program p
+  | Some (Mod  (_, m, _)) ->
+      Behavioral_to_vhdl.vhdl_of_program
+        { modules=[m]; library_cells=[] }
+  | _ -> failwith ("emit_vhdl: not a program/module handle: " ^ h)
+
+let lwrite_verilog h path =
+  let body = lemit_verilog h in
+  let oc = open_out path in
+  output_string oc body;
+  close_out oc;
+  "ok"
+
+let lwrite_vhdl h path =
+  let body = lemit_vhdl h in
+  let oc = open_out path in
+  output_string oc body;
+  close_out oc;
+  "ok"
+
+(* Run the full convert_hdl pipeline (header preservation +
+ * frontend dispatch + emitter dispatch) without spawning a subprocess
+ * — gives Lua scripts the same end-to-end translation that the
+ * convert_hdl exe offers, and returns the output path. *)
+let lconvert_hdl input output =
+  let kind p =
+    match String.lowercase_ascii (Filename.extension p) with
+    | ".vhd" | ".vhdl" -> `Vhdl
+    | ".v" | ".sv" -> `Verilog
+    | _ -> failwith ("convert_hdl: unknown extension: " ^ p)
+  in
+  let src = kind input and dst = kind output in
+  (* read source *)
+  let ic = open_in input in
+  let n = in_channel_length ic in
+  let buf = Bytes.create n in
+  really_input ic buf 0 n;
+  close_in ic;
+  let src_text = Bytes.unsafe_to_string buf in
+  (* extract leading comment block (matching convert_hdl's logic) *)
+  let lines = String.split_on_char '\n' src_text in
+  let is_blank s = String.trim s = "" in
+  let comment_match k s =
+    let s = String.trim s in
+    String.length s >= 2 &&
+    (match k with
+     | `Vhdl -> String.sub s 0 2 = "--"
+     | `Verilog -> String.sub s 0 2 = "//" || String.sub s 0 2 = "/*")
+  in
+  let rec take acc = function
+    | [] -> List.rev acc
+    | l :: tl when is_blank l || comment_match src l -> take (l :: acc) tl
+    | _ -> List.rev acc
+  in
+  let header_lines = take [] lines in
+  let strip_marker s =
+    let s = String.trim s in
+    let lp p = let lp = String.length p in
+      if String.length s >= lp && String.sub s 0 lp = p
+      then String.sub s lp (String.length s - lp) |> String.trim else s in
+    match src with
+    | `Vhdl -> lp "--"
+    | `Verilog ->
+        let s = lp "//" in let s = if String.length s >= 2 && String.sub s 0 2 = "/*"
+                                   then String.sub s 2 (String.length s - 2) else s in
+        let n = String.length s in
+        let s = if n >= 2 && String.sub s (n-2) 2 = "*/" then String.sub s 0 (n-2) else s in
+        String.trim s
+  in
+  let prefix = match dst with `Vhdl -> "-- " | `Verilog -> "// " in
+  let header =
+    if header_lines = [] then ""
+    else String.concat "\n"
+           (List.map (fun l ->
+              let stripped = strip_marker l in
+              if stripped = "" then "" else prefix ^ stripped)
+              header_lines) ^ "\n"
+  in
+  let prog =
+    match src with
+    | `Vhdl ->
+        (match Vhdl_to_behavioral.convert_vhdl_file_to_behavioral input with
+         | Some p -> p | None -> failwith "vhdl frontend failed")
+    | `Verilog ->
+        let auto_top () =
+          let re = Str.regexp "^[ \t]*module[ \t\n]+\\([A-Za-z_][A-Za-z0-9_]*\\)" in
+          try let _ = Str.search_forward re src_text 0 in
+              Str.matched_group 1 src_text
+          with Not_found -> Filename.remove_extension (Filename.basename input)
+        in
+        Verible_to_behavioral.convert_files ~top:(auto_top ()) [input]
+  in
+  let body = match dst with
+    | `Vhdl -> Behavioral_to_vhdl.vhdl_of_program prog
+    | `Verilog -> Behavioral_to_verilog.verilog_of_program prog
+  in
+  let oc = open_out output in
+  if header <> "" then output_string oc header;
+  output_string oc body;
+  close_out oc;
+  output
+
 let litems () =
   let lst = Hashtbl.fold (fun k v acc ->
     let kind = match v with
@@ -339,6 +469,14 @@ module MakeLib
                        (wrap2 ltiming);
         "name",       V.efunc (V.string **->> V.string) (wrap1 lname);
         "items",      V.efunc (V.unit **->> V.string)   (wrap1 litems);
+        "emit_verilog",  V.efunc (V.string **->> V.string) (wrap1 lemit_verilog);
+        "emit_vhdl",     V.efunc (V.string **->> V.string) (wrap1 lemit_vhdl);
+        "write_verilog", V.efunc (V.string **-> V.string **->> V.string)
+                          (wrap2 lwrite_verilog);
+        "write_vhdl",    V.efunc (V.string **-> V.string **->> V.string)
+                          (wrap2 lwrite_vhdl);
+        "convert_hdl",   V.efunc (V.string **-> V.string **->> V.string)
+                          (wrap2 lconvert_hdl);
       ] g
   end
 end

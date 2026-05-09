@@ -580,7 +580,13 @@ Verbs:
   random      [-n N] [-seed S] [-out DIR] [-features M]  constrained-random generator
   list-mods   <frontend> <top> <files…>             module index per frontend
   ff-stats    <frontend> <top> <files…>             FF set summary
-  script      <file.lua>                            run a Lua script (svd.* API)
+  script      <file.lua>                            run a Lua script (svd.* API).  Bindings:
+                                                       svd.parse / pick / miter / gate_miter
+                                                       svd.bir / insts / timing / name / items
+                                                       svd.liberty / expand
+                                                       svd.emit_verilog / emit_vhdl       (BIR → text)
+                                                       svd.write_verilog / write_vhdl     (BIR → file)
+                                                       svd.convert_hdl(in, out)           (cross-translate, header-preserving)
   verify-arch <adder|mul> <arch> [--width N]        prove arch ≡ `+` / `*`, cache cert
   emit-arch   <adder|mul> <arch> <out.sv> [--width N]  write certified arch block as SV
   timing      <top> <files…> [--target-depth N]     critical-path report + cert-gated upgrade hints
