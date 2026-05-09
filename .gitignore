@@ -125,3 +125,8 @@ test_z3_mul
 # tracks across yosys/openroad upgrades; they must NOT be ignored.
 !baseline/results/
 !baseline/results/**
+test/cva6_ram/
+test/grlib_z3_sweep/
+test/random/
+test/smollm_vivado/
+test/uart_vhdl_vivado/
