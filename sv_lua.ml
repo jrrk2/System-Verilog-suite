@@ -162,6 +162,17 @@ let lparse frontend top files =
   let p = load_frontend ~frontend ~top ~files in
   hadd (Prog (top, p))
 
+(* No-top "read everything" entry — see Verible_to_behavioral.convert_files_all.
+ * Currently only the verible frontend has a no-top path; the others fall
+ * back to load_frontend with "" as top, which slang/yosys will reject —
+ * fine, the GUI guards on frontend before calling this. *)
+let lparse_all frontend files =
+  let p = match frontend with
+    | "verible" -> Verible_to_behavioral.convert_files_all files
+    | other -> load_frontend ~frontend:other ~top:"" ~files
+  in
+  hadd (Prog ("(all)", p))
+
 let lpick prog_h top =
   let _, p = find_prog prog_h in
   match List.find_opt (fun (m : bmodule) -> m.name = top) p.modules with
@@ -402,6 +413,39 @@ let litems () =
   String.concat "\n" (List.sort compare lst)
 
 (* ──────────────────────────────────────────────────────────────────
+ * GUI hooks — populated by sv_gui.ml at startup so the embedded Lua
+ * interpreter can drive lablgtk3 widgets. CLI users (sv_decompiler,
+ * sv_main_unified, …) never set these, so the gui.* Lua functions
+ * collapse to no-ops there. Hooks stay primitive (string/unit) so this
+ * file does NOT depend on lablgtk3. *)
+
+let gui_add_menu_hook       : (string -> unit) ref = ref (fun _ -> ())
+let gui_add_item_hook       : (string -> string -> string -> unit) ref =
+  ref (fun _ _ _ -> ())
+let gui_set_text_hook       : (string -> unit) ref = ref (fun _ -> ())
+let gui_get_text_hook       : (unit -> string) ref = ref (fun () -> "")
+let gui_append_text_hook    : (string -> unit) ref = ref (fun _ -> ())
+let gui_message_hook        : (string -> unit) ref = ref (fun s -> print_endline s)
+let gui_error_hook          : (string -> unit) ref =
+  ref (fun s -> prerr_endline s)
+let gui_open_file_hook      : (unit -> string) ref = ref (fun () -> "")
+let gui_save_file_hook      : (unit -> string) ref = ref (fun () -> "")
+let gui_set_status_hook     : (string -> unit) ref = ref (fun _ -> ())
+let gui_quit_hook           : (unit -> unit) ref = ref (fun () -> ())
+
+let lgui_add_menu  name      = !gui_add_menu_hook name; ""
+let lgui_add_item  m l h     = !gui_add_item_hook m l h; ""
+let lgui_set_text  s         = !gui_set_text_hook s; ""
+let lgui_get_text  ()        = !gui_get_text_hook ()
+let lgui_append_text s       = !gui_append_text_hook s; ""
+let lgui_message   s         = !gui_message_hook s; ""
+let lgui_error     s         = !gui_error_hook s; ""
+let lgui_open_file ()        = !gui_open_file_hook ()
+let lgui_save_file ()        = !gui_save_file_hook ()
+let lgui_set_status s        = !gui_set_status_hook s; ""
+let lgui_quit      ()        = !gui_quit_hook (); ""
+
+(* ──────────────────────────────────────────────────────────────────
  * lua-ml interpreter setup. Boilerplate copied from
  * hardcaml-lua/myluaclient.ml; the Char/Pair user-types are kept so the
  * standard library combine works, but we don't expose them in scripts. *)
@@ -452,6 +496,9 @@ module MakeLib
         "parse",      V.efunc (V.string **-> V.string **-> V.list V.string
                                **->> V.string)
                        (wrap3 lparse);
+        "parse_all",  V.efunc (V.string **-> V.list V.string
+                               **->> V.string)
+                       (wrap2 lparse_all);
         "pick",       V.efunc (V.string **-> V.string **->> V.string)
                        (wrap2 lpick);
         "miter",      V.efunc (V.string **-> V.string **->> V.string)
@@ -477,6 +524,23 @@ module MakeLib
                           (wrap2 lwrite_vhdl);
         "convert_hdl",   V.efunc (V.string **-> V.string **->> V.string)
                           (wrap2 lconvert_hdl);
+      ] g;
+      C.register_module "gui" [
+        "add_menu",    V.efunc (V.string **->> V.string) (wrap1 lgui_add_menu);
+        "add_item",    V.efunc (V.string **-> V.string **-> V.string
+                                **->> V.string)
+                       (wrap3 lgui_add_item);
+        "set_text",    V.efunc (V.string **->> V.string) (wrap1 lgui_set_text);
+        "get_text",    V.efunc (V.unit **->> V.string)   (wrap1 lgui_get_text);
+        "append_text", V.efunc (V.string **->> V.string)
+                       (wrap1 lgui_append_text);
+        "message",     V.efunc (V.string **->> V.string) (wrap1 lgui_message);
+        "error",       V.efunc (V.string **->> V.string) (wrap1 lgui_error);
+        "open_file",   V.efunc (V.unit **->> V.string)   (wrap1 lgui_open_file);
+        "save_file",   V.efunc (V.unit **->> V.string)   (wrap1 lgui_save_file);
+        "set_status",  V.efunc (V.string **->> V.string)
+                       (wrap1 lgui_set_status);
+        "quit",        V.efunc (V.unit **->> V.string)   (wrap1 lgui_quit);
       ] g
   end
 end

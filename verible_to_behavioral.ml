@@ -3135,3 +3135,22 @@ let convert_files ~top files : bprogram =
  * module declaration. *)
 let convert_files_with_externals ~top files : bprogram =
   convert_files_inner ~keep_external:true ~top files
+
+(* No-top "read everything" convenience: parse the input files, emit one
+ * bmodule per declared module at its body-declared default parameters,
+ * and skip the top-down specialise_design walk entirely.  Useful when
+ * the caller (e.g. the GUI) wants to inspect a file before deciding
+ * which module to elaborate as top.  Param-dependent specialisations
+ * (popcount__W8 vs popcount__W16) are NOT generated here — they require
+ * a known instantiation site and so live downstream of elaboration.   *)
+let convert_files_all files : bprogram =
+  mem_init_search_paths := discover_init_dirs files;
+  let mods, pkgs = parse_files_full files in
+  let bmods = List.map (fun (mdecl : module_decl) ->
+    let m = convert_module ~pkgs mdecl [] in
+    { m with name = mdecl.m_name }
+  ) mods in
+  let prog = { modules = bmods; library_cells = [] } in
+  let attr_tables = List.map Sv_attr_extract.extract_file files in
+  List.fold_left (fun p tbl -> Sv_attr_extract.stamp_program tbl p)
+    prog attr_tables

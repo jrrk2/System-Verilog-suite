@@ -432,6 +432,26 @@ let () = preprocess_string_ref := preprocess_string
  * argument is appended.  The file's own directory is pushed onto the
  * front automatically so relative `\`include` resolves like a
  * synthesis tool's. *)
+(* Scan preprocessed SV text for top-level `module|interface|program <id>`
+   declarations and return the names in source order.  Intended to run on
+   the OUTPUT of `preprocess_string`/`preprocess_file` so macro-expanded
+   and `\`include`-pulled module decls are visible.  Used by tools (e.g.
+   the lablgtk3 GUI) that need to pick a sensible top when the user has
+   not specified one. *)
+let module_decl_re =
+  Str.regexp
+    "\\(^\\|[^A-Za-z0-9_]\\)\\(module\\|interface\\|program\\)[ \t\n\r]+\\([A-Za-z_][A-Za-z0-9_]*\\)"
+
+let find_module_names text =
+  let names = ref [] in
+  let pos = ref 0 in
+  (try while true do
+    let p = Str.search_forward module_decl_re text !pos in
+    names := Str.matched_group 3 text :: !names;
+    pos := p + 1
+  done with Not_found -> ());
+  List.rev !names
+
 let preprocess_file ?(incdirs=[]) filename =
   let ic = open_in filename in
   let n = in_channel_length ic in
