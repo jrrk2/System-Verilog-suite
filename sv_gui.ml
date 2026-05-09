@@ -717,6 +717,17 @@ let decomp_shim_exe () =
   Filename.concat (repo_root ())
     "_build/default/synth_orfs_shim.exe"
 
+(* OpenRAM technology to match an ORFS platform.  Hardcaml memlower
+   reads MEM_MACRO_TECH from the environment to decide which OpenRAM
+   tech directory to invoke.  scn4m_subm is OpenRAM's bundled
+   educational PDK and won't physically align with nangate45's metal
+   stack — using it produces a "valid but wrong" SRAM macro.        *)
+let openram_tech_for_platform = function
+  | "nangate45" -> "freepdk45"
+  | "sky130hd"  -> "sky130"
+  | "gf180mcu"  -> "gf180mcu"
+  | _           -> "scn4m_subm"   (* asap7 has no OpenRAM tech — fall back *)
+
 let spawn_orfs cfg =
   (* If the user wants our hardcaml synth, ensure the Makefile patch
      and the shim binary are both ready before launching. *)
@@ -761,13 +772,29 @@ let spawn_orfs cfg =
   append_text "\n";
   set_status (Printf.sprintf "ORFS: %s on %s — running" cfg.o_top cfg.o_platform);
 
+  let mem_tech = openram_tech_for_platform cfg.o_platform in
+  if use_decomp then
+    append_text (Printf.sprintf
+      "[orfs] OpenRAM tech: %s (matched to %s)\n"
+      mem_tech cfg.o_platform);
   let r, w = Unix.pipe () in
   let pid =
     try
       let base = [| "make"; "-C"; flow_dir; "DESIGN_CONFIG=" ^ mk_path |] in
-      Unix.create_process "make"
-        (Array.append base extra_args)
-        Unix.stdin w w
+      let argv = Array.append base extra_args in
+      (* Inherit parent env, but force MEM_MACRO_TECH so the synth
+         shim picks the OpenRAM tech that matches the ORFS platform. *)
+      let env =
+        let parent = Unix.environment () in
+        let kv = "MEM_MACRO_TECH=" ^ mem_tech in
+        Array.append (Array.of_list
+          (List.filter (fun e ->
+            not (String.length e >= 16
+                 && String.sub e 0 16 = "MEM_MACRO_TECH=")
+          ) (Array.to_list parent)))
+          [| kv |]
+      in
+      Unix.create_process_env "make" argv env Unix.stdin w w
     with e ->
       Unix.close r; Unix.close w;
       error_dialog ("Failed to launch make: " ^ Printexc.to_string e);
