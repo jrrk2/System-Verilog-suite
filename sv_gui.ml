@@ -560,6 +560,7 @@ type orfs_cfg = {
   o_workdir    : string;
   o_mem_bits   : int;           (* SYNTH_MEMORY_MAX_BITS in config.mk    *)
   o_use_decomp : bool;          (* USE_DECOMP_SYNTH=1 to make            *)
+  o_bit_blast  : bool;          (* MEMLOWER=0 — skip OpenRAM, all flops  *)
 }
 
 (* Total bits of a btype, recursing into arrays/structs.  Used to size
@@ -810,26 +811,32 @@ let spawn_orfs cfg =
   set_status (Printf.sprintf "ORFS: %s on %s — running" cfg.o_top cfg.o_platform);
 
   let mem_tech = openram_tech_for_platform cfg.o_platform in
-  if use_decomp then
+  if use_decomp && not cfg.o_bit_blast then
     append_text (Printf.sprintf
       "[orfs] OpenRAM tech: %s (matched to %s)\n"
       mem_tech cfg.o_platform);
+  if use_decomp && cfg.o_bit_blast then
+    append_text "[orfs] memory bit-blast: ON (MEMLOWER=0, OpenRAM skipped)\n";
   let r, w = Unix.pipe () in
   let pid =
     try
       let base = [| "make"; "-C"; flow_dir; "DESIGN_CONFIG=" ^ mk_path |] in
       let argv = Array.append base extra_args in
-      (* Inherit parent env, but force MEM_MACRO_TECH so the synth
-         shim picks the OpenRAM tech that matches the ORFS platform. *)
+      (* Inherit parent env; force MEM_MACRO_TECH (so the OpenRAM tech
+         matches the ORFS platform) and MEMLOWER (0 disables OpenRAM
+         altogether — every memory becomes flops, useful while
+         OpenRAM v1.2.49's dual-port router hangs are unresolved). *)
+      let prefix p e =
+        let pl = String.length p in
+        String.length e >= pl && String.sub e 0 pl = p
+      in
       let env =
-        let parent = Unix.environment () in
-        let kv = "MEM_MACRO_TECH=" ^ mem_tech in
-        Array.append (Array.of_list
-          (List.filter (fun e ->
-            not (String.length e >= 16
-                 && String.sub e 0 16 = "MEM_MACRO_TECH=")
-          ) (Array.to_list parent)))
-          [| kv |]
+        let parent = Array.to_list (Unix.environment ()) in
+        let parent = List.filter (fun e ->
+          not (prefix "MEM_MACRO_TECH=" e || prefix "MEMLOWER=" e)) parent in
+        Array.of_list (parent @
+          ("MEM_MACRO_TECH=" ^ mem_tech)
+          :: (if cfg.o_bit_blast then ["MEMLOWER=0"] else []))
       in
       Unix.create_process_env "make" argv env Unix.stdin w w
     with e ->
@@ -970,6 +977,11 @@ let show_orfs_run_dialog () =
     ~active:true
     ~packing:(d#vbox#pack ~padding:4) () in
 
+  let bit_blast_chk = GButton.check_button
+    ~label:"Bit-blast memories (skip OpenRAM — workaround for v1.2.49 router hangs)"
+    ~active:true
+    ~packing:(d#vbox#pack ~padding:4) () in
+
   let hint = GMisc.label
     ~text:(Printf.sprintf
       "ORFS install: %s\nResults will land in <ORFS>/flow/results/<platform>/<top>/base/"
@@ -992,6 +1004,7 @@ let show_orfs_run_dialog () =
            o_workdir    = workdir_e#text;
            o_mem_bits   = 4096;     (* refined by do_orfs_run from BIR *)
            o_use_decomp = decomp_chk#active;
+           o_bit_blast  = bit_blast_chk#active;
          }
          with _ -> None)
     | _ -> None
