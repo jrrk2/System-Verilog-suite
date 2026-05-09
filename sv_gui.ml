@@ -128,6 +128,90 @@ let add_lua_item menu_name label handler =
   in
   dynamic_items := (item :> GObj.widget) :: !dynamic_items
 
+(* ---------- dependency discovery for "Parse Verible" ----------
+   When the user opens a single .sv file we want to also pull in the
+   files that define modules it instantiates, so the BIR view shows the
+   full design.  Strategy: scan sibling directories for *.sv, build a
+   module-name → file-path map (via Sv_preproc.find_module_names so
+   macros / `\`include`s are honoured), parse the seed file, walk the
+   resulting BIR for unresolved instance.module_name references, add
+   the matching files, and re-parse.  Iterate until fixed point.       *)
+
+let sv_dir_index : (string * (string, string) Hashtbl.t) ref =
+  ref ("", Hashtbl.create 0)
+
+let walk_sv_dir ?(max_depth = 4) root =
+  let table = Hashtbl.create 256 in
+  let rec walk depth dir =
+    if depth > max_depth then ()
+    else if Sys.file_exists dir && Sys.is_directory dir then begin
+      let entries =
+        try Array.to_list (Sys.readdir dir) with _ -> [] in
+      List.iter (fun e ->
+        if e = "" || e.[0] = '.' then ()    (* skip hidden / .git *)
+        else begin
+          let p = Filename.concat dir e in
+          if (try Sys.is_directory p with _ -> false)
+          then walk (depth + 1) p
+          else if Filename.check_suffix p ".sv"
+               || Filename.check_suffix p ".v" then begin
+            try
+              let text = Sv_preproc.preprocess_file p in
+              let names = Sv_preproc.find_module_names text in
+              List.iter (fun n ->
+                if not (Hashtbl.mem table n) then Hashtbl.add table n p
+              ) names
+            with _ -> ()
+          end
+        end
+      ) entries
+    end
+  in
+  walk 0 root;
+  table
+
+(* Cache one index per scan-root so reopening files in the same project
+   doesn't rescan the tree each time. *)
+let module_name_index_for path =
+  let root = Filename.dirname path in
+  let cached_root, cached_tbl = !sv_dir_index in
+  if cached_root = root then cached_tbl
+  else begin
+    let tbl = walk_sv_dir root in
+    sv_dir_index := (root, tbl);
+    tbl
+  end
+
+let close_verible_dependencies ~seed name_map =
+  let files = ref [seed] in
+  let prog  = ref (Verible_to_behavioral.convert_files_all !files) in
+  let max_iters = 8 in
+  let iter = ref 0 in
+  let changed = ref true in
+  while !changed && !iter < max_iters do
+    incr iter;
+    changed := false;
+    let defined = List.fold_left (fun acc (m : Behavioral_ir.bmodule) ->
+      m.name :: acc) [] (!prog).modules in
+    let referenced =
+      List.concat_map (fun (m : Behavioral_ir.bmodule) ->
+        List.map (fun (i : Behavioral_ir.binstance) -> i.module_name)
+          m.instances) (!prog).modules in
+    let unresolved = List.filter (fun n -> not (List.mem n defined))
+                       referenced in
+    let added = List.fold_left (fun acc n ->
+      match Hashtbl.find_opt name_map n with
+      | Some path when not (List.mem path !files) ->
+          files := path :: !files;
+          changed := true;
+          (n, path) :: acc
+      | _ -> acc
+    ) [] unresolved in
+    if added <> [] then
+      prog := Verible_to_behavioral.convert_files_all !files
+  done;
+  (List.rev !files, !prog)
+
 (* ---------- hardwired actions: parse / optim / Z3 miter ---------- *)
 
 let with_errors label f =
@@ -180,11 +264,23 @@ let do_parse fe () =
        top only later (Verify / hardcaml).  For frontends whose driver
        elaborates from a hard-coded top we still seed it from the source
        so the driver is happy, but no specialisation walk happens.     *)
-    let p =
+    let p, file_count, extra_banner =
       match fe with
-      | "verible" -> Verible_to_behavioral.convert_files_all [path]
+      | "verible" ->
+          let name_map = module_name_index_for path in
+          let files, prog =
+            close_verible_dependencies ~seed:path name_map in
+          let extra =
+            if List.length files > 1 then
+              Printf.sprintf "// dependencies pulled in (%d files):\n%s\n"
+                (List.length files)
+                (String.concat ""
+                   (List.map (fun f -> "//   " ^ f ^ "\n") files))
+            else ""
+          in
+          (prog, List.length files, extra)
       | "vhdl" | "verilator" ->
-          Sv_lua.load_frontend ~frontend:fe ~top:"" ~files:[path]
+          (Sv_lua.load_frontend ~frontend:fe ~top:"" ~files:[path], 1, "")
       | _ ->
           (* slang / yosys driver requires --top; seed it from the source
              so the driver elaborates SOMETHING, then dump every module
@@ -192,17 +288,21 @@ let do_parse fe () =
              yosys hierarchy is rooted but other modules survive when
              present in the file). *)
           let top = derive_top ~frontend:fe path in
-          Sv_lua.load_frontend ~frontend:fe ~top ~files:[path]
+          (Sv_lua.load_frontend ~frontend:fe ~top ~files:[path], 1, "")
     in
     current_prog := Some (path, p);
     let names = List.map (fun (m : Behavioral_ir.bmodule) -> m.name)
                   p.modules in
     dump_prog ~banner:(Printf.sprintf
-      "// %s — %d module(s) from %s\n// modules: %s\n\n"
+      "// %s — %d module(s) from %s%s\n// modules: %s\n%s\n"
       fe (List.length p.modules) path
-      (String.concat ", " names)) p;
-    set_status (Printf.sprintf "%s: %d module(s) loaded" fe
-                  (List.length p.modules)))
+      (if file_count > 1 then Printf.sprintf
+        " (+%d dependency files)" (file_count - 1)
+       else "")
+      (String.concat ", " names)
+      extra_banner) p;
+    set_status (Printf.sprintf "%s: %d module(s) from %d file(s) loaded" fe
+                  (List.length p.modules) file_count))
 
 let do_optim () =
   match !current_prog with
