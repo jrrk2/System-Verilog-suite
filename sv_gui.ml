@@ -58,10 +58,44 @@ let error_dialog msg =
 
 (* Sticky directory across all file choosers — opening any picker
    returns to the directory of the last successfully picked file.
-   Initialised to $HOME so the very first chooser doesn't open at
-   GTK's default (often /run/user/<uid> or the binary's cwd).      *)
+   Persisted across sessions in
+   $XDG_CONFIG_HOME/sv_decompiler/last_dir.txt; loaded at startup
+   and rewritten on every successful pick.                         *)
 let last_chooser_dir : string ref =
   ref (try Sys.getenv "HOME" with Not_found -> "")
+
+let last_dir_file () =
+  let xdg =
+    try Sys.getenv "XDG_CONFIG_HOME"
+    with Not_found ->
+      try (Sys.getenv "HOME") ^ "/.config"
+      with Not_found -> "/tmp"
+  in
+  Filename.concat xdg "sv_decompiler/last_dir.txt"
+
+let load_last_chooser_dir () =
+  let p = last_dir_file () in
+  if Sys.file_exists p then
+    try
+      let ic = open_in p in
+      (try
+         let l = String.trim (input_line ic) in
+         if l <> "" && Sys.file_exists l && Sys.is_directory l
+         then last_chooser_dir := l
+       with End_of_file -> ());
+      close_in ic
+    with _ -> ()
+
+let save_last_chooser_dir () =
+  let p = last_dir_file () in
+  let dir = Filename.dirname p in
+  if not (Sys.file_exists dir) then
+    ignore (Sys.command (Printf.sprintf "mkdir -p %s" (Filename.quote dir)));
+  try
+    let oc = open_out p in
+    output_string oc (!last_chooser_dir ^ "\n");
+    close_out oc
+  with _ -> ()
 
 let chooser_dialog action title =
   let d = GWindow.file_chooser_dialog
@@ -80,7 +114,10 @@ let chooser_dialog action title =
     | _   -> ""
   in
   d#destroy ();
-  if result <> "" then last_chooser_dir := Filename.dirname result;
+  if result <> "" then begin
+    last_chooser_dir := Filename.dirname result;
+    save_last_chooser_dir ()
+  end;
   result
 
 let open_file_dialog () = chooser_dialog `OPEN "Open file"
@@ -1579,6 +1616,7 @@ let () =
   ignore (ctx#push "Ready");
 
   load_search_paths ();
+  load_last_chooser_dir ();
   install_hooks ();
 
   (* File menu. *)
