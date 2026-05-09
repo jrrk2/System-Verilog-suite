@@ -627,3 +627,147 @@ let merge_slice_writes_module (m : bmodule) =
 
 let merge_slice_writes_program (p : bprogram) =
   { p with modules = List.map merge_slice_writes_module p.modules }
+
+(* ── byte-wise @mem_write merge ─────────────────────────────────────
+   picosoc_mem and most byte-write-enable RAMs use the canonical SV
+   pattern
+
+       if (wen[0]) mem[addr][ 7: 0] <= wdata[ 7: 0];
+       if (wen[1]) mem[addr][15: 8] <= wdata[15: 8];
+       if (wen[2]) mem[addr][23:16] <= wdata[23:16];
+       if (wen[3]) mem[addr][31:24] <= wdata[31:24];
+
+   Both Verible and Verilator drop the LHS bit-slice on the array
+   element, so each `if` lands as
+
+       BIf { cond = wen[i];
+             then = [BCallStmt @mem_write(mem, addr, wdata[hi:lo])] }
+
+   at the same nesting level — same arr, same addr, but each data is
+   a different byte slice of `wdata`.  Memlower then counts 4 sibling
+   ports and bit-blasts the array (8 K flops for picosoc_mem).
+
+   This pass detects the run, infers each byte's target by the data
+   slice's lsb, and collapses to ONE @mem_write under OR-of-enables
+   whose data is a read-modify-write of the array element with each
+   byte conditionally replaced.  Memlower then sees 1 write port and
+   maps to FakeRAM with w_mask = {wen[3], wen[2], wen[1], wen[0]}.   *)
+
+let extract_byte_write = function
+  | BIf { condition;
+          then_stmts =
+            [BCallStmt { func = "@mem_write";
+                         args = [BVar arr; addr;
+                                 BSlice { signal = src; msb; lsb }]}];
+          else_stmts = [] }
+    when msb >= lsb ->
+      Some (condition, arr, addr, src, lsb, msb - lsb + 1)
+  | _ -> None
+
+let try_merge_bytewise_run = function
+  | first :: _ as stmts ->
+      (match extract_byte_write first with
+       | None -> None
+       | Some (_, arr0, addr0, src0, _, _) ->
+           let rec gather acc = function
+             | [] -> List.rev acc, []
+             | s :: tl ->
+                 (match extract_byte_write s with
+                  | Some (c, a, addr, src, lsb, w)
+                    when a = arr0
+                      && bexpr_eq addr addr0
+                      && bexpr_eq src src0 ->
+                      gather ((c, lsb, w) :: acc) tl
+                  | _ -> List.rev acc, s :: tl)
+           in
+           let collected, rest = gather [] stmts in
+           if List.length collected < 2 then None
+           else
+             let sorted = List.sort
+               (fun (_, a, _) (_, b, _) -> compare a b) collected in
+             let contiguous = match sorted with
+               | (_, lsb0, _) :: _ ->
+                   let rec ok expected = function
+                     | [] -> true
+                     | (_, lsb, w) :: tl ->
+                         lsb = expected && ok (expected + w) tl
+                   in
+                   ok lsb0 sorted
+               | [] -> false
+             in
+             if not contiguous then None
+             else
+               let elem_read = BSelect { array = BVar arr0; index = addr0 } in
+               let parts = List.rev_map (fun (c, lsb, w) ->
+                 let hi = lsb + w - 1 in
+                 BCond {
+                   condition = c;
+                   then_val  = BSlice { signal = src0; msb = hi; lsb };
+                   else_val  = BSlice { signal = elem_read; msb = hi; lsb };
+                 }) sorted in
+               let combined_data = match parts with
+                 | [single] -> single
+                 | many -> BConcat many in
+               let any_enable =
+                 List.fold_left (fun acc (c, _, _) ->
+                   match acc with
+                   | None -> Some c
+                   | Some prev ->
+                       Some (BBinOp { op = BOr; lhs = prev; rhs = c;
+                                      result_type = BBool })
+                 ) None collected in
+               let merged =
+                 BIf {
+                   condition = (match any_enable with
+                                | Some c -> c
+                                | None -> BConst { value = 1; width = 1 });
+                   then_stmts = [BCallStmt {
+                     func = "@mem_write";
+                     args = [BVar arr0; addr0; combined_data];
+                   }];
+                   else_stmts = [];
+                 } in
+               Some (merged :: rest))
+  | [] -> None
+
+let rec merge_bytewise_in_stmts ss =
+  (* Don't recurse on the merged result — the merged BIf has a BConcat
+     data argument that won't re-match extract_byte_write, so a second
+     pass would just skip it.  If anything, recursing back into the
+     same list could cause an infinite loop if the merged shape did
+     accidentally match.  Splice merged in and continue with rest.  *)
+  match ss with
+  | [] -> []
+  | s :: rest ->
+      (match try_merge_bytewise_run ss with
+       | Some (merged :: after_run) ->
+           merged :: merge_bytewise_in_stmts after_run
+       | Some [] | None ->
+           merge_bytewise_in_stmt s :: merge_bytewise_in_stmts rest)
+
+and merge_bytewise_in_stmt = function
+  | BBlock ss -> BBlock (merge_bytewise_in_stmts ss)
+  | BIf r ->
+      BIf { r with
+            then_stmts = merge_bytewise_in_stmts r.then_stmts;
+            else_stmts = merge_bytewise_in_stmts r.else_stmts }
+  | BCase r ->
+      BCase { r with
+              cases = List.map (fun (k, ss) ->
+                       (k, merge_bytewise_in_stmts ss)) r.cases;
+              default = merge_bytewise_in_stmts r.default }
+  | BWhile r -> BWhile { r with body = merge_bytewise_in_stmts r.body }
+  | BFor   r -> BFor   { r with body = merge_bytewise_in_stmts r.body }
+  | other -> other
+
+let merge_bytewise_writes_module (m : bmodule) =
+  let walk_proc = function
+    | BSequential s ->
+        BSequential { s with body = merge_bytewise_in_stmts s.body }
+    | BCombinational c ->
+        BCombinational { c with body = merge_bytewise_in_stmts c.body }
+  in
+  { m with processes = List.map walk_proc m.processes }
+
+let merge_bytewise_writes_program (p : bprogram) =
+  { p with modules = List.map merge_bytewise_writes_module p.modules }
