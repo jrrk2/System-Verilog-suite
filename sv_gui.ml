@@ -550,29 +550,51 @@ let pow2_ceiling ?(floor = 4096) n =
   !p
 
 (* Heuristic: the most likely top is a module that nobody instantiates
-   AND has the most stuff in it.  "Stuff" = total signal bits + heavy
-   weight per instance + medium weight per process.  Falls back to the
-   biggest overall module if every module is instantiated somewhere
-   (e.g. cyclic submodule reference).                                  *)
+   AND has the largest *recursive* subtree.  Local-only score caused
+   picosoc_regs (fat register file, no instances) to beat picosoc
+   (4 child instances, each itself substantial).  We now compute
+   subtree score = local + sum of subtree(child) for every child
+   instance, with cycle protection.  Unresolved instances are given a
+   nominal weight so a pure-instance top doesn't lose to a leaf with a
+   bigger array.                                                      *)
 let pick_default_top (p : Behavioral_ir.bprogram) =
+  let by_name = Hashtbl.create 16 in
+  List.iter (fun (m : Behavioral_ir.bmodule) ->
+    Hashtbl.replace by_name m.name m) p.modules;
+  let local_score (m : Behavioral_ir.bmodule) =
+    let sig_bits = List.fold_left (fun acc (s : Behavioral_ir.bsignal) ->
+      acc + btype_bits s.stype) 0 m.signals in
+    sig_bits + 10 * List.length m.processes
+  in
+  let memo : (string, int) Hashtbl.t = Hashtbl.create 16 in
+  let rec subtree visiting (m : Behavioral_ir.bmodule) =
+    if Hashtbl.mem visiting m.name then 0
+    else match Hashtbl.find_opt memo m.name with
+    | Some s -> s
+    | None ->
+        Hashtbl.add visiting m.name ();
+        let kids = List.fold_left (fun acc (i : Behavioral_ir.binstance) ->
+          match Hashtbl.find_opt by_name i.module_name with
+          | Some child -> acc + subtree visiting child
+          | None -> acc + 500   (* unresolved — assume substantial *)
+        ) 0 m.instances in
+        Hashtbl.remove visiting m.name;
+        let s = local_score m + kids in
+        Hashtbl.replace memo m.name s; s
+  in
   let instantiated =
     List.fold_left (fun acc (m : Behavioral_ir.bmodule) ->
       List.fold_left (fun acc (i : Behavioral_ir.binstance) ->
         i.module_name :: acc) acc m.instances) [] p.modules in
-  let score (m : Behavioral_ir.bmodule) =
-    let sig_bits = List.fold_left (fun acc (s : Behavioral_ir.bsignal) ->
-      acc + btype_bits s.stype) 0 m.signals in
-    sig_bits
-    + 50 * List.length m.instances
-    + 10 * List.length m.processes
-  in
   let candidates =
     List.filter (fun (m : Behavioral_ir.bmodule) ->
       not (List.mem m.name instantiated)) p.modules in
   let pool = if candidates = [] then p.modules else candidates in
-  match List.sort (fun a b -> compare (score b) (score a)) pool with
-  | m :: _ -> m.name
-  | []     -> ""
+  let scored = List.map (fun m ->
+    (m, subtree (Hashtbl.create 4) m)) pool in
+  match List.sort (fun (_, a) (_, b) -> compare b a) scored with
+  | (m, _) :: _ -> m.name
+  | []          -> ""
 
 let orfs_dir () =
   try Sys.getenv "ORFS_DIR"
@@ -812,9 +834,20 @@ let show_orfs_run_dialog () =
 
   let default_top, default_file = match !current_prog with
     | Some (path, p) ->
-        let top = match pick_default_top p with
-          | "" -> Filename.chop_extension (Filename.basename path)
-          | n  -> n
+        (* Common case: the user picked foo.sv and there's a module
+           named foo in it — that's almost always the intended top.
+           Fall back to the recursive subtree heuristic only if no
+           module matches the seed file's basename, which catches
+           generated/auto-named files but never overrules the
+           obvious intent.                                          *)
+        let stem = Filename.chop_extension (Filename.basename path) in
+        let by_basename = List.exists
+          (fun (m : Behavioral_ir.bmodule) -> m.name = stem) p.modules in
+        let top =
+          if by_basename then stem
+          else match pick_default_top p with
+            | "" -> stem
+            | n  -> n
         in (top, path)
     | None -> ("", "")
   in
@@ -850,6 +883,23 @@ let show_orfs_run_dialog () =
 
   let workdir_e = GEdit.entry ~text:default_workdir () in
   pack_row "Workdir:" workdir_e;
+  (* Auto-update workdir as the user edits the Top field — but only if
+     the user hasn't manually edited the workdir away from the
+     auto-derived path.  Tracked via a simple flag flipped by the
+     workdir entry's `changed` signal.                              *)
+  let workdir_user_edited = ref false in
+  let workdir_pre = ref default_workdir in
+  ignore (workdir_e#connect#changed ~callback:(fun () ->
+    if workdir_e#text <> !workdir_pre then workdir_user_edited := true));
+  ignore (top_e#connect#changed ~callback:(fun () ->
+    if not !workdir_user_edited then begin
+      let home = try Sys.getenv "HOME" with Not_found -> "." in
+      let stem = let t = top_e#text in if t = "" then "design" else t in
+      let p = Filename.concat home
+        (Filename.concat "sv_decompiler_orfs" stem) in
+      workdir_pre := p;
+      workdir_e#set_text p
+    end));
 
   let decomp_chk = GButton.check_button
     ~label:"Use decompiler synth (hardcaml gate-level netlist instead of yosys+ABC)"
