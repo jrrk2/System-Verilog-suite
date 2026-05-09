@@ -551,6 +551,8 @@ let do_miter fe_a fe_b () =
    into the centre text view via a Glib IO watch so the GUI stays
    responsive while ORFS runs (5–30 min for nangate45 designs).        *)
 
+type mem_backend = Mem_fakeram | Mem_openram | Mem_bitblast
+
 type orfs_cfg = {
   o_top        : string;
   o_files      : string list;   (* full closed-over fileset for VERILOG_FILES *)
@@ -560,7 +562,7 @@ type orfs_cfg = {
   o_workdir    : string;
   o_mem_bits   : int;           (* SYNTH_MEMORY_MAX_BITS in config.mk    *)
   o_use_decomp : bool;          (* USE_DECOMP_SYNTH=1 to make            *)
-  o_bit_blast  : bool;          (* MEMLOWER=0 — skip OpenRAM, all flops  *)
+  o_mem_back   : mem_backend;   (* memory lowering strategy              *)
 }
 
 (* Total bits of a btype, recursing into arrays/structs.  Used to size
@@ -811,21 +813,33 @@ let spawn_orfs cfg =
   set_status (Printf.sprintf "ORFS: %s on %s — running" cfg.o_top cfg.o_platform);
 
   let mem_tech = openram_tech_for_platform cfg.o_platform in
-  if use_decomp && not cfg.o_bit_blast then
-    append_text (Printf.sprintf
-      "[orfs] OpenRAM tech: %s (matched to %s)\n"
-      mem_tech cfg.o_platform);
-  if use_decomp && cfg.o_bit_blast then
-    append_text "[orfs] memory bit-blast: ON (MEMLOWER=0, OpenRAM skipped)\n";
+  let plat_dir =
+    Filename.concat (orfs_dir ())
+      (Filename.concat "flow"
+         (Filename.concat "platforms" cfg.o_platform))
+  in
+  if use_decomp then begin
+    let label = match cfg.o_mem_back with
+      | Mem_fakeram  -> "FakeRAM (pre-built tables)"
+      | Mem_openram  -> Printf.sprintf "OpenRAM (tech=%s)" mem_tech
+      | Mem_bitblast -> "bit-blast (MEMLOWER=0, all flops)"
+    in
+    append_text (Printf.sprintf "[orfs] memory backend: %s\n" label);
+    if cfg.o_mem_back = Mem_fakeram then
+      append_text (Printf.sprintf
+        "[orfs] FakeRAM platform dir: %s\n" plat_dir)
+  end;
   let r, w = Unix.pipe () in
   let pid =
     try
       let base = [| "make"; "-C"; flow_dir; "DESIGN_CONFIG=" ^ mk_path |] in
       let argv = Array.append base extra_args in
-      (* Inherit parent env; force MEM_MACRO_TECH (so the OpenRAM tech
-         matches the ORFS platform) and MEMLOWER (0 disables OpenRAM
-         altogether — every memory becomes flops, useful while
-         OpenRAM v1.2.49's dual-port router hangs are unresolved). *)
+      (* Inherit parent env; layer in memory-backend selection per cfg:
+         FakeRAM → MEM_USE_FAKERAM=1 + FAKERAM_PLATFORM_DIR pointing at
+                   the ORFS platform tree (where pre-built fakeram45_*
+                   .lef/.lib live).
+         OpenRAM → just MEM_MACRO_TECH (matched to platform).
+         Bit-blast → MEMLOWER=0 in the shim's env.                    *)
       let prefix p e =
         let pl = String.length p in
         String.length e >= pl && String.sub e 0 pl = p
@@ -833,10 +847,19 @@ let spawn_orfs cfg =
       let env =
         let parent = Array.to_list (Unix.environment ()) in
         let parent = List.filter (fun e ->
-          not (prefix "MEM_MACRO_TECH=" e || prefix "MEMLOWER=" e)) parent in
-        Array.of_list (parent @
-          ("MEM_MACRO_TECH=" ^ mem_tech)
-          :: (if cfg.o_bit_blast then ["MEMLOWER=0"] else []))
+          not (prefix "MEM_MACRO_TECH=" e
+               || prefix "MEMLOWER=" e
+               || prefix "MEM_USE_FAKERAM=" e
+               || prefix "FAKERAM_PLATFORM_DIR=" e)) parent in
+        let extras =
+          ("MEM_MACRO_TECH=" ^ mem_tech) ::
+          (match cfg.o_mem_back with
+           | Mem_bitblast -> [ "MEMLOWER=0" ]
+           | Mem_fakeram  -> [ "MEM_USE_FAKERAM=1"
+                             ; "FAKERAM_PLATFORM_DIR=" ^ plat_dir ]
+           | Mem_openram  -> [])
+        in
+        Array.of_list (parent @ extras)
       in
       Unix.create_process_env "make" argv env Unix.stdin w w
     with e ->
@@ -977,10 +1000,23 @@ let show_orfs_run_dialog () =
     ~active:true
     ~packing:(d#vbox#pack ~padding:4) () in
 
-  let bit_blast_chk = GButton.check_button
-    ~label:"Bit-blast memories (skip OpenRAM — workaround for v1.2.49 router hangs)"
-    ~active:true
+  let mem_label = GMisc.label
+    ~text:"Memory backend:" ~xalign:0.0
     ~packing:(d#vbox#pack ~padding:4) () in
+  ignore mem_label;
+  let mem_box = GPack.hbox ~spacing:8 ~packing:d#vbox#pack () in
+  let fakeram_rb = GButton.radio_button
+    ~label:"FakeRAM (pre-built)"
+    ~active:true ~packing:mem_box#pack () in
+  let openram_rb = GButton.radio_button
+    ~group:fakeram_rb#group
+    ~label:"OpenRAM (generate)"
+    ~packing:mem_box#pack () in
+  let bitblast_rb = GButton.radio_button
+    ~group:fakeram_rb#group
+    ~label:"Bit-blast (flops)"
+    ~packing:mem_box#pack () in
+  ignore openram_rb; ignore bitblast_rb;
 
   let hint = GMisc.label
     ~text:(Printf.sprintf
@@ -1004,7 +1040,10 @@ let show_orfs_run_dialog () =
            o_workdir    = workdir_e#text;
            o_mem_bits   = 4096;     (* refined by do_orfs_run from BIR *)
            o_use_decomp = decomp_chk#active;
-           o_bit_blast  = bit_blast_chk#active;
+           o_mem_back   =
+             if      bitblast_rb#active then Mem_bitblast
+             else if openram_rb#active  then Mem_openram
+             else                            Mem_fakeram;
          }
          with _ -> None)
     | _ -> None
