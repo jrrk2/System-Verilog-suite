@@ -429,3 +429,90 @@ let merge_module (m : bmodule) =
 
 let merge_program (p : bprogram) =
   { p with modules = List.map merge_module p.modules }
+
+(* ── @slice_write → full-signal RMW ──────────────────────────────────
+   Convert `@slice_write(name, hi, lo, val)` into a BAssign of the
+   whole signal whose RHS reads the unwritten bits back via BSlice
+   and concats the new slice into place:
+
+       @slice_write(buf, 7, 0, d)   ;; w(buf) = 24
+   →   buf := { buf[23:8], d }
+
+   The picorv32 / spimemio pattern that prompted this:
+
+       always @(posedge clk) begin
+         if (dout_valid && dout_tag == 1) buffer[ 7: 0] <= dout_data;
+         if (dout_valid && dout_tag == 2) buffer[15: 8] <= dout_data;
+         if (dout_valid && dout_tag == 3) buffer[23:16] <= dout_data;
+       end
+
+   produces three @slice_write statements that — when lowered
+   independently to Hardcaml — leave the 24-bit `buffer` only
+   partially driven (the concat-of-slice-updates trick can't unify
+   them because each is in a different BIf branch).  Result:
+   Circuit.create_exn rejects the "unassigned 24-bit wire" and
+   spimemio falls into the HIER_SYNTH_STUB_ON_FAIL path.
+
+   Rewriting each slice write as a full-buffer RMW BAssign means
+   the lowering sees a single coherent driver per branch — last-
+   write-wins under the natural BIR semantics, just as Verilog
+   non-blocking assigns specify.  Branches that don't write keep
+   the prior value via Hardcaml's Always.Variable wire fallback.
+
+   Const-bounds only — @part_sel_write_up (variable index) keeps
+   its existing behavioral_to_hardcaml path.                      *)
+
+let rewrite_slice_write widths = function
+  | BCallStmt { func = "@slice_write";
+                args = [BVar name;
+                        BConst { value = hi; _ };
+                        BConst { value = lo; _ };
+                        rhs] } as orig ->
+      (match Hashtbl.find_opt widths.scalar name with
+       | Some w when hi >= lo && hi < w && lo >= 0 ->
+           let top =
+             if hi + 1 <= w - 1
+             then [BSlice { signal = BVar name; msb = w - 1; lsb = hi + 1 }]
+             else [] in
+           let bot =
+             if lo > 0
+             then [BSlice { signal = BVar name; msb = lo - 1; lsb = 0 }]
+             else [] in
+           let parts = top @ [rhs] @ bot in
+           let new_rhs = match parts with
+             | [single] -> single
+             | many -> BConcat many
+           in
+           BAssign { lhs = name; rhs = new_rhs }
+       | _ -> orig)
+  | other -> other
+
+let rec rewrite_slice_writes widths stmt =
+  let rstmt = rewrite_slice_writes widths in
+  let rstmts = List.map rstmt in
+  match rewrite_slice_write widths stmt with
+  | BBlock ss -> BBlock (rstmts ss)
+  | BIf r ->
+      BIf { r with
+            then_stmts = rstmts r.then_stmts;
+            else_stmts = rstmts r.else_stmts }
+  | BCase r ->
+      BCase { r with
+              cases   = List.map (fun (k, ss) -> (k, rstmts ss)) r.cases;
+              default = rstmts r.default }
+  | BWhile r -> BWhile { r with body = rstmts r.body }
+  | BFor   r -> BFor   { r with body = rstmts r.body }
+  | other -> other
+
+let merge_slice_writes_module (m : bmodule) =
+  let widths = build_widths m.signals in
+  let walk_proc = function
+    | BSequential s ->
+        BSequential { s with body = List.map (rewrite_slice_writes widths) s.body }
+    | BCombinational c ->
+        BCombinational { c with body = List.map (rewrite_slice_writes widths) c.body }
+  in
+  { m with processes = List.map walk_proc m.processes }
+
+let merge_slice_writes_program (p : bprogram) =
+  { p with modules = List.map merge_slice_writes_module p.modules }
