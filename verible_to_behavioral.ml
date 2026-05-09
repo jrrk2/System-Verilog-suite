@@ -764,29 +764,62 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         | _ -> false
       in
       (match dim_node with
-       | TUPLE6 (STRING dt, _, msb, _, lsb, _)
+       | TUPLE6 (STRING dt, _, e1, _, e2, _)
          when prefix_is "select_variable_dimension" dt ->
            let signal_width () = match signal with
              | BVar n -> List.assoc_opt n !cur_signal_widths
              | _ -> None in
-           (match eval_int ~pkgs ~params msb,
-                  eval_int ~pkgs ~params lsb with
-            | Some m, Some l -> BSlice { signal; msb = m; lsb = l }
-            | None, Some l ->
-                (* msb is something like `$high(sig)` we can't fold.
-                 * If the signal width is known, treat msb as
-                 * width-1 (the common SV idiom for "from MSB down").
-                 * Without this fallback the slice silently collapses
-                 * to the whole signal — see cva6's exp_backoff
-                 * `lfsr_q[$high(lfsr_q):1]`. *)
-                (match signal_width () with
-                 | Some w when w > 0 ->
-                     BSlice { signal; msb = w - 1; lsb = l }
+           (* Distinguish dimension subtype:
+                "1" → range  [m:l]   (e1=msb,  e2=lsb)
+                "3" → up     [b +: w] (e1=base, e2=width)
+                "4" → down   [b -: w] (e1=base, e2=width) *)
+           let tag = String.sub dt
+               (String.length "select_variable_dimension")
+               (String.length dt
+                - String.length "select_variable_dimension") in
+           (match tag with
+            | "3" ->
+                (* `signal[base +: width]`: bits [base+width-1 : base].
+                   When base is dynamic (e.g. a for-loop variable
+                   that unroll will later substitute), preserve the
+                   shape as a `@part_select_up` BCall so a downstream
+                   pass can fold it once base becomes constant. *)
+                (match eval_int ~pkgs ~params e1,
+                       eval_int ~pkgs ~params e2 with
+                 | Some b, Some w when w > 0 ->
+                     BSlice { signal; msb = b + w - 1; lsb = b }
+                 | _, Some w when w > 0 ->
+                     BCall { func = "@part_select_up";
+                             args = [signal;
+                                     recurse e1;
+                                     BConst { value = w; width = 32 }] }
                  | _ -> signal)
-            | Some m, None ->
-                (* Symmetric: lsb unknown, msb known. Default lsb=0. *)
-                BSlice { signal; msb = m; lsb = 0 }
-            | _ -> signal)
+            | "4" ->
+                (* `signal[base -: width]`: bits [base : base-width+1]. *)
+                (match eval_int ~pkgs ~params e1,
+                       eval_int ~pkgs ~params e2 with
+                 | Some b, Some w when w > 0 ->
+                     BSlice { signal; msb = b; lsb = b - w + 1 }
+                 | _, Some w when w > 0 ->
+                     BCall { func = "@part_select_down";
+                             args = [signal;
+                                     recurse e1;
+                                     BConst { value = w; width = 32 }] }
+                 | _ -> signal)
+            | _ ->
+                (* dimension 1 (range) or unknown → existing range
+                   logic with $high-style fallback. *)
+                (match eval_int ~pkgs ~params e1,
+                       eval_int ~pkgs ~params e2 with
+                 | Some m, Some l -> BSlice { signal; msb = m; lsb = l }
+                 | None, Some l ->
+                     (match signal_width () with
+                      | Some w when w > 0 ->
+                          BSlice { signal; msb = w - 1; lsb = l }
+                      | _ -> signal)
+                 | Some m, None ->
+                     BSlice { signal; msb = m; lsb = 0 }
+                 | _ -> signal))
        | TUPLE4 (STRING dt, _, idx, _)
          when prefix_is "select_variable_dimension" dt ->
            if is_array_sig then
@@ -1453,21 +1486,29 @@ let extract_always ~pkgs ~params ~arrays tok =
       | _ -> ()) an;
     match !has_edge with
     | true ->
-        (* Sequential. Find the clock identifier from the first
-         * event_expression1. *)
-        let clk =
+        (* Sequential.  Walk the event_expression collecting (edge, id)
+         * pairs in source order so we can pair edges to their idents
+         * properly.  For `@(posedge clk or posedge rst)` we get
+         * [(`Pos, "clk"); (`Pos, "rst")].  Order in the source must
+         * NOT matter — clock vs reset is decided from body shape. *)
+        let edge_idents =
           let evs = collect_by (has_tag (prefix_is "event_expression")) an in
-          match evs with
-          | e :: _ ->
-              let ids = ref [] in
-              walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) e;
-              (match !ids with
-               | id :: _ -> id
-               | [] -> "clk")
-          | [] -> "clk"
+          let acc = ref [] in
+          let pending = ref None in
+          let collect = function
+            | Posedge -> pending := Some `Pos
+            | Negedge -> pending := Some `Neg
+            | SymbolIdentifier id ->
+                (match !pending with
+                 | Some e ->
+                     acc := (e, id) :: !acc;
+                     pending := None
+                 | None -> ())
+            | _ -> ()
+          in
+          List.iter (walk collect) evs;
+          List.rev !acc
         in
-        (* Body is the statement that follows the timing-control
-         * statement; find a seq_block or any procedural shape. *)
         let body_nodes = collect_by (has_tag (fun t ->
           prefix_is "seq_block" t ||
           prefix_is "nonblocking_assignment" t ||
@@ -1479,13 +1520,104 @@ let extract_always ~pkgs ~params ~arrays tok =
           | b :: _ -> [stmt_to_bstmt ~pkgs ~params ~arrays b]
           | [] -> []
         in
+        (* Find the outer if in the body — skipping BBlock wrappers —
+         * and decide whether its condition is an async-reset test.
+         * Per the project's no-name-heuristics rule, classification
+         * comes purely from structure: a sensitivity ID is the reset
+         * iff the outer-if condition references it (directly or
+         * negated).  Returns:
+         *   `Reset (rst_name, polarity)   — async reset detected
+         *   `NoReset                      — body has no outer reset-if *)
+        let classify_reset () =
+          let sens_names = List.map snd edge_idents in
+          let mem n = List.mem n sens_names in
+          let rec outer = function
+            | [] -> None
+            | BBlock xs :: _ -> outer xs
+            | BIf { condition; _ } :: _ -> Some condition
+            | _ :: tl -> outer tl
+          in
+          (* Strip wrappers Verible emits around 1-bit conditions:
+             logical-not lowers via `or_reduce` for 1-bit operands so
+             `!rst_n` arrives as `BUnOp(BNot, BCall(or_reduce, [rst_n]))`.
+             Reduction-or of a 1-bit value is the value itself. *)
+          let rec simplify = function
+            | BCall { func = "or_reduce"; args = [x] } -> simplify x
+            | BCall { func = "and_reduce"; args = [x] } -> simplify x
+            (* For 1-bit operands, reduction-or/and is the identity;
+               Verible inserts these around `!x` to widen to a bool
+               truth-test, so strip them here. *)
+            | BUnOp { op = BRedOr; operand; _ } -> simplify operand
+            | BUnOp { op = BRedAnd; operand; _ } -> simplify operand
+            | BUnOp { op = BNot; operand; result_type } ->
+                BUnOp { op = BNot; operand = simplify operand; result_type }
+            | other -> other
+          in
+          match outer body with
+          | None -> `NoReset
+          | Some cond ->
+              (match simplify cond with
+               | BVar n when mem n -> `Reset (n, `Pos)
+               | BUnOp { op = BNot; operand = BVar n; _ } when mem n ->
+                   `Reset (n, `Neg)
+               | BBinOp { op = BEq; lhs = BVar n;
+                          rhs = BConst { value = 0; _ }; _ } when mem n ->
+                   `Reset (n, `Neg)
+               | BBinOp { op = BEq; lhs = BVar n;
+                          rhs = BConst { value = 1; _ }; _ } when mem n ->
+                   `Reset (n, `Pos)
+               | BBinOp { op = BNe; lhs = BVar n;
+                          rhs = BConst { value = 0; _ }; _ } when mem n ->
+                   `Reset (n, `Pos)
+               | BBinOp { op = BNe; lhs = BVar n;
+                          rhs = BConst { value = 1; _ }; _ } when mem n ->
+                   `Reset (n, `Neg)
+               | _ -> `NoReset)
+        in
+        let pick_clock () =
+          (* Default = first edge ident (used when no reset detected). *)
+          match edge_idents with
+          | (e, n) :: _ -> (n, e)
+          | [] -> ("clk", `Pos)
+        in
+        let clk_name, clk_edge, reset, reset_edge, reset_async =
+          let nedges = List.length edge_idents in
+          match nedges, classify_reset () with
+          | 0, _ ->
+              (* No edges parsed (shouldn't happen given has_edge) —
+               * preserve old behaviour. *)
+              ("clk", `Pos, None, None, false)
+          | 1, _ ->
+              (* Single edge: that's the clock; sync reset (if any)
+               * stays in the body — caller derives sync-reset
+               * semantics from `if (rst) ...` shape, no FF-spec
+               * change needed. *)
+              let (e, n) = List.hd edge_idents in
+              (n, e, None, None, false)
+          | _, `Reset (rst, rst_pol) ->
+              (* Multi-edge: pick the non-reset edge as clock.  Reset
+               * polarity comes from the body test, not from the
+               * sensitivity edge — `@(... or posedge rst) if (!rst)`
+               * is a real (if rare) idiom; the body wins. *)
+              let clock = List.find (fun (_, n) -> n <> rst) edge_idents in
+              let (cke, cn) = clock in
+              let r_edge = try Some (fst (List.find (fun (_, n) -> n = rst) edge_idents))
+                           with Not_found -> Some rst_pol in
+              let _ = r_edge in
+              (cn, cke, Some rst, Some rst_pol, true)
+          | _, `NoReset ->
+              (* Multi-edge but body has no reset-if — fall back to
+               * first edge as clock, no reset.  Conservative. *)
+              let (n, e) = pick_clock () in
+              (n, e, None, None, false)
+        in
         BSequential {
           name = "always_ff";
-          clock = clk;
-          clock_edge = `Pos;
-          reset = None;
-          reset_edge = None;
-          reset_async = false;
+          clock = clk_name;
+          clock_edge = clk_edge;
+          reset;
+          reset_edge;
+          reset_async;
           body;
         }
     | false ->
