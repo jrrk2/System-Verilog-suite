@@ -105,4 +105,31 @@ module RTL_REG_ASYNC (input C, input RST, input [`RTL_W-1:0] D,
     else     Q <= D;
 endmodule
 
+// RTL_REG_CE: plain register with clock-enable (no reset).  When CE is
+// high the FF samples D; when CE is low the FF holds.  The variant exists
+// so cell-mapped output can route Vivado-RTL's CE-bearing register cells
+// through the converter without a special case.
+module RTL_REG_CE (input C, input CE, input [`RTL_W-1:0] D,
+                   output reg [`RTL_W-1:0] Q);
+  always @(posedge C)
+    if (CE) Q <= D;
+endmodule
+
+// RTL_REG_SYNC_CE: synchronous reset + clock-enable.  Reset wins over CE.
+module RTL_REG_SYNC_CE (input C, input CE, input RST, input [`RTL_W-1:0] D,
+                        output reg [`RTL_W-1:0] Q);
+  always @(posedge C)
+    if (RST)     Q <= '0;
+    else if (CE) Q <= D;
+endmodule
+
+// RTL_REG_ASYNC_CE: asynchronous reset + clock-enable (e.g. Yosys
+// `$adffe` lowers to this shape).  Reset still wins over CE.
+module RTL_REG_ASYNC_CE (input C, input CE, input RST, input [`RTL_W-1:0] D,
+                         output reg [`RTL_W-1:0] Q);
+  always @(posedge C or posedge RST)
+    if (RST)     Q <= '0;
+    else if (CE) Q <= D;
+endmodule
+
 /* verilator lint_on DECLFILENAME */

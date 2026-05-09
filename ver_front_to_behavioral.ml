@@ -242,7 +242,9 @@ let extract_cells body =
  * we can emit one combined BSequential process for the whole register. *)
 
 let is_register_cell ct =
-  ct = "RTL_REG" || ct = "RTL_REG_SYNC" || ct = "RTL_REG_ASYNC"
+  ct = "RTL_REG"      || ct = "RTL_REG_CE"
+  || ct = "RTL_REG_SYNC"  || ct = "RTL_REG_SYNC_CE"
+  || ct = "RTL_REG_ASYNC" || ct = "RTL_REG_ASYNC_CE"
 
 (* Vivado preserves the original SV signal name in the FF *instance*
  * label even when its optimiser renames the corresponding Q-pin net.
@@ -419,12 +421,25 @@ let cell_to_bprocess (c : cell_inst) =
         let reset_pin = pin_expr "RST" c.pins in
         let pre_pin   = pin_expr "PRE" c.pins in
         let clr_pin   = pin_expr "CLR" c.pins in
+        let ce_pin    = pin_expr "CE"  c.pins in
         let zero = BConst { value = 0; width = 64 } in
         (* All-ones at whatever width Q resolves to — z3_miter widens the
          * BConst-zero to Q's width and ~0 then becomes the proper
          * all-ones mask. Used for the async PRE (preset-to-1) case. *)
         let ones = BUnOp { op = BNot; operand = zero; result_type = result_t } in
-        let inner = BAssign { lhs = q; rhs = d } in
+        let inner_data = BAssign { lhs = q; rhs = d } in
+        (* Clock-enable: when CE is wired up, the data update is gated
+         * by `if (CE) Q <= D`.  CE sits INSIDE the reset/clr/pre wraps
+         * so reset semantics dominate.  When CE is low the FF holds —
+         * an empty else-branch is the BIR convention for "no change",
+         * which downstream FFrip turns into the standard FDxE pattern. *)
+        let gated_data = match ce_pin with
+          | Some ce ->
+              BIf { condition = ce;
+                    then_stmts = [inner_data];
+                    else_stmts = [BAssign { lhs = q; rhs = BVar q }] }
+          | None -> inner_data
+        in
         (* Lower priority first, higher priority later — outermost wins.
          * Vivado's RTL_REG_ASYNC follows the order PRE > CLR > RST in the
          * underlying flop, so wrap CLR around RST and PRE around CLR. *)
@@ -436,9 +451,9 @@ let cell_to_bprocess (c : cell_inst) =
                     else_stmts = [inner] }
           | None -> inner
         in
-        let wrapped = wrap inner reset_pin zero in
-        let wrapped = wrap wrapped clr_pin   zero in
-        let wrapped = wrap wrapped pre_pin   ones in
+        let wrapped = wrap gated_data reset_pin zero in
+        let wrapped = wrap wrapped    clr_pin   zero in
+        let wrapped = wrap wrapped    pre_pin   ones in
         let body = [wrapped] in
         let async = async || pre_pin <> None || clr_pin <> None in
         Some (BSequential {
@@ -494,9 +509,12 @@ let cell_to_bprocess (c : cell_inst) =
            combinational lhs
              (BCond { condition = s; then_val = i0; else_val = i1 })
        | _ -> None)
-  | "RTL_REG"        -> mk_register ~async:false
-  | "RTL_REG_SYNC"   -> mk_register ~async:false
-  | "RTL_REG_ASYNC"  -> mk_register ~async:true
+  | "RTL_REG"
+  | "RTL_REG_CE"          -> mk_register ~async:false
+  | "RTL_REG_SYNC"
+  | "RTL_REG_SYNC_CE"     -> mk_register ~async:false
+  | "RTL_REG_ASYNC"
+  | "RTL_REG_ASYNC_CE"    -> mk_register ~async:true
   (* Reduction operators. *)
   | "RTL_REDUCTION_AND"  -> comb_reduction `And
   | "RTL_REDUCTION_OR"   -> comb_reduction `Or

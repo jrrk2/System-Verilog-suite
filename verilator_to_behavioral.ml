@@ -565,17 +565,62 @@ let always_to_bprocess = function
         BCombinational { name = "always_comb"; sensitivity = [BAny]; body }
   | _ -> BCombinational { name = "always"; sensitivity = [BAny]; body = [] }
 
+(* Walk a procedural block tree and collect every nested `Var` /
+ * `Var'` node so procedural-scope locals like
+ *   always_ff @(posedge clk) begin
+ *     case (state)
+ *       S1: begin
+ *         logic signed [30:0] x_round;     // anon block (BEGIN/unnamedblkN)
+ *         x_round = ...;
+ *       end
+ *     endcase
+ *   end
+ * surface in the bsignal list with their source-stated width.
+ * Without this, the Var lives only in the named-or-anon hierarchy
+ * inside the BEGIN/CASEITEM and gets dropped by extract_signals'
+ * top-level filter, leaving downstream Z3 width-inference to
+ * default to 1 bit.  Verible's frontend reads procedural decls
+ * directly from the source so its BIR carries the right width;
+ * before this walker the verilator side disagreed, raising
+ * `(_ BitVec 1) and (_ BitVec 31) are incompatible` from Z3. *)
+let rec collect_nested_vars node acc =
+  match node with
+  | Var _ as v -> v :: acc
+  | Var' _ as v -> v :: acc
+  | Begin { stmts; _ } -> List.fold_left (fun a s -> collect_nested_vars s a) acc stmts
+  | Always { stmts; _ } -> List.fold_left (fun a s -> collect_nested_vars s a) acc stmts
+  | If { then_stmt; else_stmt; _ } ->
+      let acc = collect_nested_vars then_stmt acc in
+      (match else_stmt with
+       | Some e -> collect_nested_vars e acc
+       | None -> acc)
+  | Case { items; _ } ->
+      List.fold_left (fun a (ci : case_item) ->
+        List.fold_left (fun a' s -> collect_nested_vars s a') a ci.statements
+      ) acc items
+  | For { stmts; _ } -> List.fold_left (fun a s -> collect_nested_vars s a) acc stmts
+  | _ -> acc
+
 (* Extract signals from module. For unpacked-array dtypes the bsignal
  * carries `BArray { element = BInt; size }` so memory-inference
  * downstream can read the depth and element width directly from the
- * Verilator typetable instead of guessing. *)
+ * Verilator typetable instead of guessing.
+ *
+ * Includes procedural-scope locals via collect_nested_vars — these
+ * live in the static-named (named begin) or anonymous (auto
+ * `unnamedblkN`) hierarchy that Verilator builds during elaboration.
+ * Same direction (`Internal`) and same dtype-ref resolution as the
+ * top-level path; a name collision with a top-level signal is
+ * resolved by the de-dup at the end (last write wins, but in
+ * practice procedural shadows only happen with deliberate name
+ * reuse across case arms — which is the cordic_sincos pattern). *)
 let extract_signals stmts =
   let dir_of d = match String.uppercase_ascii d with
     | "INPUT" -> `Input
     | "OUTPUT" -> `Output
     | _ -> `Internal
   in
-  List.filter_map (function
+  let var_of_node = function
     | Var { name; dtype_ref; direction; _ } ->
         let elem_width = get_width_from_dtype dtype_ref in
         let signed = is_signed_dtype dtype_ref in
@@ -589,17 +634,36 @@ let extract_signals stmts =
           name;
           stype;
           direction = dir_of direction;
-          initial_value = None; attrs = []; 
+          initial_value = None; attrs = [];
         }
     | Var' { name; direction; _ } ->
         Some {
           name;
           stype = BInt { width = 32; signed = Unsigned };
           direction = dir_of direction;
-          initial_value = None; attrs = []; 
+          initial_value = None; attrs = [];
         }
     | _ -> None
-  ) stmts
+  in
+  let top_level = List.filter_map var_of_node stmts in
+  (* Also collect procedural-scope locals from inside Always/Begin/If/
+     Case/For trees.  Each becomes an `Internal` bsignal (regardless
+     of what direction the Var node carries — procedural locals are
+     never module ports, and we treat the dropped direction as
+     internal). *)
+  let proc_vars =
+    List.fold_left (fun acc s -> collect_nested_vars s acc) [] stmts
+    |> List.filter_map var_of_node
+    |> List.map (fun s -> { s with direction = `Internal })
+  in
+  (* De-dup: a name appearing in both lists keeps the top-level
+     definition (more authoritative; usually a port).  Procedural
+     locals fill in only the names not already declared at module
+     scope. *)
+  let known = List.fold_left (fun acc (s : bsignal) -> s.name :: acc) [] top_level in
+  let extras = List.filter (fun (s : bsignal) ->
+    not (List.mem s.name known)) proc_vars in
+  top_level @ extras
 
 (* Find a pin's connected expression by pin name. *)
 let pin_expr pin_name pins =
@@ -653,13 +717,30 @@ let cell_to_bprocess = function
         | _ -> None
       in
       (* Sequential register builder. Async controls posedge-or-posedge sense;
-       * sync looks like a single posedge clock. *)
+       * sync looks like a single posedge clock.  If a CE (clock-enable) pin
+       * is connected the data update is gated by `if (CE) Q <= D`; else
+       * the FF holds (the empty else branch maps to "no change" through
+       * the normal FF-rip semantics).  Stacking is reset > CE > D. *)
       let mk_register ~async =
         match lhs_of "Q", pin "C", pin "D" with
         | Some q, Some _c, Some d ->
             let clock = match pin "C" with
               | Some (BVar n) -> n | _ -> "clk" in
             let reset_pin = pin "RST" in
+            let ce_pin = pin "CE" in
+            let data_assign = BAssign { lhs = q; rhs = d } in
+            (* `if (CE) Q <= D else Q <= Q` when CE is wired up.
+               Explicit Q-hold matches the rtlil_to_behavioral.ml
+               $dffe / $adffe conventions so downstream FFrip
+               recognises this as the same shape regardless of
+               which frontend produced it. *)
+            let gated_data = match ce_pin with
+              | Some ce ->
+                  BIf { condition = ce;
+                        then_stmts = [data_assign];
+                        else_stmts = [BAssign { lhs = q; rhs = BVar q }] }
+              | None -> data_assign
+            in
             let body = match reset_pin with
               | Some r ->
                   [BIf {
@@ -667,10 +748,10 @@ let cell_to_bprocess = function
                     then_stmts = [BAssign {
                       lhs = q; rhs = BConst { value = 0; width = 64 }
                     }];
-                    else_stmts = [BAssign { lhs = q; rhs = d }];
+                    else_stmts = [gated_data];
                   }]
               | None ->
-                  [BAssign { lhs = q; rhs = d }]
+                  [gated_data]
             in
             Some (BSequential {
               name = Printf.sprintf "%s_inst" mod_name;
@@ -709,9 +790,12 @@ let cell_to_bprocess = function
                                            then_val = i0; else_val = i1 })
             | _ -> None)
        (* sequential *)
-       | "RTL_REG"        -> mk_register ~async:false
-       | "RTL_REG_SYNC"   -> mk_register ~async:false
-       | "RTL_REG_ASYNC"  -> mk_register ~async:true
+       | "RTL_REG"
+       | "RTL_REG_CE"          -> mk_register ~async:false
+       | "RTL_REG_SYNC"
+       | "RTL_REG_SYNC_CE"     -> mk_register ~async:false
+       | "RTL_REG_ASYNC"
+       | "RTL_REG_ASYNC_CE"    -> mk_register ~async:true
        | _ -> None)
   | _ -> None
 
