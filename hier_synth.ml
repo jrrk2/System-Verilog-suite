@@ -108,10 +108,34 @@ let rec render_conn_expr (parent_name : string) (port : string) (e : bexpr)
           for i = width - 1 downto 0 do
             Buffer.add_char buf (if (value lsr i) land 1 = 1 then '1' else '0')
           done; Buffer.contents buf), [])
+  | BBinOp { op; lhs; rhs; _ } ->
+      let l, ld = render_conn_expr parent_name port lhs in
+      let r, rd = render_conn_expr parent_name port rhs in
+      let opv = match op with
+        | BAdd -> "+" | BSub -> "-" | BMul -> "*" | BDiv -> "/" | BMod -> "%"
+        | BAnd -> "&" | BOr  -> "|" | BXor -> "^"
+        | BShl -> "<<" | BShr -> ">>" | BAshr -> ">>>"
+        | BEq -> "==" | BNe -> "!=" | BLt -> "<" | BLe -> "<="
+        | BGt -> ">" | BGe -> ">="
+      in
+      (Printf.sprintf "(%s %s %s)" l opv r, ld @ rd)
+  | BUnOp { op; operand; _ } ->
+      let o, od = render_conn_expr parent_name port operand in
+      let opv = match op with
+        | BNot -> "~" | BNeg -> "-"
+        | BRedAnd -> "&" | BRedOr -> "|" | BRedXor -> "^"
+      in
+      (Printf.sprintf "(%s%s)" opv o, od)
+  | BCond { condition; then_val; else_val } ->
+      let c, cd = render_conn_expr parent_name port condition in
+      let t, td = render_conn_expr parent_name port then_val in
+      let f, fd = render_conn_expr parent_name port else_val in
+      (Printf.sprintf "(%s ? %s : %s)" c t f, cd @ td @ fd)
   | _ ->
       failwith (Printf.sprintf
         "hier_synth: parent %s's child connection on port %s is too \
-         complex — only Var/Slice/Concat/Const supported on instance pins"
+         complex — only Var/Slice/Concat/Const/BinOp/UnOp/Cond supported \
+         on instance pins"
         parent_name port)
 
 let net_of_conn parent port e =
@@ -391,6 +415,32 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
                (List.map (fun (k, v) -> k ^ "=" ^ v) s.attrs))
         ) synth_bmod.signals
       end;
+      (* Graceful-degradation: when HIER_SYNTH_STUB_ON_FAIL=1 is set,
+         emit a stub module (declared ports, outputs tied to zero, no
+         body) instead of failing the whole flow.  Lets downstream
+         flows make progress on the rest of the design while specific
+         modules are debugged.                                       *)
+      if Sys.getenv_opt "HIER_SYNTH_STUB_ON_FAIL" = Some "1" then begin
+        Printf.eprintf "[hier_synth] STUB: %s — %s\n%!"
+          m.name (Printexc.to_string e);
+        let stub : bmodule = {
+          synth_bmod with
+          processes = [];
+          instances = [];
+          mems = [];
+          funcs = [];
+          (* Keep declared ports, remove internals — outputs will be
+             driven by Signal.zero via the create_circuit "Output that's
+             never written becomes a zero" path. *)
+          signals = List.filter (fun (s : bsignal) ->
+            s.direction <> `Internal) synth_bmod.signals;
+        } in
+        try Behavioral_to_hardcaml.create_circuit stub
+        with e2 ->
+          failwith (Printf.sprintf
+            "hier_synth: stub fallback ALSO failed for %s: %s"
+            m.name (Printexc.to_string e2))
+      end else
       failwith (Printf.sprintf "hier_synth: lowering failed for module %s: %s\n%s"
                   m.name (Printexc.to_string e) bt)
   in

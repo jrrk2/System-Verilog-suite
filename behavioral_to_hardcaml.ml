@@ -32,25 +32,27 @@ let get_signal ctx name =
   match List.assoc_opt name ctx.signals with
   | Some s -> s
   | None ->
-      (* Unknown name — mint a 32-bit unassigned wire so downstream
-         lowering doesn't crash mid-expression.  This is ALMOST always
-         a bug upstream (missing input port, missing variable in
-         pre-pass, expression referencing a free identifier).  Hardcaml
-         will reject the resulting circuit later with the cryptic
-         "circuit input signal must have a port name" error.  Tag the
-         wire with the name so the failure points at the right
-         identifier, and emit a one-time diagnostic when a debug env
-         flag is set. *)
+      (* Unknown name — almost always a bug upstream (missing input
+         port, missing variable in pre-pass, expression referencing a
+         free identifier).  Previously we minted an unassigned 32-bit
+         wire; that produced the cryptic Hardcaml error
+            "circuit input signal must have a port name (unassigned
+             wire?)"
+         at Circuit.create_exn time, with no useful pointer to which
+         identifier was the offender.  Now we tie to a constant zero
+         of width 32 so the circuit creates cleanly (the resulting
+         design is almost certainly wrong wherever this fires, but at
+         least layout proceeds and the diagnostic below names the
+         identifier).                                                *)
       let width = 32 in
-      let wire = Signal.wire width in
-      let _ = Signal.(--) wire ("__unbound_" ^ name) in
-      if Sys.getenv_opt "BIR_NAME_WIRES" <> None
-      || Sys.getenv_opt "BIR_GET_SIGNAL_DEBUG" <> None then
-        Printf.eprintf
-          "[expr_to_signal] unbound identifier %s — minting 32-bit unassigned wire\n%!"
-          name;
-      ctx.signals <- (name, wire) :: ctx.signals;
-      wire
+      let z = Signal.zero width in
+      let _ = Signal.(--) z ("__unbound_" ^ name) in
+      Printf.eprintf
+        "[expr_to_signal] unbound identifier %s — tied to %d-bit zero \
+         (upstream BIR is missing a declaration or driver)\n%!"
+        name width;
+      ctx.signals <- (name, z) :: ctx.signals;
+      z
 
 (* Get or create variable from context *)
 let get_or_create_var ctx name width is_reg =
