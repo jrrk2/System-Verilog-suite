@@ -408,6 +408,48 @@ let rec stmt_to_bstmt = function
                           expr_to_bexpr rhs];
                 }
             | None -> BBlock [])
+       | Sel { expr = sel_expr; lsb; width; _ } ->
+           (* Bit-slice write: `name[lsb +: width] <= rhs` (also used
+              for the `[hi:lo]` form, which Verilator lowers to lsb +
+              width).  Drop the slice indexing here and you get a
+              full-signal clobber that loses upstream bits — Verible
+              emits @slice_write / @part_sel_write_up to preserve the
+              partial-write semantics, and the miter only agrees if
+              we match.                                              *)
+           (match base_name sel_expr with
+            | Some name ->
+                let const_int_of t =
+                  match expr_to_bexpr t with
+                  | BConst { value; _ } -> Some value
+                  | _ -> None
+                in
+                let lsb_const   = Option.bind lsb   const_int_of in
+                let width_const = Option.bind width const_int_of in
+                let rhs_e = expr_to_bexpr rhs in
+                (match lsb_const, width_const with
+                 | Some lo, Some w ->
+                     let hi = lo + w - 1 in
+                     BCallStmt {
+                       func = "@slice_write";
+                       args = [ BVar name
+                              ; BConst { value = hi; width = 32 }
+                              ; BConst { value = lo; width = 32 }
+                              ; rhs_e ];
+                     }
+                 | _ ->
+                     let lsb_e = match lsb with
+                       | Some l -> expr_to_bexpr l
+                       | None   -> BConst { value = 0; width = 32 } in
+                     let width_e = match width with
+                       | Some w -> expr_to_bexpr w
+                       | None   -> BConst { value = 1; width = 32 } in
+                     BCallStmt {
+                       func = "@part_sel_write_up";
+                       args = [ BVar name; lsb_e; width_e; rhs_e ];
+                     })
+            | None ->
+                strict_bail "Sel LHS base" "stmt_to_bstmt.Assign.Sel" sel_expr;
+                BBlock [])
        | _ ->
            (match base_name lhs with
             | Some name ->
