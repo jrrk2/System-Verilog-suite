@@ -2644,11 +2644,16 @@ let convert_module ~pkgs (mdecl : module_decl)
       | _ -> Some p
     ) processes in
     let merged = Hashtbl.fold (fun arr writes acc ->
-      let arr_size, elem_w =
+      let arr_size, elem_w, is_scalar =
         match List.find_opt (fun (s : bsignal) -> s.name = arr) signals with
         | Some { stype = BArray { size; element = BInt { width; _ } }; _ } ->
-            (size, width)
-        | _ -> (List.length writes, 1)
+            (size, width, false)
+        | Some { stype = BInt { width; _ }; _ } ->
+            (* Scalar bit-vector — `assign foo[k] = X` writes a single
+               bit, not an array element.  Each "index" corresponds to
+               one bit of width 1, so the concat reassembles bit-wise. *)
+            (width, 1, true)
+        | _ -> (List.length writes, 1, false)
       in
       let truncate_to_elem e =
         if elem_w >= 32 then e
@@ -2656,26 +2661,36 @@ let convert_module ~pkgs (mdecl : module_decl)
       in
       (* Sort msb-first so the concat reads top-to-bottom. *)
       let sorted = List.sort (fun (a, _) (b, _) -> compare b a) writes in
-      (* Fill any uncovered indices with a self-read of the array. *)
+      (* Filler for uncovered slots.  For true unpacked arrays we keep
+         the self-read so existing behaviour around inferred RAMs
+         doesn't change.  For scalar bit-vectors a self-read closes a
+         combinational loop (cfgreg_do[k] driven by cfgreg_do[k]) the
+         moment any bit isn't covered by an explicit `assign cfgreg_do[i]
+         = …` site — which happens whenever multi-bit slice assigns
+         like `assign cfgreg_do[30:23] = 0` aren't decomposed to per-bit
+         writes by the upstream collector.  Fall back to constant zero
+         instead, which is the synthesizable default for an undriven
+         output wire and unblocks Hardcaml's Always.compile.            *)
+      let filler_at _k =
+        if is_scalar then BConst { value = 0; width = elem_w }
+        else BSelect {
+          array = BVar arr;
+          index = BConst { value = _k; width = 32 };
+        }
+      in
       let parts = ref [] in
       let cursor = ref (arr_size - 1) in
       List.iter (fun (idx, data) ->
         if idx < !cursor then
           for k = !cursor downto idx + 1 do
-            parts := BSelect {
-              array = BVar arr;
-              index = BConst { value = k; width = 32 };
-            } :: !parts
+            parts := filler_at k :: !parts
           done;
         parts := truncate_to_elem data :: !parts;
         cursor := idx - 1
       ) sorted;
       if !cursor >= 0 then
         for k = !cursor downto 0 do
-          parts := BSelect {
-            array = BVar arr;
-            index = BConst { value = k; width = 32 };
-          } :: !parts
+          parts := filler_at k :: !parts
         done;
       let rhs = match List.rev !parts with
         | [single] -> single
