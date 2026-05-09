@@ -110,6 +110,67 @@ let rec eval_int ~pkgs ~params tok =
            let rec p b e = if e = 0 then 1 else b * p b (e - 1) in
            Some (p a e)
        | _ -> None)
+  (* Bitwise / logical / comparison operators on constants — extends
+     eval_int's coverage so picorv32-style body localparams like
+       localparam WITH_PCPI = ENABLE_PCPI || ENABLE_MUL || …;
+       localparam irqregs_offset = ENABLE_REGS_16_31 ? 32 : 16;
+     resolve at elaboration time instead of leaking through as bare
+     identifiers downstream.                                          *)
+  | TUPLE4 (STRING tag, lhs, _op, rhs)
+    when prefix_is "and_expr"    tag
+      || prefix_is "bitand_expr" tag
+      || prefix_is "logand_expr" tag ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (a land b)
+       | _ -> None)
+  | TUPLE4 (STRING tag, lhs, _op, rhs)
+    when prefix_is "or_expr"    tag
+      || prefix_is "bitor_expr" tag
+      || prefix_is "logor_expr" tag ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (a lor b)
+       | _ -> None)
+  | TUPLE4 (STRING tag, lhs, _op, rhs)
+    when prefix_is "xor_expr"    tag
+      || prefix_is "bitxor_expr" tag ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (a lxor b)
+       | _ -> None)
+  | TUPLE4 (STRING "comp_expr2", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (if a <  b then 1 else 0)
+       | _ -> None)
+  | TUPLE4 (STRING "comp_expr3", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (if a >  b then 1 else 0)
+       | _ -> None)
+  | TUPLE4 (STRING "comp_expr4", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (if a <= b then 1 else 0)
+       | _ -> None)
+  | TUPLE4 (STRING "comp_expr5", lhs, _op, rhs) ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (if a >= b then 1 else 0)
+       | _ -> None)
+  | TUPLE4 (STRING tag, lhs, _op, rhs)
+    when prefix_is "logeq_expr2"     tag
+      || prefix_is "binary_eq_expr1" tag ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (if a = b then 1 else 0)
+       | _ -> None)
+  | TUPLE4 (STRING tag, lhs, _op, rhs)
+    when prefix_is "logneq_expr"     tag
+      || prefix_is "binary_neq_expr" tag ->
+      (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
+       | Some a, Some b -> Some (if a <> b then 1 else 0)
+       | _ -> None)
+  (* Ternary `cond ? t : e` — used by irqregs_offset and many similar
+     control-knob localparams.                                         *)
+  | TUPLE6 (STRING tag, cond, _, t, _, e) when prefix_is "cond_expr" tag ->
+      (match eval_int ~pkgs ~params cond with
+       | Some 0 -> eval_int ~pkgs ~params e
+       | Some _ -> eval_int ~pkgs ~params t
+       | None -> None)
   (* Function-like call wrapper: `reference_or_call_base1(reference,
    * call_base)`. The lexer treats `$clog2` as a SymbolIdentifier
    * (not SystemTFIdentifier — only `$test$plusargs` is whitelisted),
