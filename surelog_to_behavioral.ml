@@ -1,20 +1,35 @@
-(* Surelog UHDM dump → Behavioral_ir bridge.
+(* Surelog UHDM dump → Behavioral_ir bridge — DEPRECATED for Z3 oracle work.
  *
  * Walks the token tree produced by Surelog_uhdm.ml_start (a hierarchy
  * of TUPLE2/TUPLE3/.../TLIST + terminal tokens) and emits a
- * Behavioral_ir.bprogram. This is the 5th elaboration reference point
- * after Verilator JSON, Verible parse-tree, Yosys RTLIL, and Vivado VHDL.
+ * Behavioral_ir.bprogram with module-level port surface only.
  *
- * Coverage today (developed against test/surelog/apb_uart.dump):
- *   - Module names, ports (direction, width), nets
- *   - Stub processes (no body conversion yet — emits an empty
- *     BCombinational so module structure round-trips)
+ * **Status (2026-05-09):** parked as a port-surface pipecleaner; not
+ * a Z3 oracle peer.  The fuller plan (cont_assigns, processes,
+ * instances, typespec width resolution — pending task #50) was
+ * abandoned in favour of slang because:
+ *   1. Slang is a strict superset for elaboration coverage —
+ *      parses CVA6's type parameters which Surelog can't (see
+ *      project memory `project_surelog_role.md`).
+ *   2. Slang is already a working Z3 oracle (test_z3_oracle slang
+ *      verible counter → ✅ FORMALLY EQUIVALENT, eth_rstgen
+ *      passes, multiple sv-tests cases pass).
+ *   3. The remaining surelog→BIR work is ~200–300 lines of UHDM
+ *      operator-tree walking just to *match* what slang already
+ *      provides — pure duplication.
  *
- * Not yet:
- *   - Always-block bodies (vpiAlways → BSequential/BCombinational)
- *   - Continuous assigns (vpiContAssign → BCombinational)
- *   - Module instances (vpiInstance → binstance)
- *   - Function/task bodies *)
+ * **What stays:** Module names + ports.  Width extraction below
+ * walks for inline `Vpisize:N` annotations when present (post-elab
+ * dumps).  The lex/parse + token-tree infrastructure is preserved
+ * so users with a UHDM dump can sanity-check it lands; for actual
+ * Z3 oracle work, route through slang via test_z3_oracle.exe.
+ *
+ * Coverage today:
+ *   - Module names, ports (direction, width)
+ *   - Width: Vpisize annotations on logic_typespec (post-elab only)
+ *
+ * Won't fix here (use slang):
+ *   - Always-block bodies, continuous assigns, instances, funcs *)
 
 open Surelog_uhdm
 open Behavioral_ir
@@ -109,13 +124,22 @@ let port_directions m_node =
   tbl
 
 (* Logic_net carries the signal width via a vpiTypespec → ref_typespec
- * → logic_typespec ladder. The dump usually emits this as `, line:L:C,
- * endln:L:C` annotations on logic_typespec — width has to come from the
- * vpiSize attribute, which appears on constant nodes but not on plain
- * logic_typespec. For now we default to 1; the BSequential/BCombinational
- * encoder will widen when it sees concrete usage. Future work: parse
- * vpiTypespec → vpiActual → logic_typespec → range to get the real width. *)
-let width_of_logic_net _node = 1
+ * → logic_typespec ladder.  Walk the subtree looking for the first
+ * `Vpisize:N` annotation; that's the post-elab width.  Falls back to
+ * 1 when the dump is pre-elab (no typespec was resolved) — that's
+ * the common case for the apb_uart fixture which is a Pre-Elab dump. *)
+let rec find_size t =
+  match t with
+  | TUPLE2 (Vpisize, Int n) -> Some n
+  | TUPLE2 (_, _) | TUPLE3 _ | TUPLE4 _ | TUPLE5 _
+  | TUPLE6 _ | TUPLE7 _ | TLIST _ ->
+      List.fold_left (fun acc c ->
+        match acc with Some _ -> acc | None -> find_size c)
+        None (children t)
+  | _ -> None
+
+let width_of_logic_net node =
+  match find_size node with Some n when n > 0 -> n | _ -> 1
 
 let extract_signal m_node port_dir net_node =
   let inner = unwrap_kind Logic_net net_node in
@@ -156,9 +180,13 @@ let module_name m_node =
 let extract_module m_node : bmodule =
   let name = module_name m_node in
   let signals = extract_signals m_node in
-  (* Stub: we don't decode processes/assigns/instances yet — the
-   * structure below just records that a module exists with the right
-   * signal surface. *)
+  (* Processes/cont_assigns/instances NOT decoded.  Slang covers the
+   * same SystemVerilog corpus (and more — it parses CVA6's type
+   * parameters which Surelog can't), is already Z3-capable, and
+   * needs none of the UHDM operator-tree walking that a full
+   * surelog → BIR would require.  Keep this frontend at port-
+   * surface granularity as a UHDM dump pipecleaner; for actual Z3
+   * oracle work, route through slang via test_z3_oracle.exe. *)
   {
     name;
     params = [];
