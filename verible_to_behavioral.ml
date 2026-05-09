@@ -29,6 +29,26 @@ open Verible_elaborate
 (* Walk an expression token tree, fold to an int when every leaf is
  * a literal or a known package constant. Returns None when the
  * expression has a free identifier. *)
+(* Width prefix from a sized literal subtree (e.g. `4'b0001` → 4).
+   Used by eval_int's concat handler to know how many bits each part
+   contributes when folding {a, b, c} into an integer.              *)
+let width_of_sized_literal tok =
+  match tok with
+  | TUPLE3 (STRING tag, base_token, _digits)
+    when prefix_is "bin_based_number" tag
+      || prefix_is "hex_based_number" tag
+      || prefix_is "dec_based_number" tag
+      || prefix_is "oct_based_number" tag ->
+      let bs = match base_token with
+        | TK_BinBase s | TK_HexBase s | TK_DecBase s | TK_OctBase s -> s
+        | _ -> ""
+      in
+      (try
+         let i = String.index bs '\'' in
+         Some (int_of_string (String.sub bs 0 i))
+       with _ -> None)
+  | _ -> None
+
 let rec eval_int ~pkgs ~params tok =
   let lookup name =
     match List.assoc_opt name params with
@@ -171,6 +191,33 @@ let rec eval_int ~pkgs ~params tok =
        | Some 0 -> eval_int ~pkgs ~params e
        | Some _ -> eval_int ~pkgs ~params t
        | None -> None)
+  (* Concat `{a, b, c}` — fold to integer when every part is a sized
+     literal (so we know its width).  picorv32-style trace-flag
+     localparams like
+       localparam [35:0] TRACE_BRANCH = {4'b0001, 32'b0};
+     are this shape exactly.  Body is a TLIST in reverse source
+     order; reverse for MSB → LSB.                                   *)
+  | TUPLE4 (STRING tag, _, body, _) when prefix_is "range_list_in_braces" tag ->
+      let parts = match body with
+        | TLIST xs ->
+            List.filter (fun e -> match e with
+              | TLIST [] | EMPTY_TOKEN -> false | _ -> true) (List.rev xs)
+        | other -> [other]
+      in
+      let folded =
+        List.fold_left (fun acc part ->
+          match acc with
+          | None -> None
+          | Some acc_val ->
+              (match eval_int ~pkgs ~params part,
+                     width_of_sized_literal part with
+               | Some v, Some w ->
+                   let mask = (1 lsl w) - 1 in
+                   Some ((acc_val lsl w) lor (v land mask))
+               | _ -> None)
+        ) (Some 0) parts
+      in
+      folded
   (* Function-like call wrapper: `reference_or_call_base1(reference,
    * call_base)`. The lexer treats `$clog2` as a SymbolIdentifier
    * (not SystemTFIdentifier — only `$test$plusargs` is whitelisted),
