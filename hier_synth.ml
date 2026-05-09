@@ -322,7 +322,83 @@ let auto_buffer_chain_wires
    and return: (synth-able bmodule, child instance splice list,
    set of phantom-IO names).  The synth-able view has m.instances=[]
    so [Behavioral_to_hardcaml.create_circuit] doesn't choke. *)
+(* OpenSTA's read_verilog (and most netlist consumers) only accept
+   simple expressions on instance pin connections — bare identifiers,
+   slices, concats and constants.  When picosoc instantiates
+     picosoc_mem #(.WORDS(MEM_WORDS)) memory (
+       .wen( (mem_valid && !mem_ready &&
+              mem_addr < 4*MEM_WORDS) ? mem_wstrb : 4'b0 ), ...);
+   the expression on .wen has to come out of the parent already
+   computed, with the instance pin reading a single wire.
+
+   We hoist any non-simple pin expression into a fresh internal
+   signal `__hoist_<inst>_<port>_<n>` and add an `assign` to the
+   parent's body so the original instance line shrinks to
+       .wen(__hoist_memory_wen_1)
+   which OpenSTA happily reads.                                     *)
+let is_simple_pin_expr = function
+  | BVar _ | BSlice _ | BConcat _ | BConst _ -> true
+  | _ -> false
+
+let auto_hoist_complex_pins (parent : bmodule) (modules : bmodule list)
+  : bmodule
+  =
+  let counter = ref 0 in
+  let extra_signals = ref [] in
+  let extra_assigns = ref [] in
+  let lookup_port_w mod_name port =
+    match lookup_module mod_name modules with
+    | None -> 32
+    | Some c ->
+        (try
+          let s = List.find (fun (s : bsignal) -> s.name = port) c.signals in
+          signal_width s
+         with Not_found -> 32)
+  in
+  let san s =
+    String.map (fun c ->
+      if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+         || (c >= '0' && c <= '9') || c = '_' then c
+      else '_') s
+  in
+  let process_inst (i : binstance) =
+    let conns' = List.map (fun (port, e) ->
+      if is_simple_pin_expr e then (port, e)
+      else begin
+        incr counter;
+        let w = lookup_port_w i.module_name port in
+        let nm = Printf.sprintf "__hoist_%s_%s_%d"
+          (san i.inst_name) (san port) !counter in
+        let stype =
+          if w = 1 then BBool else BInt { width = w; signed = Unsigned } in
+        let s : bsignal =
+          { name = nm; stype; direction = `Internal;
+            initial_value = None; attrs = [] } in
+        extra_signals := s :: !extra_signals;
+        extra_assigns := BAssign { lhs = nm; rhs = e } :: !extra_assigns;
+        (port, BVar nm)
+      end
+    ) i.port_connections in
+    { i with port_connections = conns' }
+  in
+  let new_insts = List.map process_inst parent.instances in
+  if !extra_signals = [] then parent
+  else begin
+    let proc =
+      BCombinational {
+        name = "__hoisted_pin_assigns";
+        sensitivity = [ BAny ];
+        body = List.rev !extra_assigns;
+      } in
+    { parent with
+      signals = parent.signals @ List.rev !extra_signals;
+      instances = new_insts;
+      processes = parent.processes @ [proc];
+    }
+  end
+
 let prepare_parent (parent : bmodule) (modules : bmodule list) =
+  let parent = auto_hoist_complex_pins parent modules in
   let parent = auto_buffer_chain_wires parent modules in
   let child_results =
     List.map (child_inst_phantoms ~parent ~modules) parent.instances in
