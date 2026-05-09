@@ -515,13 +515,14 @@ let do_miter fe_a fe_b () =
    responsive while ORFS runs (5–30 min for nangate45 designs).        *)
 
 type orfs_cfg = {
-  o_top      : string;
-  o_files    : string list;     (* full closed-over fileset for VERILOG_FILES *)
-  o_platform : string;
-  o_freq_ghz : float;
-  o_util     : int;
-  o_workdir  : string;
-  o_mem_bits : int;             (* SYNTH_MEMORY_MAX_BITS in config.mk    *)
+  o_top        : string;
+  o_files      : string list;   (* full closed-over fileset for VERILOG_FILES *)
+  o_platform   : string;
+  o_freq_ghz   : float;
+  o_util       : int;
+  o_workdir    : string;
+  o_mem_bits   : int;           (* SYNTH_MEMORY_MAX_BITS in config.mk    *)
+  o_use_decomp : bool;          (* USE_DECOMP_SYNTH=1 to make            *)
 }
 
 (* Total bits of a btype, recursing into arrays/structs.  Used to size
@@ -624,22 +625,126 @@ let write_orfs_files cfg =
   write_file mk_path mk;
   (sdc_path, mk_path)
 
+(* Hijacking the ORFS Makefile so USE_DECOMP_SYNTH=1 routes 1_2_yosys.v
+   through synth_orfs_shim instead of yosys+ABC.  test/orfs/install.sh
+   applies the patch idempotently; we run it on demand if the patch
+   isn't there yet.                                                   *)
+let repo_root () =
+  (* Walk up from the executable's directory looking for test/orfs/install.sh
+     so the GUI works whether launched from the repo root or _build/. *)
+  let exe = try Sys.executable_name with _ -> Sys.argv.(0) in
+  let exe_abs =
+    if Filename.is_relative exe
+    then Filename.concat (Sys.getcwd ()) exe else exe in
+  let rec walk dir n =
+    let probe = Filename.concat dir "test/orfs/install.sh" in
+    if Sys.file_exists probe then Some dir
+    else if n = 0 then None
+    else
+      let parent = Filename.dirname dir in
+      if parent = dir then None else walk parent (n - 1)
+  in
+  match walk (Filename.dirname exe_abs) 6 with
+  | Some d -> d
+  | None -> Filename.dirname exe_abs    (* best-effort *)
+
+let decomp_synth_patch_applied () =
+  let mk = Filename.concat (orfs_dir ()) "flow/Makefile" in
+  if not (Sys.file_exists mk) then false
+  else
+    try
+      let ic = open_in mk in
+      let found = ref false in
+      (try while not !found do
+         let l = input_line ic in
+         if (try ignore (Str.search_forward
+                           (Str.regexp_string "USE_DECOMP_SYNTH") l 0); true
+             with Not_found -> false)
+         then found := true
+       done with End_of_file -> ());
+      close_in ic;
+      !found
+    with _ -> false
+
+let ensure_decomp_synth_patch () =
+  if decomp_synth_patch_applied () then true
+  else begin
+    let install_sh =
+      Filename.concat (repo_root ()) "test/orfs/install.sh" in
+    if not (Sys.file_exists install_sh) then begin
+      error_dialog (Printf.sprintf
+        "ORFS Makefile patch not applied and install script not found at:\n\
+         %s\n\nCannot enable USE_DECOMP_SYNTH automatically." install_sh);
+      false
+    end else begin
+      append_text (Printf.sprintf
+        "[orfs] applying Makefile patch via %s …\n" install_sh);
+      let rc = Sys.command (Filename.quote install_sh) in
+      if rc <> 0 then begin
+        error_dialog (Printf.sprintf
+          "%s failed (rc=%d).  See terminal for details." install_sh rc);
+        false
+      end else begin
+        append_text "[orfs] Makefile patch installed\n";
+        true
+      end
+    end
+  end
+
+let decomp_shim_exe () =
+  Filename.concat (repo_root ())
+    "_build/default/synth_orfs_shim.exe"
+
 let spawn_orfs cfg =
+  (* If the user wants our hardcaml synth, ensure the Makefile patch
+     and the shim binary are both ready before launching. *)
+  let use_decomp = cfg.o_use_decomp in
+  let proceed =
+    if not use_decomp then true
+    else if not (Sys.file_exists (decomp_shim_exe ())) then begin
+      error_dialog (Printf.sprintf
+        "synth_orfs_shim.exe not found at:\n%s\n\nBuild it with:\n\
+         dune build _build/default/synth_orfs_shim.exe"
+        (decomp_shim_exe ()));
+      false
+    end else
+      ensure_decomp_synth_patch ()
+  in
+  if not proceed then raise Exit;
+
   let _, mk_path = write_orfs_files cfg in
   let flow_dir = Filename.concat (orfs_dir ()) "flow" in
   set_text "";
   append_text (Printf.sprintf
     "[orfs] workdir=%s\n[orfs] config.mk=%s\n[orfs] flow=%s\n"
     cfg.o_workdir mk_path flow_dir);
-  append_text (Printf.sprintf "[orfs] running: make -C %s DESIGN_CONFIG=%s\n\n"
-                 flow_dir mk_path);
+  let extra_args =
+    if use_decomp
+    then [| "USE_DECOMP_SYNTH=1";
+            "DECOMP_SHIM=" ^ decomp_shim_exe () |]
+    else [||]
+  in
+  let make_cmd_str =
+    Printf.sprintf "make -C %s DESIGN_CONFIG=%s%s"
+      flow_dir mk_path
+      (if use_decomp
+       then " USE_DECOMP_SYNTH=1 DECOMP_SHIM=" ^ decomp_shim_exe ()
+       else "")
+  in
+  append_text (Printf.sprintf "[orfs] running: %s\n" make_cmd_str);
+  if use_decomp then
+    append_text "[orfs] synth backend: hardcaml (synth_orfs_shim) — yosys/ABC bypassed\n"
+  else
+    append_text "[orfs] synth backend: yosys + ABC (stock ORFS)\n";
+  append_text "\n";
   set_status (Printf.sprintf "ORFS: %s on %s — running" cfg.o_top cfg.o_platform);
 
   let r, w = Unix.pipe () in
   let pid =
     try
+      let base = [| "make"; "-C"; flow_dir; "DESIGN_CONFIG=" ^ mk_path |] in
       Unix.create_process "make"
-        [| "make"; "-C"; flow_dir; "DESIGN_CONFIG=" ^ mk_path |]
+        (Array.append base extra_args)
         Unix.stdin w w
     with e ->
       Unix.close r; Unix.close w;
@@ -746,6 +851,11 @@ let show_orfs_run_dialog () =
   let workdir_e = GEdit.entry ~text:default_workdir () in
   pack_row "Workdir:" workdir_e;
 
+  let decomp_chk = GButton.check_button
+    ~label:"Use decompiler synth (hardcaml gate-level netlist instead of yosys+ABC)"
+    ~active:true
+    ~packing:(d#vbox#pack ~padding:4) () in
+
   let hint = GMisc.label
     ~text:(Printf.sprintf
       "ORFS install: %s\nResults will land in <ORFS>/flow/results/<platform>/<top>/base/"
@@ -759,14 +869,15 @@ let show_orfs_run_dialog () =
     match d#run () with
     | `OK ->
         (try Some {
-           o_top      = top_e#text;
-           o_files    = [file_e#text];     (* expanded by do_orfs_run *)
-           o_platform = (try List.nth platforms combo#active
-                         with _ -> "nangate45");
-           o_freq_ghz = (try float_of_string freq_e#text with _ -> 1.0);
-           o_util     = (try int_of_string util_e#text with _ -> 30);
-           o_workdir  = workdir_e#text;
-           o_mem_bits = 4096;     (* refined by do_orfs_run from BIR *)
+           o_top        = top_e#text;
+           o_files      = [file_e#text];   (* expanded by do_orfs_run *)
+           o_platform   = (try List.nth platforms combo#active
+                           with _ -> "nangate45");
+           o_freq_ghz   = (try float_of_string freq_e#text with _ -> 1.0);
+           o_util       = (try int_of_string util_e#text with _ -> 30);
+           o_workdir    = workdir_e#text;
+           o_mem_bits   = 4096;     (* refined by do_orfs_run from BIR *)
+           o_use_decomp = decomp_chk#active;
          }
          with _ -> None)
     | _ -> None
