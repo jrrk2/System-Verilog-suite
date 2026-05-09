@@ -286,10 +286,18 @@ let rec expr_to_signal ctx = function
          returns bits [hi:lo] inclusive.  BIR's BSlice uses (msb, lsb)
          with msb = high index, lsb = low index — but the converter
          occasionally emits little-endian (`[0:N]`) where msb < lsb.
-         Normalise here. *)
+         Normalise here.  When the slice goes entirely past the
+         signal's width (e.g. width-21 signal selected as [20:82]
+         after some bogus parse), clamp both ends so we never feed
+         hi < lo into Signal.select; out-of-range bits read as 0.   *)
       let hi = max msb lsb and lo = min msb lsb in
-      let hi = min hi (Signal.width s - 1) in
-      Signal.select s hi lo
+      let w  = Signal.width s in
+      if lo >= w then
+        let nbits = max 1 (hi - lo + 1) in
+        Signal.zero nbits
+      else
+        let hi = min hi (w - 1) in
+        Signal.select s hi lo
 
   | BConcat exprs ->
       let signals = List.map (expr_to_signal ctx) exprs in
