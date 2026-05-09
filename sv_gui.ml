@@ -56,6 +56,10 @@ let error_dialog msg =
     ~parent:(need_window ()) ~modal:true () in
   ignore (d#run ()); d#destroy ()
 
+(* Sticky directory across all file choosers — opening any picker
+   returns to the directory of the last successfully picked file. *)
+let last_chooser_dir : string ref = ref ""
+
 let chooser_dialog action title =
   let d = GWindow.file_chooser_dialog
     ~action ~title ~parent:(need_window ()) ~modal:true () in
@@ -64,11 +68,17 @@ let chooser_dialog action title =
     `OK;
   (* Double-click (or Enter on a selected file) → same as clicking Open. *)
   ignore (d#connect#file_activated ~callback:(fun () -> d#response `OK));
+  if !last_chooser_dir <> ""
+     && Sys.file_exists !last_chooser_dir
+     && Sys.is_directory !last_chooser_dir
+  then ignore (d#set_current_folder !last_chooser_dir);
   let result = match d#run () with
     | `OK -> (match d#filename with Some f -> f | None -> "")
     | _   -> ""
   in
-  d#destroy (); result
+  d#destroy ();
+  if result <> "" then last_chooser_dir := Filename.dirname result;
+  result
 
 let open_file_dialog () = chooser_dialog `OPEN "Open file"
 let save_file_dialog () = chooser_dialog `SAVE "Save file"
@@ -508,7 +518,32 @@ type orfs_cfg = {
   o_freq_ghz : float;
   o_util     : int;
   o_workdir  : string;
+  o_mem_bits : int;             (* SYNTH_MEMORY_MAX_BITS in config.mk    *)
 }
+
+(* Total bits of a btype, recursing into arrays/structs.  Used to size
+   yosys's SYNTH_MEMORY_MAX_BITS so a `reg [W-1:0] mem [0:D-1]` doesn't
+   trip the platform's default 4096-bit ceiling.                       *)
+let rec btype_bits = function
+  | Behavioral_ir.BInt { width; _ } -> width
+  | BBool -> 1
+  | BArray { element; size } -> size * btype_bits element
+  | BStruct { fields } ->
+      List.fold_left (fun acc (_, t) -> acc + btype_bits t) 0 fields
+
+let max_array_bits (p : Behavioral_ir.bprogram) =
+  List.fold_left (fun acc (m : Behavioral_ir.bmodule) ->
+    List.fold_left (fun acc (s : Behavioral_ir.bsignal) ->
+      match s.stype with
+      | BArray _ -> max acc (btype_bits s.stype)
+      | _ -> acc) acc m.signals) 0 p.modules
+
+(* Round up to the next power of two, with a sane minimum. *)
+let pow2_ceiling ?(floor = 4096) n =
+  let n = max n floor in
+  let p = ref 1 in
+  while !p < n do p := !p * 2 done;
+  !p
 
 let orfs_dir () =
   try Sys.getenv "ORFS_DIR"
@@ -552,8 +587,10 @@ let write_orfs_files cfg =
        export CORE_ASPECT_RATIO      = 1\n\
        export CORE_MARGIN            = 2\n\
        export PLACE_DENSITY_LB_ADDON = 0.20\n\
-       export TNS_END_PERCENT        = 100\n"
+       export TNS_END_PERCENT        = 100\n\
+       export SYNTH_MEMORY_MAX_BITS  = %d\n"
       cfg.o_top cfg.o_top cfg.o_platform verilog_files sdc_path cfg.o_util
+      cfg.o_mem_bits
   in
   let mk_path = Filename.concat cfg.o_workdir "config.mk" in
   write_file mk_path mk;
@@ -701,6 +738,7 @@ let show_orfs_run_dialog () =
            o_freq_ghz = (try float_of_string freq_e#text with _ -> 1.0);
            o_util     = (try int_of_string util_e#text with _ -> 30);
            o_workdir  = workdir_e#text;
+           o_mem_bits = 4096;     (* refined by do_orfs_run from BIR *)
          }
          with _ -> None)
     | _ -> None
@@ -748,8 +786,22 @@ let do_orfs_run () =
               (List.length files) (List.length names));
             List.iter (fun f ->
               append_text ("  " ^ f ^ "\n")) files;
+            (* Auto-size SYNTH_MEMORY_MAX_BITS from the largest array we
+               discovered.  Yosys's platform default (4096) trips on
+               anything bigger — picosoc_mem at 256×32 = 8192 bits is
+               typical.  Round up to the next pow2 with a 4096 floor.  *)
+            let max_bits = max_array_bits prog in
+            let mem_cap = pow2_ceiling (max max_bits 4096) in
+            if max_bits > 0 then
+              append_text (Printf.sprintf
+                "[orfs] largest array: %d bits → SYNTH_MEMORY_MAX_BITS = %d\n"
+                max_bits mem_cap)
+            else
+              append_text (Printf.sprintf
+                "[orfs] no arrays detected → SYNTH_MEMORY_MAX_BITS = %d\n"
+                mem_cap);
             append_text "\n";
-            spawn_orfs { cfg with o_files = files }
+            spawn_orfs { cfg with o_files = files; o_mem_bits = mem_cap }
           end
         with Exit -> ()
 
