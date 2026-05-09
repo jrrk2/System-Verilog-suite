@@ -24,7 +24,27 @@ type macro =
 
 let defines : (string, macro) Hashtbl.t = Hashtbl.create 64
 
-let reset () = Hashtbl.clear defines
+(* Search path for `include "file"`.  Set by preprocess_file /
+ * preprocess_string callers; defaults to [].  When an include is
+ * encountered, the file is searched first in the directory of the
+ * including file (pushed onto the front of the path on entry, popped
+ * on exit), then in each entry of this list in order. *)
+let include_dirs : string list ref = ref []
+
+(* Forward-declared mutable ref so process_directive can recurse into
+ * preprocess_string (which is defined below).  Filled in at the
+ * bottom of this file. *)
+let preprocess_string_ref :
+  (?keep_defines:bool -> string -> string) ref =
+  ref (fun ?keep_defines:_ s -> s)
+
+(* Already-included files — avoid include-cycle infinite loops without
+ * insisting on `\`ifndef GUARD` everywhere.  Cleared by reset(). *)
+let included_files : (string, unit) Hashtbl.t = Hashtbl.create 16
+
+let reset () =
+  Hashtbl.clear defines;
+  Hashtbl.clear included_files
 
 let is_id_start c =
   (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_'
@@ -232,7 +252,54 @@ let process_directive ifdef_stk line =
   | "undef" when active () ->
       Hashtbl.remove defines rest; ""
   | "include" when active () ->
-      ""  (* TODO: handle include — picorv32 doesn't use it *)
+      (* `include "filename"` (or `include <filename>`).  Search:
+         1. directory of the including file (front of include_dirs)
+         2. each entry in include_dirs in order.
+         Recursively preprocess the contents and inline it.  Cycles
+         are short-circuited via included_files.  If the include
+         can't be resolved, emit a marker comment and continue —
+         most missing-include cases are vendor `\`include
+         "definitions.svh"` files we don't have, and the source is
+         designed to compile without them. *)
+      let strip_quotes s =
+        let n = String.length s in
+        if n >= 2 &&
+           ((s.[0] = '"' && s.[n-1] = '"') ||
+            (s.[0] = '<' && s.[n-1] = '>'))
+        then String.sub s 1 (n-2) else s
+      in
+      let target = strip_quotes rest in
+      let resolved =
+        if Filename.is_relative target then
+          List.find_map (fun d ->
+            let p = Filename.concat d target in
+            if Sys.file_exists p then Some p else None) !include_dirs
+        else if Sys.file_exists target then Some target
+        else None
+      in
+      (match resolved with
+       | None ->
+           Printf.sprintf "// [sv_preproc] include not resolved: %s\n"
+             target
+       | Some path when Hashtbl.mem included_files path ->
+           Printf.sprintf "// [sv_preproc] include (already-seen): %s\n"
+             path
+       | Some path ->
+           Hashtbl.add included_files path ();
+           let ic = open_in path in
+           let n = in_channel_length ic in
+           let buf = Bytes.create n in
+           really_input ic buf 0 n;
+           close_in ic;
+           let body = Bytes.unsafe_to_string buf in
+           (* Push the included file's dir onto the search path so
+              its own relative includes resolve. *)
+           let parent_dir = Filename.dirname path in
+           let saved = !include_dirs in
+           include_dirs := parent_dir :: saved;
+           let expanded = !preprocess_string_ref ~keep_defines:true body in
+           include_dirs := saved;
+           expanded)
   | "timescale" | "default_nettype" | "resetall"
   | "celldefine" | "endcelldefine" | "begin_keywords" | "end_keywords"
   | "pragma" | "line" | "nounconnected_drive" | "unconnected_drive" ->
@@ -356,13 +423,24 @@ let preprocess_string ?(keep_defines = false) text =
   ) raw;
   Buffer.contents out
 
+let () = preprocess_string_ref := preprocess_string
+
 (* File-level convenience: read into a string, then funnel through
- * preprocess_string.  Preserves the previous external behaviour for
- * any caller that already invokes this. *)
-let preprocess_file filename =
+ * preprocess_string.  The optional ~incdirs seeds the include search
+ * path for THIS file's parse only; if the caller has already set
+ * `include_dirs := [...]` externally those entries are kept and the
+ * argument is appended.  The file's own directory is pushed onto the
+ * front automatically so relative `\`include` resolves like a
+ * synthesis tool's. *)
+let preprocess_file ?(incdirs=[]) filename =
   let ic = open_in filename in
   let n = in_channel_length ic in
   let buf = Bytes.create n in
   really_input ic buf 0 n;
   close_in ic;
-  preprocess_string (Bytes.unsafe_to_string buf)
+  let parent_dir = Filename.dirname filename in
+  let saved = !include_dirs in
+  include_dirs := parent_dir :: (saved @ incdirs);
+  let result = preprocess_string (Bytes.unsafe_to_string buf) in
+  include_dirs := saved;
+  result
