@@ -462,55 +462,166 @@ let merge_program (p : bprogram) =
    Const-bounds only — @part_sel_write_up (variable index) keeps
    its existing behavioral_to_hardcaml path.                      *)
 
-let rewrite_slice_write widths = function
+(* slice_write site collected during a body walk.  cond = None means
+   unconditional; otherwise the conjunction of every BIf / BCase guard
+   between the site and the body's root.                            *)
+type slice_site = {
+  cond   : bexpr option;
+  target : string;
+  hi     : int;
+  lo     : int;
+  rhs    : bexpr;
+}
+
+let and_opt a b = match a, b with
+  | None, c | c, None -> c
+  | Some x, Some y ->
+      Some (BBinOp { op = BAnd; lhs = x; rhs = y; result_type = BBool })
+
+let rec collect_slice_sites cond acc = function
   | BCallStmt { func = "@slice_write";
-                args = [BVar name;
+                args = [BVar n;
                         BConst { value = hi; _ };
                         BConst { value = lo; _ };
-                        rhs] } as orig ->
-      (match Hashtbl.find_opt widths.scalar name with
-       | Some w when hi >= lo && hi < w && lo >= 0 ->
-           let top =
-             if hi + 1 <= w - 1
-             then [BSlice { signal = BVar name; msb = w - 1; lsb = hi + 1 }]
-             else [] in
-           let bot =
-             if lo > 0
-             then [BSlice { signal = BVar name; msb = lo - 1; lsb = 0 }]
-             else [] in
-           let parts = top @ [rhs] @ bot in
-           let new_rhs = match parts with
-             | [single] -> single
-             | many -> BConcat many
-           in
-           BAssign { lhs = name; rhs = new_rhs }
-       | _ -> orig)
-  | other -> other
+                        rhs] } ->
+      { cond; target = n; hi; lo; rhs } :: acc
+  | BBlock ss ->
+      List.fold_left (collect_slice_sites cond) acc ss
+  | BIf { condition; then_stmts; else_stmts } ->
+      let then_cond = and_opt cond (Some condition) in
+      let neg = BUnOp { op = BNot; operand = condition; result_type = BBool } in
+      let else_cond = and_opt cond (Some neg) in
+      let acc = List.fold_left (collect_slice_sites then_cond) acc then_stmts in
+      List.fold_left (collect_slice_sites else_cond) acc else_stmts
+  | BCase { selector; cases; default } ->
+      let acc = List.fold_left (fun a (key, ss) ->
+        let arm_cond =
+          BBinOp { op = BEq; lhs = selector; rhs = key; result_type = BBool } in
+        List.fold_left (collect_slice_sites
+                          (and_opt cond (Some arm_cond))) a ss) acc cases in
+      let not_any_key = List.fold_left (fun acc (key, _) ->
+        let neq =
+          BBinOp { op = BNe; lhs = selector; rhs = key; result_type = BBool } in
+        match acc with
+        | None -> Some neq
+        | Some prev ->
+            Some (BBinOp { op = BAnd; lhs = prev; rhs = neq;
+                           result_type = BBool })) None cases in
+      List.fold_left (collect_slice_sites
+                        (and_opt cond not_any_key)) acc default
+  | BWhile { body; _ } | BFor { body; _ } ->
+      List.fold_left (collect_slice_sites cond) acc body
+  | _ -> acc
 
-let rec rewrite_slice_writes widths stmt =
-  let rstmt = rewrite_slice_writes widths in
-  let rstmts = List.map rstmt in
-  match rewrite_slice_write widths stmt with
-  | BBlock ss -> BBlock (rstmts ss)
+let rec scrub_slice_writes = function
+  | BCallStmt { func = "@slice_write"; _ } -> BBlock []
+  | BBlock ss -> BBlock (List.map scrub_slice_writes ss)
   | BIf r ->
       BIf { r with
-            then_stmts = rstmts r.then_stmts;
-            else_stmts = rstmts r.else_stmts }
+            then_stmts = List.map scrub_slice_writes r.then_stmts;
+            else_stmts = List.map scrub_slice_writes r.else_stmts }
   | BCase r ->
       BCase { r with
-              cases   = List.map (fun (k, ss) -> (k, rstmts ss)) r.cases;
-              default = rstmts r.default }
-  | BWhile r -> BWhile { r with body = rstmts r.body }
-  | BFor   r -> BFor   { r with body = rstmts r.body }
+              cases   = List.map (fun (k, ss) ->
+                          (k, List.map scrub_slice_writes ss)) r.cases;
+              default = List.map scrub_slice_writes r.default }
+  | BWhile r -> BWhile { r with body = List.map scrub_slice_writes r.body }
+  | BFor   r -> BFor   { r with body = List.map scrub_slice_writes r.body }
   | other -> other
+
+(* Build a single BAssign that drives [target] for the next cycle as a
+   concat of MSB-to-LSB segments.  Each segment is either:
+   - the prior FF Q value of [target] for a bit range nobody writes
+   - a `cond ? rhs : prior` mux for a bit range a single site writes
+   Returns [None] if the sites overlap (last-wins semantics would need
+   per-bit muxing — not implemented yet).                            *)
+let merge_target_sites ~width target sites =
+  (* MSB-first (descending hi) so we walk the bit range from top to
+     bottom in concat order. *)
+  let sorted = List.sort (fun a b -> compare b.hi a.hi) sites in
+  let prior hi lo = BSlice { signal = BVar target; msb = hi; lsb = lo } in
+  let overlap = ref false in
+  let rec walk cur = function
+    | [] ->
+        if cur >= 0 then [prior cur 0] else []
+    | s :: rest ->
+        if s.hi > cur then begin
+          overlap := true; []
+        end else
+          let gap =
+            if s.hi < cur then [prior cur (s.hi + 1)] else [] in
+          let seg = match s.cond with
+            | None -> s.rhs
+            | Some c ->
+                BCond { condition = c;
+                        then_val = s.rhs;
+                        else_val = prior s.hi s.lo } in
+          gap @ [seg] @ walk (s.lo - 1) rest
+  in
+  let parts = walk (width - 1) sorted in
+  if !overlap then None
+  else
+    let rhs = match parts with
+      | [single] -> single
+      | many -> BConcat many in
+    Some (BAssign { lhs = target; rhs })
+
+(* Per-process body merge.  Scan once for slice-write sites grouped
+   by target; for every target whose sites are non-overlapping and
+   whose declared width is known, scrub the original slice writes
+   from the body and append one merged final-assign at the end (so
+   it lands AFTER any existing writes to the same signal — matches
+   non-blocking last-wins semantics).                              *)
+let merge_slice_writes_body widths body =
+  let sites = List.fold_left (collect_slice_sites None) [] body in
+  if sites = [] then body
+  else
+    let by_target : (string, slice_site list) Hashtbl.t = Hashtbl.create 8 in
+    List.iter (fun s ->
+      let cur = try Hashtbl.find by_target s.target with Not_found -> [] in
+      Hashtbl.replace by_target s.target (s :: cur)) sites;
+    let merges = Hashtbl.fold (fun target ts acc ->
+      match Hashtbl.find_opt widths.scalar target with
+      | Some w ->
+          (match merge_target_sites ~width:w target ts with
+           | Some bassign -> (target, bassign) :: acc
+           | None -> acc)
+      | None -> acc) by_target [] in
+    if merges = [] then body
+    else
+      let merged_targets = List.map fst merges in
+      (* Scrub slice_writes ONLY for targets we successfully merged;
+         leave others (overlap / unknown width) alone — they'll fall
+         through to the existing per-site lowering.                *)
+      let rec scrub_only stmt =
+        match stmt with
+        | BCallStmt { func = "@slice_write";
+                      args = [BVar n; _; _; _] }
+          when List.mem n merged_targets -> BBlock []
+        | BBlock ss -> BBlock (List.map scrub_only ss)
+        | BIf r ->
+            BIf { r with
+                  then_stmts = List.map scrub_only r.then_stmts;
+                  else_stmts = List.map scrub_only r.else_stmts }
+        | BCase r ->
+            BCase { r with
+                    cases = List.map (fun (k, ss) ->
+                              (k, List.map scrub_only ss)) r.cases;
+                    default = List.map scrub_only r.default }
+        | BWhile r -> BWhile { r with body = List.map scrub_only r.body }
+        | BFor   r -> BFor   { r with body = List.map scrub_only r.body }
+        | _ -> stmt
+      in
+      let scrubbed = List.map scrub_only body in
+      scrubbed @ List.map snd merges
 
 let merge_slice_writes_module (m : bmodule) =
   let widths = build_widths m.signals in
   let walk_proc = function
     | BSequential s ->
-        BSequential { s with body = List.map (rewrite_slice_writes widths) s.body }
+        BSequential { s with body = merge_slice_writes_body widths s.body }
     | BCombinational c ->
-        BCombinational { c with body = List.map (rewrite_slice_writes widths) c.body }
+        BCombinational { c with body = merge_slice_writes_body widths c.body }
   in
   { m with processes = List.map walk_proc m.processes }
 
