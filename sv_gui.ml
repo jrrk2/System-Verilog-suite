@@ -57,8 +57,11 @@ let error_dialog msg =
   ignore (d#run ()); d#destroy ()
 
 (* Sticky directory across all file choosers — opening any picker
-   returns to the directory of the last successfully picked file. *)
-let last_chooser_dir : string ref = ref ""
+   returns to the directory of the last successfully picked file.
+   Initialised to $HOME so the very first chooser doesn't open at
+   GTK's default (often /run/user/<uid> or the binary's cwd).      *)
+let last_chooser_dir : string ref =
+  ref (try Sys.getenv "HOME" with Not_found -> "")
 
 let chooser_dialog action title =
   let d = GWindow.file_chooser_dialog
