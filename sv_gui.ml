@@ -656,11 +656,19 @@ let write_orfs_files cfg =
   let period_ns = 1.0 /. cfg.o_freq_ghz in
   let io_delay  = period_ns *. 0.1 in
   let sdc =
+    (* OpenSTA's TCL doesn't include `remove_from_collection`; use a
+       foreach + name-filter loop instead.  Applying set_input_delay to
+       the clock port itself works in most STA tools but is semantically
+       redundant once create_clock is in place — explicitly exclude it
+       to avoid double-constraining the clock pin.                    *)
     Printf.sprintf
       "current_design %s\n\
        create_clock -name clk -period %.3f [get_ports clk]\n\
-       set non_clk [remove_from_collection [all_inputs] [get_ports clk]]\n\
-       set_input_delay  %.3f -clock clk $non_clk\n\
+       foreach p [get_ports *] {\n\
+         \  if {[get_property $p direction] eq \"input\" && [get_property $p name] ne \"clk\"} {\n\
+         \    set_input_delay %.3f -clock clk $p\n\
+         \  }\n\
+       }\n\
        set_output_delay %.3f -clock clk [all_outputs]\n"
       cfg.o_top period_ns io_delay io_delay
   in
