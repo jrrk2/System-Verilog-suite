@@ -1716,13 +1716,26 @@ let extract_instances ~pkgs ~params tok =
              | _ -> ()) in_);
       match !mod_name, !inst_name with
       | Some m, Some i ->
-          let prefixed_inst = String.concat "." (label_stack @ [i]) in
-          Some {
-            inst_name = prefixed_inst;
-            module_name = m;
-            param_values = [];
-            port_connections = List.rev !port_conns;
-          }
+          (* Verible's `instantiation_base` non-terminal is shared
+             between real module instantiations and certain unpacked-
+             array data declarations (e.g.
+                  reg [31:0] mem [0:WORDS-1];
+             gets surfaced as if WORDS were the module type and `mem`
+             the instance name).  Real instantiations always have a
+             paren-bound port list (possibly empty); mis-tagged array
+             decls have no port_named children at all and their
+             "module name" is a parameter in scope giving the bound.
+             Drop the candidate when both signs apply.              *)
+          let param_names = List.map fst params in
+          if !port_conns = [] && List.mem m param_names then None
+          else
+            let prefixed_inst = String.concat "." (label_stack @ [i]) in
+            Some {
+              inst_name = prefixed_inst;
+              module_name = m;
+              param_values = [];
+              port_connections = List.rev !port_conns;
+            }
       | _ -> None
     ) inst_nodes
   ) bases_with_labels

@@ -82,5 +82,8 @@ let () =
     (List.length files) (List.length prog.modules);
   List.iter (fun f -> Printf.printf "  file:   %s\n" f) files;
   List.iter (fun (m : Behavioral_ir.bmodule) ->
-    Printf.printf "  module: %s\n" m.name
+    Printf.printf "  module: %s\n" m.name;
+    List.iter (fun (i : Behavioral_ir.binstance) ->
+      Printf.printf "      inst: %s : %s\n" i.inst_name i.module_name
+    ) m.instances
   ) prog.modules

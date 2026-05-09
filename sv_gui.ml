@@ -246,6 +246,21 @@ let module_name_index_for path =
     tbl
   end
 
+(* The Verible converter's extract_instances occasionally surfaces
+   non-instantiation parse-tree nodes (variable decls of typedef'd
+   types, $clog2-bounded array dimensions, …) as binstances.  We
+   silently drop those at closure time so the user isn't prompted
+   to "locate" a typedef or system function.  Real module names
+   don't start with $ and don't end with _t in any project we've
+   seen — if a user really has a module named `foo_t`, they can
+   still rename or reach it by passing the file to convert_files
+   directly.                                                       *)
+let looks_like_module_name n =
+  let l = String.length n in
+  l > 0
+  && n.[0] <> '$'
+  && not (l >= 2 && String.sub n (l - 2) 2 = "_t")
+
 (* Closure walker — `on_missing` is called once per never-seen
    unresolved module name.  Return Some path to register that file
    (its dir is also indexed for sibling deps); return None to skip
@@ -267,7 +282,9 @@ let close_verible_dependencies ~seed ~on_missing name_map =
         List.map (fun (i : Behavioral_ir.binstance) -> i.module_name)
           m.instances) (!prog).modules in
     let unresolved = List.filter (fun n ->
-      not (List.mem n defined) && not (Hashtbl.mem skipped n))
+      not (List.mem n defined)
+      && not (Hashtbl.mem skipped n)
+      && looks_like_module_name n)
       referenced in
     let any_added = ref false in
     List.iter (fun n ->
