@@ -207,7 +207,11 @@ let next_pow2 n =
   let rec loop p = if p >= n then p else loop (p * 2) in
   loop 1
 
-let openram_num_words r = next_pow2 r.num_words
+(* OpenRAM also enforces a minimum of 16 rows total
+ * (sram_config.amend_words_per_row asserts
+ *  tentative_num_rows * words_per_row >= 16).  Tiny depths like 4
+ * are bumped to 16; the upper rows are present but unaddressed. *)
+let openram_num_words r = max 16 (next_pow2 r.num_words)
 
 let emit_openram_config r =
   match r.kind with

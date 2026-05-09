@@ -46,6 +46,7 @@ let () =
   let prog =
     prog
     |> Behavioral_unroll.unroll_program
+    |> Behavioral_mem_merge.merge_program
     |> Behavioral_inline.inline_program
     |> Behavioral_iflift.lift_program
     |> Behavioral_blocking_subst.blocking_subst_program

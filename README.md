@@ -36,11 +36,13 @@ every backend reads `bmodule`s.
 
 | Frontend | Module | Reads | Notes |
 |---|---|---|---|
-| Verible | `verible_to_behavioral.ml` + `verible_elaborate.ml` | SV source via OCaml port of Verible's grammar | Full elaboration: parameter overrides, generate unrolling, const-fn evaluation, struct-typed parameters |
-| Verilator JSON | `verilator_to_behavioral.ml` | `verilator --json-only` AST dump | Already-elaborated, monomorphic — read after Verilator does the heavy lifting |
-| Vivado RTL VHDL | `vhdl_to_ver_front.ml` → `ver_front_to_behavioral.ml` | Structural VHDL emitted by Vivado's `synth_design -rtl` (after Vivado has parsed and elaborated the original SV source) | Treats RTL_REG_SYNC/ASYNC cells as `BSequential` processes; the structural oracle |
+| Verible | `verible_to_behavioral.ml` + `verible_elaborate.ml` | SV source via OCaml port of Verible's grammar | Full elaboration: parameter overrides, generate unrolling, const-fn evaluation, struct-typed parameters. `\`include` resolution is in-OCaml via `Sv_preproc` (no shell-out to verilator -E) |
+| Verilator JSON | `verilator_to_behavioral.ml` | `verilator --json-only` AST dump | Already-elaborated, monomorphic. Walks procedural-scope `Var` declarations (named-begin / `unnamedblkN`) so locals carry source-stated widths into the BIR |
+| Slang | `slang_to_behavioral.ml` | `slang --ast-json` | Independent SV elaborator, parses CVA6 (handles type parameters Surelog can't); first-class Z3 oracle peer |
+| Vivado RTL VHDL | `vhdl_to_ver_front.ml` → `ver_front_to_behavioral.ml` | Structural VHDL emitted by Vivado's `synth_design -rtl` (after Vivado has parsed and elaborated the original SV source) | Treats RTL_REG_SYNC/ASYNC/_CE cells as `BSequential` processes; the structural oracle |
+| GRLIB / VHDL native | `vhdl_to_behavioral.ml` | VHDL source via the `vhd_front` parser | Records, enums, conditional concurrent assigns. 1072/1105 GRLIB files (97%) emit clean BIR; first Z3 ✅ EQUIVALENT on `eth_rstgen` against ghdl-synth (verilator/slang oracles) |
 | Yosys RTLIL | `rtlil_to_behavioral.ml` | `read_verilog`-then-`write_rtlil` | Used for the four-way miter |
-| Surelog UHDM | `surelog_to_behavioral.ml` | UHDM dump from Surelog | Leaf-cell pipecleaner; not used for CVA6-scale designs (type-parameter limitation) |
+| Surelog UHDM | `surelog_to_behavioral.ml` | UHDM dump from Surelog | **Parked at port-surface only** — slang covers a strict superset (CVA6's type parameters work) and is already a Z3 oracle. Use slang for new oracle work |
 
 Each frontend produces a `bprogram = { modules: bmodule list; library_cells: ... }`.
 A `bmodule` is `{ name; params; signals; processes; instances; funcs; mems }`
@@ -129,6 +131,34 @@ unroll → inline → iflift → blocking_subst → meminfer → flatten
 | `Behavioral_share` | `behavioral_share.ml` | Post-FF-rip register sharing — collapse pairs of FFs whose D-cones are structurally identical |
 | `Behavioral_ffrip` | `behavioral_ffrip.ml` | Convert each `BSequential` Q to a primary input `<Q>__Q`; emit each Q's next-state expression as a fresh primary output `<Q>__D`. Reduces equivalence checking to a combinational problem |
 | `Behavioral_sanity` | `behavioral_sanity.ml` | Brain-dead semantic checks: duplicate signal declarations, multi-driver assigns, mixed proc/cont drivers |
+
+## VHDL ↔ (System)Verilog cross-translate
+
+The pipeline is symmetric: any frontend lands `bprogram`, any backend
+reads `bprogram`. With `behavioral_to_vhdl.ml` mirroring
+`behavioral_to_verilog.ml`, the same BIR drives both directions.
+
+`convert_hdl.exe input.{vhd,v,sv} [-o output] [--top NAME]`:
+
+- Auto-detects source / dest by extension; if `-o` is omitted, the
+  output's language is the opposite of the input's.
+- Preserves the leading copyright/SPDX/license comment block and
+  re-prefixes its markers for the target (`-- ` ↔ `// `). Crucial when
+  GRLIB / OpenCores / IETF-licensed sources are translated for use in
+  toolchains that consume the other HDL.
+- High-level processes survive intact: `BSequential` →
+  `process(clk, rst); if rst='1' then RESET; elsif rising_edge(clk)
+  then BODY end if;` (canonical async-reset idiom);  `BCombinational` →
+  `process(all)` (VHDL-2008). `BIf` / `BCase` / `BFor` / `BWhile`
+  preserved inside the process body — no flattening to nets.
+- Verilog-side arithmetic operands cast to `(un)signed` for VHDL math,
+  result cast back to `std_logic_vector` — the canonical synthesizable
+  idiom that `ghdl-synth` / Vivado / DC accept.
+
+Same operations are reachable from Lua via `svd.emit_verilog(h)`,
+`svd.emit_vhdl(h)`, `svd.write_verilog(h, path)`, `svd.write_vhdl(h, path)`,
+`svd.convert_hdl(in_path, out_path)`. Demo:
+`test/lua/hdl_convert_demo.lua` exercises every binding end-to-end.
 
 ## Z3 miter (`z3_miter.ml`)
 
@@ -227,12 +257,18 @@ Built via `dune build`. The most-used executables:
 
 | Executable | Source | Use |
 |---|---|---|
-| `test_cva6_ff_diff.exe` | `test_cva6_ff_diff.ml` | Per-entity FF-set diff between Vivado's elaborated form (its `synth_design -rtl` VHDL output) and Verible-elaborated SV. Optional `MITER_Z3=1` runs Z3 on FF-matching pairs |
-| `test_cva6_bottom_up.exe` | `test_cva6_bottom_up.ml` | Pairwise Z3 miter for every Verilator-JSON module against the matching entity in Vivado's elaborated VHDL output (`cva6_elab.vhd`) |
-| `test_verilator_vs_verible.exe` | `test_verilator_vs_verible.ml` | Verilator-JSON ↔ Verible-OCaml miter on a single SV file |
+| `convert_hdl.exe` | `convert_hdl.ml` | VHDL ↔ (System)Verilog cross-translate; license-header-preserving, `--top` auto-detected from `module <NAME>` |
+| `test_z3_oracle.exe` | `test_z3_oracle.ml` | **Unified pair-Z3 harness.** `--oracle <fa> --peer <fb>` selects any pair from {verible, slang, yosys, verilator, vhdl, surelog}. Replaces the per-pair test drivers (`test_slang_vs_verible`, `test_yosys_vs_verible`, `test_verilator_vs_verible`) with one knob |
+| `test_yosys_oracle_sweep.exe` | `test_yosys_oracle_sweep.ml` | Parallel-correctness sweep across a corpus. `--oracle / --peer` for any frontend pair; `--incdir` threads through to verilator and our `Sv_preproc`. Two modes: per-file iteration (auto-top), or one elaboration set per `--top` |
+| `test_cva6_slang_diff.exe` | `test_cva6_slang_diff.ml` | Slang ↔ Verible per-entity miter on the cva6 flat SV. Slang as the primary elaborator; pairs by base-name + port-shape across both frontends' specialisations |
+| `test_grlib_vhdl_z3.exe` | `test_grlib_vhdl_z3.ml` | GRLIB bottom-up Z3 sweep: per leaf, our VHDL→BIR vs ghdl-synth→Verilog→{verilator JSON, slang}→BIR through the Z3 miter |
+| `test_vhdl_bir_dump.exe` | `test_vhdl_bir_dump.ml` | Single-VHDL-file BIR dump. `--multi <top> <files>` walks the instance graph for hierarchy dumps |
+| `test_cva6_ff_diff.exe` | `test_cva6_ff_diff.ml` | Per-entity FF-set diff between Vivado's elaborated form and Verible-elaborated SV. `MITER_Z3=1` runs Z3 on FF-matching pairs |
+| `test_cva6_bottom_up.exe` | `test_cva6_bottom_up.ml` | Pairwise Z3 miter for every Verilator-JSON module against the matching entity in Vivado's elaborated VHDL output |
 | `test_verible_to_bir.exe` | `test_verible_to_bir.ml` | Verible-side BIR dump for a single SV file. Useful for debugging elaboration. `--miter <vhd>` adds Z3 against a Vivado entity |
 | `ff_stats.exe` | `ff_stats.ml` | Run all four frontends on a single testcase and report each one's Q__Q / Q__D set, with pairwise overlap numbers |
 | `random_sv_gen.exe` | `random_sv_gen.ml` | Constrained-random SV generator. `--features mixed` rotates through nine modes |
+| `sv_decompiler.exe script <file.lua>` | `sv_decompiler.ml` + `sv_lua.ml` | Run a Lua script with the `svd.*` API exposed (parse / pick / miter / gate_miter / liberty / expand / bir / insts / timing / emit_verilog / emit_vhdl / write_verilog / write_vhdl / convert_hdl) |
 
 ## Test infrastructure
 
@@ -358,9 +394,10 @@ Required for the test suites listed alongside each tool:
 |---|---|---|
 | **Verilator** ≥ 5.024 | Verilator JSON frontend; pre-flatten wrapper for the sv-tests integration | required for the four-way miter; otherwise optional |
 | **OpenROAD-flow-scripts** (recent) | layout demos (gcd, MAC), cell-mapped equivalence using Nangate45 cells, post-CTS arrival measurements | required for `test_synth_equiv.exe` against ORFS-emitted netlists; otherwise optional |
-| **Slang** | Slang SystemVerilog frontend (`test_slang_vs_verible.exe`) | optional |
-| **Surelog** | UHDM frontend (leaf-cell pipecleaner, doesn't reach CVA6 scale) | optional |
-| **Yosys** | RTLIL frontend, four-way miter (`test_yosys_vs_verible.exe`), oracle harness (#101 in progress) | optional |
+| **Slang** | Slang SV frontend; primary peer for the unified Z3 oracle harness; cva6 slang-primary sweep | recommended for new oracle work |
+| **GHDL** ≥ 4.0 with `--synth` | GRLIB bottom-up Z3 sweep (`test_grlib_vhdl_z3.exe`); converts VHDL to Verilog so verilator/slang oracles can read it | required for the GRLIB sweep; otherwise optional |
+| **Surelog** | UHDM frontend (parked at port-surface; slang strictly supersedes for SV elaboration) | optional |
+| **Yosys** | RTLIL frontend, parallel-correctness sweep (`test_yosys_oracle_sweep.exe`), four-way miter (`test_yosys_vs_verible.exe`) | optional |
 | **Vivado 2020.1** | CVA6 entity oracle, Vivado column on the sv-tests dashboard | optional |
 
 Verible itself is **not** an external dependency — the SystemVerilog
@@ -405,21 +442,28 @@ frontends and (for elaboration) inside `verible_elaborate.ml`.
 
 Pending in the task tracker, in rough priority order:
 
-1. **Push `cascade_mac` through ORFS layout** — verified compositionally
-   end-to-end; the multiplier-heavy P&R pass closes the loop on the
-   arch-swap demo for multiplier-bound paths (#125)
-2. **Auto-cascade `gen_mul`** for widths beyond Z3's monolithic ceiling
+1. **Auto-cascade `gen_mul`** for widths beyond Z3's monolithic ceiling
    (~10-bit) — emit hierarchical mul-leaves + adder-leaves automatically
    so any wide multiplier inherits the cascade verification path (#126)
-3. **`hier_synth` chain-wire phantom direction** — auto-insert the
-   single-driver buffer so users don't have to spell out
-   `assign w_buf = w_q;` between chained instances (#127)
-4. **Verible LHS-context width propagation** — propagate the assignment
-   target width into `BBinOp.result_type` so all consumers see consistent
-   widths (currently worked-around per-op in `z3_miter`) (#128)
-5. **Carry-lookahead subtractor for `gen_sub`** — mirror `gen_add`'s
-   ripple-carry baseline with an alternative (#112)
-6. CVA6 popcount Z3, `ct_vfdsu_*` width mismatches, `RTL_REG` with CE,
-   full-synthesis equivalence path, Surelog widening for type params,
-   yosys-as-oracle parallel-correctness harness (#101), kepler-formal as
-   second oracle (#105), Naja interchange for cert caching (#106).
+2. **Predictor calibration sweep against measured ORFS QoR** —
+   close the loop between `predict_swap`'s analytical numbers and
+   real post-CTS measurements (#109)
+3. **Triage one `ct_vfdsu_*` failure** — the cva6 slang-primary sweep's
+   11 NOTEQUIV cases all cluster in T-Head's VFDSU FP unit, almost
+   certainly a single elaboration disagreement class shared across the
+   block (#108 follow-up)
+4. **Procedural-scope shadow renaming** — when two case arms declare
+   the same name with different widths (cordic_sincos `x_shift` 31-bit
+   vs 19-bit), qualify the bsignal name with the static-named (or
+   anonymous `unnamedblkN`) hierarchy so the BIR carries both (#25
+   follow-up)
+5. **Full-synthesis equivalence path** — extend the cell-mapped miter
+   to handle full `synth_design` output (Vivado's primitive-mapped
+   form), not just `synth_design -rtl` (#26)
+6. **Naja interchange format support** for incremental cert caching (#106)
+7. **kepler-formal as a second oracle** for the parallel-correctness
+   harness (#105)
+8. **Surelog: extract widths, processes, instances** — parked, not
+   blocked. Slang covers the same cases (and more) and is already a
+   working Z3 oracle; revisit only if the UHDM ecosystem grows a
+   feature slang doesn't have
