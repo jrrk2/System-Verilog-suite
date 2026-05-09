@@ -62,6 +62,8 @@ let chooser_dialog action title =
   d#add_button "Cancel" `CANCEL;
   d#add_button (match action with `OPEN -> "Open" | `SAVE -> "Save" | _ -> "OK")
     `OK;
+  (* Double-click (or Enter on a selected file) → same as clicking Open. *)
+  ignore (d#connect#file_activated ~callback:(fun () -> d#response `OK));
   let result = match d#run () with
     | `OK -> (match d#filename with Some f -> f | None -> "")
     | _   -> ""
@@ -129,19 +131,18 @@ let add_lua_item menu_name label handler =
   dynamic_items := (item :> GObj.widget) :: !dynamic_items
 
 (* ---------- dependency discovery for "Parse Verible" ----------
-   When the user opens a single .sv file we want to also pull in the
-   files that define modules it instantiates, so the BIR view shows the
-   full design.  Strategy: scan sibling directories for *.sv, build a
-   module-name → file-path map (via Sv_preproc.find_module_names so
-   macros / `\`include`s are honoured), parse the seed file, walk the
-   resulting BIR for unresolved instance.module_name references, add
-   the matching files, and re-parse.  Iterate until fixed point.       *)
+   When the user opens a single .sv file we pull in the files that
+   define modules it instantiates so the BIR view shows the full
+   design.  Strategy: scan sibling directories + persisted search
+   paths for *.sv/*.v, build a module-name → file-path map (via
+   Sv_preproc.find_module_names so macros / `\`include`s are honoured),
+   parse the seed file, walk the BIR for unresolved
+   instance.module_name references, add the matching files, and
+   re-parse.  When a name still can't be found we ask the user to
+   locate it; the chosen file's directory becomes a permanent search
+   path persisted under $XDG_CONFIG_HOME/sv_decompiler/.            *)
 
-let sv_dir_index : (string * (string, string) Hashtbl.t) ref =
-  ref ("", Hashtbl.create 0)
-
-let walk_sv_dir ?(max_depth = 4) root =
-  let table = Hashtbl.create 256 in
+let walk_sv_dir_into ?(max_depth = 4) tbl root =
   let rec walk depth dir =
     if depth > max_depth then ()
     else if Sys.file_exists dir && Sys.is_directory dir then begin
@@ -159,7 +160,7 @@ let walk_sv_dir ?(max_depth = 4) root =
               let text = Sv_preproc.preprocess_file p in
               let names = Sv_preproc.find_module_names text in
               List.iter (fun n ->
-                if not (Hashtbl.mem table n) then Hashtbl.add table n p
+                if not (Hashtbl.mem tbl n) then Hashtbl.add tbl n p
               ) names
             with _ -> ()
           end
@@ -167,25 +168,93 @@ let walk_sv_dir ?(max_depth = 4) root =
       ) entries
     end
   in
-  walk 0 root;
-  table
+  walk 0 root
 
-(* Cache one index per scan-root so reopening files in the same project
-   doesn't rescan the tree each time. *)
+let walk_sv_dir ?(max_depth = 4) root =
+  let tbl = Hashtbl.create 256 in
+  walk_sv_dir_into ~max_depth tbl root;
+  tbl
+
+(* Persisted search paths — populated on demand by the user when a
+   dependency can't be located, kept across sessions in a plain text
+   file (one absolute path per line).                              *)
+let search_paths : string list ref = ref []
+
+let search_paths_file () =
+  let xdg =
+    try Sys.getenv "XDG_CONFIG_HOME"
+    with Not_found ->
+      try (Sys.getenv "HOME") ^ "/.config"
+      with Not_found -> "/tmp"
+  in
+  Filename.concat xdg "sv_decompiler/search_paths.txt"
+
+let load_search_paths () =
+  let p = search_paths_file () in
+  if Sys.file_exists p then begin
+    try
+      let ic = open_in p in
+      let lines = ref [] in
+      (try while true do
+         let l = input_line ic in
+         let l = String.trim l in
+         if l <> "" && l.[0] <> '#' then lines := l :: !lines
+       done with End_of_file -> ());
+      close_in ic;
+      search_paths := List.rev !lines
+    with _ -> ()
+  end
+
+let save_search_paths () =
+  let p = search_paths_file () in
+  let dir = Filename.dirname p in
+  if not (Sys.file_exists dir) then
+    ignore (Sys.command (Printf.sprintf "mkdir -p %s" (Filename.quote dir)));
+  try
+    let oc = open_out p in
+    output_string oc
+      "# sv_decompiler search paths (one absolute dir per line)\n";
+    List.iter (fun d -> output_string oc (d ^ "\n")) !search_paths;
+    close_out oc
+  with _ -> ()
+
+let add_search_path d =
+  let d = if Filename.is_relative d
+          then Filename.concat (Sys.getcwd ()) d else d in
+  if not (List.mem d !search_paths) then begin
+    search_paths := !search_paths @ [d];
+    save_search_paths ()
+  end
+
+(* Cache the merged seed-dir + search-path index keyed by its full
+   composition so changing search_paths invalidates the cache.       *)
+let sv_dir_index : (string * (string, string) Hashtbl.t) ref =
+  ref ("", Hashtbl.create 0)
+
 let module_name_index_for path =
-  let root = Filename.dirname path in
-  let cached_root, cached_tbl = !sv_dir_index in
-  if cached_root = root then cached_tbl
+  let seed_root = Filename.dirname path in
+  let key = String.concat "|" (seed_root :: !search_paths) in
+  let cached_key, cached_tbl = !sv_dir_index in
+  if cached_key = key then cached_tbl
   else begin
-    let tbl = walk_sv_dir root in
-    sv_dir_index := (root, tbl);
+    let tbl = Hashtbl.create 256 in
+    walk_sv_dir_into tbl seed_root;
+    List.iter (fun d ->
+      if d <> seed_root then walk_sv_dir_into tbl d
+    ) !search_paths;
+    sv_dir_index := (key, tbl);
     tbl
   end
 
-let close_verible_dependencies ~seed name_map =
+(* Closure walker — `on_missing` is called once per never-seen
+   unresolved module name.  Return Some path to register that file
+   (its dir is also indexed for sibling deps); return None to skip
+   this name (remembered, so we don't re-prompt in the same call). *)
+let close_verible_dependencies ~seed ~on_missing name_map =
   let files = ref [seed] in
   let prog  = ref (Verible_to_behavioral.convert_files_all !files) in
   let max_iters = 8 in
+  let skipped : (string, unit) Hashtbl.t = Hashtbl.create 8 in
   let iter = ref 0 in
   let changed = ref true in
   while !changed && !iter < max_iters do
@@ -197,17 +266,32 @@ let close_verible_dependencies ~seed name_map =
       List.concat_map (fun (m : Behavioral_ir.bmodule) ->
         List.map (fun (i : Behavioral_ir.binstance) -> i.module_name)
           m.instances) (!prog).modules in
-    let unresolved = List.filter (fun n -> not (List.mem n defined))
-                       referenced in
-    let added = List.fold_left (fun acc n ->
-      match Hashtbl.find_opt name_map n with
-      | Some path when not (List.mem path !files) ->
-          files := path :: !files;
+    let unresolved = List.filter (fun n ->
+      not (List.mem n defined) && not (Hashtbl.mem skipped n))
+      referenced in
+    let any_added = ref false in
+    List.iter (fun n ->
+      let pick =
+        match Hashtbl.find_opt name_map n with
+        | Some p -> Some p
+        | None ->
+            match on_missing n with
+            | Some p ->
+                Hashtbl.replace name_map n p;
+                walk_sv_dir_into name_map (Filename.dirname p);
+                Some p
+            | None ->
+                Hashtbl.add skipped n ();
+                None
+      in
+      match pick with
+      | Some p when not (List.mem p !files) ->
+          files := p :: !files;
           changed := true;
-          (n, path) :: acc
-      | _ -> acc
-    ) [] unresolved in
-    if added <> [] then
+          any_added := true
+      | _ -> ()
+    ) unresolved;
+    if !any_added then
       prog := Verible_to_behavioral.convert_files_all !files
   done;
   (List.rev !files, !prog)
@@ -268,8 +352,40 @@ let do_parse fe () =
       match fe with
       | "verible" ->
           let name_map = module_name_index_for path in
+          let on_missing module_name =
+            let parent = need_window () in
+            let d = GWindow.dialog
+              ~title:("Module not found: " ^ module_name)
+              ~parent ~modal:true ~width:480 () in
+            let lbl = GMisc.label
+              ~text:(Printf.sprintf
+                "Module '%s' is instantiated but no source file was \
+                 found in the current search paths.\n\n\
+                 Locate the .sv/.v file — its directory will be added \
+                 to the persisted search paths so future runs find \
+                 sibling modules automatically."
+                module_name)
+              ~xalign:0.0 ~justify:`LEFT
+              ~packing:(d#vbox#pack ~padding:8) () in
+            lbl#set_line_wrap true;
+            d#add_button "Locate file…" `OK;
+            d#add_button "Skip"         `CANCEL;
+            d#vbox#misc#show_all ();
+            let action = d#run () in
+            d#destroy ();
+            match action with
+            | `OK ->
+                let f = open_file_dialog () in
+                if f = "" then None
+                else begin
+                  add_search_path (Filename.dirname f);
+                  Some f
+                end
+            | _ -> None
+          in
           let files, prog =
-            close_verible_dependencies ~seed:path name_map in
+            close_verible_dependencies
+              ~seed:path ~on_missing name_map in
           let extra =
             if List.length files > 1 then
               Printf.sprintf "// dependencies pulled in (%d files):\n%s\n"
@@ -1144,6 +1260,7 @@ let () =
   status_ctx_ref := Some ctx;
   ignore (ctx#push "Ready");
 
+  load_search_paths ();
   install_hooks ();
 
   (* File menu. *)
