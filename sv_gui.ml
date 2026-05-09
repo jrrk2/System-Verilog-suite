@@ -827,7 +827,10 @@ let spawn_orfs cfg =
     append_text (Printf.sprintf "[orfs] memory backend: %s\n" label);
     if cfg.o_mem_back = Mem_fakeram then
       append_text (Printf.sprintf
-        "[orfs] FakeRAM platform dir: %s\n" plat_dir)
+        "[orfs] FakeRAM platform dir: %s\n" plat_dir);
+    append_text
+      "[orfs] HIER_SYNTH_STUB_ON_FAIL=1 (failing modules become \
+       port-only stubs — temporary)\n"
   end;
   let r, w = Unix.pipe () in
   let pid =
@@ -839,7 +842,16 @@ let spawn_orfs cfg =
                    the ORFS platform tree (where pre-built fakeram45_*
                    .lef/.lib live).
          OpenRAM → just MEM_MACRO_TECH (matched to platform).
-         Bit-blast → MEMLOWER=0 in the shim's env.                    *)
+         Bit-blast → MEMLOWER=0 in the shim's env.
+
+         HIER_SYNTH_STUB_ON_FAIL=1 is forced ON for now: if a single
+         module's Hardcaml lowering fails, the synth shim emits a
+         port-only stub for that module instead of aborting the whole
+         flow.  Lets the user push large designs (e.g. picosoc with
+         spimemio's partial-slice-write chain) through layout while
+         specific modules are debugged.  Temporary — once the underlying
+         lowering bugs are fixed this default should flip back to
+         strict.                                                      *)
       let prefix p e =
         let pl = String.length p in
         String.length e >= pl && String.sub e 0 pl = p
@@ -850,14 +862,16 @@ let spawn_orfs cfg =
           not (prefix "MEM_MACRO_TECH=" e
                || prefix "MEMLOWER=" e
                || prefix "MEM_USE_FAKERAM=" e
-               || prefix "FAKERAM_PLATFORM_DIR=" e)) parent in
+               || prefix "FAKERAM_PLATFORM_DIR=" e
+               || prefix "HIER_SYNTH_STUB_ON_FAIL=" e)) parent in
         let extras =
-          ("MEM_MACRO_TECH=" ^ mem_tech) ::
-          (match cfg.o_mem_back with
-           | Mem_bitblast -> [ "MEMLOWER=0" ]
-           | Mem_fakeram  -> [ "MEM_USE_FAKERAM=1"
-                             ; "FAKERAM_PLATFORM_DIR=" ^ plat_dir ]
-           | Mem_openram  -> [])
+          ("MEM_MACRO_TECH=" ^ mem_tech)
+          :: "HIER_SYNTH_STUB_ON_FAIL=1"
+          :: (match cfg.o_mem_back with
+              | Mem_bitblast -> [ "MEMLOWER=0" ]
+              | Mem_fakeram  -> [ "MEM_USE_FAKERAM=1"
+                                ; "FAKERAM_PLATFORM_DIR=" ^ plat_dir ]
+              | Mem_openram  -> [])
         in
         Array.of_list (parent @ extras)
       in
