@@ -296,6 +296,39 @@ let close_verible_dependencies ~seed ~on_missing name_map =
   done;
   (List.rev !files, !prog)
 
+(* Modal dialog: ask the user to locate a missing module's source.
+   Shared between Decompile→Parse Verible and Topology→Run ORFS so both
+   paths apply the same dependency closure with the same UX.            *)
+let prompt_locate_module module_name =
+  let parent = need_window () in
+  let d = GWindow.dialog
+    ~title:("Module not found: " ^ module_name)
+    ~parent ~modal:true ~width:480 () in
+  let lbl = GMisc.label
+    ~text:(Printf.sprintf
+      "Module '%s' is instantiated but no source file was found in \
+       the current search paths.\n\nLocate the .sv/.v file — its \
+       directory will be added to the persisted search paths so future \
+       runs find sibling modules automatically."
+      module_name)
+    ~xalign:0.0 ~justify:`LEFT
+    ~packing:(d#vbox#pack ~padding:8) () in
+  lbl#set_line_wrap true;
+  d#add_button "Locate file…" `OK;
+  d#add_button "Skip"         `CANCEL;
+  d#vbox#misc#show_all ();
+  let action = d#run () in
+  d#destroy ();
+  match action with
+  | `OK ->
+      let f = open_file_dialog () in
+      if f = "" then None
+      else begin
+        add_search_path (Filename.dirname f);
+        Some f
+      end
+  | _ -> None
+
 (* ---------- hardwired actions: parse / optim / Z3 miter ---------- *)
 
 let with_errors label f =
@@ -352,40 +385,9 @@ let do_parse fe () =
       match fe with
       | "verible" ->
           let name_map = module_name_index_for path in
-          let on_missing module_name =
-            let parent = need_window () in
-            let d = GWindow.dialog
-              ~title:("Module not found: " ^ module_name)
-              ~parent ~modal:true ~width:480 () in
-            let lbl = GMisc.label
-              ~text:(Printf.sprintf
-                "Module '%s' is instantiated but no source file was \
-                 found in the current search paths.\n\n\
-                 Locate the .sv/.v file — its directory will be added \
-                 to the persisted search paths so future runs find \
-                 sibling modules automatically."
-                module_name)
-              ~xalign:0.0 ~justify:`LEFT
-              ~packing:(d#vbox#pack ~padding:8) () in
-            lbl#set_line_wrap true;
-            d#add_button "Locate file…" `OK;
-            d#add_button "Skip"         `CANCEL;
-            d#vbox#misc#show_all ();
-            let action = d#run () in
-            d#destroy ();
-            match action with
-            | `OK ->
-                let f = open_file_dialog () in
-                if f = "" then None
-                else begin
-                  add_search_path (Filename.dirname f);
-                  Some f
-                end
-            | _ -> None
-          in
           let files, prog =
             close_verible_dependencies
-              ~seed:path ~on_missing name_map in
+              ~seed:path ~on_missing:prompt_locate_module name_map in
           let extra =
             if List.length files > 1 then
               Printf.sprintf "// dependencies pulled in (%d files):\n%s\n"
@@ -484,7 +486,7 @@ let do_miter fe_a fe_b () =
 
 type orfs_cfg = {
   o_top      : string;
-  o_file     : string;
+  o_files    : string list;     (* full closed-over fileset for VERILOG_FILES *)
   o_platform : string;
   o_freq_ghz : float;
   o_util     : int;
@@ -521,6 +523,7 @@ let write_orfs_files cfg =
   in
   let sdc_path = Filename.concat cfg.o_workdir "constraint.sdc" in
   write_file sdc_path sdc;
+  let verilog_files = String.concat " " cfg.o_files in
   let mk =
     Printf.sprintf
       "export DESIGN_NICKNAME = %s\n\
@@ -533,7 +536,7 @@ let write_orfs_files cfg =
        export CORE_MARGIN            = 2\n\
        export PLACE_DENSITY_LB_ADDON = 0.20\n\
        export TNS_END_PERCENT        = 100\n"
-      cfg.o_top cfg.o_top cfg.o_platform cfg.o_file sdc_path cfg.o_util
+      cfg.o_top cfg.o_top cfg.o_platform verilog_files sdc_path cfg.o_util
   in
   let mk_path = Filename.concat cfg.o_workdir "config.mk" in
   write_file mk_path mk;
@@ -675,7 +678,7 @@ let show_orfs_run_dialog () =
     | `OK ->
         (try Some {
            o_top      = top_e#text;
-           o_file     = file_e#text;
+           o_files    = [file_e#text];     (* expanded by do_orfs_run *)
            o_platform = (try List.nth platforms combo#active
                          with _ -> "nangate45");
            o_freq_ghz = (try float_of_string freq_e#text with _ -> 1.0);
@@ -692,16 +695,46 @@ let do_orfs_run () =
   match show_orfs_run_dialog () with
   | None -> ()
   | Some cfg ->
-      if cfg.o_top = "" || cfg.o_file = "" then
+      let seed = match cfg.o_files with f :: _ -> f | [] -> "" in
+      if cfg.o_top = "" || seed = "" then
         error_dialog "Top and Verilog file are required."
-      else if not (Sys.file_exists cfg.o_file) then
-        error_dialog ("Verilog file not found:\n" ^ cfg.o_file)
+      else if not (Sys.file_exists seed) then
+        error_dialog ("Verilog file not found:\n" ^ seed)
       else if not (Sys.file_exists (orfs_dir ())) then
         error_dialog (Printf.sprintf
           "ORFS install not found at %s.\nSet $ORFS_DIR or install at \
            $HOME/OpenROAD-flow-scripts." (orfs_dir ()))
       else
-        try spawn_orfs cfg with Exit -> ()
+        try
+          (* Same dependency closure as Decompile→Parse Verible.  Yosys's
+             read_verilog needs every module that gets instantiated (the
+             "Module \\X referenced … is not part of the design" error
+             from a single-file submission).                            *)
+          set_status "ORFS: discovering Verilog dependencies …";
+          let name_map = module_name_index_for seed in
+          let files, prog =
+            close_verible_dependencies
+              ~seed ~on_missing:prompt_locate_module name_map in
+          let names = List.map (fun (m : Behavioral_ir.bmodule) -> m.name)
+                        prog.modules in
+          if not (List.mem cfg.o_top names) then begin
+            error_dialog (Printf.sprintf
+              "Top module '%s' not found among discovered modules.\n\n\
+               Discovered: %s\n\n\
+               Edit the Top field or pick a different seed file."
+              cfg.o_top
+              (String.concat ", " (List.sort compare names)))
+          end else begin
+            set_text "";
+            append_text (Printf.sprintf
+              "[orfs] dependency closure: %d files, %d modules\n"
+              (List.length files) (List.length names));
+            List.iter (fun f ->
+              append_text ("  " ^ f ^ "\n")) files;
+            append_text "\n";
+            spawn_orfs { cfg with o_files = files }
+          end
+        with Exit -> ()
 
 (* ---------- Phase 2: DEF/LEF reader + Cairo layout viewer ----------
    ORFS produces 6_final.def in results/<platform>/<design>/base/.  We
