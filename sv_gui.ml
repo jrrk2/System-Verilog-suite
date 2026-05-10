@@ -765,6 +765,18 @@ let decomp_shim_exe () =
   Filename.concat (repo_root ())
     "_build/default/synth_orfs_shim.exe"
 
+let orfs_prep_exe () =
+  Filename.concat (repo_root ())
+    "_build/default/orfs_prep.exe"
+
+(* Date stamp used as FLOW_VARIANT — keeps each run in its own
+   results subdir under <flow>/results/<plat>/<top>/<stamp>/.       *)
+let stamp_now () =
+  let t = Unix.localtime (Unix.time ()) in
+  Printf.sprintf "%04d%02d%02d_%02d%02d%02d"
+    (t.tm_year + 1900) (t.tm_mon + 1) t.tm_mday
+    t.tm_hour t.tm_min t.tm_sec
+
 (* OpenRAM technology to match an ORFS platform.  Hardcaml memlower
    reads MEM_MACRO_TECH from the environment to decide which OpenRAM
    tech directory to invoke.  scn4m_subm is OpenRAM's bundled
@@ -793,21 +805,89 @@ let spawn_orfs cfg =
   in
   if not proceed then raise Exit;
 
-  let _, mk_path = write_orfs_files cfg in
+  let sdc_path, base_mk_path = write_orfs_files cfg in
   let flow_dir = Filename.concat (orfs_dir ()) "flow" in
+  let mem_tech = openram_tech_for_platform cfg.o_platform in
+  let plat_dir =
+    Filename.concat (orfs_dir ())
+      (Filename.concat "flow"
+         (Filename.concat "platforms" cfg.o_platform))
+  in
+  (* When using our hardcaml synth, run orfs_prep first.  It picks a
+     date-stamped FLOW_VARIANT, runs the same pipeline as the make-
+     time shim, and writes a self-contained per-variant config.mk
+     with ADDITIONAL_LEFS / ADDITIONAL_LIBS for any memory macros it
+     emitted.  Without that, the GUI's bare config.mk leaves OpenROAD
+     unable to find the macro LEF and floorplan rejects the design
+     (ORD-2013 "LEF master not found").  The bare config.mk we just
+     wrote is still useful as a fallback when use_decomp=false. *)
+  let variant, mk_path =
+    if use_decomp && Sys.file_exists (orfs_prep_exe ()) then begin
+      let v = stamp_now () in
+      let prep_argv = [|
+        orfs_prep_exe ();
+        "--top"; cfg.o_top;
+        "--orfs-flow"; flow_dir;
+        "--platform"; cfg.o_platform;
+        "--design-cfg-dir"; cfg.o_workdir;
+        "--sdc"; sdc_path;
+        "--variant"; v;
+        "--";
+      |] in
+      let argv = Array.append prep_argv (Array.of_list cfg.o_files) in
+      (* orfs_prep needs the same memory-backend env as the make-time
+         shim — re-export them so its catalogue + wrapper-emit pick
+         FakeRAM / OpenRAM as the user selected.                     *)
+      let prefix p e =
+        let pl = String.length p in
+        String.length e >= pl && String.sub e 0 pl = p in
+      let parent = Array.to_list (Unix.environment ()) in
+      let parent = List.filter (fun e ->
+        not (prefix "MEM_MACRO_TECH=" e
+             || prefix "MEMLOWER=" e
+             || prefix "MEM_USE_FAKERAM=" e
+             || prefix "FAKERAM_PLATFORM_DIR=" e)) parent in
+      let extras =
+        ("MEM_MACRO_TECH=" ^ mem_tech)
+        :: (match cfg.o_mem_back with
+            | Mem_bitblast -> [ "MEMLOWER=0" ]
+            | Mem_fakeram  -> [ "MEM_USE_FAKERAM=1"
+                              ; "FAKERAM_PLATFORM_DIR=" ^ plat_dir ]
+            | Mem_openram  -> []) in
+      let env = Array.of_list (parent @ extras) in
+      append_text (Printf.sprintf "[orfs] preflight: orfs_prep variant=%s\n" v);
+      let pid = Unix.create_process_env (orfs_prep_exe ()) argv env
+                  Unix.stdin Unix.stderr Unix.stderr in
+      let _, status = Unix.waitpid [] pid in
+      (match status with
+       | Unix.WEXITED 0 ->
+           let prep_mk = Filename.concat
+             (Filename.concat cfg.o_workdir v) "config.mk" in
+           if Sys.file_exists prep_mk then v, prep_mk
+           else begin
+             append_text "[orfs] orfs_prep produced no config; using bare config.mk\n";
+             "base", base_mk_path
+           end
+       | _ ->
+           append_text "[orfs] orfs_prep failed; using bare config.mk\n";
+           "base", base_mk_path)
+    end else
+      "base", base_mk_path
+  in
   set_text "";
   append_text (Printf.sprintf
-    "[orfs] workdir=%s\n[orfs] config.mk=%s\n[orfs] flow=%s\n"
-    cfg.o_workdir mk_path flow_dir);
+    "[orfs] workdir=%s\n[orfs] variant=%s\n[orfs] config.mk=%s\n[orfs] flow=%s\n"
+    cfg.o_workdir variant mk_path flow_dir);
   let extra_args =
     if use_decomp
     then [| "USE_DECOMP_SYNTH=1";
-            "DECOMP_SHIM=" ^ decomp_shim_exe () |]
-    else [||]
+            "DECOMP_SHIM=" ^ decomp_shim_exe ();
+            "FLOW_VARIANT=" ^ variant |]
+    else [| "FLOW_VARIANT=" ^ variant |]
   in
   let make_cmd_str =
-    Printf.sprintf "make -C %s DESIGN_CONFIG=%s%s"
-      flow_dir mk_path
+    Printf.sprintf "make -C %s DESIGN_CONFIG=%s FLOW_VARIANT=%s%s"
+      flow_dir mk_path variant
       (if use_decomp
        then " USE_DECOMP_SYNTH=1 DECOMP_SHIM=" ^ decomp_shim_exe ()
        else "")
@@ -820,12 +900,6 @@ let spawn_orfs cfg =
   append_text "\n";
   set_status (Printf.sprintf "ORFS: %s on %s — running" cfg.o_top cfg.o_platform);
 
-  let mem_tech = openram_tech_for_platform cfg.o_platform in
-  let plat_dir =
-    Filename.concat (orfs_dir ())
-      (Filename.concat "flow"
-         (Filename.concat "platforms" cfg.o_platform))
-  in
   if use_decomp then begin
     let label = match cfg.o_mem_back with
       | Mem_fakeram  -> "FakeRAM (pre-built tables)"
