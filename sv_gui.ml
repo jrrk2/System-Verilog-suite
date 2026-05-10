@@ -1513,18 +1513,55 @@ let render_layout cr ~width ~height ?path layout =
      | None -> ()
      | Some p ->
          let idx = inst_index layout in
+         let matched = ref 0 in
+         let unmatched = ref 0 in
+         let unmatched_samples = ref [] in
          let pts = List.filter_map (fun (h : timing_hop) ->
            match Hashtbl.find_opt idx h.t_inst with
-           | None -> None
+           | None ->
+               incr unmatched;
+               if List.length !unmatched_samples < 3 then
+                 unmatched_samples := h.t_inst :: !unmatched_samples;
+               None
            | Some pl ->
+               incr matched;
                let w_um, h_um =
                  try Hashtbl.find layout.l_macro_um pl.p_cell
                  with Not_found -> (0.5, 1.4) in
                let cx_dbu = pl.p_x + int_of_float (w_um *. units_f /. 2.0) in
                let cy_dbu = pl.p_y + int_of_float (h_um *. units_f /. 2.0) in
-               Some (xform cx_dbu cy_dbu)
+               Some (cx_dbu, cy_dbu, xform cx_dbu cy_dbu)
          ) p.tp_hops in
+         (* Telemetry — surfaced once per overlay redraw (not per
+            frame) via the status bar.  Helps the user spot hop-name
+            mismatches (where the path hop's t_inst doesn't match any
+            placement's p_inst) vs. a genuinely clustered path.    *)
          (match pts with
+          | first :: _ ->
+              let xmin = ref max_int and xmax = ref min_int in
+              let ymin = ref max_int and ymax = ref min_int in
+              List.iter (fun (xd, yd, _) ->
+                if xd < !xmin then xmin := xd;
+                if xd > !xmax then xmax := xd;
+                if yd < !ymin then ymin := yd;
+                if yd > !ymax then ymax := yd) pts;
+              let dx_um = float_of_int (!xmax - !xmin) /. units_f in
+              let dy_um = float_of_int (!ymax - !ymin) /. units_f in
+              set_status (Printf.sprintf
+                "Path: %d/%d hops matched · bbox %.1f × %.1f µm%s"
+                !matched (!matched + !unmatched) dx_um dy_um
+                (if !unmatched > 0
+                 then Printf.sprintf "  (sample miss: %s)"
+                        (List.hd !unmatched_samples)
+                 else ""));
+              let _ = first in ()
+          | [] when !unmatched > 0 ->
+              set_status (Printf.sprintf
+                "Path: 0/%d hops matched against placement (sample miss: %s)"
+                !unmatched (List.hd !unmatched_samples))
+          | [] -> ());
+         let xy_pts = List.map (fun (_, _, p) -> p) pts in
+         (match xy_pts with
           | [] -> ()
           | (x0, y0) :: rest ->
               Cairo.set_source_rgba cr 0.90 0.10 0.10 0.95;
