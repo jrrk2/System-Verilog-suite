@@ -202,10 +202,29 @@ let report ?(wp=Wire_delay.default_params)
   let cell_of = Hashtbl.create 4096 in
   List.iter (fun (p : Placement.placement) ->
     Hashtbl.replace cell_of p.Placement.inst p.Placement.cell) placements;
+  (* Clock-tree cells (CLKBUF / CLKGATE / CLKINV …) carry the largest
+     accumulated arrival in any post-CTS netlist because they form a
+     deliberate buffer chain.  They aren't data paths — they're the
+     clock distribution itself.  Skip them when picking the worst
+     data-arrival endpoint.  Match on cell_name prefix (works across
+     Nangate45 / sky130 / gf180mcu naming).  Also skip cells whose
+     instance name starts with `clkbuf_`/`clknet_` — those are the
+     names ORFS gives to CTS-inserted buffer instances regardless
+     of the underlying cell type.                                  *)
+  let is_clock_cell ~cell ~inst =
+    let starts pfx s =
+      let pl = String.length pfx and sl = String.length s in
+      sl >= pl && String.sub s 0 pl = pfx in
+    starts "CLKBUF" cell || starts "CLKGATE" cell
+    || starts "CLKINV" cell || starts "CLKAND" cell
+    || starts "clkbuf_" inst || starts "clknet_" inst
+    || starts "delaybuf_" inst || starts "clkload" inst
+  in
   Hashtbl.iter (fun inst v ->
-    if v > !worst_v then begin
+    let cell = try Hashtbl.find cell_of inst with Not_found -> "" in
+    if v > !worst_v && not (is_clock_cell ~cell ~inst) then begin
       worst_v := v; worst_inst := inst;
-      worst_cell := (try Hashtbl.find cell_of inst with Not_found -> "")
+      worst_cell := cell
     end) arr;
   let total_wire = List.fold_left
     (fun acc (n : Nets.net) ->
@@ -230,11 +249,17 @@ let report ?(wp=Wire_delay.default_params)
   let rec walk hops cur depth =
     if depth >= 256 then List.rev hops
     else
-      let hop = (cur, cell_of_or_blank cur, arr_of cur) in
+      let cell = cell_of_or_blank cur in
+      let hop = (cur, cell, arr_of cur) in
       let hops = hop :: hops in
       match Hashtbl.find_opt fanin cur with
       | None | Some [] -> List.rev hops
       | Some preds ->
+          (* Skip clock-tree predecessors when walking back too. *)
+          let preds =
+            List.filter (fun (src, _) ->
+              let c = cell_of_or_blank src in
+              not (is_clock_cell ~cell:c ~inst:src)) preds in
           let best =
             List.fold_left (fun acc (src, w) ->
               let a = arr_of src +. w in
