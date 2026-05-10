@@ -150,6 +150,10 @@ let preserved_envs = [
   "SV_DECOMP_LIBERTY";
   "SV_DECOMP_NO_SIZE";
   "SV_DECOMP_WIRE_CAP_PF";
+  "SV_DECOMP_ARCH_SWAP";
+  "SV_DECOMP_ARCH_MIN_W";
+  "SV_DECOMP_NO_TIE_FAN";
+  "SV_DECOMP_TIE_FANOUT_MAX";
 ]
 
 let emit_config_mk ~top ~nickname ~platform ~variant
