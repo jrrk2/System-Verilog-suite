@@ -403,9 +403,30 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
          | Some (we_expr, w_addr, w_data), Some r_addr ->
              let aw = bits_needed mm.depth in
              let dw = mm.data_width in
+             (* Even when the source has a separate read site that
+                always fires (rdata <= mem[r_addr]) and a write site
+                guarded by we_expr, a 1RW cell can serve both: each
+                cycle is exactly one operation.  Mux the address with
+                we_expr, hold ce_in asserted, and let the cell either
+                read or write that address per cycle.
+
+                When r_addr is structurally identical to w_addr (the
+                picosoc_mem case where both use the same `addr` bus)
+                the mux degenerates to a wire — same end result.  For
+                designs where the source genuinely needs simultaneous
+                read+write at different addresses (true dual-port
+                register files), set MEM_REQUIRE_DUAL_PORT=1 to fall
+                back to the 1RW1R request shape and require a
+                dual-port macro.                                    *)
+             let force_dual_port =
+               Sys.getenv_opt "MEM_REQUIRE_DUAL_PORT" = Some "1" in
+             let kind =
+               if force_dual_port
+               then Mem_macro_resolve.Sram { n_rw = 1; n_r = 1; n_w = 0 }
+               else Mem_macro_resolve.Sram { n_rw = 1; n_r = 0; n_w = 0 } in
              let req = Mem_macro_resolve.{
                tech;
-               kind = Sram { n_rw = 1; n_r = 1; n_w = 0 };
+               kind;
                word_size = dw;
                num_words = mm.depth;
              } in
@@ -466,20 +487,33 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
              let addr0  = suffix (List.nth ps.addr 0) in
              let din0   = suffix (match List.nth ps.din 0 with
                                   | Some n -> n | None -> "din0") in
-             let clk1   = suffix (List.nth ps.clk 1) in
-             let csb1   = suffix (List.nth ps.csb 1) in
-             let addr1  = suffix (List.nth ps.addr 1) in
-             let dout1  = suffix (List.nth ps.dout 1) in
+             let dout0  = suffix (List.nth ps.dout 0) in
              let inv_we = bool_not we_expr in
              let orig_clk = match w_proc with
                | BSequential s -> s.clock | _ -> "clk" in
              let read_clk = match r_proc with
                | BSequential s -> s.clock | _ -> "clk" in
+             ignore read_clk;   (* unused in 1RW mode; only port 0 clk *)
+             (* Address pin: if dual-port, port 0 gets w_addr, port 1
+                r_addr.  If 1RW, single port gets we ? w_addr : r_addr
+                (degenerates to a wire when w_addr ≡ r_addr).      *)
+             let muxed_addr =
+               BCond { condition = we_expr;
+                       then_val = w_addr;
+                       else_val = r_addr } in
              let driver_body = List.concat [
                [ BAssign { lhs = clk0; rhs = BVar orig_clk };
-                 BAssign { lhs = csb0; rhs = inv_we };
+                 (* csb0 is active-low chip-select.  In 1RW we keep it
+                    asserted (=0) every cycle so the cell either reads
+                    or writes per `we_in`.  In dual-port we asserted
+                    only on writes (since reads use port 1).         *)
+                 BAssign { lhs = csb0;
+                           rhs = if force_dual_port then inv_we
+                                 else zero_lit 1 };
                  BAssign { lhs = web0; rhs = inv_we };
-                 BAssign { lhs = addr0; rhs = w_addr };
+                 BAssign { lhs = addr0;
+                           rhs = if force_dual_port then w_addr
+                                 else muxed_addr };
                  BAssign { lhs = din0;  rhs = w_data };
                ];
                (match List.nth ps.wmask 0 with
@@ -487,19 +521,28 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                     [ BAssign { lhs = suffix wm;
                                 rhs = one_lit (max 1 (dw / 8)) } ]
                 | None -> []);
-               [ BAssign { lhs = clk1; rhs = BVar read_clk };
-                 BAssign { lhs = csb1; rhs = zero_lit 1 };
-                 BAssign { lhs = addr1; rhs = r_addr };
-               ];
+               (if not force_dual_port then [] else
+                let clk1  = suffix (List.nth ps.clk 1) in
+                let csb1  = suffix (List.nth ps.csb 1) in
+                let addr1 = suffix (List.nth ps.addr 1) in
+                [ BAssign { lhs = clk1; rhs = BVar read_clk };
+                  BAssign { lhs = csb1; rhs = zero_lit 1 };
+                  BAssign { lhs = addr1; rhs = r_addr };
+                ]);
              ] in
              let driver = BCombinational {
                name = mname ^ "_drv";
                sensitivity = [BAny];
                body = driver_body;
              } in
+             let read_pin =
+               if force_dual_port
+               then suffix (List.nth ps.dout 1)
+               else dout0
+             in
              let rewrite_body body =
                let body = strip_mem_writes mname body in
-               List.map (rewrite_reads_s mname dout1) body
+               List.map (rewrite_reads_s mname read_pin) body
              in
              let processes' =
                List.mapi (fun i p ->

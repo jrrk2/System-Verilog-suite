@@ -314,8 +314,33 @@ let count_read_sites_in_body m_name body =
     | BBlock ss -> stmts ss
     | BWhile { condition; body } -> expr condition + stmts body
     | BFor   { condition; body; _ } -> expr condition + stmts body
+    | BCallStmt { func = "@mem_write";
+                  args = (BVar n) :: rest } when n = m_name ->
+        (* RMW reads of the same memory inside its own @mem_write
+           data argument are NOT separate read ports — they're the
+           macro's "value-before-write" which a byte-mask cell
+           computes internally.  Count reads to OTHER memories in
+           rest normally; skip self-reads via expr_skip_self.    *)
+        List.fold_left (fun a e -> a + expr_skip_self e) 0 rest
     | BCallStmt { args; _ } ->
         List.fold_left (fun a e -> a + expr e) 0 args
+    | _ -> 0
+  and expr_skip_self = function
+    | BSelect { array = BVar n; index } when n = m_name ->
+        (* This is the RMW read of m_name — skip it.  Recurse into
+           index in case it has reads of other memories.         *)
+        expr_skip_self index
+    | BBinOp { lhs; rhs; _ } -> expr_skip_self lhs + expr_skip_self rhs
+    | BUnOp { operand; _ } -> expr_skip_self operand
+    | BSlice { signal; _ } -> expr_skip_self signal
+    | BSelect { array; index } -> expr_skip_self array + expr_skip_self index
+    | BConcat es -> List.fold_left (fun a e -> a + expr_skip_self e) 0 es
+    | BReplicate { value; _ } -> expr_skip_self value
+    | BCond { condition; then_val; else_val } ->
+        expr_skip_self condition
+        + max (expr_skip_self then_val) (expr_skip_self else_val)
+    | BCall { args; _ } ->
+        List.fold_left (fun a e -> a + expr_skip_self e) 0 args
     | _ -> 0
   and stmts ss = List.fold_left (fun acc s -> acc + stmt s) 0 ss
   in
@@ -469,14 +494,30 @@ let infer_module (m : bmodule) =
   in
   (* find_ram_writes returns one (name, aw, dw) tuple per @mem_write
      site, so the same memory shows up N times after generate-unroll
-     etc.  Dedup by name, keeping the widest seen data width. *)
+     etc.  Dedup by name, keeping the widest seen data width.
+
+     IMPORTANT: filter out names whose declared type is a scalar BInt
+     rather than a BArray.  The Verible converter promotes any indexed
+     LHS (incl. `scalar_reg[bit_idx] <= ...`) into the @mem_write
+     intermediate so [merge_array_writes] can fold cell-mapped per-bit
+     drives back to a full-bus assign.  When that fold doesn't fire
+     (non-contiguous bit positions, irregular indices, etc.) the
+     @mem_write residue is still a SCALAR bit-blast, not a real memory
+     — naively classifying it produces nonsense like next_irq_pending
+     w_ports=5 (in fact 5 bit-set sites on a single 32-bit reg). *)
   let ram_writes =
     let h = Hashtbl.create 8 in
     List.iter (fun (n, aw, dw) ->
-      match Hashtbl.find_opt h n with
-      | None -> Hashtbl.add h n (n, aw, dw)
-      | Some (_, aw', dw') ->
-          Hashtbl.replace h n (n, max aw aw', max dw dw')
+      match lookup_signal n with
+      | Some { stype = BArray _; _ } ->
+          (match Hashtbl.find_opt h n with
+           | None -> Hashtbl.add h n (n, aw, dw)
+           | Some (_, aw', dw') ->
+               Hashtbl.replace h n (n, max aw aw', max dw dw'))
+      | _ ->
+          (* Scalar BInt with @mem_writes — bit-blast residue, not a
+             memory.  Leave it for the bit-level lowering path. *)
+          ()
     ) (find_ram_writes processes);
     Hashtbl.fold (fun _ v acc -> v :: acc) h []
   in
