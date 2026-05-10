@@ -155,6 +155,8 @@ let preserved_envs = [
   "SV_DECOMP_NO_TIE_FAN";
   "SV_DECOMP_TIE_FANOUT_MAX";
   "SV_DECOMP_NO_DCE";
+  "SV_DECOMP_MUX_FLATTEN";
+  "SV_DECOMP_MUX_CHAIN_MIN";
 ]
 
 let emit_config_mk ~top ~nickname ~platform ~variant

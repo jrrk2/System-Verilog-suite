@@ -58,6 +58,17 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
        | e -> fail (Printf.sprintf "hier_synth crashed: %s" (Printexc.to_string e))
   in
 
+  (* Mux-chain flattening — collapse priority-chain MUX2 cascades
+     into balanced one-hot AND-OR.  Off by default for now; flip to
+     on once the picosoc result confirms it.                         *)
+  let netlists =
+    if Sys.getenv_opt "SV_DECOMP_MUX_FLATTEN" <> Some "1" then netlists
+    else
+      List.map (fun (mn : Hier_synth.module_netlist) ->
+        let nl', _, _ = Mux_chain_flatten.flatten_module mn.mn_netlist in
+        { mn with mn_netlist = nl' }
+      ) netlists
+  in
   (* Tie-fanout limiter — splits over-loaded LOGIC0/LOGIC1 cells so
      OpenROAD's repair_tie_fanout doesn't have to.  Default fanout
      cap 16; SV_DECOMP_TIE_FANOUT_MAX overrides; SV_DECOMP_NO_TIE_FAN=1
