@@ -31,4 +31,7 @@ let () =
   let out_path = Sys.argv.(2) in
   let files    = Array.to_list (Array.sub Sys.argv 3 (Array.length Sys.argv - 3)) in
   let _ = Synth_pipeline.run ~top ~out_path ~files () in
-  ()
+  (* Marker line the ORFS Makefile hook greps for to verify the shim
+     succeeded (Makefile:281).  Don't drop or rename — older variants
+     of the patch key on this exact prefix.                          *)
+  Printf.eprintf "[synth_orfs_shim] OK\n"
