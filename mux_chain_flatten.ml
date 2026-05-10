@@ -170,9 +170,17 @@ let flatten_chain ~tail_out ~head_default
   (* Prefix-AND of ~sels, indexed so prefix.(i) = ~sel_{n-1} & ... &
      ~sel_{i+1}.  That makes winᵢ = prefix.(i) & selᵢ:
        i = n-1: prefix = 1'b1, win = sel_{n-1}.
-       i = 0  : prefix = ~sel_{n-1} & ~sel_{n-2} & ... & ~sel_1.    *)
+       i = 0  : prefix = ~sel_{n-1} & ~sel_{n-2} & ... & ~sel_1.
+
+     prefix.(n-1) is conceptually 1'b1 (the empty AND), and only
+     feeds prefix.(n-2) = AND(1'b1, ~sel_{n-1}) = ~sel_{n-1}.  We
+     short-circuit by setting prefix.(n-2) directly to nsels.(n-1)
+     instead of emitting an AND with a constant pin — passing a
+     literal on a cell pin makes read_verilog tag the net POWER
+     (DRT-0305: "Net is signal type POWER is not routable").       *)
   let prefix = Array.make n "1'b1" in
-  for i = n - 2 downto 0 do
+  if n >= 2 then prefix.(n - 2) <- nsels.(n - 1);
+  for i = n - 3 downto 0 do
     prefix.(i) <- emit_and ~insts ~wires prefix.(i + 1) nsels.(i + 1)
   done;
   (* none = prefix.(0) & ~sels.(0)                                   *)
