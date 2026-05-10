@@ -87,20 +87,53 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
     let oc = open_out out_path in
     let total_cells = ref 0 in
     let total_children = ref 0 in
+    (* Macro stubs need their wrapper body inlined.  Without it the
+       module declares its ports and ends — OpenROAD then sees the
+       wrapper as a module with no implementation, and the inner
+       fakeram45 instance never reaches the layout (the LEF is
+       loaded but unused).  Look up by mn_name in mem_arts and
+       splice in the cache .v file content instead of calling the
+       generic empty-body emitter.                                  *)
+    let macro_v_by_name : (string, string) Hashtbl.t = Hashtbl.create 4 in
+    List.iter (fun a ->
+      Hashtbl.replace macro_v_by_name
+        a.Mem_macro_resolve.module_name a.verilog_path
+    ) mem_arts;
+    let inline_file path =
+      try
+        let ic = open_in path in
+        let buf = Buffer.create 1024 in
+        (try
+          while true do Buffer.add_channel buf ic 4096 done
+        with End_of_file -> ());
+        close_in ic;
+        output_string oc (Buffer.contents buf);
+        output_char oc '\n'
+      with Sys_error msg ->
+        Printf.eprintf "[synth_pipeline] WARN: failed to inline %s: %s\n"
+          path msg
+    in
     List.iter (fun (mn : Hier_synth.module_netlist) ->
-      let child_insts =
-        List.map (fun (c : Hier_synth.child_inst_emit) ->
-          { Cell_verilog_emit.ci_module = c.ci_module;
-            ci_inst = c.ci_inst;
-            ci_conns = c.ci_conns }) mn.mn_child_insts in
-      Cell_verilog_emit.emit_module_hier
-        ~oc ~module_name:mn.mn_name
-        ~real_inputs:mn.mn_real_inputs
-        ~real_outputs:mn.mn_real_outputs
-        ~child_insts
-        mn.mn_netlist;
-      total_cells := !total_cells + List.length mn.mn_netlist.insts;
-      total_children := !total_children + List.length mn.mn_child_insts
+      match Hashtbl.find_opt macro_v_by_name mn.mn_name with
+      | Some wrapper_v ->
+          (* Macro stub — emit the cache wrapper instead of the
+             empty-body stub.  No netlist cells to count; no child
+             instances on the macro itself. *)
+          inline_file wrapper_v
+      | None ->
+          let child_insts =
+            List.map (fun (c : Hier_synth.child_inst_emit) ->
+              { Cell_verilog_emit.ci_module = c.ci_module;
+                ci_inst = c.ci_inst;
+                ci_conns = c.ci_conns }) mn.mn_child_insts in
+          Cell_verilog_emit.emit_module_hier
+            ~oc ~module_name:mn.mn_name
+            ~real_inputs:mn.mn_real_inputs
+            ~real_outputs:mn.mn_real_outputs
+            ~child_insts
+            mn.mn_netlist;
+          total_cells := !total_cells + List.length mn.mn_netlist.insts;
+          total_children := !total_children + List.length mn.mn_child_insts
     ) netlists;
     close_out oc;
 
