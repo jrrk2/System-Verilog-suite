@@ -513,14 +513,22 @@ let emit_fakeram_wrapper r fakeram_mod =
     (Printf.sprintf "  output [%d:0] dout0\n" (dw - 1));
   Buffer.add_string buf ");\n";
   (* OpenROAD's STA Verilog reader (synth_odb.tcl) is structural-only
-     and rejects inline bitwise expressions in port connections.
-     Pre-compute ce_in / we_in via continuous assigns so the macro
-     port list contains plain wire references only.  yosys is fine
-     with either form, but we have to clear OpenROAD's bar.        *)
+     and rejects BOTH inline bitwise expressions in port connections
+     AND continuous-assign statements.  Build the active-low → active-
+     high translation out of standard-cell instances instead — every
+     downstream tool (yosys, OpenROAD, OpenSTA) is happy with that.
+
+     ce_in = ~csb0
+     we_in = (~web0) & (~csb0)  →  ~(web0 | csb0)  →  NOR2_X1.
+
+     NOR2_X1 is in Nangate45 (we already use it elsewhere); INV_X1
+     too.  No new ADDITIONAL_LEFS needed.                             *)
   Buffer.add_string buf "  wire ce_in;\n";
   Buffer.add_string buf "  wire we_in;\n";
-  Buffer.add_string buf "  assign ce_in = ~csb0;\n";
-  Buffer.add_string buf "  assign we_in = ~web0 & ~csb0;\n";
+  Buffer.add_string buf
+    "  INV_X1  _wrap_inv_csb_ ( .A(csb0), .ZN(ce_in) );\n";
+  Buffer.add_string buf
+    "  NOR2_X1 _wrap_nor_we_  ( .A1(web0), .A2(csb0), .ZN(we_in) );\n";
   Buffer.add_string buf
     (Printf.sprintf "  %s ram (\n" fakeram_mod);
   Buffer.add_string buf "    .clk      (clk0),\n";
