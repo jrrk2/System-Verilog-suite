@@ -90,6 +90,37 @@ let () =
        | e -> fail (Printf.sprintf "hier_synth crashed: %s" (Printexc.to_string e))
   in
 
+  (* Load-aware drive-strength selection.  Pre-placement: walk each
+     net's fanout, sum sink pin caps + per-fanout wire estimate, swap
+     each driver to the smallest Liberty variant whose max_capacitance
+     covers the load.  Sends a pre-sized netlist to OpenROAD so the
+     placer has slack to optimise rather than spending its budget on
+     repair.  Set SV_DECOMP_NO_SIZE=1 to skip. *)
+  let netlists =
+    if Sys.getenv_opt "SV_DECOMP_NO_SIZE" = Some "1" then netlists
+    else
+      match Lib_size.liberty_path_or_default () with
+      | None ->
+          Printf.eprintf
+            "[lib_size] no Liberty found; skipping drive-strength sizing \
+             (set SV_DECOMP_LIBERTY=<path> to enable)\n";
+          netlists
+      | Some lib_path ->
+          let cat = Lib_size.catalogue_for_path lib_path in
+          let total = ref 0 in
+          let netlists' = List.map (fun (mn : Hier_synth.module_netlist) ->
+            let nl', n = Lib_size.resize_module ~cat mn.mn_netlist in
+            total := !total + n;
+            { mn with mn_netlist = nl' }
+          ) netlists in
+          Printf.eprintf
+            "[lib_size] resized %d cell(s) using %s (wire_cap_ff=%.3f)\n"
+            !total
+            (Filename.basename lib_path)
+            (Lib_size.wire_cap_ff ());
+          netlists'
+  in
+
   (* Emit one Verilog file with all module blocks in dependency order
      (children first, top last).  ORFS doesn't care about order, but
      readability does. *)
