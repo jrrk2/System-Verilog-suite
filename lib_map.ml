@@ -485,6 +485,122 @@ let gen_add_brent_kung ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
   let cout = if w > 0 then g.(w - 1) else "1'b0" in
   (Array.to_list sums, cout, List.rev !insts, !wires)
 
+(* Brent-Kung subtractor: sums = a - b, cout = ~borrow.  Same prefix
+   tree as [gen_add_brent_kung], but with b inverted and cin = 1 so
+   the formula a + ~b + 1 = a - b holds.  Used by [gen_lt_brent_kung]
+   below — picosoc's WNS path after the add-swap landed on a 26-bit
+   LT comparator inside a ripple gen_sub chain.  *)
+let gen_sub_brent_kung ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
+  let w = max a_w b_w in
+  let insts = ref [] and wires = ref [] in
+  let add_w n = wires := (n, 1) :: !wires in
+  let add_i i = insts := i :: !insts in
+  let mk_gate ~bit_ctx cell ins out =
+    add_i { cell;
+            inst_name = mint_ctx ~ctx:bit_ctx cell.cell_name;
+            conns =
+              List.map2 (fun p n -> { pin = p; net = n }) cell.in_pins ins
+              @ [{ pin = cell.out_pin; net = out }] }
+  in
+  (* Step 1: pre-stage — invert b, then compute g/p with cin=1
+     folded in for bit 0:
+       p_i = a_i ^ ~b_i ;  g_i = a_i & ~b_i              (i ≥ 1)
+       p_0 = a_0 ^ ~b_0 ;  g_0 = (a_0 & ~b_0) | p_0      (cin=1)        *)
+  let g = Array.make w "" in
+  let p = Array.make w "" in
+  let p_init = Array.make w "" in
+  let nb = Array.make w "" in
+  for i = 0 to w - 1 do
+    let ai = if i < a_w then bit_at a_name a_w i else "1'b0" in
+    let bi = if i < b_w then bit_at b_name b_w i else "1'b0" in
+    let bit_ctx =
+      if ctx = "" then "" else Printf.sprintf "%s_bit%d" ctx i in
+    let nbi = mint_ctx ~ctx:bit_ctx "nb" in
+    add_w nbi;
+    mk_gate ~bit_ctx cell_inv [bi] nbi;
+    nb.(i) <- nbi;
+    let gi_raw = mint_ctx ~ctx:bit_ctx "graw" in
+    let pi = mint_ctx ~ctx:bit_ctx "p" in
+    add_w gi_raw; add_w pi;
+    mk_gate ~bit_ctx cell_and [ai; nbi] gi_raw;
+    mk_gate ~bit_ctx cell_xor [ai; nbi] pi;
+    let gi =
+      if i = 0 then begin
+        let g0 = mint_ctx ~ctx:bit_ctx "g" in
+        add_w g0;
+        mk_gate ~bit_ctx cell_or [gi_raw; pi] g0;
+        g0
+      end else gi_raw
+    in
+    g.(i) <- gi; p.(i) <- pi; p_init.(i) <- pi
+  done;
+  let combine ~bit_ctx i j =
+    let pj = p.(j) and gj = g.(j) in
+    let pi = p.(i) and gi = g.(i) in
+    let new_p = mint_ctx ~ctx:bit_ctx "pp" in
+    let pAg   = mint_ctx ~ctx:bit_ctx "pAg" in
+    let new_g = mint_ctx ~ctx:bit_ctx "gg" in
+    add_w new_p; add_w pAg; add_w new_g;
+    mk_gate ~bit_ctx cell_and [pi; pj] new_p;
+    mk_gate ~bit_ctx cell_and [pi; gj] pAg;
+    mk_gate ~bit_ctx cell_or  [gi; pAg] new_g;
+    p.(i) <- new_p; g.(i) <- new_g
+  in
+  let log2w =
+    let rec l n = if n <= 1 then 0 else 1 + l ((n + 1) / 2) in l w in
+  for k = 0 to log2w - 1 do
+    let step = 1 lsl (k + 1) in
+    let half = 1 lsl k in
+    let i = ref (step - 1) in
+    while !i < w do
+      let j = !i - half in
+      if j >= 0 then
+        combine ~bit_ctx:(if ctx = "" then ""
+                          else Printf.sprintf "%s_bit%d_fwd%d" ctx !i k) !i j;
+      i := !i + step
+    done
+  done;
+  for k = log2w - 2 downto 0 do
+    let step = 1 lsl (k + 1) in
+    let half = 1 lsl k in
+    let i = ref (3 * half - 1) in
+    while !i < w do
+      let j = !i - half in
+      if j >= 0 then
+        combine ~bit_ctx:(if ctx = "" then ""
+                          else Printf.sprintf "%s_bit%d_bk%d" ctx !i k) !i j;
+      i := !i + step
+    done
+  done;
+  (* Sum: bit 0 = ~p_init.0 (cin=1); bit i = p_init.i ^ g.(i-1)        *)
+  let sums = Array.make w "" in
+  for i = 0 to w - 1 do
+    let bit_ctx =
+      if ctx = "" then "" else Printf.sprintf "%s_bit%d" ctx i in
+    let si = mint_ctx ~ctx:bit_ctx "sum" in
+    add_w si;
+    if i = 0 then
+      mk_gate ~bit_ctx cell_inv [p_init.(0)] si
+    else
+      mk_gate ~bit_ctx cell_xor [p_init.(i); g.(i - 1)] si;
+    sums.(i) <- si
+  done;
+  let cout = if w > 0 then g.(w - 1) else "1'b1" in
+  (Array.to_list sums, cout, List.rev !insts, !wires)
+
+(* Brent-Kung less-than: lt = ~cout(a - b).  Replaces the ripple
+   gen_lt → gen_sub when SV_DECOMP_ARCH_SWAP=1 + width threshold.    *)
+let gen_lt_brent_kung ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
+  let _sums, cout, insts, wires =
+    gen_sub_brent_kung ~ctx ~a_name ~a_w ~b_name ~b_w () in
+  let lt = mint_ctx ~ctx "lt" in
+  let inv = { cell = cell_inv;
+              inst_name = mint_ctx ~ctx cell_inv.cell_name;
+              conns = [
+                { pin = List.hd cell_inv.in_pins; net = cout };
+                { pin = cell_inv.out_pin; net = lt }] } in
+  (lt, insts @ [inv], (lt, 1) :: wires)
+
 (* Like [gen_add] but takes pre-built bit lists (LSB-first) instead
    of named-bus operands.  Used by [gen_mul] — partial-product rows
    are sets of fresh 1-bit nets, not bit-selects of a declared bus.
@@ -645,36 +761,29 @@ let rec walk ctx sig_ =
                      let block_kind = match op with
                        | Signal_add -> Block_tag.ADD
                        | _          -> Block_tag.SUB in
-                     (* Arch selection: SV_DECOMP_ARCH_SWAP=1 picks
-                        Brent-Kung for any add/sub at width ≥
-                        SV_DECOMP_ARCH_MIN_W (default 8).  Subtract
-                        is implemented via the standard a + ~b + 1
-                        prefix-sum trick, but for now the arch swap
-                        only kicks in for add — sub still uses
-                        ripple (gen_sub).  TODO: gen_sub_brent_kung
-                        once add path is exercised end-to-end.       *)
                      let want_swap =
                        Sys.getenv_opt "SV_DECOMP_ARCH_SWAP" = Some "1" in
                      let min_w =
                        match Sys.getenv_opt "SV_DECOMP_ARCH_MIN_W" with
                        | Some s -> (try int_of_string s with _ -> 8)
                        | None -> 8 in
-                     let use_bk =
-                       want_swap && op = Signal_add
-                       && (max a_w b_w) >= min_w in
+                     let use_bk = want_swap && (max a_w b_w) >= min_w in
                      let arch = if use_bk then "brent_kung" else "ripple" in
                      let sums, _co, insts, wires_ =
                        Block_tag.with_block ~kind:block_kind
                          ~signal:out_name ~width:(max a_w b_w) ~arch
                          (fun _ ->
-                           if use_bk then
-                             gen_add_brent_kung ~ctx:out_name
-                               ~a_name:an ~a_w ~b_name:bn ~b_w ()
-                           else match op with
-                           | Signal_add ->
+                           match use_bk, op with
+                           | true,  Signal_add ->
+                               gen_add_brent_kung ~ctx:out_name
+                                 ~a_name:an ~a_w ~b_name:bn ~b_w ()
+                           | true,  _ (* Signal_sub *) ->
+                               gen_sub_brent_kung ~ctx:out_name
+                                 ~a_name:an ~a_w ~b_name:bn ~b_w ()
+                           | false, Signal_add ->
                                gen_add ~ctx:out_name
                                  ~a_name:an ~a_w ~b_name:bn ~b_w ()
-                           | _ ->
+                           | false, _ ->
                                gen_sub ~ctx:out_name
                                  ~a_name:an ~a_w ~b_name:bn ~b_w ()) in
                      absorb_helper insts wires_;
@@ -692,13 +801,26 @@ let rec walk ctx sig_ =
                        ctx.assigns <- (out_name, concat_rhs) :: ctx.assigns
                      end
                  | Signal_lt ->
+                     let want_swap =
+                       Sys.getenv_opt "SV_DECOMP_ARCH_SWAP" = Some "1" in
+                     let min_w =
+                       match Sys.getenv_opt "SV_DECOMP_ARCH_MIN_W" with
+                       | Some s -> (try int_of_string s with _ -> 8)
+                       | None -> 8 in
+                     let use_bk = want_swap && (max a_w b_w) >= min_w in
+                     let arch =
+                       if use_bk then "brent_kung_then_invert"
+                       else "sub_then_invert" in
                      let res, insts, wires_ =
                        Block_tag.with_block ~kind:Block_tag.LT
-                         ~signal:out_name ~width:(max a_w b_w)
-                         ~arch:"sub_then_invert"
+                         ~signal:out_name ~width:(max a_w b_w) ~arch
                          (fun _ ->
-                           gen_lt ~ctx:out_name
-                             ~a_name:an ~a_w ~b_name:bn ~b_w ()) in
+                           if use_bk then
+                             gen_lt_brent_kung ~ctx:out_name
+                               ~a_name:an ~a_w ~b_name:bn ~b_w ()
+                           else
+                             gen_lt ~ctx:out_name
+                               ~a_name:an ~a_w ~b_name:bn ~b_w ()) in
                      absorb_helper insts wires_;
                      ctx.assigns <- (out_name, res) :: ctx.assigns
                  | Signal_mulu | Signal_muls ->

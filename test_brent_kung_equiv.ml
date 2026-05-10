@@ -48,11 +48,13 @@ let simulate ~insts ~inputs =
   List.iter (eval_gate vals) insts;
   vals
 
-let test_width width =
+let test_width ?(sub=false) width =
   let a_name = "a" and b_name = "b" in
+  let gen = if sub then gen_sub_brent_kung else gen_add_brent_kung in
   let _, _, insts, _wires =
-    gen_add_brent_kung ~ctx:"test" ~a_name ~a_w:width ~b_name ~b_w:width () in
-  Printf.printf "  width=%d  cells=%d\n" width (List.length insts);
+    gen ~ctx:"test" ~a_name ~a_w:width ~b_name ~b_w:width () in
+  Printf.printf "  %s width=%d  cells=%d\n"
+    (if sub then "sub" else "add") width (List.length insts);
   (* Collect output net names (sum bits) *)
   let sum_nets = List.init width (fun i ->
     let bit_ctx = Printf.sprintf "test_bit%d" i in
@@ -76,7 +78,7 @@ let test_width width =
      sum wire NAMES.                                              *)
   Block_tag.reset ();
   let sums, _cout, insts2, _wires2 =
-    gen_add_brent_kung ~ctx:"test" ~a_name ~a_w:width ~b_name ~b_w:width () in
+    gen ~ctx:"test" ~a_name ~a_w:width ~b_name ~b_w:width () in
   let sum_names = sums in
   let n_total = 1 lsl width in
   let n_test =
@@ -108,7 +110,10 @@ let test_width width =
         let bit = try Hashtbl.find vals n with Not_found -> 0 in
         bit lsl i
       ) sum_names |> List.fold_left (+) 0 in
-      let sum_expect = (a + b) land ((1 lsl width) - 1) in
+      let mask = if width >= 62 then -1 else (1 lsl width) - 1 in
+      let sum_expect =
+        if sub then (a - b) land mask
+        else      (a + b) land mask in
       if sum_actual <> sum_expect then begin
         if !mismatches < 5 then
           Printf.printf "  MISMATCH a=%d b=%d expect=%d got=%d\n"
@@ -134,7 +139,9 @@ let () =
   List.iter (fun w ->
     Printf.printf "── width %d ──\n" w;
     Block_tag.reset ();
-    if not (test_width w) then all_ok := false
+    if not (test_width w) then all_ok := false;
+    Block_tag.reset ();
+    if not (test_width ~sub:true w) then all_ok := false
   ) widths;
   if !all_ok then begin
     Printf.printf "\nALL PASS\n";
