@@ -1590,9 +1590,12 @@ let ensure_def_for_odb ~odb_path ~def_path =
       Filename.concat (orfs_dir ()) "tools/install/OpenROAD/bin/openroad" in
     if not (Sys.file_exists openroad) then
       failwith ("openroad binary missing at " ^ openroad);
+    (* Tcl quoting: { … } passes the path literally with no
+       interpretation.  Filename.quote here would emit shell-style
+       single quotes which Tcl treats as part of the filename. *)
     let tcl =
-      Printf.sprintf "read_db %s\nwrite_def %s\nexit 0\n"
-        (Filename.quote odb_path) (Filename.quote def_path) in
+      Printf.sprintf "read_db {%s}\nwrite_def {%s}\nexit 0\n"
+        odb_path def_path in
     let tcl_file = Filename.temp_file "stage_" ".tcl" in
     let oc = open_out tcl_file in
     output_string oc tcl; close_out oc;
