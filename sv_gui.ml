@@ -1247,11 +1247,16 @@ let def_die_re     =
   Str.regexp
     "DIEAREA[ \t]+([ \t]*\\(-?[0-9]+\\)[ \t]+\\(-?[0-9]+\\)[ \t]*)[ \t]+\
      ([ \t]*\\(-?[0-9]+\\)[ \t]+\\(-?[0-9]+\\)[ \t]*)"
+(* DEF orientations: N, S, E, W, FN, FS, FE, FW.  The flipped
+   variants START WITH F, so the leading character class must
+   include F too — earlier `[NSEW][NSEWF]*` rejected `FS` etc. and
+   silently dropped half the placements (every flipped row of
+   clkbufs / DFFs in particular).                                  *)
 let def_comp_re    =
   Str.regexp
     "[ \t]*-[ \t]+\\([^ \t]+\\)[ \t]+\\([^ \t]+\\).*PLACED[ \t]+\
      ([ \t]*\\(-?[0-9]+\\)[ \t]+\\(-?[0-9]+\\)[ \t]*)[ \t]+\
-     \\([NSEW][NSEWF]*\\)"
+     \\([NSEWF][NSEWF]*\\)"
 
 let parse_def path =
   let lines = layout_lines path in
