@@ -512,11 +512,20 @@ let emit_fakeram_wrapper r fakeram_mod =
   Buffer.add_string buf
     (Printf.sprintf "  output [%d:0] dout0\n" (dw - 1));
   Buffer.add_string buf ");\n";
+  (* OpenROAD's STA Verilog reader (synth_odb.tcl) is structural-only
+     and rejects inline bitwise expressions in port connections.
+     Pre-compute ce_in / we_in via continuous assigns so the macro
+     port list contains plain wire references only.  yosys is fine
+     with either form, but we have to clear OpenROAD's bar.        *)
+  Buffer.add_string buf "  wire ce_in;\n";
+  Buffer.add_string buf "  wire we_in;\n";
+  Buffer.add_string buf "  assign ce_in = ~csb0;\n";
+  Buffer.add_string buf "  assign we_in = ~web0 & ~csb0;\n";
   Buffer.add_string buf
     (Printf.sprintf "  %s ram (\n" fakeram_mod);
   Buffer.add_string buf "    .clk      (clk0),\n";
-  Buffer.add_string buf "    .ce_in    (~csb0),\n";
-  Buffer.add_string buf "    .we_in    (~web0 & ~csb0),\n";
+  Buffer.add_string buf "    .ce_in    (ce_in),\n";
+  Buffer.add_string buf "    .we_in    (we_in),\n";
   Buffer.add_string buf "    .addr_in  (addr0),\n";
   Buffer.add_string buf "    .wd_in    (din0),\n";
   if dw >= 8 then

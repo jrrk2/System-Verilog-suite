@@ -544,16 +544,47 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                let body = strip_mem_writes mname body in
                List.map (rewrite_reads_s mname read_pin) body
              in
+             (* Rewrite every process — not just w_idx / r_idx — so
+                stray BSelect (BVar mname) reads in other always
+                blocks (e.g. peek paths, debug taps) get redirected
+                to the macro pin too.  Without this, hier_synth's
+                expr_to_signal hits "unbound identifier mem" on
+                whatever survives and ties it to a 32-bit zero,
+                silently breaking those paths.  w_idx / r_idx still
+                get strip_mem_writes; everything else just gets
+                read-rewriting (no @mem_write to strip).            *)
              let processes' =
                List.mapi (fun i p ->
-                 if i = w_idx || i = r_idx then
-                   match p with
-                   | BSequential s ->
-                       BSequential { s with body = rewrite_body s.body }
-                   | BCombinational c ->
-                       BCombinational { c with body = rewrite_body c.body }
-                 else p
+                 let do_strip = (i = w_idx || i = r_idx) in
+                 match p with
+                 | BSequential s ->
+                     let body =
+                       if do_strip then rewrite_body s.body
+                       else List.map (rewrite_reads_s mname read_pin) s.body in
+                     BSequential { s with body }
+                 | BCombinational c ->
+                     let body =
+                       if do_strip then rewrite_body c.body
+                       else List.map (rewrite_reads_s mname read_pin) c.body in
+                     BCombinational { c with body }
                ) m.processes in
+             (* Same rewrite for instance port connections — a child
+                might be wired to mem[index] and that BSelect needs
+                to become BVar dout too.                            *)
+             let instances' =
+               List.map (fun (i : binstance) ->
+                 { i with port_connections =
+                     List.map (fun (p, e) ->
+                       (p, rewrite_reads_e mname read_pin e))
+                       i.port_connections }
+               ) m.instances in
+             (* And every function/task body in case [Behavioral_inline]
+                left a function that closes over `mem`.              *)
+             let funcs' =
+               List.map (fun (f : bfunc) ->
+                 { f with body =
+                     List.map (rewrite_reads_s mname read_pin) f.body }
+               ) m.funcs in
              let signals' =
                List.filter (fun (s : bsignal) -> s.name <> mname) m.signals
                @ new_sigs in
@@ -561,7 +592,8 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                m with
                signals = signals';
                processes = processes' @ [driver];
-               instances = inst :: m.instances;
+               instances = inst :: instances';
+               funcs = funcs';
                mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems;
              } in
              `Lowered (m', art))
