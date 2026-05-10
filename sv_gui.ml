@@ -1576,8 +1576,11 @@ let pr_stage_files dir =
   with_final
 
 (* Convert <stage>.odb → <stage>.def using openroad.  Cached: if the
-   .def already exists alongside the .odb with newer mtime, skip.   *)
-let ensure_def_for_odb ~odb_path ~def_path lef_paths =
+   .def already exists alongside the .odb with newer mtime, skip.
+   The .odb carries its own LEF references, so a bare read_db +
+   write_def is enough — adding read_lef calls actually fails because
+   openroad rejects duplicate library definitions.                  *)
+let ensure_def_for_odb ~odb_path ~def_path =
   let need_run =
     not (Sys.file_exists def_path)
     || (Unix.stat odb_path).st_mtime > (Unix.stat def_path).st_mtime in
@@ -1587,24 +1590,35 @@ let ensure_def_for_odb ~odb_path ~def_path lef_paths =
       Filename.concat (orfs_dir ()) "tools/install/OpenROAD/bin/openroad" in
     if not (Sys.file_exists openroad) then
       failwith ("openroad binary missing at " ^ openroad);
-    let lef_args =
-      List.map (fun p -> Printf.sprintf "read_lef %s" (Filename.quote p))
-        lef_paths in
     let tcl =
-      String.concat "\n" lef_args
-      ^ Printf.sprintf "\nread_db %s\nwrite_def %s\nexit 0\n"
-          (Filename.quote odb_path) (Filename.quote def_path) in
+      Printf.sprintf "read_db %s\nwrite_def %s\nexit 0\n"
+        (Filename.quote odb_path) (Filename.quote def_path) in
     let tcl_file = Filename.temp_file "stage_" ".tcl" in
     let oc = open_out tcl_file in
     output_string oc tcl; close_out oc;
-    let cmd = Printf.sprintf "%s -exit -no_init -no_splash %s 2>&1"
-      (Filename.quote openroad) (Filename.quote tcl_file) in
+    let log_file = Filename.temp_file "stage_or_" ".log" in
+    let cmd = Printf.sprintf "%s -exit -no_init -no_splash %s > %s 2>&1"
+      (Filename.quote openroad) (Filename.quote tcl_file)
+      (Filename.quote log_file) in
     set_status (Printf.sprintf "Converting %s → %s …"
       (Filename.basename odb_path) (Filename.basename def_path));
-    let rc = Sys.command (cmd ^ " >/dev/null") in
+    let rc = Sys.command cmd in
     (try Sys.remove tcl_file with _ -> ());
-    if rc <> 0 then
-      failwith (Printf.sprintf "openroad write_def failed (rc=%d)" rc)
+    if rc <> 0 then begin
+      let snippet =
+        try
+          let ic = open_in log_file in
+          let buf = Buffer.create 1024 in
+          (try while true do Buffer.add_channel buf ic 256 done
+           with End_of_file -> ());
+          close_in ic;
+          Buffer.contents buf
+        with _ -> "" in
+      (try Sys.remove log_file with _ -> ());
+      failwith
+        (Printf.sprintf "openroad write_def failed (rc=%d)\n%s" rc snippet)
+    end else
+      (try Sys.remove log_file with _ -> ())
   end
 
 (* Stage picker — modal dialog listing available .odb stages plus
@@ -1673,7 +1687,7 @@ let do_open_orfs_run () =
         (* Convert .odb → .def if the picked stage isn't already a
            .def (everything except 6_final). *)
         if not (Filename.check_suffix stage_file ".def") then
-          ensure_def_for_odb ~odb_path:stage_file ~def_path lefs;
+          ensure_def_for_odb ~odb_path:stage_file ~def_path;
         set_status (Printf.sprintf "Loading %s/%s (LEF count: %d) …"
                       stage_label (Filename.basename def_path)
                       (List.length lefs));
