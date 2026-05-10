@@ -58,6 +58,21 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
        | e -> fail (Printf.sprintf "hier_synth crashed: %s" (Printexc.to_string e))
   in
 
+  (* Tie-fanout limiter — splits over-loaded LOGIC0/LOGIC1 cells so
+     OpenROAD's repair_tie_fanout doesn't have to.  Default fanout
+     cap 16; SV_DECOMP_TIE_FANOUT_MAX overrides; SV_DECOMP_NO_TIE_FAN=1
+     skips entirely.                                                  *)
+  let netlists =
+    if Sys.getenv_opt "SV_DECOMP_NO_TIE_FAN" = Some "1" then netlists
+    else
+      let total = ref 0 in
+      let netlists' = List.map (fun (mn : Hier_synth.module_netlist) ->
+        let nl', n = Tie_fanout.split_module mn.mn_netlist in
+        total := !total + n;
+        { mn with mn_netlist = nl' }
+      ) netlists in
+      netlists'
+  in
   let netlists =
     if Sys.getenv_opt "SV_DECOMP_NO_SIZE" = Some "1" then netlists
     else
