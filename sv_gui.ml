@@ -1377,6 +1377,62 @@ let worst_max_path paths =
   | p :: _ -> Some p     (* OpenROAD orders by ascending slack *)
   | []     -> None
 
+(* Build a [timing_path] from a [Lef_def.Placement_timing.report]
+   when no 6_finish.rpt exists for an intermediate stage.  Uses our
+   own placement-aware critical-path estimator (DEF + LEF + Liberty)
+   to produce arrival times along the longest path back from the
+   worst-arrival cell.  Numbers are unit-less ps from the report;
+   t_arrival in our overlay struct is "ns" by convention so we
+   divide by 1000.                                                 *)
+let timing_path_of_report
+      ~lib_path ~lef_path ~def_path ~design : timing_path option =
+  let pin_dir =
+    try
+      let entries = Lef_def.Lef_pins.parse lef_path in
+      Some (Lef_def.Lef_pins.table_of_entries entries)
+    with _ -> None in
+  let placements =
+    try Lef_def.Placement.parse def_path with _ -> [] in
+  let nets =
+    try Lef_def.Nets.parse def_path with _ -> [] in
+  if placements = [] then None
+  else
+    let delay_tbl =
+      try Some (Cell_delay.load lib_path) with _ -> None in
+    let r =
+      match delay_tbl with
+      | Some tbl ->
+          Lef_def.Placement_timing.report ?pin_dir
+            ~delay_of:(Cell_delay.lookup tbl)
+            placements nets
+      | None ->
+          Lef_def.Placement_timing.report ?pin_dir
+            placements nets in
+    if r.worst_inst = "" then None
+    else begin
+      let hops =
+        List.map (fun (inst, cell, arr_ps) ->
+          { t_inst = inst; t_cell = cell;
+            t_arrival = arr_ps /. 1000.0 }) r.path_hops in
+      let summary =
+        Printf.sprintf
+          "Estimated critical path (placement-aware, no STA report):\n\
+           design = %s\n\
+           worst inst = %s (%s)\n\
+           worst arrival = %.3f ns (= %.1f ps)\n\
+           total wire delay across signal nets = %.1f ps\n\
+           path hops = %d"
+          design r.worst_inst r.worst_cell
+          (r.worst_arr_ps /. 1000.0) r.worst_arr_ps
+          r.total_wire_ps (List.length hops) in
+      Some { tp_startpoint = (match hops with
+                              | [] -> "?"
+                              | h :: _ -> h.t_inst);
+             tp_endpoint   = r.worst_inst;
+             tp_hops       = hops;
+             tp_text       = summary }
+    end
+
 (* Index instances by name for fast lookup during overlay rendering. *)
 let inst_index layout =
   let h = Hashtbl.create (List.length layout.l_components) in
@@ -1703,22 +1759,42 @@ let do_open_orfs_run () =
             (Filename.concat "reports"
                (Filename.concat platform
                   (Filename.concat layout.l_design "base"))) in
-        (* Critical path comes from the timing report, which only
-           exists for the final signoff stage.  Intermediate stages
-           load without it.                                         *)
+        (* Critical path: prefer 6_finish.rpt when present (final
+           signoff has the real STA), otherwise fall back to our
+           placement-aware estimator on the staged DEF + platform
+           LEF + liberty.  The estimate is approximate (no real CTS,
+           no slew propagation through Liberty NLDM) but good enough
+           to highlight the worst path on a partial layout.        *)
         let rpt_path = Filename.concat reports_dir "6_finish.rpt" in
         let critical_path =
           if stage_label = "6_final" && Sys.file_exists rpt_path
           then worst_max_path (parse_timing_report rpt_path)
-          else None
+          else begin
+            let lib_path =
+              Filename.concat flow
+                (Filename.concat "platforms"
+                   (Filename.concat platform
+                      "lib/NangateOpenCellLibrary_typical.lib")) in
+            let lef_path =
+              Filename.concat flow
+                (Filename.concat "platforms"
+                   (Filename.concat platform
+                      "lef/NangateOpenCellLibrary.macro.mod.lef")) in
+            if Sys.file_exists lib_path && Sys.file_exists lef_path
+            then
+              try
+                timing_path_of_report
+                  ~lib_path ~lef_path ~def_path ~design:layout.l_design
+              with _ -> None
+            else None
+          end
         in
         open_layout_window ?critical_path layout;
-        let extra = match critical_path with
-          | Some _ -> " + critical path"
-          | None ->
-              if stage_label <> "6_final"
-              then " (intermediate; no STA)"
-              else ""
+        let extra = match critical_path, stage_label = "6_final" with
+          | Some _, true  -> " + critical path"
+          | Some _, false -> " + estimated critical path"
+          | None,   false -> " (intermediate; no STA, estimator unavailable)"
+          | None,   true  -> ""
         in
         set_status (Printf.sprintf
           "Opened layout %s @ %s — %d instances%s"

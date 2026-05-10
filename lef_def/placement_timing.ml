@@ -176,6 +176,11 @@ type report = {
   worst_arr_ps  : float;
   worst_cell    : string;
   total_wire_ps : float;
+  (* Path back from [worst_inst] to a starting endpoint, ordered
+     start → end.  Each tuple is (inst, cell, arrival_ps).  Used by
+     the GUI when 6_finish.rpt is unavailable so an intermediate
+     stage can still be opened with a critical-path overlay. *)
+  path_hops     : (string * string * float) list;
 }
 
 let report ?(wp=Wire_delay.default_params)
@@ -206,9 +211,47 @@ let report ?(wp=Wire_delay.default_params)
     (fun acc (n : Nets.net) ->
        let d, _ = Wire_delay.net_delay_ps ~p:wp plc_tbl n in
        acc +. d) 0. nets in
+  (* Reconstruct a path from worst_inst back to an endpoint by
+     walking fanin edges, picking the predecessor with max arrival
+     at each hop.  Stops when a node has no fanin (port / startpoint)
+     or arrival drops to 0.  The forward edges have wire weights;
+     "max-arrival fanin" is approximated as: among (src, w) pairs in
+     the inverted edge list, pick the src whose [arr.(src) + w] is
+     largest.  Cap at 256 hops to avoid pathological loops.        *)
+  let fanin = Hashtbl.create 4096 in
+  Hashtbl.iter (fun src outs ->
+    List.iter (fun (dst, w) ->
+      let cur = try Hashtbl.find fanin dst with Not_found -> [] in
+      Hashtbl.replace fanin dst ((src, w) :: cur)) outs) edges;
+  let cell_of_or_blank inst =
+    try Hashtbl.find cell_of inst with Not_found -> "" in
+  let arr_of inst =
+    try Hashtbl.find arr inst with Not_found -> 0. in
+  let rec walk hops cur depth =
+    if depth >= 256 then List.rev hops
+    else
+      let hop = (cur, cell_of_or_blank cur, arr_of cur) in
+      let hops = hop :: hops in
+      match Hashtbl.find_opt fanin cur with
+      | None | Some [] -> List.rev hops
+      | Some preds ->
+          let best =
+            List.fold_left (fun acc (src, w) ->
+              let a = arr_of src +. w in
+              match acc with
+              | None -> Some (src, a)
+              | Some (_, b) when a > b -> Some (src, a)
+              | other -> other
+            ) None preds in
+          (match best with
+           | None -> List.rev hops
+           | Some (src, _) -> walk hops src (depth + 1)) in
+  let path_hops =
+    if !worst_inst = "" then [] else walk [] !worst_inst 0 in
   {
     worst_inst    = !worst_inst;
     worst_arr_ps  = !worst_v;
     worst_cell    = !worst_cell;
     total_wire_ps = total_wire;
+    path_hops;
   }
