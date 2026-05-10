@@ -147,6 +147,11 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
        untruncated info.                                          *)
     let blocks_json_path = out_path ^ ".blocks.json" in
     Block_tag.write_blocks_json blocks_json_path;
-    Printf.eprintf "[synth_pipeline] wrote %s\n" blocks_json_path
+    Printf.eprintf "[synth_pipeline] wrote %s\n" blocks_json_path;
+    (* Pre-empt OpenROAD's [replace_arith_modules]: predict which
+       arith blocks would be candidates for an arch swap.  This is
+       analysis-only for now; SV_DECOMP_ARCH_SWAP=1 will gate the
+       in-place swap once it's certified end-to-end.              *)
+    Block_arch_swap.report ()
   end;
   netlists, mem_arts

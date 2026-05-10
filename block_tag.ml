@@ -250,6 +250,10 @@ let blocks : block_record list ref = ref []
 
 let record b = blocks := b :: !blocks
 
+(* Read-only access for downstream passes (block_arch_swap, prettifier).
+   Returns blocks in registration order (oldest first).  *)
+let with_blocks f = f (List.rev !blocks)
+
 let module_names : (string, string) Hashtbl.t = Hashtbl.create 8
 let register_module name =
   let h = modhash_of name in
