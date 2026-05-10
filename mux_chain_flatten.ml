@@ -138,10 +138,35 @@ let emit_or ~insts ~wires a b =
                       { pin = "ZN"; net = z }] } :: !insts;
   z
 
-(* Balanced OR-reduce of a list of nets.  Empty -> "1'b0", single
-   value -> itself, otherwise pairwise OR until one remains. *)
+(* Constant-net handling: connecting a cell pin to a literal 1'b0 /
+   1'b1 makes OpenROAD's read_verilog tag the resulting net as
+   POWER, then TritonRoute refuses to route it (DRT-0305).  The
+   fix that mirrors lib_map.tie_resolve: route every constant
+   reference through a LOGIC0_X1 / LOGIC1_X1 cell driving a SIGNAL
+   net.  These per-chain refs allocate the tie cell lazily so a
+   chain that doesn't need a tie pays nothing.                    *)
+let alloc_tie ~insts ~wires ~cell ~role =
+  let net = mint_local role in
+  wires := (net, 1) :: !wires;
+  insts := { cell;
+             inst_name = mint_local cell.cell_name;
+             conns = [{ pin = cell.out_pin; net }] } :: !insts;
+  net
+
+(* Returns a fresh _tie_lo_ / _tie_hi_ wire each call — slightly
+   wasteful (one tie cell per literal use) but rounds back at
+   downstream DCE / OpenROAD's repair_tie_fanout, and it keeps the
+   pass purely additive (we don't depend on lib_map's already-
+   emitted tie cells, which post-DCE may not exist).               *)
+let tie_lo ~insts ~wires =
+  alloc_tie ~insts ~wires ~cell:cell_logic0 ~role:"tielo"
+let tie_hi ~insts ~wires =
+  alloc_tie ~insts ~wires ~cell:cell_logic1 ~role:"tiehi"
+
+(* Balanced OR-reduce of a list of nets.  Empty -> tie_lo wire,
+   single value -> itself, otherwise pairwise OR until one remains. *)
 let rec or_reduce ~insts ~wires = function
-  | [] -> "1'b0"
+  | [] -> tie_lo ~insts ~wires
   | [x] -> x
   | xs ->
       let rec pair = function
@@ -172,15 +197,12 @@ let flatten_chain ~tail_out ~head_default
        i = n-1: prefix = 1'b1, win = sel_{n-1}.
        i = 0  : prefix = ~sel_{n-1} & ~sel_{n-2} & ... & ~sel_1.
 
-     prefix.(n-1) is conceptually 1'b1 (the empty AND), and only
-     feeds prefix.(n-2) = AND(1'b1, ~sel_{n-1}) = ~sel_{n-1}.  We
-     short-circuit by setting prefix.(n-2) directly to nsels.(n-1)
-     instead of emitting an AND with a constant pin — passing a
-     literal on a cell pin makes read_verilog tag the net POWER
-     (DRT-0305: "Net is signal type POWER is not routable").       *)
-  let prefix = Array.make n "1'b1" in
-  if n >= 2 then prefix.(n - 2) <- nsels.(n - 1);
-  for i = n - 3 downto 0 do
+     prefix.(n-1) starts as a real tie_hi-driven SIGNAL wire so any
+     downstream consumer (or stale ref) sees a routable net rather
+     than a literal 1'b1 — keeping the pass safe under any cell
+     pin connection.                                                *)
+  let prefix = Array.make n (tie_hi ~insts ~wires) in
+  for i = n - 2 downto 0 do
     prefix.(i) <- emit_and ~insts ~wires prefix.(i + 1) nsels.(i + 1)
   done;
   (* none = prefix.(0) & ~sels.(0)                                   *)
