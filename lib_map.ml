@@ -84,6 +84,37 @@ let mint prefix =
   incr next_id;
   Printf.sprintf "_%s_%d_" prefix !next_id
 
+(* Identifier-safe rewrite of an arbitrary RTL net name.  Verilog
+   identifiers can't carry [, ], {, }, dots, slashes, etc — replace
+   those with `_` so [out_name] = "alu_out[15]" or "child.inst.foo"
+   becomes a usable inst-name fragment.  Keeps the result short (≤32
+   chars) so cell names stay greppable in the placement reports.  *)
+let sanitize_for_id s =
+  let n = String.length s in
+  let n = if n > 32 then 32 else n in
+  let b = Bytes.create n in
+  for i = 0 to n - 1 do
+    let c = s.[i] in
+    Bytes.set b i
+      (match c with
+       | 'a'..'z' | 'A'..'Z' | '0'..'9' | '_' -> c
+       | _ -> '_')
+  done;
+  Bytes.to_string b
+
+(* Mint a context-bearing name.  Cells get inst names like
+   _<ctx>_<celltype>_<id>_ which traces straight back to the RTL
+   net the cell drives — STA's report_checks output then reads
+   like `cpu/alu_out__add_bit15__ab__123_/Z` instead of an
+   anonymous `_AND2_X1_2478_/ZN`.  When ctx is empty (legacy /
+   internal cases) we fall back to the original [mint].          *)
+let mint_ctx ~ctx prefix =
+  if ctx = "" then mint prefix
+  else begin
+    incr next_id;
+    Printf.sprintf "_%s__%s_%d_" (sanitize_for_id ctx) prefix !next_id
+  end
+
 let net_for_signal s =
   let names = names s in
   match names with
@@ -102,7 +133,10 @@ let bit_net signal_name bit_idx width =
 let blast_op2 ~cell ~out_name ~width ~a_name ~b_name ~a_w ~b_w =
   let insts = ref [] in
   for i = 0 to width - 1 do
-    let inst_name = mint cell.cell_name in
+    let bit_ctx =
+      if width = 1 then out_name
+      else Printf.sprintf "%s_bit%d" out_name i in
+    let inst_name = mint_ctx ~ctx:bit_ctx cell.cell_name in
     let ai = if a_w = 1 then a_name else Printf.sprintf "%s[%d]" a_name i in
     let bi = if b_w = 1 then b_name else Printf.sprintf "%s[%d]" b_name i in
     let oi = if width = 1 then out_name
@@ -119,7 +153,10 @@ let blast_op2 ~cell ~out_name ~width ~a_name ~b_name ~a_w ~b_w =
 let blast_unary ~cell ~out_name ~width ~a_name ~a_w =
   let insts = ref [] in
   for i = 0 to width - 1 do
-    let inst_name = mint cell.cell_name in
+    let bit_ctx =
+      if width = 1 then out_name
+      else Printf.sprintf "%s_bit%d" out_name i in
+    let inst_name = mint_ctx ~ctx:bit_ctx cell.cell_name in
     let ai = if a_w = 1 then a_name else Printf.sprintf "%s[%d]" a_name i in
     let oi = if width = 1 then out_name
              else Printf.sprintf "%s[%d]" out_name i in
@@ -134,7 +171,10 @@ let blast_unary ~cell ~out_name ~width ~a_name ~a_w =
 let blast_mux ~out_name ~width ~sel_name ~a_name ~b_name =
   let insts = ref [] in
   for i = 0 to width - 1 do
-    let inst_name = mint cell_mux.cell_name in
+    let bit_ctx =
+      if width = 1 then out_name
+      else Printf.sprintf "%s_bit%d" out_name i in
+    let inst_name = mint_ctx ~ctx:bit_ctx cell_mux.cell_name in
     let ai = if width = 1 then a_name else Printf.sprintf "%s[%d]" a_name i in
     let bi = if width = 1 then b_name else Printf.sprintf "%s[%d]" b_name i in
     let oi = if width = 1 then out_name else Printf.sprintf "%s[%d]" out_name i in
@@ -225,50 +265,62 @@ let gen_eq ~a_name ~a_w ~b_name ~b_w =
   (result, List.rev !insts @ or_insts @ [inv_inst], final_wires)
 
 (* Build a full-adder from XOR/AND/OR gates.  Inputs (a, b, cin),
-   outputs (sum, cout).  Returns sum_net, cout_net, instances, wires. *)
-let gen_fa ~a ~b ~cin =
+   outputs (sum, cout).  Returns sum_net, cout_net, instances, wires.
+   [~ctx] is woven into mint so the per-bit nets / cells trace back
+   to the RTL output (e.g., "alu_out_bit15").                       *)
+let gen_fa ?(ctx="") ~a ~b ~cin () =
   let insts = ref [] and wires = ref [] in
   let add_w n = wires := (n, 1) :: !wires in
   let add_i i = insts := i :: !insts in
-  let ab = mint "ab" in
+  let mk = mint_ctx ~ctx in
+  let gi cell ins out =
+    { cell; inst_name = mk cell.cell_name;
+      conns =
+        List.map2 (fun p n -> { pin = p; net = n }) cell.in_pins ins
+        @ [{ pin = cell.out_pin; net = out }] }
+  in
+  let ab = mk "ab" in
   add_w ab;
-  add_i (gate_inst ~cell:cell_xor ~ipins:cell_xor.in_pins
-           ~ins:[a; b] ~out:ab);
-  let sum = mint "sum" in
+  add_i (gi cell_xor [a; b] ab);
+  let sum = mk "sum" in
   add_w sum;
-  add_i (gate_inst ~cell:cell_xor ~ipins:cell_xor.in_pins
-           ~ins:[ab; cin] ~out:sum);
-  let aandb = mint "aab" in
+  add_i (gi cell_xor [ab; cin] sum);
+  let aandb = mk "aab" in
   add_w aandb;
-  add_i (gate_inst ~cell:cell_and ~ipins:cell_and.in_pins
-           ~ins:[a; b] ~out:aandb);
-  let ab_and_cin = mint "abc" in
+  add_i (gi cell_and [a; b] aandb);
+  let ab_and_cin = mk "abc" in
   add_w ab_and_cin;
-  add_i (gate_inst ~cell:cell_and ~ipins:cell_and.in_pins
-           ~ins:[ab; cin] ~out:ab_and_cin);
-  let cout = mint "co" in
+  add_i (gi cell_and [ab; cin] ab_and_cin);
+  let cout = mk "co" in
   add_w cout;
-  add_i (gate_inst ~cell:cell_or ~ipins:cell_or.in_pins
-           ~ins:[aandb; ab_and_cin] ~out:cout);
+  add_i (gi cell_or [aandb; ab_and_cin] cout);
   (sum, cout, List.rev !insts, !wires)
 
 (* N-bit subtractor: a - b = a + ~b + 1.  Returns (sum_bits_msb_first,
    final_cout, all_insts, all_wires). *)
-let gen_sub ~a_name ~a_w ~b_name ~b_w =
+let gen_sub ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
   let w = max a_w b_w in
   let insts = ref [] and wires = ref [] in
   let inv_b_bits = List.init w (fun i ->
     let bi = if i < b_w then bit_at b_name b_w i else "1'b0" in
-    let inv = mint "nb" in
+    let bit_ctx =
+      if ctx = "" then "" else Printf.sprintf "%s_bit%d" ctx i in
+    let inv = mint_ctx ~ctx:bit_ctx "nb" in
     wires := (inv, 1) :: !wires;
-    insts := gate_inst ~cell:cell_inv ~ipins:cell_inv.in_pins
-               ~ins:[bi] ~out:inv :: !insts;
+    insts := { cell = cell_inv;
+               inst_name = mint_ctx ~ctx:bit_ctx cell_inv.cell_name;
+               conns = [
+                 { pin = List.hd cell_inv.in_pins; net = bi };
+                 { pin = cell_inv.out_pin; net = inv }] } :: !insts;
     inv) in
   let sums = ref [] and cin = ref "1'b1" in
   for i = 0 to w - 1 do
     let ai = if i < a_w then bit_at a_name a_w i else "1'b0" in
     let bi = List.nth inv_b_bits i in
-    let s, co, fa_insts, fa_wires = gen_fa ~a:ai ~b:bi ~cin:!cin in
+    let bit_ctx =
+      if ctx = "" then "" else Printf.sprintf "%s_bit%d" ctx i in
+    let s, co, fa_insts, fa_wires =
+      gen_fa ~ctx:bit_ctx ~a:ai ~b:bi ~cin:!cin () in
     sums := s :: !sums;
     insts := List.rev_append fa_insts !insts;
     wires := !wires @ fa_wires;
@@ -277,24 +329,31 @@ let gen_sub ~a_name ~a_w ~b_name ~b_w =
   (List.rev !sums, !cin, List.rev !insts, !wires)
 
 (* Less-than: a < b ⇔ subtraction borrows out ⇔ ~cout. *)
-let gen_lt ~a_name ~a_w ~b_name ~b_w =
-  let _sums, cout, insts, wires = gen_sub ~a_name ~a_w ~b_name ~b_w in
-  let lt = mint "lt" in
-  let inv = gate_inst ~cell:cell_inv ~ipins:cell_inv.in_pins
-              ~ins:[cout] ~out:lt in
+let gen_lt ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
+  let _sums, cout, insts, wires =
+    gen_sub ~ctx ~a_name ~a_w ~b_name ~b_w () in
+  let lt = mint_ctx ~ctx "lt" in
+  let inv = { cell = cell_inv;
+              inst_name = mint_ctx ~ctx cell_inv.cell_name;
+              conns = [
+                { pin = List.hd cell_inv.in_pins; net = cout };
+                { pin = cell_inv.out_pin; net = lt }] } in
   (lt, insts @ [inv], (lt, 1) :: wires)
 
 (* N-bit ripple-carry adder: a + b.  Same FA chain as gen_sub but
    feeds b directly (no inversion) and cin = 0.  Returns
    (sum_bits_msb_first, final_cout, all_insts, all_wires). *)
-let gen_add ~a_name ~a_w ~b_name ~b_w =
+let gen_add ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
   let w = max a_w b_w in
   let insts = ref [] and wires = ref [] in
   let sums = ref [] and cin = ref "1'b0" in
   for i = 0 to w - 1 do
     let ai = if i < a_w then bit_at a_name a_w i else "1'b0" in
     let bi = if i < b_w then bit_at b_name b_w i else "1'b0" in
-    let s, co, fa_insts, fa_wires = gen_fa ~a:ai ~b:bi ~cin:!cin in
+    let bit_ctx =
+      if ctx = "" then "" else Printf.sprintf "%s_bit%d" ctx i in
+    let s, co, fa_insts, fa_wires =
+      gen_fa ~ctx:bit_ctx ~a:ai ~b:bi ~cin:!cin () in
     sums := s :: !sums;
     insts := List.rev_append fa_insts !insts;
     wires := !wires @ fa_wires;
@@ -317,7 +376,7 @@ let gen_add_bits ~(a_bits : string list) ~(b_bits : string list) =
   let insts = ref [] and wires = ref [] in
   let sums = ref [] and cin = ref "1'b0" in
   for i = 0 to w - 1 do
-    let s, co, fa_insts, fa_wires = gen_fa ~a:a.(i) ~b:b.(i) ~cin:!cin in
+    let s, co, fa_insts, fa_wires = gen_fa ~a:a.(i) ~b:b.(i) ~cin:!cin () in
     sums := s :: !sums;
     insts := List.rev_append fa_insts !insts;
     wires := !wires @ fa_wires;
@@ -458,8 +517,12 @@ let rec walk ctx sig_ =
                  | Signal_sub | Signal_add ->
                      let sums, _co, insts, wires_ =
                        (match op with
-                        | Signal_add -> gen_add ~a_name:an ~a_w ~b_name:bn ~b_w
-                        | _          -> gen_sub ~a_name:an ~a_w ~b_name:bn ~b_w)
+                        | Signal_add ->
+                            gen_add ~ctx:out_name
+                              ~a_name:an ~a_w ~b_name:bn ~b_w ()
+                        | _          ->
+                            gen_sub ~ctx:out_name
+                              ~a_name:an ~a_w ~b_name:bn ~b_w ())
                      in
                      absorb_helper insts wires_;
                      let sums = let n = min w (List.length sums) in
@@ -477,7 +540,8 @@ let rec walk ctx sig_ =
                      end
                  | Signal_lt ->
                      let res, insts, wires_ =
-                       gen_lt ~a_name:an ~a_w ~b_name:bn ~b_w in
+                       gen_lt ~ctx:out_name
+                         ~a_name:an ~a_w ~b_name:bn ~b_w () in
                      absorb_helper insts wires_;
                      ctx.assigns <- (out_name, res) :: ctx.assigns
                  | Signal_mulu | Signal_muls ->
