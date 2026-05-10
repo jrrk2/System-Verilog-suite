@@ -1550,14 +1550,106 @@ let pick_results_dir () =
   d#destroy ();
   path
 
+(* Available P&R stage outputs.  ORFS writes <stage>.odb after each
+   step; if the flow fails partway through, the later .odb files are
+   absent.  6_final.def is the only signoff DEF; for intermediate
+   stages we dump the .odb to a sibling .def via openroad. *)
+let pr_stage_files dir =
+  let stages = [
+    "1_synth";
+    "2_1_floorplan"; "2_2_floorplan_macro"; "2_3_floorplan_tapcell";
+    "2_4_floorplan_pdn"; "2_floorplan";
+    "3_1_place_gp_skip_io"; "3_2_place_iop"; "3_3_place_gp";
+    "3_4_place_resized"; "3_5_place_dp"; "3_place";
+    "4_1_cts"; "4_cts";
+    "5_1_grt"; "5_2_route"; "5_3_fillcell"; "5_route";
+  ] in
+  let odbs = List.filter_map (fun s ->
+    let p = Filename.concat dir (s ^ ".odb") in
+    if Sys.file_exists p then Some (s, p) else None
+  ) stages in
+  let final_def = Filename.concat dir "6_final.def" in
+  let with_final =
+    if Sys.file_exists final_def
+    then odbs @ [("6_final", final_def)]
+    else odbs in
+  with_final
+
+(* Convert <stage>.odb → <stage>.def using openroad.  Cached: if the
+   .def already exists alongside the .odb with newer mtime, skip.   *)
+let ensure_def_for_odb ~odb_path ~def_path lef_paths =
+  let need_run =
+    not (Sys.file_exists def_path)
+    || (Unix.stat odb_path).st_mtime > (Unix.stat def_path).st_mtime in
+  if not need_run then ()
+  else begin
+    let openroad =
+      Filename.concat (orfs_dir ()) "tools/install/OpenROAD/bin/openroad" in
+    if not (Sys.file_exists openroad) then
+      failwith ("openroad binary missing at " ^ openroad);
+    let lef_args =
+      List.map (fun p -> Printf.sprintf "read_lef %s" (Filename.quote p))
+        lef_paths in
+    let tcl =
+      String.concat "\n" lef_args
+      ^ Printf.sprintf "\nread_db %s\nwrite_def %s\nexit 0\n"
+          (Filename.quote odb_path) (Filename.quote def_path) in
+    let tcl_file = Filename.temp_file "stage_" ".tcl" in
+    let oc = open_out tcl_file in
+    output_string oc tcl; close_out oc;
+    let cmd = Printf.sprintf "%s -exit -no_init -no_splash %s 2>&1"
+      (Filename.quote openroad) (Filename.quote tcl_file) in
+    set_status (Printf.sprintf "Converting %s → %s …"
+      (Filename.basename odb_path) (Filename.basename def_path));
+    let rc = Sys.command (cmd ^ " >/dev/null") in
+    (try Sys.remove tcl_file with _ -> ());
+    if rc <> 0 then
+      failwith (Printf.sprintf "openroad write_def failed (rc=%d)" rc)
+  end
+
+(* Stage picker — modal dialog listing available .odb stages plus
+   6_final.def if present.  Returns (stage_label, def_path) or None.
+   The latest available stage is pre-selected so the most-likely
+   "what we got" view opens by default.                            *)
+let pick_pr_stage stages =
+  let parent = need_window () in
+  let d = GWindow.dialog
+    ~title:"Pick P&R stage to view"
+    ~parent ~modal:true () in
+  let _ = d#vbox#pack
+    (GMisc.label ~text:"Layout stage:" ~xalign:0.0 ())#coerce in
+  let combo = GEdit.combo_box_text ~packing:d#vbox#pack () in
+  let combo_box, _ = combo in
+  List.iter (fun (label, _) -> GEdit.text_combo_add combo label) stages;
+  if stages <> [] then combo_box#set_active (List.length stages - 1);
+  d#add_button "Cancel" `CANCEL;
+  d#add_button "Open"   `OK;
+  let result = match d#run () with
+    | `OK ->
+        let i = combo_box#active in
+        if i >= 0 && i < List.length stages
+        then Some (List.nth stages i)
+        else None
+    | _ -> None in
+  d#destroy ();
+  result
+
 let do_open_orfs_run () =
   with_errors "open ORFS run" (fun () ->
     let dir = pick_results_dir () in
     if dir = "" then () else begin
-      let def_path = Filename.concat dir "6_final.def" in
-      if not (Sys.file_exists def_path) then
-        error_dialog ("No 6_final.def found in:\n" ^ dir)
-      else begin
+      let stages = pr_stage_files dir in
+      if stages = [] then begin
+        error_dialog ("No .odb or 6_final.def found in:\n" ^ dir);
+        ()
+      end else
+      match pick_pr_stage stages with
+      | None -> ()
+      | Some (stage_label, stage_file) ->
+        let def_path =
+          if Filename.check_suffix stage_file ".def"
+          then stage_file
+          else Filename.concat dir (stage_label ^ ".def") in
         (* results/<platform>/<design>/base → walk up to find platforms/<platform>/lef. *)
         let base_dir   = dir in
         let design_dir = Filename.dirname base_dir in
@@ -1578,8 +1670,13 @@ let do_open_orfs_run () =
               [] (Sys.readdir lef_dir)
           else []
         in
-        set_status (Printf.sprintf "Loading %s (LEF count: %d) …"
-                      def_path (List.length lefs));
+        (* Convert .odb → .def if the picked stage isn't already a
+           .def (everything except 6_final). *)
+        if not (Filename.check_suffix stage_file ".def") then
+          ensure_def_for_odb ~odb_path:stage_file ~def_path lefs;
+        set_status (Printf.sprintf "Loading %s/%s (LEF count: %d) …"
+                      stage_label (Filename.basename def_path)
+                      (List.length lefs));
         let layout = load_layout def_path lefs in
         (* Timing report sits in the parallel reports/ tree:
            flow/results/<plat>/<des>/base/  ↔  flow/reports/<plat>/<des>/base/
@@ -1589,21 +1686,27 @@ let do_open_orfs_run () =
             (Filename.concat "reports"
                (Filename.concat platform
                   (Filename.concat layout.l_design "base"))) in
+        (* Critical path comes from the timing report, which only
+           exists for the final signoff stage.  Intermediate stages
+           load without it.                                         *)
         let rpt_path = Filename.concat reports_dir "6_finish.rpt" in
         let critical_path =
-          if Sys.file_exists rpt_path
+          if stage_label = "6_final" && Sys.file_exists rpt_path
           then worst_max_path (parse_timing_report rpt_path)
           else None
         in
         open_layout_window ?critical_path layout;
         let extra = match critical_path with
           | Some _ -> " + critical path"
-          | None -> ""
+          | None ->
+              if stage_label <> "6_final"
+              then " (intermediate; no STA)"
+              else ""
         in
         set_status (Printf.sprintf
-          "Opened layout %s — %d instances%s"
-          layout.l_design (List.length layout.l_components) extra)
-      end
+          "Opened layout %s @ %s — %d instances%s"
+          layout.l_design stage_label
+          (List.length layout.l_components) extra)
     end)
 
 (* ---------- script discovery / loading ---------- *)
