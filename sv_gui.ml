@@ -1771,14 +1771,20 @@ let do_open_orfs_run () =
                       stage_label (Filename.basename def_path)
                       (List.length lefs));
         let layout = load_layout def_path lefs in
-        (* Timing report sits in the parallel reports/ tree:
-           flow/results/<plat>/<des>/base/  ↔  flow/reports/<plat>/<des>/base/
-           ORFS's final STA is "6_finish.rpt".                         *)
+        (* Timing report sits in the parallel reports/ tree, with the
+           SAME variant name as the results dir we just opened:
+             flow/results/<plat>/<des>/<variant>/  ↔
+             flow/reports/<plat>/<des>/<variant>/
+           Use the actual variant from the picked path — hard-coding
+           "base" was a regression that made the GUI show -6.87
+           (the original baseline) when the user opened a fresh
+           stamped variant whose own report was at -2.26.            *)
+        let variant = Filename.basename base_dir in
         let reports_dir =
           Filename.concat flow
             (Filename.concat "reports"
                (Filename.concat platform
-                  (Filename.concat layout.l_design "base"))) in
+                  (Filename.concat layout.l_design variant))) in
         (* Critical path: prefer 6_finish.rpt when present (final
            signoff has the real STA), otherwise fall back to our
            placement-aware estimator on the staged DEF + platform
