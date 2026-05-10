@@ -250,20 +250,30 @@ let report ?(wp=Wire_delay.default_params)
      of [hops] is the chain head (oldest, lowest arrival) and the
      last element is the end (worst).  Returning hops *without*
      reversing gives natural start→end ordering for the report. *)
+  let is_placed inst = Hashtbl.mem cell_of inst in
   let rec walk hops cur depth =
     if depth >= 256 then hops
     else
       let cell = cell_of_or_blank cur in
-      let hop = (cur, cell, arr_of cur) in
-      let hops = hop :: hops in
+      (* Only emit a hop for instances that actually have a placement
+         — otherwise the path overlay can't render them.  Pseudo-
+         names like sub-block instance prefixes ("cpu") that appear
+         in net pin refs but have no own COMPONENT entry would
+         otherwise pollute the hop list and tank the
+         hops-matched / hops-total ratio in the GUI overlay.       *)
+      let hops =
+        if is_placed cur then (cur, cell, arr_of cur) :: hops
+        else hops in
       match Hashtbl.find_opt fanin cur with
       | None | Some [] -> hops
       | Some preds ->
-          (* Skip clock-tree predecessors when walking back too. *)
+          (* Skip clock-tree predecessors AND non-placed pseudo-
+             names when walking back. *)
           let preds =
             List.filter (fun (src, _) ->
               let c = cell_of_or_blank src in
-              not (is_clock_cell ~cell:c ~inst:src)) preds in
+              is_placed src
+              && not (is_clock_cell ~cell:c ~inst:src)) preds in
           let best =
             List.fold_left (fun acc (src, w) ->
               let a = arr_of src +. w in
