@@ -246,14 +246,18 @@ let report ?(wp=Wire_delay.default_params)
     try Hashtbl.find cell_of inst with Not_found -> "" in
   let arr_of inst =
     try Hashtbl.find arr inst with Not_found -> 0. in
+  (* Each step prepends the current hop, so after the walk the head
+     of [hops] is the chain head (oldest, lowest arrival) and the
+     last element is the end (worst).  Returning hops *without*
+     reversing gives natural start→end ordering for the report. *)
   let rec walk hops cur depth =
-    if depth >= 256 then List.rev hops
+    if depth >= 256 then hops
     else
       let cell = cell_of_or_blank cur in
       let hop = (cur, cell, arr_of cur) in
       let hops = hop :: hops in
       match Hashtbl.find_opt fanin cur with
-      | None | Some [] -> List.rev hops
+      | None | Some [] -> hops
       | Some preds ->
           (* Skip clock-tree predecessors when walking back too. *)
           let preds =
@@ -269,7 +273,7 @@ let report ?(wp=Wire_delay.default_params)
               | other -> other
             ) None preds in
           (match best with
-           | None -> List.rev hops
+           | None -> hops
            | Some (src, _) -> walk hops src (depth + 1)) in
   let path_hops =
     if !worst_inst = "" then [] else walk [] !worst_inst 0 in

@@ -1414,6 +1414,25 @@ let timing_path_of_report
         List.map (fun (inst, cell, arr_ps) ->
           { t_inst = inst; t_cell = cell;
             t_arrival = arr_ps /. 1000.0 }) r.path_hops in
+      (* Build a per-hop table showing the incremental delay each
+         cell contributes — that's what makes the report actionable.
+         Δ for hop i = arr(i) - arr(i-1); for the first hop it's
+         the cell's own delay (arr(0) itself).                      *)
+      let hop_lines =
+        let buf = Buffer.create 256 in
+        Buffer.add_string buf
+          "  arr(ns)  Δ(ps)  cell           inst\n";
+        Buffer.add_string buf
+          "  -------  -----  -------------  --------------------\n";
+        let prev_arr = ref 0.0 in
+        List.iter (fun h ->
+          let delta_ps = (h.t_arrival -. !prev_arr) *. 1000.0 in
+          Buffer.add_string buf
+            (Printf.sprintf "  %7.3f  %5.1f  %-13s  %s\n"
+               h.t_arrival delta_ps h.t_cell h.t_inst);
+          prev_arr := h.t_arrival
+        ) hops;
+        Buffer.contents buf in
       let summary =
         Printf.sprintf
           "Estimated critical path (placement-aware, no STA report):\n\
@@ -1421,10 +1440,11 @@ let timing_path_of_report
            worst inst = %s (%s)\n\
            worst arrival = %.3f ns (= %.1f ps)\n\
            total wire delay across signal nets = %.1f ps\n\
-           path hops = %d"
+           path hops = %d\n\n\
+           %s"
           design r.worst_inst r.worst_cell
           (r.worst_arr_ps /. 1000.0) r.worst_arr_ps
-          r.total_wire_ps (List.length hops) in
+          r.total_wire_ps (List.length hops) hop_lines in
       Some { tp_startpoint = (match hops with
                               | [] -> "?"
                               | h :: _ -> h.t_inst);
