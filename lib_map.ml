@@ -379,6 +379,112 @@ let gen_add ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
   done;
   (List.rev !sums, !cin, List.rev !insts, !wires)
 
+(* Brent-Kung prefix-sum adder.  O(log W) carry-tree depth instead
+   of O(W) for ripple — for picosoc's 32-bit chains, 96 → 11 carry
+   stages.
+
+   Structure:
+     1.  Pre-stage:  p_i = a_i ^ b_i ;  g_i = a_i & b_i  for each i.
+     2.  Forward sweep — at level k = 0 .. log2(W)-1, every position
+         i where (i+1) mod 2^(k+1) = 0 combines with position i-2^k:
+              p'_i = p_i & p_{i-2^k}
+              g'_i = g_i | (p_i & g_{i-2^k})
+         After the forward sweep, g_i carries the true carry-out at
+         positions 2^L−1, 2*2^L−1, …  (the "powers of 2 minus 1").
+     3.  Backward sweep — fills in the carry at positions skipped by
+         the forward sweep.  For k = log2(W)-2 .. 0, every position
+         i = 3*2^k - 1, 5*2^k - 1, …  combines with i-2^k.
+     4.  Final sum: sum_i = p_i_initial ^ c_{i-1}  where c_{-1} = 0
+         and c_i = g_i (after the full tree).
+
+   Same return shape as [gen_add]: (sums LSB-first, cout, insts,
+   wires).  Each gate is minted via [mint_ctx], so the encoded
+   inst names trace back to (signal, bit, role) for STA reports. *)
+let gen_add_brent_kung ?(ctx="") ~a_name ~a_w ~b_name ~b_w () =
+  let w = max a_w b_w in
+  let insts = ref [] and wires = ref [] in
+  let add_w n = wires := (n, 1) :: !wires in
+  let add_i i = insts := i :: !insts in
+  let mk_gate ~bit_ctx cell ins out =
+    add_i { cell;
+            inst_name = mint_ctx ~ctx:bit_ctx cell.cell_name;
+            conns =
+              List.map2 (fun p n -> { pin = p; net = n }) cell.in_pins ins
+              @ [{ pin = cell.out_pin; net = out }] }
+  in
+  (* Step 1: pre-stage *)
+  let g = Array.make w "" in
+  let p = Array.make w "" in
+  let p_init = Array.make w "" in     (* original p, kept for sum *)
+  for i = 0 to w - 1 do
+    let ai = if i < a_w then bit_at a_name a_w i else "1'b0" in
+    let bi = if i < b_w then bit_at b_name b_w i else "1'b0" in
+    let bit_ctx =
+      if ctx = "" then "" else Printf.sprintf "%s_bit%d" ctx i in
+    let gi = mint_ctx ~ctx:bit_ctx "g" in
+    let pi = mint_ctx ~ctx:bit_ctx "p" in
+    add_w gi; add_w pi;
+    mk_gate ~bit_ctx cell_and [ai; bi] gi;
+    mk_gate ~bit_ctx cell_xor [ai; bi] pi;
+    g.(i) <- gi; p.(i) <- pi; p_init.(i) <- pi
+  done;
+  (* combine helper: replaces (g.(i), p.(i)) with the prefix-merged
+     pair, stamping the new gates with [bit_ctx]. *)
+  let combine ~bit_ctx i j =
+    let pj = p.(j) and gj = g.(j) in
+    let pi = p.(i) and gi = g.(i) in
+    let new_p = mint_ctx ~ctx:bit_ctx "pp" in
+    let pAg   = mint_ctx ~ctx:bit_ctx "pAg" in
+    let new_g = mint_ctx ~ctx:bit_ctx "gg" in
+    add_w new_p; add_w pAg; add_w new_g;
+    mk_gate ~bit_ctx cell_and [pi; pj] new_p;
+    mk_gate ~bit_ctx cell_and [pi; gj] pAg;
+    mk_gate ~bit_ctx cell_or  [gi; pAg] new_g;
+    p.(i) <- new_p; g.(i) <- new_g
+  in
+  (* log2 ceil *)
+  let log2w =
+    let rec l n = if n <= 1 then 0 else 1 + l ((n + 1) / 2) in l w in
+  (* Step 2: forward sweep *)
+  for k = 0 to log2w - 1 do
+    let step = 1 lsl (k + 1) in
+    let half = 1 lsl k in
+    let i = ref (step - 1) in
+    while !i < w do
+      let j = !i - half in
+      if j >= 0 then
+        combine ~bit_ctx:(if ctx = "" then ""
+                          else Printf.sprintf "%s_bit%d_fwd%d" ctx !i k) !i j;
+      i := !i + step
+    done
+  done;
+  (* Step 3: backward sweep *)
+  for k = log2w - 2 downto 0 do
+    let step = 1 lsl (k + 1) in
+    let half = 1 lsl k in
+    let i = ref (3 * half - 1) in
+    while !i < w do
+      let j = !i - half in
+      if j >= 0 then
+        combine ~bit_ctx:(if ctx = "" then ""
+                          else Printf.sprintf "%s_bit%d_bk%d" ctx !i k) !i j;
+      i := !i + step
+    done
+  done;
+  (* Step 4: sum_i = p_init.(i) ^ c_{i-1}; c_{-1} = 0; c_i = g.(i) *)
+  let sums = Array.make w "" in
+  for i = 0 to w - 1 do
+    let cin = if i = 0 then "1'b0" else g.(i - 1) in
+    let bit_ctx =
+      if ctx = "" then "" else Printf.sprintf "%s_bit%d" ctx i in
+    let si = mint_ctx ~ctx:bit_ctx "sum" in
+    add_w si;
+    mk_gate ~bit_ctx cell_xor [p_init.(i); cin] si;
+    sums.(i) <- si
+  done;
+  let cout = if w > 0 then g.(w - 1) else "1'b0" in
+  (Array.to_list sums, cout, List.rev !insts, !wires)
+
 (* Like [gen_add] but takes pre-built bit lists (LSB-first) instead
    of named-bus operands.  Used by [gen_mul] — partial-product rows
    are sets of fresh 1-bit nets, not bit-selects of a declared bus.
@@ -539,12 +645,32 @@ let rec walk ctx sig_ =
                      let block_kind = match op with
                        | Signal_add -> Block_tag.ADD
                        | _          -> Block_tag.SUB in
+                     (* Arch selection: SV_DECOMP_ARCH_SWAP=1 picks
+                        Brent-Kung for any add/sub at width ≥
+                        SV_DECOMP_ARCH_MIN_W (default 8).  Subtract
+                        is implemented via the standard a + ~b + 1
+                        prefix-sum trick, but for now the arch swap
+                        only kicks in for add — sub still uses
+                        ripple (gen_sub).  TODO: gen_sub_brent_kung
+                        once add path is exercised end-to-end.       *)
+                     let want_swap =
+                       Sys.getenv_opt "SV_DECOMP_ARCH_SWAP" = Some "1" in
+                     let min_w =
+                       match Sys.getenv_opt "SV_DECOMP_ARCH_MIN_W" with
+                       | Some s -> (try int_of_string s with _ -> 8)
+                       | None -> 8 in
+                     let use_bk =
+                       want_swap && op = Signal_add
+                       && (max a_w b_w) >= min_w in
+                     let arch = if use_bk then "brent_kung" else "ripple" in
                      let sums, _co, insts, wires_ =
                        Block_tag.with_block ~kind:block_kind
-                         ~signal:out_name ~width:(max a_w b_w)
-                         ~arch:"ripple"
+                         ~signal:out_name ~width:(max a_w b_w) ~arch
                          (fun _ ->
-                           match op with
+                           if use_bk then
+                             gen_add_brent_kung ~ctx:out_name
+                               ~a_name:an ~a_w ~b_name:bn ~b_w ()
+                           else match op with
                            | Signal_add ->
                                gen_add ~ctx:out_name
                                  ~a_name:an ~a_w ~b_name:bn ~b_w ()
