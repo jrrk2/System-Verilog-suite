@@ -439,6 +439,133 @@ let generate_sram_into_cache r cache_dir =
    wmaskN) interface onto FakeRAM's (clk, ce_in, we_in, addr_in, wd_in,
    rd_out, w_mask_in).                                                *)
 
+(* Liberty-driven lookup: find a cell whose function expression matches
+   the predicate, return its smallest-X-suffix variant.  Used so the
+   FakeRAM wrapper isn't tied to nangate45 cell names — sky130 calls
+   its inverter `sky130_fd_sc_hd__inv_1`, gf180mcu has its own naming,
+   etc.  Cache per-Liberty-path so repeated wrapper emits are cheap. *)
+
+type wrapper_cells = {
+  inv_cell  : string;       (* "<NAME>" with port { input = "A"; output = "ZN" } *)
+  inv_in    : string;
+  inv_out   : string;
+  nor2_cell : string;
+  nor2_a1   : string;
+  nor2_a2   : string;
+  nor2_out  : string;
+}
+
+let wrapper_cells_cache : (string, wrapper_cells) Hashtbl.t =
+  Hashtbl.create 4
+
+let drive_x_re = Str.regexp ".*_X\\([0-9]+\\)$"
+let drive_int s =
+  if Str.string_match drive_x_re s 0 then int_of_string (Str.matched_group 1 s)
+  else 1
+
+let normalize_fn s =
+  String.concat ""
+    (List.filter (fun s -> s <> "") (String.split_on_char ' ' s))
+
+(* Returns an inverter and a NOR2 from the given Liberty.  Tries
+   the preferred SV_DECOMP_LIBERTY/Lib_size default; falls back to
+   nangate45 names with a logged warning if nothing matches.       *)
+let find_wrapper_cells () : wrapper_cells =
+  let lib_path = match Lib_size.liberty_path_or_default () with
+    | Some p -> p
+    | None ->
+        Printf.eprintf
+          "[mem_macro_resolve] WARN: no Liberty discovered; using nangate45 cell names for wrapper\n";
+        ""
+  in
+  match Hashtbl.find_opt wrapper_cells_cache lib_path with
+  | Some r -> r
+  | None ->
+      let fallback = {
+        inv_cell = "INV_X1"; inv_in = "A"; inv_out = "ZN";
+        nor2_cell = "NOR2_X1"; nor2_a1 = "A1"; nor2_a2 = "A2"; nor2_out = "ZN";
+      } in
+      let result =
+        if lib_path = "" then fallback
+        else
+          let lib =
+            try Some (Sv_liberty.parse_liberty_file lib_path)
+            with e ->
+              Printf.eprintf
+                "[mem_macro_resolve] WARN: Liberty parse failed (%s); fallback to nangate45 names\n"
+                (Printexc.to_string e);
+              None in
+          match lib with
+          | None -> fallback
+          | Some lib ->
+              let cells = Hashtbl.fold (fun _ v acc -> v :: acc) lib.cells [] in
+              let inputs (c : Sv_liberty.cell_info) =
+                List.filter (fun (p : Sv_liberty.pin_info) ->
+                  p.direction = Input) c.pins in
+              let outputs (c : Sv_liberty.cell_info) =
+                List.filter (fun (p : Sv_liberty.pin_info) ->
+                  p.direction = Output && p.function_expr <> None) c.pins in
+              (* Inverter: 1 input, 1 output with f = "!<in>".         *)
+              let is_inv c =
+                match inputs c, outputs c with
+                | [i], [o] ->
+                    (match o.function_expr with
+                     | Some f -> normalize_fn f = "!" ^ i.name
+                     | None -> false)
+                | _ -> false in
+              (* NOR2: 2 inputs, 1 output with f = "!(<a>|<b>)".       *)
+              let is_nor2 c =
+                match inputs c, outputs c with
+                | [a; b], [o] ->
+                    (match o.function_expr with
+                     | Some f ->
+                         let f = normalize_fn f in
+                         f = "!(" ^ a.name ^ "|" ^ b.name ^ ")" ||
+                         f = "!(" ^ b.name ^ "|" ^ a.name ^ ")"
+                     | None -> false)
+                | _ -> false in
+              let pick pred =
+                List.filter pred cells
+                |> List.sort (fun a b ->
+                     compare (drive_int a.Sv_liberty.cell_name)
+                             (drive_int b.Sv_liberty.cell_name))
+                |> function
+                  | [] -> None
+                  | c :: _ ->
+                      let i = List.hd (inputs c) in
+                      let o = List.hd (outputs c) in
+                      Some (c.Sv_liberty.cell_name, i.name, o.name)
+              in
+              let pick_nor2 () =
+                match List.filter is_nor2 cells with
+                | [] -> None
+                | cs ->
+                    let c = List.hd
+                      (List.sort (fun a b ->
+                        compare (drive_int a.Sv_liberty.cell_name)
+                                (drive_int b.Sv_liberty.cell_name)) cs) in
+                    let ins = inputs c in
+                    let o = List.hd (outputs c) in
+                    match ins with
+                    | [a; b] -> Some (c.Sv_liberty.cell_name,
+                                      a.name, b.name, o.name)
+                    | _ -> None
+              in
+              let inv = pick is_inv in
+              let nor2 = pick_nor2 () in
+              (match inv, nor2 with
+               | Some (icell, iin, iout), Some (ncell, na, nb, nout) ->
+                   { inv_cell = icell; inv_in = iin; inv_out = iout;
+                     nor2_cell = ncell; nor2_a1 = na; nor2_a2 = nb;
+                     nor2_out = nout }
+               | _ ->
+                   Printf.eprintf
+                     "[mem_macro_resolve] WARN: Liberty %s lacks discoverable INV/NOR2 cells; using nangate45 names\n"
+                     (Filename.basename lib_path);
+                   fallback) in
+      Hashtbl.add wrapper_cells_cache lib_path result;
+      result
+
 let fakeram_platform_dir () = Sys.getenv_opt "FAKERAM_PLATFORM_DIR"
 
 let fakeram_use_enabled () =
@@ -515,20 +642,24 @@ let emit_fakeram_wrapper r fakeram_mod =
   (* OpenROAD's STA Verilog reader (synth_odb.tcl) is structural-only
      and rejects BOTH inline bitwise expressions in port connections
      AND continuous-assign statements.  Build the active-low → active-
-     high translation out of standard-cell instances instead — every
+     high translation out of standard-cell instances — every
      downstream tool (yosys, OpenROAD, OpenSTA) is happy with that.
 
-     ce_in = ~csb0
-     we_in = (~web0) & (~csb0)  →  ~(web0 | csb0)  →  NOR2_X1.
+       ce_in = ~csb0
+       we_in = (~web0) & (~csb0)  =  ~(web0 | csb0)   →  NOR2.
 
-     NOR2_X1 is in Nangate45 (we already use it elsewhere); INV_X1
-     too.  No new ADDITIONAL_LEFS needed.                             *)
+     Cell names (and pin names) come from the platform Liberty via
+     [find_wrapper_cells], so the wrapper retargets cleanly to
+     sky130 / gf180mcu / etc. without code changes.                 *)
+  let wc = find_wrapper_cells () in
   Buffer.add_string buf "  wire ce_in;\n";
   Buffer.add_string buf "  wire we_in;\n";
   Buffer.add_string buf
-    "  INV_X1  _wrap_inv_csb_ ( .A(csb0), .ZN(ce_in) );\n";
+    (Printf.sprintf "  %s _wrap_inv_csb_ ( .%s(csb0), .%s(ce_in) );\n"
+       wc.inv_cell wc.inv_in wc.inv_out);
   Buffer.add_string buf
-    "  NOR2_X1 _wrap_nor_we_  ( .A1(web0), .A2(csb0), .ZN(we_in) );\n";
+    (Printf.sprintf "  %s _wrap_nor_we_  ( .%s(web0), .%s(csb0), .%s(we_in) );\n"
+       wc.nor2_cell wc.nor2_a1 wc.nor2_a2 wc.nor2_out);
   Buffer.add_string buf
     (Printf.sprintf "  %s ram (\n" fakeram_mod);
   Buffer.add_string buf "    .clk      (clk0),\n";
