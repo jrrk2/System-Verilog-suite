@@ -102,17 +102,35 @@ let sanitize_for_id s =
   done;
   Bytes.to_string b
 
-(* Mint a context-bearing name.  Cells get inst names like
-   _<ctx>_<celltype>_<id>_ which traces straight back to the RTL
-   net the cell drives — STA's report_checks output then reads
-   like `cpu/alu_out__add_bit15__ab__123_/Z` instead of an
-   anonymous `_AND2_X1_2478_/ZN`.  When ctx is empty (legacy /
-   internal cases) we fall back to the original [mint].          *)
+(* Parse a legacy free-form context string like "alu_out_bit15" into
+   (signal, bit) so we can feed it to [Block_tag.mint_in_scope] and
+   produce a structured, reversible cell name.  Falls back to
+   (ctx, None) when no _bitN suffix is present.                    *)
+let parse_bit_ctx ctx =
+  let re = Str.regexp "^\\(.*\\)_bit\\([0-9]+\\)$" in
+  if Str.string_match re ctx 0
+  then (Str.matched_group 1 ctx,
+        try Some (int_of_string (Str.matched_group 2 ctx)) with _ -> None)
+  else (ctx, None)
+
+(* Mint a context-bearing name.  When [Block_tag.current_modhash] is
+   set (Hier_synth.set_current_module has been called), cells get
+   structured Block_tag-encoded names that survive layout transforms
+   and let downstream passes recover (module, signal, bit, block,
+   role).  When unset (legacy / internal cases), falls back to the
+   simple `_<ctx>__<prefix>_<id>_` form.                            *)
 let mint_ctx ~ctx prefix =
-  if ctx = "" then mint prefix
-  else begin
-    incr next_id;
-    Printf.sprintf "_%s__%s_%d_" (sanitize_for_id ctx) prefix !next_id
+  if !Block_tag.current_modhash = "" then begin
+    if ctx = "" then mint prefix
+    else begin
+      incr next_id;
+      Printf.sprintf "_%s__%s_%d_" (sanitize_for_id ctx) prefix !next_id
+    end
+  end else begin
+    let signal, bit = parse_bit_ctx ctx in
+    (* Block_tag.mint_in_scope picks the active block's kind when one
+       is set; otherwise we tag this as a stand-alone OP per-bit cell. *)
+    Block_tag.mint_in_scope ~kind:Block_tag.OP ~signal ?bit ~role:prefix ()
   end
 
 let net_for_signal s =
@@ -510,20 +528,29 @@ let rec walk ctx sig_ =
             | None ->
                 (match op with
                  | Hardcaml.Signal.Type.Signal_eq ->
-                     let res, insts, wires_ = gen_eq ~a_name:an ~a_w
-                                                ~b_name:bn ~b_w in
+                     let res, insts, wires_ =
+                       Block_tag.with_block ~kind:Block_tag.EQ
+                         ~signal:out_name ~width:(max a_w b_w)
+                         ~arch:"reduce_or"
+                         (fun _ -> gen_eq ~a_name:an ~a_w ~b_name:bn ~b_w) in
                      absorb_helper insts wires_;
                      ctx.assigns <- (out_name, res) :: ctx.assigns
                  | Signal_sub | Signal_add ->
+                     let block_kind = match op with
+                       | Signal_add -> Block_tag.ADD
+                       | _          -> Block_tag.SUB in
                      let sums, _co, insts, wires_ =
-                       (match op with
-                        | Signal_add ->
-                            gen_add ~ctx:out_name
-                              ~a_name:an ~a_w ~b_name:bn ~b_w ()
-                        | _          ->
-                            gen_sub ~ctx:out_name
-                              ~a_name:an ~a_w ~b_name:bn ~b_w ())
-                     in
+                       Block_tag.with_block ~kind:block_kind
+                         ~signal:out_name ~width:(max a_w b_w)
+                         ~arch:"ripple"
+                         (fun _ ->
+                           match op with
+                           | Signal_add ->
+                               gen_add ~ctx:out_name
+                                 ~a_name:an ~a_w ~b_name:bn ~b_w ()
+                           | _ ->
+                               gen_sub ~ctx:out_name
+                                 ~a_name:an ~a_w ~b_name:bn ~b_w ()) in
                      absorb_helper insts wires_;
                      let sums = let n = min w (List.length sums) in
                                 List.filteri (fun i _ -> i < n) sums in
@@ -540,8 +567,12 @@ let rec walk ctx sig_ =
                      end
                  | Signal_lt ->
                      let res, insts, wires_ =
-                       gen_lt ~ctx:out_name
-                         ~a_name:an ~a_w ~b_name:bn ~b_w () in
+                       Block_tag.with_block ~kind:Block_tag.LT
+                         ~signal:out_name ~width:(max a_w b_w)
+                         ~arch:"sub_then_invert"
+                         (fun _ ->
+                           gen_lt ~ctx:out_name
+                             ~a_name:an ~a_w ~b_name:bn ~b_w ()) in
                      absorb_helper insts wires_;
                      ctx.assigns <- (out_name, res) :: ctx.assigns
                  | Signal_mulu | Signal_muls ->
@@ -549,7 +580,9 @@ let rec walk ctx sig_ =
                         cert-gated swap targets sitting on top of
                         the same partial-product + gen_add primitives. *)
                      let sums, _co, insts, wires_ =
-                       gen_mul ~a_name:an ~a_w ~b_name:bn ~b_w in
+                       Block_tag.with_block ~kind:Block_tag.MUL
+                         ~signal:out_name ~width:(a_w + b_w) ~arch:"array"
+                         (fun _ -> gen_mul ~a_name:an ~a_w ~b_name:bn ~b_w) in
                      absorb_helper insts wires_;
                      (* gen_mul returns msb-first; truncate to LHS w. *)
                      let sums =

@@ -140,6 +140,13 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
     Printf.eprintf
       "[synth_pipeline] OK — %d module block(s), %d cells, %d child instances\n"
       (List.length netlists) !total_cells !total_children;
-    Printf.eprintf "[synth_pipeline] wrote %s\n" out_path
+    Printf.eprintf "[synth_pipeline] wrote %s\n" out_path;
+    (* Sidecar JSON: full RTL signal names + module-hash mappings +
+       per-block kind/width/arch.  Reverse mapping for downstream
+       pretty-printers / fanout-cone extractors that need the
+       untruncated info.                                          *)
+    let blocks_json_path = out_path ^ ".blocks.json" in
+    Block_tag.write_blocks_json blocks_json_path;
+    Printf.eprintf "[synth_pipeline] wrote %s\n" blocks_json_path
   end;
   netlists, mem_arts

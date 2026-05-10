@@ -520,6 +520,13 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
       failwith (Printf.sprintf "hier_synth: lowering failed for module %s: %s\n%s"
                   m.name (Printexc.to_string e) bt)
   in
+  (* Set the Block_tag scope so every cell minted by Lib_map carries
+     this module's hash in its inst name.  Hier_synth.synth_program
+     calls synth_one once per module in topo order (children first);
+     each module gets a clean modhash slot.  The Block_tag.reset call
+     up in [synth_program] zeroes the per-program block-id counter so
+     blocks get a stable global id across the whole synth run.       *)
+  Block_tag.set_current_module m.name;
   let raw = Lib_map.map_circuit circuit in
   (* DCE on the per-module netlist, gated behind LIB_MAP_DCE=1.
      Effective on cell count (~56% reduction on gcd) but can shrink
@@ -552,5 +559,6 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
 (* ── Top-level driver ─────────────────────────────────────────── *)
 
 let synth_program (prog : bprogram) : module_netlist list =
+  Block_tag.reset ();
   let ordered = topo_sort prog.modules in
   List.map (synth_one ~modules:prog.modules) ordered

@@ -109,10 +109,8 @@ let sanitize_id ?(maxlen=24) s =
    netlist, which the seq counter already guarantees.  The hash is
    for greppability ("show me everything from this module"). *)
 let modhash_of name =
-  let h = ref 0xcbf29ce484222325 in
-  String.iter (fun c ->
-    h := (!h lxor (Char.code c)) * 0x100000001b3 land 0xffffffffff) name;
-  Printf.sprintf "%06x" (!h land 0xffffff)
+  (* OCaml's polymorphic hash is plenty unique for our 6-hex slot. *)
+  Printf.sprintf "%06x" (Hashtbl.hash name land 0xffffff)
 
 let int_field n width = function
   | None -> String.make width '_'
@@ -286,8 +284,56 @@ let write_blocks_json path =
   output_string oc (Buffer.contents buf);
   close_out oc
 
+(* ─── "Current scope" — set by Hier_synth before per-module synth so
+       Lib_map can mint tags without plumbing the modhash through
+       every helper signature.  Block id + kind held in per-helper-
+       call refs so blast_op2 / gen_add internals don't need extra
+       parameters.  Defined at the end of the file so they can
+       reference module_names / record / alloc_block_id above.  *)
+
+let current_modhash = ref ""
+let current_block_id : int option ref = ref None
+let current_block_kind : kind option ref = ref None
+
+let set_current_module name =
+  current_modhash := register_module name
+
+let with_block ~kind ~signal ~width ~arch f =
+  let id = alloc_block_id () in
+  record { br_id = id; br_kind = kind;
+           br_module = (try Hashtbl.find module_names !current_modhash
+                        with Not_found -> "");
+           br_signal = signal; br_width = width; br_arch = arch };
+  let prev_id = !current_block_id and prev_k = !current_block_kind in
+  current_block_id := Some id;
+  current_block_kind := Some kind;
+  let r =
+    try f id
+    with e ->
+      current_block_id := prev_id;
+      current_block_kind := prev_k;
+      raise e in
+  current_block_id := prev_id;
+  current_block_kind := prev_k;
+  r
+
+(* Mint a tag using current_modhash + current_block_id.  When inside
+   a with_block scope, the block's kind takes precedence over the
+   kind argument so every cell in the block carries the same kind
+   tag — role distinguishes cells within (ab / abc / co / etc.).
+   Outside any block, caller's kind (usually OP for per-bit blasts)
+   is used.                                                         *)
+let mint_in_scope ~kind ~signal ?bit ~role () =
+  let effective_kind = match !current_block_kind with
+    | Some k -> k | None -> kind in
+  mint ~block_id:!current_block_id
+    ~kind:effective_kind ~modhash:!current_modhash ~signal ?bit ~role ()
+
 let reset () =
   next_seq := 0;
   next_block := 0;
   blocks := [];
+  current_modhash := "";
+  current_block_id := None;
+  current_block_kind := None;
   Hashtbl.clear module_names
