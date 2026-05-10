@@ -1532,12 +1532,13 @@ let render_layout cr ~width ~height ?path layout =
                let cy_dbu = pl.p_y + int_of_float (h_um *. units_f /. 2.0) in
                Some (cx_dbu, cy_dbu, xform cx_dbu cy_dbu)
          ) p.tp_hops in
-         (* Telemetry — surfaced once per overlay redraw (not per
-            frame) via the status bar.  Helps the user spot hop-name
-            mismatches (where the path hop's t_inst doesn't match any
-            placement's p_inst) vs. a genuinely clustered path.    *)
+         (* Telemetry — log to stderr (always visible) AND status bar.
+            Helps spot hop-name mismatches vs genuinely clustered paths. *)
+         let log msg =
+           Printf.eprintf "[path-overlay] %s\n%!" msg;
+           set_status msg in
          (match pts with
-          | first :: _ ->
+          | _ :: _ ->
               let xmin = ref max_int and xmax = ref min_int in
               let ymin = ref max_int and ymax = ref min_int in
               List.iter (fun (xd, yd, _) ->
@@ -1547,18 +1548,32 @@ let render_layout cr ~width ~height ?path layout =
                 if yd > !ymax then ymax := yd) pts;
               let dx_um = float_of_int (!xmax - !xmin) /. units_f in
               let dy_um = float_of_int (!ymax - !ymin) /. units_f in
-              set_status (Printf.sprintf
+              log (Printf.sprintf
                 "Path: %d/%d hops matched · bbox %.1f × %.1f µm%s"
                 !matched (!matched + !unmatched) dx_um dy_um
                 (if !unmatched > 0
                  then Printf.sprintf "  (sample miss: %s)"
                         (List.hd !unmatched_samples)
                  else ""));
-              let _ = first in ()
+              if !unmatched > 0 then begin
+                Printf.eprintf "[path-overlay] more sample misses: %s\n%!"
+                  (String.concat ", " !unmatched_samples);
+                (* Also dump a few inst names from the index for comparison *)
+                let idx_keys =
+                  Hashtbl.fold (fun k _ acc ->
+                    if List.length acc < 3 then k :: acc else acc) idx [] in
+                Printf.eprintf "[path-overlay] sample placement insts: %s\n%!"
+                  (String.concat ", " idx_keys)
+              end
           | [] when !unmatched > 0 ->
-              set_status (Printf.sprintf
-                "Path: 0/%d hops matched against placement (sample miss: %s)"
-                !unmatched (List.hd !unmatched_samples))
+              log (Printf.sprintf
+                "Path: 0/%d hops matched (sample miss: %s)"
+                !unmatched (List.hd !unmatched_samples));
+              let idx_keys =
+                Hashtbl.fold (fun k _ acc ->
+                  if List.length acc < 3 then k :: acc else acc) idx [] in
+              Printf.eprintf "[path-overlay] sample placement insts: %s\n%!"
+                (String.concat ", " idx_keys)
           | [] -> ());
          let xy_pts = List.map (fun (_, _, p) -> p) pts in
          (match xy_pts with
