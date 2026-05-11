@@ -124,6 +124,32 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
             (Lib_size.wire_cap_ff ());
           netlists'
   in
+  (* Scan-chain insertion — swaps DFF → SDFF and stitches every FF in
+     emission order into a single chain.  Adds scan_en, scan_in inputs
+     and a scan_out output to each module.  Off by default;
+     SV_DECOMP_SCAN=1 enables.  Sits after [Lib_size] so the SDFF
+     variants inherit any drive-strength bumps the original DFFs got. *)
+  let netlists =
+    if not (Scan_insert.enabled ()) then netlists
+    else
+      let total_ffs = ref 0 in
+      let netlists' = List.map (fun (mn : Hier_synth.module_netlist) ->
+        let nl', n = Scan_insert.scan_module mn.mn_netlist in
+        if n > 0 then begin
+          total_ffs := !total_ffs + n;
+          let new_inputs  = mn.mn_real_inputs  @ [("scan_en", 1); ("scan_in", 1)] in
+          let new_outputs = mn.mn_real_outputs @ [("scan_out", 1)] in
+          { mn with
+            mn_netlist     = nl';
+            mn_real_inputs = new_inputs;
+            mn_real_outputs = new_outputs }
+        end else mn
+      ) netlists in
+      Printf.eprintf
+        "[scan_insert] stitched %d FF(s) into scan chain(s) across %d module(s)\n"
+        !total_ffs (List.length netlists');
+      netlists'
+  in
 
   if emit_verilog then begin
     let oc = open_out out_path in
