@@ -157,6 +157,10 @@ let preserved_envs = [
   "SV_DECOMP_NO_DCE";
   "SV_DECOMP_MUX_FLATTEN";
   "SV_DECOMP_MUX_CHAIN_MIN";
+  "SV_DECOMP_NO_KARY_MERGE";
+  "SV_DECOMP_KARY_MAX_PASSES";
+  "SV_DECOMP_KARY_DEBUG";
+  "SV_DECOMP_TIMING_REF";
 ]
 
 let emit_config_mk ~top ~nickname ~platform ~variant

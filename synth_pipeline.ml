@@ -69,6 +69,22 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
         { mn with mn_netlist = nl' }
       ) netlists
   in
+  (* k-ary AND/OR merge — collapse chains/trees of AND2/OR2 into
+     AND3/AND4/OR3/OR4 where intermediate nets are single-fanout.
+     A 7-deep OR2 chain (8 inputs) becomes a 2-deep OR4 tree:
+     2.3× fewer cells, 3.5× shorter depth.  On by default;
+     SV_DECOMP_NO_KARY_MERGE=1 skips.                                *)
+  let netlists =
+    if Sys.getenv_opt "SV_DECOMP_NO_KARY_MERGE" = Some "1" then netlists
+    else
+      let total = ref 0 in
+      let netlists' = List.map (fun (mn : Hier_synth.module_netlist) ->
+        let nl', n = Kary_merge.merge_module mn.mn_netlist in
+        total := !total + n;
+        { mn with mn_netlist = nl' }
+      ) netlists in
+      netlists'
+  in
   (* Tie-fanout limiter — splits over-loaded LOGIC0/LOGIC1 cells so
      OpenROAD's repair_tie_fanout doesn't have to.  Default fanout
      cap 16; SV_DECOMP_TIE_FANOUT_MAX overrides; SV_DECOMP_NO_TIE_FAN=1

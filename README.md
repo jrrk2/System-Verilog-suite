@@ -200,12 +200,53 @@ the worked example.
 
 ## Synth pipeline (BIR → cell-mapped Verilog)
 
+Driven by `synth_pipeline.ml` — the same code path is called both
+from `synth_orfs_shim.exe` at ORFS make-time and from `orfs_prep.exe`
+at pre-flight.  Stages run in this order:
+
 | Stage | Module | Purpose |
 |---|---|---|
 | `Behavioral_to_hardcaml.create_circuit` | `behavioral_to_hardcaml.ml` | Lower a `bmodule` to a hardcaml `Circuit.t` — operators map to `Signal` ops, `BSequential` blocks to `Reg_spec`-clocked registers |
-| `Lib_map.map_circuit` | `lib_map.ml` | Tech-map hardcaml's `Comb_op` / `Mux` / `Eq` / `Add` / `Sub` / `Mul` / `Lt` nodes onto Liberty cells. Bit-blasts adders/subtractors as ripple-carry, multipliers as Array (b_w iterations of `gen_add`), gates as `AND2_X1`/`OR2_X1`/`XOR2_X1`/`INV_X1`/`MUX2_X1`. Set `LIB_MAP_DCE=1` for dead-code elimination |
-| `Hier_synth.synth_program` | `hier_synth.ml` | Per-module gate-level synth in dependency order. Children get phantom IO at their parent so each module synthesises standalone, while the cell-Verilog emit step splices each instance line back in alongside the parent's cells. Preserves both hier (instance lines) and flat (gate cells) views |
+| `Lib_map.map_circuit` | `lib_map.ml` | Tech-map hardcaml's `Comb_op` / `Mux` / `Eq` / `Add` / `Sub` / `Mul` / `Lt` nodes onto Liberty cells. Bit-blasts adders/subtractors as ripple-carry (or Brent-Kung under `SV_DECOMP_ARCH_SWAP=1`), multipliers as Array (b_w iterations of `gen_add`), gates as `AND2_X1`/`OR2_X1`/`XOR2_X1`/`INV_X1`/`MUX2_X1`. Set `LIB_MAP_DCE=1` for dead-code elimination |
+| `Hier_synth.synth_program` | `hier_synth.ml` | Per-module gate-level synth in dependency order. Children get phantom IO at their parent so each module synthesises standalone, while the cell-Verilog emit step splices each instance line back in alongside the parent's cells. Preserves both hier (instance lines) and flat (gate cells) views.  `HIER_SYNTH_TRACE=1` logs which module is being lowered (useful for localising upstream BIR bugs) |
+| `Mux_chain_flatten` (opt) | `mux_chain_flatten.ml` | Priority MUX2 chains → balanced one-hot AND-OR (depth O(log N)).  Off by default; flip on with `SV_DECOMP_MUX_FLATTEN=1`.  Constants routed through tie cells to keep DRT-0305 (POWER-net) clean |
+| `Kary_merge` | `kary_merge.ml` | Collapse same-family AND2/OR2 chains and trees into AND3/AND4/OR3/OR4.  *Duplicating* absorb — a high-fanout 2-input driver is inlined into every consumer, then `dce_module` sweeps it if all consumers absorbed it.  Iterates to fixed point (cap 16, override `SV_DECOMP_KARY_MAX_PASSES`).  Slack-aware: `SV_DECOMP_TIMING_REF=<6_finish.rpt>` falls back to single-fanout absorb on cells that were on the prior run's worst path, so widening a chain head from `OR2_X4` (40 ps) to `OR4_X4` (72 ps) only happens off the critical path.  `SV_DECOMP_NO_KARY_MERGE=1` skips entirely |
+| `Tie_fanout` | `tie_fanout.ml` | Splits over-loaded `LOGIC0_X1` / `LOGIC1_X1` cells before OpenROAD's `repair_tie_fanout` does.  `SV_DECOMP_TIE_FANOUT_MAX=N` (default 16); `SV_DECOMP_NO_TIE_FAN=1` skips |
+| `Lib_size` | `lib_size.ml` | Liberty-driven drive-strength sizing using the same NLDM tables OpenSTA consults at signoff.  `SV_DECOMP_NO_SIZE=1` skips |
+| `Block_arch_swap.report` | `block_arch_swap.ml` | Predict-only report on which arith blocks would be candidates for an arch swap; actual swap is `SV_DECOMP_ARCH_SWAP=1` gated and cert-checked |
 | `Cell_verilog_emit` | `cell_verilog_emit.ml` | Write OpenROAD-readable structural Verilog: bus reconstruction emitted as `assign bus = {bit_w-1, …, 1, 0};` so OpenSTA can trace each gate's full bus driver |
+
+### Slack-feedback loop (`SV_DECOMP_TIMING_REF`)
+
+Each structural pass uses the same Liberty NLDM tables OpenSTA uses,
+so per-cell delay estimates agree at signoff.  Where the passes
+diverge from STA is in *decision aggressiveness* — `kary_merge` will
+otherwise greedily promote a chain head to OR4, even when the wider
+cell's per-cell delay (~1.4× OR2) costs more than the eliminated
+hop saves.
+
+`SV_DECOMP_TIMING_REF=<path/to/6_finish.rpt>` closes that loop.  It
+parses the worst-slack max-path block from a prior run, indexes
+every hop's inst path (both full and leaf forms), and feeds the set
+to `kary_merge` so cells *on that path* fall back to single-fanout
+absorb.  Off-path cells keep the aggressive dup behaviour (area win
++ neutral-or-better depth).
+
+Picosoc through nangate45 ORFS, 1.1 ns SDC:
+
+| Variant | WNS | TNS | placements |
+|---|---:|---:|---:|
+| baseline (`SV_DECOMP_NO_KARY_MERGE=1`)            | -2.26 ns | -38.68 ns | 5817 |
+| `kary_merge` on, no slack gate                    | -0.58 ns |  -4.62 ns | 4388 |
+| `kary_merge` on, gate = baseline rpt              | -0.58 ns |  -4.62 ns | (same) |
+
+picosoc's critical path is essentially single-fanout end-to-end, so
+the gate is a functional no-op for this design (it matches 56/102
+baseline leaves but they're already chain heads with single-fanout
+drivers).  The gate's purpose is to keep the algorithm honest on
+designs with shared-fanout subexpressions on the critical path
+(CVA6, smollm); on picosoc we get the +1.68 ns WNS improvement from
+the rewrite alone.
 
 ### `synth_orfs_shim.exe`
 
