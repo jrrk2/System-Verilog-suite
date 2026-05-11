@@ -545,6 +545,70 @@ let do_miter fe_a fe_b () =
       end
     end)
 
+(* ---------- Hardcaml simulation + waveform window (Stage 1) ----------
+   Loads the BIR via the existing file-open dialog, lowers the top module
+   through Behavioral_to_hardcaml, runs Cyclesim for 128 cycles with
+   default stimulus (clock from Cyclesim, reset asserted for the first
+   4 cycles auto-detected from port names, all other inputs zero), and
+   pops a new GtkWindow with a Cairo waveform canvas.  Gated by
+   SV_DECOMP_GUI_SIM=1 so the default Verify menu doesn't surface a
+   half-polished feature.                                              *)
+
+let open_waveform_window (sr : Gui_sim.sim_result) =
+  let w, h = Gui_waveform.extents sr in
+  let win = GWindow.window
+    ~title:(Printf.sprintf "Waveforms: %s (%d cycles)"
+              sr.sr_module_name sr.sr_cycles)
+    ~width:(min 1400 (int_of_float w + 30))
+    ~height:(min 900 (int_of_float h + 30))
+    () in
+  let sw = GBin.scrolled_window
+    ~hpolicy:`AUTOMATIC ~vpolicy:`AUTOMATIC
+    ~packing:win#add () in
+  let da = GMisc.drawing_area
+    ~packing:sw#add_with_viewport () in
+  da#misc#set_size_request
+    ~width:(int_of_float w) ~height:(int_of_float h) ();
+  ignore (da#misc#connect#draw ~callback:(fun cr ->
+    Gui_waveform.render cr sr;
+    true));
+  win#show ()
+
+let do_simulate () =
+  with_errors "simulate" (fun () ->
+    match !current_prog with
+    | None ->
+        info_dialog "Load a SystemVerilog file first (File → Open … or \
+                     Decompile → Parse with verible …)."
+    | Some (_label, p) ->
+        (* Inline picker — pick_default_top is defined further down in
+           this file; we just want a synthesisable module with at least
+           one process or a non-empty IO surface. *)
+        let synth_candidate (m : Behavioral_ir.bmodule) =
+          m.processes <> [] || m.signals <> [] in
+        let m = match List.filter synth_candidate p.modules with
+          | [] -> failwith "no synthesisable top module in loaded BIR"
+          | [m] -> m
+          | ms ->
+              (* Pick the module whose name is not instantiated by any
+                 other module in this program — that's the topmost. *)
+              let instantiated =
+                List.concat_map (fun (m : Behavioral_ir.bmodule) ->
+                  List.map (fun (i : Behavioral_ir.binstance) -> i.module_name)
+                    m.instances
+                ) p.modules in
+              (match List.filter (fun (m : Behavioral_ir.bmodule) ->
+                       not (List.mem m.name instantiated)) ms with
+               | [t] -> t
+               | t :: _ -> t   (* tie-break: first one *)
+               | [] -> List.hd ms) in
+        set_status (Printf.sprintf "Simulating %s @ 128 cycles…" m.name);
+        let sr = Gui_sim.run ~n_cycles:128 m in
+        set_status (Printf.sprintf "Simulation OK: %s, %d cycles, %d ports"
+                      m.name sr.sr_cycles
+                      (List.length sr.sr_inputs + List.length sr.sr_outputs));
+        open_waveform_window sr)
+
 (* ---------- ORFS handholding (Phase 1: launch + log streaming) ----------
    The GUI doesn't reimplement OpenROAD; it just writes a config.mk + sdc
    with sensible defaults and shells out to ORFS's make.  Output streams
@@ -2093,6 +2157,11 @@ let () =
             ~callback:(do_miter "verilator" "slang"));
   ignore (m#add_item "Z3 miter: verible vs vhdl..."
             ~callback:(do_miter "verible" "vhdl"));
+  if Sys.getenv_opt "SV_DECOMP_GUI_SIM" = Some "1" then begin
+    ignore (m#add_separator ());
+    ignore (m#add_item "Simulate top (Cyclesim, 128 cycles)..."
+              ~callback:do_simulate)
+  end;
 
   (* Topology menu. *)
   let t = new GMenu.factory topology_menu ~accel_group in
