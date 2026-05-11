@@ -488,7 +488,18 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
              let din0   = suffix (match List.nth ps.din 0 with
                                   | Some n -> n | None -> "din0") in
              let dout0  = suffix (List.nth ps.dout 0) in
-             let inv_we = bool_not we_expr in
+             (* read_pin = which macro dout pin replaces every read of
+                this memory.  Hoisted above driver_body construction so
+                we can pre-rewrite w_data / w_addr / r_addr — the byte-
+                merge pass embeds `mem[addr]` reads in w_data for the
+                read-modify-write of non-written byte lanes, and those
+                need the same BVar dout substitution as the original
+                processes' reads.                                       *)
+             let read_pin =
+               if force_dual_port
+               then suffix (List.nth ps.dout 1)
+               else dout0
+             in
              let orig_clk = match w_proc with
                | BSequential s -> s.clock | _ -> "clk" in
              let read_clk = match r_proc with
@@ -497,6 +508,20 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
              (* Address pin: if dual-port, port 0 gets w_addr, port 1
                 r_addr.  If 1RW, single port gets we ? w_addr : r_addr
                 (degenerates to a wire when w_addr ≡ r_addr).      *)
+             (* The byte-write merge in behavioral_mem_merge injects
+                BSelect(BVar mname, addr) reads into [w_data] (read-
+                modify-write of non-written byte lanes).  And both
+                addresses are user expressions that *could* index the
+                same memory in pathological designs.  Rewrite all three
+                so any surviving `mem[…]` becomes `BVar dout` — without
+                this, hardcaml ties them to 32-bit zero and the macro's
+                din pin sees garbage.                                  *)
+             let rw_e = rewrite_reads_e mname read_pin in
+             let w_addr = rw_e w_addr in
+             let r_addr = rw_e r_addr in
+             let w_data = rw_e w_data in
+             let we_expr = rw_e we_expr in
+             let inv_we = bool_not we_expr in
              let muxed_addr =
                BCond { condition = we_expr;
                        then_val = w_addr;
@@ -535,11 +560,6 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                sensitivity = [BAny];
                body = driver_body;
              } in
-             let read_pin =
-               if force_dual_port
-               then suffix (List.nth ps.dout 1)
-               else dout0
-             in
              let rewrite_body body =
                let body = strip_mem_writes mname body in
                List.map (rewrite_reads_s mname read_pin) body

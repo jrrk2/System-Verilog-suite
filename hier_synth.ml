@@ -476,6 +476,8 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
     then m, [], []
     else prepare_parent m modules
   in
+  if Sys.getenv_opt "HIER_SYNTH_TRACE" = Some "1" then
+    Printf.eprintf "[hier_synth] synthesising module %s\n%!" m.name;
   let circuit =
     try Behavioral_to_hardcaml.create_circuit synth_bmod
     with e ->

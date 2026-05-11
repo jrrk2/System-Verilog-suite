@@ -1333,10 +1333,15 @@ let path_re_start = Str.regexp "^Startpoint: \\([^ \t]+\\)"
 let path_re_end   = Str.regexp "^Endpoint: \\([^ \t]+\\)"
 let path_re_max   = Str.regexp "^Path Type: max"
 let hop_re =
-  (* Two columns of floats, then ^ or v, then inst/pin (cell). *)
+  (* Two columns of floats, then ^ or v, then inst/pin (cell).
+     Group 3 (inst) is greedy any-non-WS, so on hierarchical names
+     like cpu/_T_xxx/Q it backtracks to the LAST "/" — splitting
+     "cpu/_T_xxx" (inst) from "Q" (pin).  Old pattern stopped at the
+     first "/", which made every hop's t_inst the bare top-level
+     prefix ("cpu") and broke the path-overlay lookup. *)
   Str.regexp
     "^[ \t]*\\([0-9.]+\\)[ \t]+\\([0-9.]+\\)[ \t]+[v^][ \t]+\
-     \\([^ \t/]+\\)/\\([^ \t]+\\)[ \t]+(\\([^ \t)]+\\))"
+     \\([^ \t]+\\)/\\([^ \t/]+\\)[ \t]+(\\([^ \t)]+\\))"
 
 let parse_path_block lines =
   let sp = ref "" and ep = ref "" and is_max = ref false in
