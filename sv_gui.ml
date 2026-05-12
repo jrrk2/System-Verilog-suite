@@ -609,6 +609,84 @@ let do_simulate () =
                       (List.length sr.sr_inputs + List.length sr.sr_outputs));
         open_waveform_window sr)
 
+(* Path of the last synth output the GUI produced, used by "Show BSDL". *)
+let last_synth_out_path : string option ref = ref None
+
+(* ATPG runner — reuses Synth_pipeline (so the DFT env toggles apply)
+   and Fault_sim, then renders per-module coverage into the text view.
+   Source files come from the currently-loaded program plus its
+   Verible dependency closure.                                          *)
+let do_atpg () =
+  with_errors "atpg" (fun () ->
+    match !current_prog with
+    | None ->
+        info_dialog "Load a SystemVerilog file first (Decompile → Parse Verible…)."
+    | Some (path, p) ->
+        let pick_top () =
+          let instantiated =
+            List.concat_map (fun (m : Behavioral_ir.bmodule) ->
+              List.map (fun (i : Behavioral_ir.binstance) -> i.module_name)
+                m.instances) p.modules in
+          match List.filter (fun (m : Behavioral_ir.bmodule) ->
+                  not (List.mem m.name instantiated)) p.modules with
+          | [t] -> t.name
+          | t :: _ -> t.name
+          | [] -> (List.hd p.modules).name in
+        let top = pick_top () in
+        let name_map = module_name_index_for path in
+        let files, _ =
+          close_verible_dependencies
+            ~seed:path ~on_missing:prompt_locate_module name_map in
+        Unix.putenv "SV_DECOMP_SCAN" "1";
+        let out_path =
+          Filename.concat (Filename.get_temp_dir_name ())
+            (Printf.sprintf "sv_gui_atpg_%s.v" top) in
+        set_status (Printf.sprintf "ATPG synth: top=%s, %d file(s)…"
+                      top (List.length files));
+        let netlists, _ =
+          Synth_pipeline.run ~emit_verilog:true ~top ~out_path ~files () in
+        last_synth_out_path := Some out_path;
+        let buf = Buffer.create 4096 in
+        Buffer.add_string buf
+          (Printf.sprintf "ATPG coverage — top=%s, %d module(s)\n\n"
+             top (List.length netlists));
+        List.iter (fun (mn : Hier_synth.module_netlist) ->
+          Buffer.add_string buf
+            (Printf.sprintf "=== %s: %d cells ===\n"
+               mn.mn_name (List.length mn.mn_netlist.insts));
+          if mn.mn_netlist.insts = [] then
+            Buffer.add_string buf "  (empty netlist — skipped)\n\n"
+          else begin
+            let r = Fault_sim.run_atpg ~module_name:mn.mn_name
+                      mn.mn_netlist in
+            Buffer.add_string buf (Fault_sim.render_report r);
+            Buffer.add_string buf "\n"
+          end
+        ) netlists;
+        set_text (Buffer.contents buf);
+        set_status "ATPG complete")
+
+let do_show_bsdl () =
+  with_errors "show-bsdl" (fun () ->
+    let candidate =
+      match !last_synth_out_path with
+      | Some p when Sys.file_exists (p ^ ".bsd") -> Some (p ^ ".bsd")
+      | _ -> None in
+    let path = match candidate with
+      | Some p -> p
+      | None -> open_file_dialog ()
+    in
+    if path = "" then ()
+    else begin
+      let ic = open_in path in
+      let buf = Buffer.create 4096 in
+      (try while true do Buffer.add_channel buf ic 4096 done
+       with End_of_file -> ());
+      close_in ic;
+      set_text (Buffer.contents buf);
+      set_status (Printf.sprintf "Loaded %s" path)
+    end)
+
 (* ---------- ORFS handholding (Phase 1: launch + log streaming) ----------
    The GUI doesn't reimplement OpenROAD; it just writes a config.mk + sdc
    with sensible defaults and shells out to ORFS's make.  Output streams
@@ -2167,6 +2245,33 @@ let () =
   let t = new GMenu.factory topology_menu ~accel_group in
   ignore (t#add_item "Run ORFS layout..."  ~callback:do_orfs_run);
   ignore (t#add_item "Open ORFS run..."    ~callback:do_open_orfs_run);
+
+  (* DFT menu — scan-chain insert, boundary scan around macros + every
+     hierarchical child, IEEE 1149.1 JTAG TAP + BSDL pad insertion at
+     the chip top.  Toggles set the corresponding env vars at runtime;
+     synth_pipeline reads them per-invocation.                          *)
+  let dft_menu = bar_factory#add_submenu "DFT" in
+  Hashtbl.add menus "DFT" dft_menu;
+  let dft = new GMenu.factory dft_menu ~accel_group in
+  let mk_env_toggle label var =
+    let item = GMenu.check_menu_item ~label ~packing:dft_menu#append () in
+    item#set_active (Sys.getenv_opt var = Some "1");
+    ignore (item#connect#toggled ~callback:(fun () ->
+      Unix.putenv var (if item#active then "1" else "0");
+      set_status (Printf.sprintf "%s = %s" var
+                    (if item#active then "1" else "0"))));
+    item
+  in
+  ignore (mk_env_toggle "Scan-chain insert (SDFFs + chain)" "SV_DECOMP_SCAN");
+  ignore (mk_env_toggle "Memory boundary scan (around macros)"
+            "SV_DECOMP_MEM_BSR");
+  ignore (mk_env_toggle "Hier boundary scan (around every child)"
+            "SV_DECOMP_HIER_BSR");
+  ignore (mk_env_toggle "JTAG TAP + BSDL pads at chip top"
+            "SV_DECOMP_JTAG");
+  ignore (dft#add_separator ());
+  ignore (dft#add_item "Run ATPG..." ~callback:do_atpg);
+  ignore (dft#add_item "Show BSDL..." ~callback:do_show_bsdl);
 
   (* View menu. *)
   let v = new GMenu.factory view_menu ~accel_group in
