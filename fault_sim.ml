@@ -67,21 +67,31 @@ type report = {
   r_total_faults : int;
   r_detected     : int;
   r_patterns     : int;
+  r_directed_attempts : int;
+  r_directed_hits     : int;
 }
 
 let render_report (r : report) =
   let pct =
     if r.r_total_faults = 0 then 0.
     else 100. *. float_of_int r.r_detected /. float_of_int r.r_total_faults in
+  let directed_line =
+    if r.r_directed_attempts = 0 then ""
+    else
+      Printf.sprintf
+        "Directed   : %d / %d justifications hit\n"
+        r.r_directed_hits r.r_directed_attempts
+  in
   Printf.sprintf
-    "ATPG random-pattern coverage report\n\
-     ───────────────────────────────────\n\
+    "ATPG coverage report\n\
+     ────────────────────\n\
      Module     : %s\n\
      Patterns   : %d  (one int = 64 patterns; bit-parallel)\n\
      Faults     : %d  (stuck-at-{0,1} at every cell output)\n\
-     Detected   : %d  (%.2f %%)\n\
+     %sDetected   : %d  (%.2f %%)\n\
      Undetected : %d  (%.2f %%)\n"
-    r.r_module r.r_patterns r.r_total_faults r.r_detected pct
+    r.r_module r.r_patterns r.r_total_faults directed_line
+    r.r_detected pct
     (r.r_total_faults - r.r_detected) (100. -. pct)
 
 (* Simulate one fault: re-run the netlist with the fault net forced
@@ -134,9 +144,71 @@ let run_atpg
     ) faults
   done;
 
+  let n_detected_random =
+    Array.fold_left (fun acc b -> if b then acc + 1 else acc) 0 detected_table in
+  ignore n_detected_random;
+
+  (* ── Directed pass — backwards-justify activation for each fault
+     still undetected.  Random fills the rest of the input space, so
+     each successful justification gets the same propagation lottery
+     as a random pattern — but with the fault site GUARANTEED at the
+     right polarity.  Most of the gain over pure random comes from
+     activating deep AND/OR chains whose only-one-controlling-value
+     activation pattern has a 1/2ⁿ random hit rate.  *)
+  let directed_attempts = ref 0 in
+  let directed_hits = ref 0 in
+  let directed_seed = seed + n_pattern_words + 1 in
+  let directed_rng = Random.State.make [| directed_seed |] in
+  let random_word () =
+    let a = Random.State.bits directed_rng in
+    let b = Random.State.bits directed_rng in
+    let c = Random.State.bits directed_rng in
+    (a lsl 30) lor (c lsl 60) lor b in
+  let consumers = Atpg_directed.consumers_of c in
+  let dist_to_obs = Atpg_directed.propagation_distances c consumers in
+  List.iteri (fun idx fault ->
+    if not detected_table.(idx) then begin
+      let needed_val = if fault.f_stuck = 0 then 1 else 0 in
+      match Atpg_directed.justify_fault c ~consumers ~dist_to_obs
+              ~target_net:fault.f_net ~target_val:needed_val with
+      | None -> ()
+      | Some pi_pat ->
+          incr directed_attempts;
+          (* Build a pattern word per PI / FF.Q: bit 0 = the
+             justification value, bits 1..63 = randomised so the
+             remaining inputs explore the propagation space.  64
+             distinct patterns per fault — same as a random word
+             but with bit 0 pinned. *)
+          let input_pat name =
+            let nid =
+              try Hashtbl.find c.c_net_of_name name
+              with Not_found -> -1 in
+            let rand = random_word () in
+            if nid < 0 then rand
+            else
+              match Hashtbl.find_opt pi_pat nid with
+              | None -> rand
+              | Some v ->
+                  (* clear bit 0, set to required value *)
+                  let cleared = rand land (lnot 1) in
+                  if v = 1 then cleared lor 1 else cleared
+          in
+          let golden = run c ~input_pat in
+          if detected_with ~c ~golden ~fault ~input_pat then begin
+            detected_table.(idx) <- true;
+            incr directed_hits
+          end
+    end
+  ) faults;
+
   let n_detected =
     Array.fold_left (fun acc b -> if b then acc + 1 else acc) 0 detected_table in
+  if Sys.getenv_opt "ATPG_DEBUG" = Some "1" then
+    Printf.eprintf "[atpg] %s: random=%d, directed=%d/%d\n%!"
+      module_name n_detected_random !directed_hits !directed_attempts;
   { r_module       = module_name;
     r_total_faults = n_faults;
     r_detected     = n_detected;
-    r_patterns     = n_pattern_words * 64 }
+    r_patterns     = n_pattern_words * 64;
+    r_directed_attempts = !directed_attempts;
+    r_directed_hits = !directed_hits }
