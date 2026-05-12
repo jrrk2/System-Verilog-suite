@@ -124,6 +124,33 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
             (Lib_size.wire_cap_ff ());
           netlists'
   in
+  (* Memory boundary scan — wrap black-box macro ports with DFFs so
+     ATPG can observe driver-side faults and control consumer-side
+     logic across an unmodelled memory.  Off by default;
+     SV_DECOMP_MEM_BSR=1 enables.  Sits BEFORE scan_insert so the new
+     DFFs get stitched into the scan chain.                            *)
+  let netlists =
+    if not (Mem_boundary_scan.enabled () || Mem_boundary_scan.hier_enabled ())
+    then netlists
+    else begin
+      let macro_names = List.map (fun a ->
+        a.Mem_macro_resolve.module_name) mem_arts in
+      let wrap_all = Mem_boundary_scan.hier_enabled () in
+      let port_dirs = Mem_boundary_scan.build_port_dir_table netlists in
+      let total = ref 0 in
+      let netlists' = List.map (fun mn ->
+        let mn', n =
+          Mem_boundary_scan.wrap_module ~wrap_all_children:wrap_all
+            ~port_dirs ~macro_names mn in
+        total := !total + n;
+        mn'
+      ) netlists in
+      Printf.eprintf
+        "[mem_bsr] inserted %d boundary-scan FF(s) (macros=%d, all-children=%b)\n"
+        !total (List.length macro_names) wrap_all;
+      netlists'
+    end
+  in
   (* Scan-chain insertion — swaps DFF → SDFF and stitches every FF in
      emission order into a single chain.  Adds scan_en, scan_in inputs
      and a scan_out output to each module.  Off by default;
