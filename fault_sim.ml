@@ -230,12 +230,16 @@ let run_atpg
      worst-case at SV_DECOMP_PODEM_TIMEOUT_MS × undetected count. *)
   let podem_enabled =
     Sys.getenv_opt "SV_DECOMP_PODEM" = Some "1" in
+  let podem_cons = if podem_enabled then Atpg_podem.consumers_of c
+                   else Hashtbl.create 1 in
+  let podem_dist = if podem_enabled then Atpg_podem.distances_to_obs c
+                   else Hashtbl.create 1 in
   if podem_enabled then
     List.iteri (fun idx fault ->
       if not detected_table.(idx) then begin
         let needed_val = if fault.f_stuck = 0 then 1 else 0 in
         incr podem_attempts;
-        match Atpg_podem.podem c
+        match Atpg_podem.podem c ~cons:podem_cons ~dist:podem_dist
                 ~target_net:fault.f_net ~target_val:needed_val
                 ~budget:podem_budget with
         | None -> ()
