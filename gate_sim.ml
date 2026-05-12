@@ -323,6 +323,15 @@ let compile (nl : netlist) : compiled =
     if not in_topo.(i) then sorted := e :: !sorted) eval_arr;
   let evals_arr = Array.of_list (List.rev !sorted) in
   let names_arr = Array.of_list (List.rev !id_to_name) in
+  (* Rebuild [driver_of] keyed on indices INTO [evals_arr] — the
+     pre-sort indices stored during the initial walk are now stale
+     because the topo sort permuted [evals].  Without this, every
+     consumer of [c_driver_of] (Atpg_directed, Atpg_podem, the
+     PO/observable filter below) was looking up the WRONG cell. *)
+  let driver_of_sorted : (net_id, int) Hashtbl.t = Hashtbl.create 1024 in
+  Array.iteri (fun i (_, _, out) ->
+    if out >= 0 then Hashtbl.replace driver_of_sorted out i
+  ) evals_arr;
   { c_n_nets      = Hashtbl.length name_to_id;
     c_net_of_name = name_to_id;
     c_name_of_net = names_arr;
@@ -330,19 +339,13 @@ let compile (nl : netlist) : compiled =
     c_ff_q_nets   = !ff_qs;
     c_ff_d_nets   = !ff_ds;
     c_pi_nets     = List.map (fun (n, _) -> alloc n) nl.inputs;
-    (* A top-level output that only exists as a [Cell_verilog_emit] bus
-       reconstruction (`assign y = {y[3],…,y[0]}`) has no cell driver
-       and so no simulated value in our model — observing it would be
-       a no-op that masks real coverage.  Keep only POs that some cell
-       does drive, plus POs that match an FF.Q net (which gets its
-       value from the test bench in scan-flattened mode).             *)
     c_po_nets     =
       List.filter_map (fun (n, _) ->
         let id = alloc n in
-        if Hashtbl.mem driver_of id then Some id
+        if Hashtbl.mem driver_of_sorted id then Some id
         else if List.mem id !ff_qs then Some id
         else None) nl.outputs;
-    c_driver_of   = driver_of }
+    c_driver_of   = driver_of_sorted }
 
 (* ── Pattern-parallel simulation ─────────────────────────────────── *)
 
