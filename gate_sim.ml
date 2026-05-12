@@ -332,13 +332,29 @@ let compile (nl : netlist) : compiled =
   Array.iteri (fun i (_, _, out) ->
     if out >= 0 then Hashtbl.replace driver_of_sorted out i
   ) evals_arr;
-  { c_n_nets      = Hashtbl.length name_to_id;
+  (* PI nets = declared module inputs + any other undriven net that
+     isn't a FF.Q (those get seeded separately).  Bit-blasted bus
+     inputs like `op[0]` exist as undriven nets but aren't always
+     present in [nl.inputs]; without them, [run]'s input_pat seeding
+     skips them and they read as 0, which silently invalidates ATPG
+     PODEM patterns that backtrace to bit-level PIs.                  *)
+  let ff_q_set = List.fold_left (fun s n -> n :: s) [] !ff_qs in
+  let declared_pis = List.map (fun (n, _) -> alloc n) nl.inputs in
+  let pi_set = ref declared_pis in
+  let n_nets = Hashtbl.length name_to_id in
+  for nid = 0 to n_nets - 1 do
+    if not (Hashtbl.mem driver_of_sorted nid)
+       && not (List.mem nid ff_q_set)
+       && not (List.mem nid declared_pis)
+    then pi_set := nid :: !pi_set
+  done;
+  { c_n_nets      = n_nets;
     c_net_of_name = name_to_id;
     c_name_of_net = names_arr;
     c_evals       = evals_arr;
     c_ff_q_nets   = !ff_qs;
     c_ff_d_nets   = !ff_ds;
-    c_pi_nets     = List.map (fun (n, _) -> alloc n) nl.inputs;
+    c_pi_nets     = !pi_set;
     c_po_nets     =
       List.filter_map (fun (n, _) ->
         let id = alloc n in

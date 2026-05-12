@@ -185,17 +185,74 @@ let d_at_observable (c : compiled) values =
   List.exists (fun n -> is_d values.(n)) c.c_po_nets
   || List.exists (fun n -> is_d values.(n)) c.c_ff_d_nets
 
-(* Objective: an X-valued side input of the D-front cell closest to a
-   PO/FF.D, target = non-controlling value of the cell's family. *)
+(* Pick a (net, value) objective from a single d-front cell.  Returns
+   None if the cell isn't actionable (e.g. all inputs already settled,
+   or unknown family).  For each cell type, finds an X-valued input
+   whose pinning lets the D propagate through this gate.              *)
+let objective_for_cell (cell : string) (ins : net_id list) values =
+  let fam = cell_family cell in
+  let is_x n = values.(n) = VX in
+  let x_in () = List.find_opt is_x ins in
+  match fam with
+  | "AND2" | "AND3" | "AND4" | "NAND2" | "NAND3" | "NAND4" ->
+      (* Drive side X to V1 (non-controlling for AND). *)
+      (match x_in () with Some n -> Some (n, V1) | None -> None)
+  | "OR2"  | "OR3"  | "OR4"  | "NOR2"  | "NOR3"  | "NOR4" ->
+      (* Drive side X to V0 (non-controlling for OR). *)
+      (match x_in () with Some n -> Some (n, V0) | None -> None)
+  | "XOR2" | "XNOR2" ->
+      (* Either polarity propagates D; pick V0 for stability. *)
+      (match x_in () with Some n -> Some (n, V0) | None -> None)
+  | "INV" | "BUF" ->
+      (* Output = (inv) input; if input is D we'd already have
+         output as D-bar / D, so cell wouldn't be on d-front. *)
+      None
+  | "MUX2" ->
+      (* ins = [a; b; s].  Cases for D propagation:
+           D on s:  need a≠b → set whichever side is X to 0 first,
+                   then on next iter set the other to 1.
+           D on a:  need s=V0 (select a).
+           D on b:  need s=V1 (select b).  *)
+      (match ins with
+       | [a; b; s] ->
+           if is_d values.(s) then begin
+             if values.(a) = VX then Some (a, V0)
+             else if values.(b) = VX then Some (b, V1)
+             else None
+           end else if is_d values.(a) && is_x s then Some (s, V0)
+           else if is_d values.(b) && is_x s then Some (s, V1)
+           else None
+       | _ -> None)
+  | "AOI21" | "OAI21" ->
+      (* AOI21(a,b,ci) = NOT((a&b)|ci); for D on a or b, want other
+         AND-leg input at V1 and ci at V0.  For D on ci, want a&b=V0
+         which we achieve by setting either a or b to V0.            *)
+      (match ins with
+       | [a; b; ci] ->
+           let want_aoi = fam = "AOI21" in
+           let _ = want_aoi in
+           if is_d values.(a) then begin
+             if is_x b then Some (b, V1)
+             else if is_x ci then Some (ci, V0)
+             else None
+           end else if is_d values.(b) then begin
+             if is_x a then Some (a, V1)
+             else if is_x ci then Some (ci, V0)
+             else None
+           end else if is_d values.(ci) then begin
+             if is_x a then Some (a, V0)
+             else if is_x b then Some (b, V0)
+             else None
+           end else None
+       | _ -> None)
+  | _ -> None
+
+(* Objective: walk D-front cells closest-to-observable first, return
+   the first viable (net, value) objective from any of them.          *)
 let pick_objective (c : compiled) ~dist values =
   let cands = d_frontier c values in
   if cands = [] then None
   else begin
-    (* Score every candidate.  Cells without a distance entry (output
-       not reachable to an observable) sort last with a sentinel ∞
-       rather than being filtered — sometimes the only viable cell on
-       the D-front has no recorded distance but the next step's imply
-       will give it one as side inputs get settled.                  *)
     let inf = max_int in
     let scored = List.map (fun i ->
       let _, _, out = c.c_evals.(i) in
@@ -203,27 +260,13 @@ let pick_objective (c : compiled) ~dist values =
       (d, i)
     ) cands in
     let sorted = List.sort compare scored in
-    (* Walk candidates in distance order; pick the first one we can
-       actually act on (AND/OR family with an X side input).         *)
     let rec try_cands = function
       | [] -> None
       | (_, i) :: rest ->
           let cell, ins, _ = c.c_evals.(i) in
-          let fam = cell_family cell in
-          match non_controlling fam with
+          match objective_for_cell cell ins values with
+          | Some obj -> Some obj
           | None -> try_cands rest
-          | Some nc ->
-              let d_inputs =
-                List.filter (fun n -> is_d values.(n)) ins in
-              let x_inputs =
-                List.filter (fun n -> values.(n) = VX) ins in
-              (* If all side inputs are already at non-controlling
-                 value, the D should already be propagating — skip
-                 (the cell will exit d-front on the next imply). *)
-              if x_inputs = [] && d_inputs <> [] then try_cands rest
-              else match x_inputs with
-                | n :: _ -> Some (n, nc)
-                | [] -> try_cands rest
     in
     try_cands sorted
   end
@@ -414,27 +457,42 @@ let podem (c : compiled) ~cons ~dist ~target_net ~target_val ~budget =
     end else begin
       match pick_objective c ~dist values with
       | Some (objective_net, objective_val) ->
-          if debug && !steps < 8 then
-            Printf.eprintf "[podem] step %d obj=(net %d, val %s) d-front=%d\n%!"
+          if debug && !steps < 16 then
+            Printf.eprintf "[podem] step %d obj=(net %d, val %s) d-front=%d stack=%d\n%!"
               !steps objective_net
               (match objective_val with V0 -> "0" | V1 -> "1"
                                       | VD -> "D" | VDb -> "D'" | VX -> "X")
-              (List.length (d_frontier c values));
+              (List.length (d_frontier c values)) (Stack.length decisions);
           (match backtrace c values objective_net objective_val with
            | Some (pi, pv) ->
-               if debug && !steps < 8 then
+               if debug && !steps < 16 then
                  Printf.eprintf "[podem]   backtrace → pi=%d val=%s state=%s\n%!"
                    pi (match pv with V0 -> "0" | V1 -> "1" | _ -> "?")
                    (if Hashtbl.mem pi_state pi then "already-set" else "fresh");
                if Hashtbl.mem pi_state pi then begin
+                 if debug && !steps < 16 then
+                   Printf.eprintf "[podem]   → backtrack (pi already set)\n%!";
                  if not (backtrack ()) then stop := true
                end else
                  push_decision pi pv
            | None ->
-               if debug && !steps < 8 then
-                 Printf.eprintf "[podem]   backtrace returned None\n%!";
+               if debug && !steps < 16 then
+                 Printf.eprintf "[podem]   backtrace returned None → backtrack\n%!";
                if not (backtrack ()) then stop := true)
       | None ->
+          if debug && !steps < 16 then begin
+            let df = d_frontier c values in
+            let by_fam = List.fold_left (fun acc i ->
+              let cell, _, _ = c.c_evals.(i) in
+              let f = cell_family cell in
+              let n = try List.assoc f acc with Not_found -> 0 in
+              (f, n+1) :: (List.remove_assoc f acc)
+            ) [] df in
+            let breakdown = String.concat "," (List.map (fun (f,n) ->
+              Printf.sprintf "%s:%d" f n) by_fam) in
+            Printf.eprintf "[podem] step %d pick_objective None → backtrack (stack=%d, d-front=%d [%s])\n%!"
+              !steps (Stack.length decisions) (List.length df) breakdown
+          end;
           if not (backtrack ()) then stop := true
     end
   done;
