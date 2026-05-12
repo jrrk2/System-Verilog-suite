@@ -146,23 +146,87 @@ let compile (nl : netlist) : compiled =
                   || ('0' <= c && c <= '9')) then ok := false
         done; !ok) in
   let alias_of : (string, string) Hashtbl.t = Hashtbl.create 64 in
+  (* Width table from nl.wires + nl.inputs + nl.outputs — every named
+     bus/scalar carries a declared width.  Used by the concat-assign
+     processor to split lhs into bit ranges that align with each
+     concat piece's width.                                            *)
+  let width_of : (string, int) Hashtbl.t = Hashtbl.create 64 in
+  let add_w (n, w) = Hashtbl.replace width_of n w in
+  List.iter add_w nl.wires;
+  List.iter add_w nl.inputs;
+  List.iter add_w nl.outputs;
+  let lookup_w n =
+    try Hashtbl.find width_of n with Not_found -> 1 in
+  (* Trim leading/trailing whitespace.  String.trim exists since 4.00 *)
+  let split_concat s =
+    let s = String.trim s in
+    let n = String.length s in
+    if n < 2 || s.[0] <> '{' || s.[n-1] <> '}' then None
+    else
+      let inner = String.sub s 1 (n - 2) in
+      let parts =
+        String.split_on_char ',' inner
+        |> List.map String.trim
+        |> List.filter (fun p -> p <> "") in
+      Some parts in
+
   List.iter (fun (l, r) ->
-    if is_simple_id l && is_simple_id r then Hashtbl.replace alias_of l r
+    if is_simple_id l && is_simple_id r then
+      (* Bus-level alias: every bit-level lookup will route through. *)
+      Hashtbl.replace alias_of l r
+    else
+      match split_concat r with
+      | None -> ()  (* arith / slice / unrecognised — skip *)
+      | Some pieces when not (is_simple_id l) -> ignore pieces  (* skip slice-LHS for now *)
+      | Some pieces ->
+          (* lhs is a simple bus name; pieces are in MSB-to-LSB order.
+             Assign each piece-bit to the corresponding lhs[bit]. *)
+          let lhs_w = lookup_w l in
+          let bit_pos = ref (lhs_w - 1) in
+          List.iter (fun piece ->
+            if !bit_pos < 0 then ()
+            else begin
+              let pw = lookup_w piece in
+              (* piece occupies pw bits, MSB at the current bit_pos. *)
+              for k = pw - 1 downto 0 do
+                if !bit_pos < 0 then ()
+                else begin
+                  let lhs_bit =
+                    if lhs_w = 1 then l
+                    else Printf.sprintf "%s[%d]" l !bit_pos in
+                  let piece_bit =
+                    if pw = 1 then piece
+                    else Printf.sprintf "%s[%d]" piece k in
+                  Hashtbl.replace alias_of lhs_bit piece_bit;
+                  decr bit_pos
+                end
+              done
+            end
+          ) pieces
   ) nl.assigns;
   (* Find canonical name with path compression. *)
   let rec canon n =
     match Hashtbl.find_opt alias_of n with
     | Some n' when n' <> n -> canon n'
     | _ -> n in
-  (* For a name like "_n_1_[3]" or "_n_1_", rewrite the leading bus
-     part through [canon]. *)
-  let rewrite name =
-    if String.contains name '[' then begin
-      let i = String.index name '[' in
-      let bus = String.sub name 0 i in
-      let rest = String.sub name i (String.length name - i) in
-      canon bus ^ rest
-    end else canon name in
+  (* For a name like "_n_1_[3]" or "_n_1_": first try a full-name
+     bit-level alias (concat-rhs assigns added these — `_n_51_[3] →
+     _T__…_sum__57_`).  If none, fall back to bus-level canon on the
+     part before `[` so a bus-rename like `_n_1_ = _n_2_` reaches the
+     bit too.  Iterate to fixed point so chains of aliases (`_n_1_[3]
+     → _n_2_[3] → _n_3_[3]`) collapse.                                *)
+  let rec rewrite name =
+    match Hashtbl.find_opt alias_of name with
+    | Some name' when name' <> name -> rewrite name'
+    | _ ->
+        if String.contains name '[' then begin
+          let i = String.index name '[' in
+          let bus = String.sub name 0 i in
+          let rest = String.sub name i (String.length name - i) in
+          let bus' = canon bus in
+          if bus' = bus then name
+          else rewrite (bus' ^ rest)
+        end else canon name in
 
   let name_to_id : (string, net_id) Hashtbl.t = Hashtbl.create 1024 in
   let id_to_name = ref [] in

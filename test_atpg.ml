@@ -16,16 +16,47 @@ let derive_top path =
   let base = Filename.basename path in
   try Filename.chop_extension base with Invalid_argument _ -> base
 
+(* Args:
+     test_atpg <file1.sv> [<fileN.sv> ...] [--top NAME] [--words N]
+   Or with positional shorthand (legacy):
+     test_atpg <file.sv> <top> <pattern-words>
+   Anything ending in .sv / .v is a file; non-flag remaining positionals
+   fill --top and --words in order.                                     *)
+let parse_args argv =
+  let files = ref [] in
+  let top = ref None in
+  let n_words = ref 16 in
+  let positional = ref [] in
+  let i = ref 1 in
+  while !i < Array.length argv do
+    let a = argv.(!i) in
+    (match a with
+     | "--top" -> incr i; top := Some argv.(!i)
+     | "--words" -> incr i; n_words := int_of_string argv.(!i)
+     | s when Filename.check_suffix s ".sv"
+            || Filename.check_suffix s ".v" -> files := s :: !files
+     | s -> positional := s :: !positional);
+    incr i
+  done;
+  (match !top, List.rev !positional with
+   | None, t :: _ -> top := Some t
+   | _ -> ());
+  (match List.rev !positional with
+   | _ :: w :: _ -> (try n_words := int_of_string w with _ -> ())
+   | _ -> ());
+  (List.rev !files,
+   (match !top with Some t -> t
+                  | None -> derive_top (List.hd (List.rev !files))),
+   !n_words)
+
 let () =
   if Array.length Sys.argv < 2 then begin
-    prerr_endline "usage: test_atpg <file.sv> [top] [pattern-words]";
+    prerr_endline "usage: test_atpg <file1.sv> [<fileN.sv> ...] [--top NAME] [--words N]";
     exit 1
   end;
-  let path = Sys.argv.(1) in
-  let top =
-    if Array.length Sys.argv >= 3 then Sys.argv.(2) else derive_top path in
-  let n_words =
-    if Array.length Sys.argv >= 4 then int_of_string Sys.argv.(3) else 16 in
+  let files, top, n_words = parse_args Sys.argv in
+  let path = List.hd files in
+  ignore path;
   Unix.putenv "SV_DECOMP_SCAN" "1";
   (* DCE / kary_merge can prune the small smoke-test designs to empty;
      turn them off here unless the user explicitly overrides. *)
@@ -37,7 +68,7 @@ let () =
     top n_words (n_words * 64);
   let netlists, _ =
     Synth_pipeline.run ~emit_verilog:false
-      ~top ~out_path:"/tmp/_atpg_ignored.v" ~files:[path] () in
+      ~top ~out_path:"/tmp/_atpg_ignored.v" ~files () in
   List.iter (fun (mn : Hier_synth.module_netlist) ->
     Printf.printf "\n=== %s: %d cells, %d wires, %d inputs, %d outputs, %d assigns ===\n%!"
       mn.mn_name
