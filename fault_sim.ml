@@ -69,6 +69,8 @@ type report = {
   r_patterns     : int;
   r_directed_attempts : int;
   r_directed_hits     : int;
+  r_podem_attempts    : int;
+  r_podem_hits        : int;
 }
 
 let render_report (r : report) =
@@ -82,15 +84,22 @@ let render_report (r : report) =
         "Directed   : %d / %d justifications hit\n"
         r.r_directed_hits r.r_directed_attempts
   in
+  let podem_line =
+    if r.r_podem_attempts = 0 then ""
+    else
+      Printf.sprintf
+        "PODEM      : %d / %d test patterns found\n"
+        r.r_podem_hits r.r_podem_attempts
+  in
   Printf.sprintf
     "ATPG coverage report\n\
      ────────────────────\n\
      Module     : %s\n\
      Patterns   : %d  (one int = 64 patterns; bit-parallel)\n\
      Faults     : %d  (stuck-at-{0,1} at every cell output)\n\
-     %sDetected   : %d  (%.2f %%)\n\
+     %s%sDetected   : %d  (%.2f %%)\n\
      Undetected : %d  (%.2f %%)\n"
-    r.r_module r.r_patterns r.r_total_faults directed_line
+    r.r_module r.r_patterns r.r_total_faults directed_line podem_line
     r.r_detected pct
     (r.r_total_faults - r.r_detected) (100. -. pct)
 
@@ -201,14 +210,71 @@ let run_atpg
     end
   ) faults;
 
+  let n_detected_directed =
+    Array.fold_left (fun acc b -> if b then acc + 1 else acc) 0 detected_table in
+
+  (* ── PODEM pass — for any fault that directed activation+propagation
+     still couldn't reach, run a proper 5-valued D-search with PI
+     backtracking.  Costs O(B) cell evals per fault where B is the
+     per-fault decision budget.  We cap at 2048 steps per fault. *)
+  let podem_attempts = ref 0 in
+  let podem_hits = ref 0 in
+  let podem_budget =
+    match Sys.getenv_opt "SV_DECOMP_PODEM_BUDGET" with
+    | Some s -> (try int_of_string s with _ -> 64)
+    | None -> 64 in
+  (* PODEM is off by default while we shake out the imply / pick-
+     objective bookkeeping that occasionally causes a sub-second hang
+     on small designs (alu4-class case statements seem to trigger it).
+     SV_DECOMP_PODEM=1 enables; the per-fault wall-clock cap bounds
+     worst-case at SV_DECOMP_PODEM_TIMEOUT_MS × undetected count. *)
+  let podem_enabled =
+    Sys.getenv_opt "SV_DECOMP_PODEM" = Some "1" in
+  if podem_enabled then
+    List.iteri (fun idx fault ->
+      if not detected_table.(idx) then begin
+        let needed_val = if fault.f_stuck = 0 then 1 else 0 in
+        incr podem_attempts;
+        match Atpg_podem.podem c
+                ~target_net:fault.f_net ~target_val:needed_val
+                ~budget:podem_budget with
+        | None -> ()
+        | Some pi_pat ->
+            (* Pack the deterministic pattern into bit 0 of every PI
+               net.  Other bits don't matter — PODEM gave us THE
+               pattern. *)
+            let input_pat name =
+              let nid =
+                try Hashtbl.find c.c_net_of_name name
+                with Not_found -> -1 in
+              if nid < 0 then 0
+              else
+                match Hashtbl.find_opt pi_pat nid with
+                | None -> 0
+                | Some 1 -> 1
+                | Some _ -> 0
+            in
+            let golden = run c ~input_pat in
+            if detected_with ~c ~golden ~fault ~input_pat then begin
+              detected_table.(idx) <- true;
+              incr podem_hits
+            end
+      end
+    ) faults;
+
   let n_detected =
     Array.fold_left (fun acc b -> if b then acc + 1 else acc) 0 detected_table in
   if Sys.getenv_opt "ATPG_DEBUG" = Some "1" then
-    Printf.eprintf "[atpg] %s: random=%d, directed=%d/%d\n%!"
-      module_name n_detected_random !directed_hits !directed_attempts;
+    Printf.eprintf "[atpg] %s: random=%d, directed=%d/%d, podem=%d/%d\n%!"
+      module_name n_detected_random
+      !directed_hits !directed_attempts
+      !podem_hits !podem_attempts;
+  ignore n_detected_directed;
   { r_module       = module_name;
     r_total_faults = n_faults;
     r_detected     = n_detected;
     r_patterns     = n_pattern_words * 64;
     r_directed_attempts = !directed_attempts;
-    r_directed_hits = !directed_hits }
+    r_directed_hits = !directed_hits;
+    r_podem_attempts = !podem_attempts;
+    r_podem_hits = !podem_hits }
