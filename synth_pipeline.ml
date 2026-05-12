@@ -177,6 +177,27 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
         !total_ffs (List.length netlists');
       netlists'
   in
+  (* JTAG TAP + boundary-scan cells at the chip top.  Adds TCK/TMS/TDI/
+     TDO/TRST pins, wraps every non-JTAG IO pad with a BSC, chains the
+     BSCs and stitches them to a TAP controller (emitted as inline
+     Verilog after the synthesized modules).  Off by default;
+     SV_DECOMP_JTAG=1 enables.                                          *)
+  let bsdl_info_opt = ref None in
+  let netlists =
+    if not (Jtag_tap_insert.enabled ()) then netlists
+    else
+      List.map (fun (mn : Hier_synth.module_netlist) ->
+        if mn.mn_name <> top then mn
+        else begin
+          let mn', info = Jtag_tap_insert.wrap_top mn in
+          bsdl_info_opt := Some info;
+          Printf.eprintf
+            "[jtag] wrapped %d BSC cells around chip-top IO pads\n"
+            (List.length info.b_cells);
+          mn'
+        end
+      ) netlists
+  in
 
   if emit_verilog then begin
     let oc = open_out out_path in
@@ -230,6 +251,17 @@ let run ?(emit_verilog=true) ~top ~out_path ~files () =
           total_cells := !total_cells + List.length mn.mn_netlist.insts;
           total_children := !total_children + List.length mn.mn_child_insts
     ) netlists;
+    (* Append JTAG TAP body + write BSDL sidecar if enabled. *)
+    (match !bsdl_info_opt with
+     | None -> ()
+     | Some info ->
+         output_string oc
+           (Jtag_tap_insert.tap_verilog_body ~idcode:info.b_idcode);
+         let bsdl_path = out_path ^ ".bsd" in
+         let bsdl_oc = open_out bsdl_path in
+         output_string bsdl_oc (Jtag_tap_insert.render_bsdl info);
+         close_out bsdl_oc;
+         Printf.eprintf "[jtag] wrote BSDL %s\n" bsdl_path);
     close_out oc;
 
     Printf.eprintf
