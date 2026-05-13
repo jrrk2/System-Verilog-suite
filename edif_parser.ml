@@ -14,6 +14,10 @@ type instance_info = {
   name: string;
   cell_type: string;
   library: string;
+  init: string option;  (* (property INIT (string "...")) — LUT truth table,
+                           FF reset state, etc.  Raw verilog literal form
+                           ("64'hABCDEF...", "1'b0", etc.); decoded by the
+                           consumer.  None when no INIT property present. *)
 }
 
 type net_pin = {
@@ -209,7 +213,18 @@ let parse_instances content =
           let cell_type = Str.matched_group 1 inst_text in
           let _ = Str.search_forward (Str.regexp "libraryref +\\([^ )]+\\)") inst_text 0 in
           let library = Str.matched_group 1 inst_text in
-          instances := { name = inst_name; cell_type; library } :: !instances
+          (* Optional (property INIT (string "...")) — truth table for LUTs,
+             reset state for FFs.  Vivado puts at most one INIT per inst. *)
+          let init =
+            try
+              let _ = Str.search_forward
+                (Str.regexp
+                   "property +INIT +(string +\"\\([^\"]*\\)\"")
+                inst_text 0 in
+              Some (Str.matched_group 1 inst_text)
+            with Not_found -> None
+          in
+          instances := { name = inst_name; cell_type; library; init } :: !instances
         with _ -> ());
 
       find_instance (inst_end + 1)

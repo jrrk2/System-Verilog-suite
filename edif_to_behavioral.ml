@@ -3,6 +3,94 @@
 open Behavioral_ir
 open Edif_parser
 
+(* ── Verilog literal → bit list (LSB first) ───────────────────────────
+   Parses "1'b0", "4'h9", "64'h9009000000009009", "8'b00010110", etc.
+   Returns (width, [bit0; bit1; ...; bit(width-1)]).  *)
+let parse_verilog_literal (s : string) : int * int list =
+  (* Strip whitespace *)
+  let s = String.trim s in
+  match String.index_opt s '\'' with
+  | None -> (1, [0])  (* no width prefix — treat as 1-bit zero *)
+  | Some apos ->
+      let width = try int_of_string (String.sub s 0 apos) with _ -> 1 in
+      let base_char = if apos + 1 < String.length s then s.[apos + 1] else 'h' in
+      let digits =
+        if apos + 2 < String.length s
+        then String.sub s (apos + 2) (String.length s - apos - 2)
+        else "" in
+      let bits = ref [] in
+      (match Char.lowercase_ascii base_char with
+       | 'h' | 'x' ->
+           String.iter (fun c ->
+             let nib =
+               match c with
+               | '_' -> -1
+               | '0'..'9' -> Char.code c - Char.code '0'
+               | 'a'..'f' -> 10 + Char.code c - Char.code 'a'
+               | 'A'..'F' -> 10 + Char.code c - Char.code 'A'
+               | _ -> -1 in
+             if nib >= 0 then
+               for i = 3 downto 0 do
+                 bits := ((nib lsr i) land 1) :: !bits
+               done
+           ) digits
+       | 'b' ->
+           String.iter (fun c ->
+             match c with
+             | '0' -> bits := 0 :: !bits
+             | '1' -> bits := 1 :: !bits
+             | _ -> ()
+           ) digits
+       | 'd' ->
+           let v = try int_of_string digits with _ -> 0 in
+           for i = 0 to max width 32 - 1 do
+             bits := ((v lsr i) land 1) :: !bits
+           done
+       | _ -> ());
+      (* bits is currently MSB-first reversed; flip to LSB-first then truncate/pad. *)
+      let bs = List.rev !bits in
+      let bs = List.rev bs in  (* nothing — kept for clarity *)
+      let lsb_first = List.rev bs in
+      let n = List.length lsb_first in
+      if n >= width then
+        (width, List.filteri (fun i _ -> i < width) lsb_first)
+      else
+        (width, lsb_first @ List.init (width - n) (fun _ -> 0))
+
+(* Build a mux tree from a LUT INIT bit list and an input list.
+   [inputs] is LSB-first (input 0 controls bit-0 selection).
+   For k inputs, INIT has 2^k bits; bit j is the output when the inputs
+   form the integer j (LSB = input 0).                                  *)
+let rec lut_mux_tree (inputs : bexpr list) (init_bits : int list) : bexpr =
+  match inputs with
+  | [] ->
+      let b = match init_bits with [b] -> b | _ -> 0 in
+      BConst { value = b; width = 1 }
+  | hi :: rest ->
+      (* Split init_bits in half: lower half = output when hi=0, upper
+         half = output when hi=1. *)
+      let n = List.length init_bits in
+      let half = n / 2 in
+      let lo_bits = List.filteri (fun i _ -> i < half) init_bits in
+      let hi_bits = List.filteri (fun i _ -> i >= half) init_bits in
+      BCond {
+        condition = hi;
+        then_val  = lut_mux_tree rest hi_bits;
+        else_val  = lut_mux_tree rest lo_bits;
+      }
+
+(* Decode a LUTk's INIT into a behavioral expression given the input
+   pins in order I0, I1, …, I(k-1).  Returns None if the INIT property
+   couldn't be parsed.                                                  *)
+let lut_to_bexpr (init : string option) (inputs : bexpr list) : bexpr option =
+  match init with
+  | None -> None
+  | Some s ->
+      let width, bits = parse_verilog_literal s in
+      let k = List.length inputs in
+      if width <> 1 lsl k then None
+      else Some (lut_mux_tree inputs bits)
+
 (* Map RTL primitives to behavioral expressions *)
 let map_rtl_primitive cell_type inputs =
   match cell_type with
@@ -67,14 +155,88 @@ let map_rtl_primitive cell_type inputs =
            Some (BCond { condition = s; then_val = i1; else_val = i0 })
        | _ -> None)
 
-  | "OBUF" | "IBUF" ->
+  | "OBUF" | "IBUF" | "BUFG" | "BUF" ->
       (match inputs with
        | [a] -> Some a  (* Passthrough *)
+       | _ -> None)
+
+  | "INV" ->
+      (match inputs with
+       | [a] -> Some (BUnOp { op = BNot; operand = a;
+                              result_type = BInt { width = 1; signed = Unsigned } })
        | _ -> None)
 
   | "GND" -> Some (BConst { value = 0; width = 1 })
   | "VCC" -> Some (BConst { value = 1; width = 1 })
 
+  | _ -> None
+
+(* Xilinx full-synth primitives with parameters (INIT).  Looks up the
+   instance's INIT property for LUTs; returns None for primitives that
+   need other handling (FFs → BSequential, CARRY4 → multi-output).    *)
+let map_xilinx_comb (cell_type : string) (init : string option)
+    (inputs : bexpr list) : bexpr option =
+  match cell_type with
+  | "LUT1" | "LUT2" | "LUT3" | "LUT4" | "LUT5" | "LUT6" ->
+      lut_to_bexpr init inputs
+  | "MUXF7" | "MUXF8" | "MUXF9" ->
+      (* MUXF{N}(I0, I1, S) → S ? I1 : I0 *)
+      (match inputs with
+       | [i0; i1; s] -> Some (BCond { condition = s; then_val = i1; else_val = i0 })
+       | _ -> None)
+  | _ -> None
+
+(* Is this cell type a Xilinx full-synth primitive?  Used to decide
+   between "lower to gates" and "treat as a hierarchical child".      *)
+let is_xilinx_primitive cell_type =
+  match cell_type with
+  | "LUT1" | "LUT2" | "LUT3" | "LUT4" | "LUT5" | "LUT6"
+  | "MUXF7" | "MUXF8" | "MUXF9"
+  | "FD" | "FDR" | "FDS" | "FDC" | "FDP"
+  | "FDE" | "FDRE" | "FDSE" | "FDCE" | "FDPE"
+  | "FDR_1" | "FDS_1" | "FDC_1" | "FDP_1"
+  | "CARRY4" | "CARRY8" | "MUXCY" | "XORCY"
+  | "INV" | "BUFG" | "BUFGCE" | "BUF" -> true
+  | _ -> false
+
+(* Xilinx flip-flop classification.
+   sync_rst   : sync reset to 0 (R pin)
+   sync_set   : sync set to 1 (S pin)
+   async_rst  : async clear to 0 (CLR pin)
+   async_set  : async preset to 1 (PRE pin)
+   has_ce     : has CE pin
+   The pin name lists below capture what Vivado uses post-`synth_design`. *)
+type ff_kind = {
+  sync_rst   : bool;
+  sync_set   : bool;
+  async_clr  : bool;
+  async_pre  : bool;
+  has_ce     : bool;
+}
+
+let xilinx_ff_kind = function
+  | "FD"    -> Some { sync_rst=false; sync_set=false; async_clr=false;
+                      async_pre=false; has_ce=false }
+  | "FDE"   -> Some { sync_rst=false; sync_set=false; async_clr=false;
+                      async_pre=false; has_ce=true  }
+  | "FDR"   -> Some { sync_rst=true;  sync_set=false; async_clr=false;
+                      async_pre=false; has_ce=false }
+  | "FDRE"  -> Some { sync_rst=true;  sync_set=false; async_clr=false;
+                      async_pre=false; has_ce=true  }
+  | "FDS"   -> Some { sync_rst=false; sync_set=true;  async_clr=false;
+                      async_pre=false; has_ce=false }
+  | "FDSE"  -> Some { sync_rst=false; sync_set=true;  async_clr=false;
+                      async_pre=false; has_ce=true  }
+  | "FDC" | "FDC_1" ->
+                Some { sync_rst=false; sync_set=false; async_clr=true;
+                       async_pre=false; has_ce=false }
+  | "FDCE"  -> Some { sync_rst=false; sync_set=false; async_clr=true;
+                      async_pre=false; has_ce=true  }
+  | "FDP" | "FDP_1" ->
+                Some { sync_rst=false; sync_set=false; async_clr=false;
+                       async_pre=true;  has_ce=false }
+  | "FDPE"  -> Some { sync_rst=false; sync_set=false; async_clr=false;
+                      async_pre=true;  has_ce=true  }
   | _ -> None
 
 (* Convert a single EDIF cell to a Behavioral IR module *)
@@ -227,28 +389,129 @@ let convert_cell (edif : edif_data) =
     | "RTL_EQ" | "RTL_EQ2" | "RTL_EQ25" | "RTL_NEQ" | "RTL_NEQ3" | "RTL_LT"
     | "RTL_MUX" | "RTL_MUX1" | "RTL_MUX5" | "RTL_MUX11" | "RTL_MUX16" | "RTL_MUX86"
     | "RTL_MUX167" | "RTL_MUX180" | "RTL_MUX189" | "RTL_MUX198"
-    | "GND" | "VCC" | "OBUF" | "IBUF" -> true
+    | "GND" | "VCC" | "OBUF" | "IBUF" | "BUFG" | "BUF" | "INV" -> true
+    | s when is_xilinx_primitive s -> true
     | _ -> false
   in
 
-  (* Create continuous assignments for RTL primitives *)
-  let assignments = ref [] in
-  List.iter (fun (inst : instance_info) ->
-    let is_primitive = is_known_primitive inst.cell_type in
+  (* Lookup a single pin's net for an instance, returning a bexpr.       *)
+  let get_pin_net inst_name pin_name : bexpr option =
+    try Some (net_to_expr (Hashtbl.find pin_to_net (inst_name, pin_name)))
+    with Not_found -> None
+  in
+  let pin_or_zero inst pin =
+    match get_pin_net inst pin with
+    | Some e -> e
+    | None -> BConst { value = 0; width = 1 } in
 
-    if is_primitive then begin
-      match get_output inst.name with
-      | Some output ->
-          (* Skip assignments to constant nets *)
-          if output = "<const0>" || output = "<const1>" then ()
-          else
-            let inputs = get_inputs inst.name in
-            (match map_rtl_primitive inst.cell_type inputs with
-             | Some expr ->
-                 assignments := BAssign { lhs = output; rhs = expr } :: !assignments
-             | None -> ())
-      | None -> ()
+  (* Create continuous assignments for primitives.  Sequential elements
+     (LUT/MUXF outputs that are direct combinational, plus Xilinx FFs)
+     accumulate separately so they can be emitted as proper processes. *)
+  let assignments = ref [] in
+  let sequential_processes = ref [] in
+  List.iter (fun (inst : instance_info) ->
+    let ct = inst.cell_type in
+
+    (* Combinational Xilinx primitives — LUT*, MUXF*, INV, BUFG, IBUF, OBUF. *)
+    (if is_xilinx_primitive ct then begin
+      match get_output inst.name, xilinx_ff_kind ct with
+      | Some output, None when output <> "<const0>" && output <> "<const1>" ->
+          (* Collect inputs in fixed pin-name order. *)
+          let in_pins = match ct with
+            | "LUT1" -> ["I0"]
+            | "LUT2" -> ["I0"; "I1"]
+            | "LUT3" -> ["I0"; "I1"; "I2"]
+            | "LUT4" -> ["I0"; "I1"; "I2"; "I3"]
+            | "LUT5" -> ["I0"; "I1"; "I2"; "I3"; "I4"]
+            | "LUT6" -> ["I0"; "I1"; "I2"; "I3"; "I4"; "I5"]
+            | "MUXF7" | "MUXF8" | "MUXF9" -> ["I0"; "I1"; "S"]
+            | "INV" | "BUFG" | "BUFGCE" | "BUF" -> ["I"]
+            | _ -> []
+          in
+          let inputs = List.filter_map (get_pin_net inst.name) in_pins in
+          let expr_opt =
+            if List.length inputs = List.length in_pins then
+              match ct with
+              | "INV" | "BUFG" | "BUFGCE" | "BUF" ->
+                  map_rtl_primitive (if ct = "INV" then "INV" else "IBUF") inputs
+              | _ -> map_xilinx_comb ct inst.init inputs
+            else None
+          in
+          (match expr_opt with
+           | Some expr ->
+               assignments := BAssign { lhs = output; rhs = expr } :: !assignments
+           | None -> ())
+      | _ -> ()
     end
+    else if is_known_primitive ct then begin
+      (* Legacy RTL_* + GND/VCC path — unchanged from before. *)
+      match get_output inst.name with
+      | Some output when output <> "<const0>" && output <> "<const1>" ->
+          let inputs = get_inputs inst.name in
+          (match map_rtl_primitive ct inputs with
+           | Some expr ->
+               assignments := BAssign { lhs = output; rhs = expr } :: !assignments
+           | None -> ())
+      | _ -> ()
+    end);
+
+    (* Xilinx FF — emit a BSequential. *)
+    (match xilinx_ff_kind ct, get_pin_net inst.name "Q" with
+     | Some k, Some q_expr ->
+         let q_name = match q_expr with BVar n -> n | _ -> inst.name ^ "_Q" in
+         let d_e = pin_or_zero inst.name "D" in
+         let clk_name = match get_pin_net inst.name "C" with
+           | Some (BVar n) -> n | _ -> "clk" in
+         let ce_e = if k.has_ce then get_pin_net inst.name "CE" else None in
+         (* Body: optionally gated by CE.  When the FF has a sync R or
+            S, that takes priority inside the clocked branch. *)
+         let core_assign =
+           let d_with_sync_rst_set =
+             if k.sync_rst then
+               BCond { condition = pin_or_zero inst.name "R";
+                       then_val  = BConst { value = 0; width = 1 };
+                       else_val  = d_e }
+             else if k.sync_set then
+               BCond { condition = pin_or_zero inst.name "S";
+                       then_val  = BConst { value = 1; width = 1 };
+                       else_val  = d_e }
+             else d_e in
+           let rhs = match ce_e with
+             | Some ce -> BCond { condition = ce;
+                                  then_val  = d_with_sync_rst_set;
+                                  else_val  = BVar q_name }
+             | None -> d_with_sync_rst_set in
+           [BAssign { lhs = q_name; rhs }] in
+         let body =
+           if k.async_clr then
+             [BIf { condition = pin_or_zero inst.name "CLR";
+                    then_stmts = [BAssign { lhs = q_name;
+                                           rhs = BConst { value = 0; width = 1 } }];
+                    else_stmts = core_assign }]
+           else if k.async_pre then
+             [BIf { condition = pin_or_zero inst.name "PRE";
+                    then_stmts = [BAssign { lhs = q_name;
+                                           rhs = BConst { value = 1; width = 1 } }];
+                    else_stmts = core_assign }]
+           else core_assign in
+         let reset, reset_async =
+           if k.async_clr then
+             (Some (match get_pin_net inst.name "CLR" with
+                    | Some (BVar n) -> n | _ -> "clr"), true)
+           else if k.async_pre then
+             (Some (match get_pin_net inst.name "PRE" with
+                    | Some (BVar n) -> n | _ -> "pre"), true)
+           else (None, false) in
+         sequential_processes := BSequential {
+           name = inst.name ^ "_ff";
+           clock = clk_name;
+           clock_edge = `Pos;
+           reset;
+           reset_edge = (if Option.is_some reset then Some `Pos else None);
+           reset_async;
+           body;
+         } :: !sequential_processes
+     | _ -> ())
   ) edif.instances;
 
   (* Create a combinational process *)
@@ -326,7 +589,7 @@ let convert_cell (edif : edif_data) =
     name = edif.module_name;
     params = [];
     signals;
-    processes = [main_process];
+    processes = main_process :: List.rev !sequential_processes;
     instances = hier_instances;
     funcs = [];
     mems = []; attrs = [];
