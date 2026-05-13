@@ -213,6 +213,9 @@ at pre-flight.  Stages run in this order:
 | `Kary_merge` | `kary_merge.ml` | Collapse same-family AND2/OR2 chains and trees into AND3/AND4/OR3/OR4.  *Duplicating* absorb — a high-fanout 2-input driver is inlined into every consumer, then `dce_module` sweeps it if all consumers absorbed it.  Iterates to fixed point (cap 16, override `SV_DECOMP_KARY_MAX_PASSES`).  Slack-aware: `SV_DECOMP_TIMING_REF=<6_finish.rpt>` falls back to single-fanout absorb on cells that were on the prior run's worst path, so widening a chain head from `OR2_X4` (40 ps) to `OR4_X4` (72 ps) only happens off the critical path.  `SV_DECOMP_NO_KARY_MERGE=1` skips entirely |
 | `Tie_fanout` | `tie_fanout.ml` | Splits over-loaded `LOGIC0_X1` / `LOGIC1_X1` cells before OpenROAD's `repair_tie_fanout` does.  `SV_DECOMP_TIE_FANOUT_MAX=N` (default 16); `SV_DECOMP_NO_TIE_FAN=1` skips |
 | `Lib_size` | `lib_size.ml` | Liberty-driven drive-strength sizing using the same NLDM tables OpenSTA consults at signoff.  `SV_DECOMP_NO_SIZE=1` skips |
+| `Mem_boundary_scan` (opt) | `mem_boundary_scan.ml` | Wrap black-box memory macros (and optionally every hierarchical child) with bit-level DFFs so ATPG can observe driver-side faults and control consumer-side logic across an unmodelled child. `SV_DECOMP_MEM_BSR=1` (macros only) / `SV_DECOMP_HIER_BSR=1` (all children). Port direction comes from each child's `mn_real_inputs`/`mn_real_outputs` |
+| `Scan_insert` (opt) | `scan_insert.ml` | Swap `DFF_X1` → `SDFF_X1` (and `DFFR` / `DFFS` / `DFFRS` variants) and stitch every flip-flop in emission order into a single scan chain. Adds `scan_en`, `scan_in` inputs and `scan_out` output. `SV_DECOMP_SCAN=1` enables |
+| `Jtag_tap_insert` (opt) | `jtag_tap_insert.ml` | IEEE 1149.1 TAP + boundary-scan cells on the chip top. Adds `jtag_tck`/`tms`/`tdi`/`trst_n` inputs and `jtag_tdo` output; wraps every other top-level IO with a BC\_1-style BSC (shift-mux + shift-FF + update-FF + output-mux, all from lib\_map primitives); appends the TAP RTL body to the output Verilog; writes a STD\_1149\_1\_2001-conformant BSDL file to `<out>.bsd`. `SV_DECOMP_JTAG=1` enables; `SV_DECOMP_JTAG_IDCODE=32'h...` overrides the default IDCODE |
 | `Block_arch_swap.report` | `block_arch_swap.ml` | Predict-only report on which arith blocks would be candidates for an arch swap; actual swap is `SV_DECOMP_ARCH_SWAP=1` gated and cert-checked |
 | `Cell_verilog_emit` | `cell_verilog_emit.ml` | Write OpenROAD-readable structural Verilog: bus reconstruction emitted as `assign bus = {bit_w-1, …, 1, 0};` so OpenSTA can trace each gate's full bus driver |
 
@@ -270,6 +273,107 @@ Sklansky, Kogge-Stone alternates). All five arches sit on top of
 the same bit-blasting primitives in `lib_map`; per-(arch, width)
 correctness is proved standalone via `verify-arch`.
 
+## DFT (scan + ATPG + JTAG / BSDL)
+
+The synth pipeline carries an optional DFT track that turns any
+design into a scan-flattenable, ATPG-friendly, JTAG-accessible chip.
+All four passes are env-gated and compose freely:
+
+| Env flag | Pass | Effect |
+|---|---|---|
+| `SV_DECOMP_SCAN=1` | `scan_insert.ml` | Functional DFFs → scan SDFFs, single chain in emission order |
+| `SV_DECOMP_MEM_BSR=1` | `mem_boundary_scan.ml` | BSCs around every memory-macro port |
+| `SV_DECOMP_HIER_BSR=1` | `mem_boundary_scan.ml` | BSCs around every hierarchical child instance (superset of `MEM_BSR`) |
+| `SV_DECOMP_JTAG=1` | `jtag_tap_insert.ml` | IEEE 1149.1 TAP + per-pad BSCs at the chip top, BSDL sidecar emitted |
+
+`test_atpg.exe` ties them together: it runs the full synth pipeline,
+forces `SV_DECOMP_SCAN=1`, then runs bit-parallel fault simulation
+(`fault_sim.ml`) on each module's gate netlist.  Three-tier ATPG:
+
+1. **Random patterns** — 64-pattern-wide ints, `n_pattern_words` of
+   them per module (default 16 → 1024 patterns).  `gate_sim.ml` does
+   the bit-parallel propagation.
+2. **Directed pass** (`atpg_directed.ml`) — for each fault not yet
+   covered, backwards-justify a PI assignment that activates the fault
+   site, randomise the remaining inputs, re-simulate.  Catches deep
+   AND/OR chains whose 1/2ⁿ random hit rate makes pure random
+   ineffective.
+3. **PODEM** (`atpg_podem.ml`) — 5-valued logic ({0, 1, X, D, D̄}),
+   D-frontier maintenance, decision-stack backtracking.  Off by
+   default; `SV_DECOMP_PODEM=1` enables; `SV_DECOMP_PODEM_BUDGET=<N>`
+   caps per-fault decisions (default 64); `SV_DECOMP_PODEM_TIMEOUT_MS`
+   wall-clocks per fault.  The objective picker handles AND/OR/NAND/
+   NOR/XOR/XNOR/INV/BUF/MUX2/AOI21/OAI21; XOR / MUX support is what
+   lifts coverage on adder-heavy and mux-cascade designs (`alu4`
+   14 % → 98 % after the picker fix).
+
+### Coverage results
+
+Measured with `SV_DECOMP_SCAN=1 SV_DECOMP_HIER_BSR=1 SV_DECOMP_JTAG=1
+SV_DECOMP_PODEM=1`, 16 pattern-words (1024 random patterns):
+
+| Block | Cells | Faults | Coverage |
+|---|---:|---:|---:|
+| `dffe_basic` | 13 | 8 | 100.00 % |
+| `gcd` (top) | 115 | 230 | 100.00 % |
+| `distributed_dual_port_ram` | 4622 | 9178 | 99.96 % |
+| `picosoc_mem__W256` | 281 | 342 | 99.42 % |
+| `gcd` / LtComparator | 100 | 196 | 98.98 % |
+| `single_port_bram` | 70 | 138 | 98.55 % |
+| `sdff_basic` | 33 | 64 | 98.44 % |
+| `alu4` | 94 | 180 | 98.33 % |
+| picorv32 CPU | 12 646 | 23 802 | 94.04 % |
+| `aes_sbox` (8→8 LUT) | 6 241 | 12 482 | 93.99 % (PODEM 352 / 1102) |
+| `spimemio` | 1 395 | 2 534 | 92.42 % |
+| `simpleuart` | 1 832 | 3 400 | 92.32 % |
+| `fifo_v3_small` | 89 | 176 | 88.64 % |
+| `picosoc` (top, all DFT) | 2 287 | 4 156 | 85.23 % |
+| `aes_rcon` | 535 | 1070 | 72.99 % |
+
+Picosoc top coverage progresses with each DFT layer:
+
+| Configuration | picosoc top coverage |
+|---|---:|
+| no DFT | 59.51 % |
+| `SCAN` | 59.51 % (same — coverage limited by black-box children) |
+| `SCAN` + `MEM_BSR` | 59.51 % (SRAM is inside a wrapper — wrapper itself unchanged) |
+| `SCAN` + `JTAG` | 64.44 % (BSCs themselves all testable; +506 faults all detected) |
+| `SCAN` + `HIER_BSR` | 83.18 % (boundary FFs around CPU/UART/SPI/MEM unblock internal cones) |
+| `SCAN` + `HIER_BSR` + `JTAG` | **85.23 %** |
+
+The residual ~15 % at picosoc top is scan-shift infrastructure
+(`clk`/`reset`/`scan_en`/`scan_in` fanout, tie-cell paths) plus a
+handful of structurally unreachable faults — fundamentally not
+addressable through combinational ATPG.  `aes_rcon`'s low 72.99 % is
+the same kind of structural unreachability: 24 of every 32 output
+bits are constant-zero by design, so stuck-at-0 faults on those bits
+have a fault-equals-good-value relation and are flagged "undetected"
+where an industrial tool would report "untestable".
+
+The pipeline carries the full chip-level structure: scan chain, mem
+BSR, hier BSR, JTAG TAP + 126-bit boundary-scan register on picosoc.
+The BSDL output passes `STD_1149_1_2001` boilerplate and is consumable
+by external JTAG tools.
+
+### GUI hook
+
+`sv_gui.exe` exposes the four toggles + ATPG runner under a top-level
+**DFT** menu:
+
+```
+DFT
+├─ [ ] Scan-chain insert (SDFFs + chain)
+├─ [ ] Memory boundary scan (around macros)
+├─ [ ] Hier boundary scan (around every child)
+├─ [ ] JTAG TAP + BSDL pads at chip top
+├─ ───────────
+├─ Run ATPG…       (renders coverage report in the text view)
+└─ Show BSDL…      (auto-finds the most recent .bsd sidecar)
+```
+
+The check-items toggle the env vars at runtime; flipping them and
+re-running ATPG picks up the new configuration without restarting.
+
 ## Cell-mapped equivalence (`test_synth_equiv.exe`)
 
 Closes the verification loop: prove that the cell-mapped Verilog we
@@ -310,6 +414,8 @@ Built via `dune build`. The most-used executables:
 | `ff_stats.exe` | `ff_stats.ml` | Run all four frontends on a single testcase and report each one's Q__Q / Q__D set, with pairwise overlap numbers |
 | `random_sv_gen.exe` | `random_sv_gen.ml` | Constrained-random SV generator. `--features mixed` rotates through nine modes |
 | `sv_decompiler.exe script <file.lua>` | `sv_decompiler.ml` + `sv_lua.ml` | Run a Lua script with the `svd.*` API exposed (parse / pick / miter / gate_miter / liberty / expand / bir / insts / timing / emit_verilog / emit_vhdl / write_verilog / write_vhdl / convert_hdl) |
+| `test_atpg.exe` | `test_atpg.ml` | Run the DFT pipeline (forces `SV_DECOMP_SCAN=1`, honours `SV_DECOMP_MEM_BSR` / `HIER_BSR` / `JTAG` / `PODEM`) on a fileset and print a per-module coverage report. `--top <name>` and `--words <N>` (default 16 = 1024 random patterns) |
+| `sv_gui.exe` | `sv_gui.ml` | lablgtk3 shell. **DFT menu** toggles the four env flags + runs ATPG and shows BSDL. Also has Decompile (Parse Verible/Slang/yosys/verilator/VHDL), Verify (Z3 miter, Cyclesim), and Topology (Run ORFS layout, Open ORFS run) menus. Lua scripts in `gui_scripts/*.lua` auto-register additional menu items via `gui.add_item` |
 
 ## Test infrastructure
 

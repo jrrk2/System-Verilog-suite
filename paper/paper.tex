@@ -545,6 +545,27 @@ Section~\ref{sec:resynth}.  Predicted vs.\ measured prediction
 error of 0.005\,\% on an 8-bit MAC, with the swap fully backed by
 a Z3 leaf certificate.
 
+\paragraph{DFT and structural ATPG.} The same gate netlist that the
+miter verifies feeds an optional design-for-test track:
+\texttt{scan\_insert.ml} swaps every \texttt{DFF\_X1} variant for its
+scan equivalent and stitches the chain;
+\texttt{mem\_boundary\_scan.ml} wraps black-box children with
+bit-level boundary FFs so an unmodelled memory or sub-block doesn't
+block ATPG observation; \texttt{jtag\_tap\_insert.ml} adds an
+IEEE~1149.1 TAP and BC\_1 cells on every chip-top pad, emitting a
+\texttt{STD\_1149\_1\_2001}-conformant BSDL sidecar.  A three-tier
+fault simulator (random, backwards-justified directed, PODEM with
+five-valued logic and D-frontier backtracking) reports per-module
+stuck-at coverage on the gate netlist.  Picosoc with the full DFT
+stack reaches 85\,\% top-level coverage and 92--99\,\% across CPU,
+SPI flash controller, UART, and memory wrapper; the AES S-box hits
+94\,\% with PODEM contributing 352 of 1102 attempted patterns
+(random alone is structurally weak on 256-entry case statements).
+The track is presented here as a structural composition demo --- it
+is not a formal contribution of this paper, but it shares the same
+gate netlist representation, which is why the same boundary
+construction works.
+
 \section{Related work}
 
 Yosys + ABC \cite{wolf2013yosys,brayton2010abc} is the
@@ -599,20 +620,29 @@ at every step it lowers the design.  The same construction makes
 wide arithmetic tractable for SMT and grounds an analytical
 post-layout resynth predictor in Z3-verified leaves.
 
-Open work, in roughly the order we expect to take it:
+Since the initial draft (\texttt{paper-v1}) three of the
+then-open items have landed: the cascaded MAC has been pushed
+through ORFS layout to post-route; LHS-context width propagation
+is fixed at the Verible converter source so consumers see
+consistent widths without per-operator workarounds in the miter;
+and the yosys-as-oracle parallel-correctness harness is in tree
+as \texttt{test\_yosys\_oracle\_sweep.exe}.  The structural DFT
+track described in Section~\ref{sec:eval} (scan, hierarchical
+boundary scan, JTAG TAP, BSDL) is also new since v1.  Open work,
+in roughly the order we expect to take it:
 
 \begin{enumerate}
 \item Auto-cascade for \texttt{gen\_mul} above the SMT
 threshold, lifting the manual buffering convention into the
 lib\_map output so any wide multiplier inherits the cascade
 verification path.
-\item Push the cascaded MAC through ORFS layout to close the
-loop on multiplier-bound architecture swaps.
-\item LHS-context width propagation in the Verible converter ---
-currently worked-around per operator in z3\_miter --- so that
-all consumers see consistent widths.
-\item A yosys-as-oracle parallel-correctness harness that
-reports BIR-vs-yosys disagreements as part of CI.
+\item Treat hard-macro pins as pseudo-observation / pseudo-control
+points in the fault simulator (the no-area-cost alternative to
+the structural BSC wrap around memories), so designs that don't
+want the extra latency get the same chip-top coverage gain.
+\item Naja interchange-format support so per-leaf SMT
+certificates can be cached and replayed across runs and tools,
+in line with the cert-gated swap construction already in tree.
 \end{enumerate}
 
 The codebase is open source at

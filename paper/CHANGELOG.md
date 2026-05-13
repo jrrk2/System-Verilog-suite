@@ -28,3 +28,30 @@ adjust.
 
 Subsequent material changes (none yet) will be listed below as
 new bullets under the next `paper-vN` heading.
+
+## paper-v2 — DFT track and v1 follow-up
+
+Material changes since `paper-v1`:
+
+- New Evaluation paragraph "DFT and structural ATPG" describing the
+  three optional passes (`scan_insert`, `mem_boundary_scan`,
+  `jtag_tap_insert`) and the three-tier fault simulator (random,
+  directed, PODEM).  Headline coverage numbers reported:
+  picosoc top 85.23 % with full DFT stack, picorv32 CPU 94.04 %,
+  AES S-box 93.99 % (PODEM 352 / 1102 patterns).
+- Three of the four v1 open-work items removed because they
+  landed in tree: cascaded MAC ORFS layout, Verible LHS-context
+  width propagation, yosys-as-oracle parallel-correctness sweep.
+- The remaining open-work list now lists the auto-cascade
+  `gen_mul`, fault-sim pseudo-IO for hard macros (no-area
+  alternative to BSC wrap), and Naja interchange certificate
+  caching.
+
+Numbers added to the README that are not yet in the paper
+(referenced as future tightening if a v3 needs them):
+
+- per-block coverage table for the smaller designs (gcd 100 %,
+  distributed\_dual\_port\_ram 99.96 %, fifo\_v3\_small 88.64 %,
+  aes\_rcon 72.99 %).
+- The picosoc DFT-layer breakdown
+  (no-DFT 59.5 % → +SCAN 59.5 % → +HIER\_BSR 83.2 % → +JTAG 85.2 %).
