@@ -118,7 +118,14 @@ let parse_const_value name =
       | _ -> int_of_string name
     else
       int_of_string name
-  with _ -> 0
+  with _ ->
+    (* Verilator-frontend silent-zero (task #139 audit).  Honour the
+       same SV_DECOMP_LENIENT escape hatch as the verible side: in
+       strict (default) raise the verible exception so the bug isn't
+       masked; in lenient mode keep the historical 0 fallback.    *)
+    if Sys.getenv_opt "SV_DECOMP_LENIENT" = Some "1" then 0
+    else raise (Verible_to_behavioral.Silent_zero_substitution
+      (Printf.sprintf "verilator parse_const_value(%S) failed" name))
 
 (* Convert Verilator expression to behavioral IR expression *)
 let rec expr_to_bexpr = function
