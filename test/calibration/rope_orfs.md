@@ -44,9 +44,44 @@ control-path debris.
 The user's intuition that "libraries were not searched adequately"
 was the right shape one level out — the library was searched, the
 arch blocks materialised, but the input-bus wiring into those arch
-blocks got lost.  Locus is somewhere in `behavioral_to_hardcaml.ml`'s
-arch-block lowering (or possibly a BIR-level DCE pass that ran before
-hardcaml saw the operand connections).
+blocks got lost.
+
+### Final root cause (cross-checked Verilator vs Verible frontends)
+
+Running both frontends on the same `rope.sv` and diffing the resulting
+BIR pins the bug to Verible's elaborator.  Line 115 of rope.sv:
+
+```systemverilog
+ang_t43 = 43'(reg_pos) * {11'b0, FREQ_TURNS_Q31[cord_pair[4:0]]};
+```
+
+`FREQ_TURNS_Q31` is an array-typed localparam whose initialiser lives
+in the included `rope_freq_turns.svh`.
+
+| | Verible BIR | Verilator BIR |
+|---|---|---|
+| `FREQ_TURNS_Q31[cord_pair[4:0]]` | `32'0` (silent zero) | `FREQ_TURNS_Q31[cord_pair[4:0]]` preserved |
+| `PI_OVER_8_Q29` (scalar localparam) | `32'210828714` ✓ | `PI_OVER_8_Q29` ✓ |
+| `mac_q15` function body | 5 params, 1 body stmt | 9 params, 5 body stmts |
+| Other localparams (H, H2, ICW, …) | all dropped | preserved |
+
+So Verible's elaborator silently substitutes 0 for array-typed
+localparams initialised in include files (and also drops the scalar
+localparam *declarations* — though it does inline their values where
+referenced).  The multiplier sees `reg_pos * 0`, downstream BIR DCE
+collapses the entire chain to constants, and `lib_map` faithfully
+materialises a 10 387-gate "compute zero from inputs and tie cells"
+network.
+
+Tracked as task #139.  The fix is to either:
+  (a) actually look up the .svh-defined initialiser inside the
+      elaborator (what Verilator does), or
+  (b) raise an explicit elaboration error rather than silently
+      substituting zero.
+
+Either fix unblocks calibration layouts for rope, cordic_sincos,
+matvec_int8_engine, rmsnorm, softmax_q15 — all of which use the
+same shape of .svh-defined lookup tables.
 
 ## What landed in tree
 
