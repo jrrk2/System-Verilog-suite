@@ -485,6 +485,15 @@ let cur_signal_struct : (string * string) list ref = ref []
  * back to dummy_bool. *)
 let cur_signal_widths : (string * int) list ref = ref []
 
+(* Per-module table of array-typed localparams from .svh includes /
+   inline `'{e1, e2, …}` initialisers.  Maps the localparam name to
+   the list of element bexprs in source order (index 0 = first elem).
+   Consulted by the reference3 walker: `LUT[i]` with i a known
+   integer literal returns the i-th element directly; with i a
+   runtime signal returns a balanced BCond mux tree over the
+   elements.  Task #139's ROM-promotion path.                       *)
+let cur_array_params : (string, bexpr list) Hashtbl.t = Hashtbl.create 4
+
 (* ─── Expression conversion ──────────────────────────────────────── *)
 
 let dummy_bool = BInt { width = 1; signed = Unsigned }
@@ -936,6 +945,40 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
   | TUPLE3 (STRING t, ref_node, dim_node) when prefix_is "reference" t
                                               && t <> "reference1" ->
       let signal = recurse ref_node in
+      (* Array-typed localparam ROM lookup (task #139).  If `signal`
+         names a localparam whose RHS was an `'{e1, …, eN}` initialiser
+         that we registered into [cur_array_params], and `dim_node` is
+         a single-index `select_variable_dimension2`, return either the
+         constant-folded element (if the index evaluates to an integer)
+         or a balanced BCond mux tree over the elements (runtime index).
+         Short-circuits before the rest of reference3 so the lookup
+         doesn't fall through to the BVar fallback that drops [sel].   *)
+      let array_param_elems = match signal with
+        | BVar n -> Hashtbl.find_opt cur_array_params n
+        | _ -> None in
+      (match array_param_elems, dim_node with
+       | Some elems, TUPLE4 (STRING dt, _, idx, _)
+         when prefix_is "select_variable_dimension" dt ->
+           let idx_e = recurse idx in
+           (match eval_int ~pkgs ~params idx with
+            | Some i ->
+                (try List.nth elems i
+                 with _ -> BConst { value = 0; width = 1 })
+            | None ->
+                let n = List.length elems in
+                (* Balanced BCond mux: (idx == 0) ? e0 : (idx == 1) ? e1 : … *)
+                let rec build i =
+                  if i >= n - 1 then List.nth elems i
+                  else BCond {
+                    condition = BBinOp {
+                      op = BEq;
+                      lhs = idx_e;
+                      rhs = BConst { value = i; width = 32 };
+                      result_type = BInt { width = 1; signed = Unsigned } };
+                    then_val = List.nth elems i;
+                    else_val = build (i + 1) }
+                in build 0)
+       | _ ->
       let is_array_sig = match signal with
         | BVar n -> List.mem n arrays
         | _ -> false
@@ -1005,7 +1048,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
              (match eval_int ~pkgs ~params idx with
               | Some i -> BSlice { signal; msb = i; lsb = i }
               | None -> signal)
-       | _ -> signal)
+       | _ -> signal))
   (* `unary_prefix_expr2`: TUPLE3(tag, unary_op_token, operand).
    * Must come before the generic TUPLE3 wrapper below — otherwise the
    * fallback recurses into the operator token and discards the operand.
@@ -1982,6 +2025,15 @@ let extract_body_params ~pkgs ~params tok =
               (try
                  match expr_to_bexpr ~pkgs ~params:acc ~arrays:[] v with
                  | BConst { value; _ } -> Some (string_of_int value)
+                 | BConcat elems ->
+                     (* Array-typed localparam (`'{e1, …, eN}` initialiser).
+                        Register the elements so LUT[i] lookups in the
+                        body can fold to the i-th element or build a
+                        BCond mux tree.  Returns None so this param
+                        doesn't enter the integer scope (it isn't an
+                        int).  Task #139's ROM-promotion path.       *)
+                     Hashtbl.replace cur_array_params id elems;
+                     None
                  | _ -> None
                with _ -> None)
         in
@@ -2036,6 +2088,12 @@ let mem_init_search_paths : string list ref = ref []
 
 let convert_module ~pkgs (mdecl : module_decl)
                           (params : (string * string) list) : bmodule =
+  (* Reset the per-module array-typed localparam ROM table BEFORE
+     extract_body_params populates it.  Otherwise the Hashtbl.clear
+     down in the signal-extraction block wipes the registrations,
+     and the reference3 walker sees an empty table when processing
+     `LUT[sel]` in the always_comb body.                              *)
+  Hashtbl.clear cur_array_params;
   (* Merge instance-override params with body-declared defaults; the
    * override wins on conflict (List.assoc_opt finds it first). *)
   let body_params = extract_body_params ~pkgs ~params mdecl.m_body in
