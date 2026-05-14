@@ -11,17 +11,42 @@ during the optional 6_report step.  The routed design is intact at
 **But the routed result is degenerate:** post-route `report_wns` gives
 0.00 ns, design area 104 µm², 0 % utilization.
 
-## Why
+## Why (revised after inspecting `1_2_yosys.v`)
 
-The top-level `rope` module is mostly arch-block bindings — its
-arithmetic is hidden in `gen_add` / `gen_mul` blocks that
-`lib_map.ml` emits as single-cell stubs.  At the gate-Verilog emit
-step, only ~3 wrapper cells reach the top netlist, even though the
-synth log reports 10 390 cells internally.
+The 10 390 cells *do* land in the rope module body: 3762 `XOR2_X1`,
+3691 `AND2_X1`, 1836 `OR2_X1`, 903 `AND3_X1`, 124 `LOGIC0_X1`, and the
+expected scattering of `INV` / `MUX2` / `DFF`.  Arch-block library
+search ran correctly — Wallace multipliers and Brent-Kung adders are
+bit-blasted into XOR/AND trees in the emitted Verilog.
 
-OpenROAD's `RSZ-0104` warnings ("Net pos[*] only has one pin")
-confirm it: the top-level input buses are tied to placeholder stubs
-and never reach a real consumer.
+What's broken is the **operand wiring around the arch blocks**.  Inside
+the rope module body:
+
+  - `in_x[*]` references: **0**
+  - `pos[*]` references:  **0**
+  - `out_y[*]` references: **0**
+  - only the 1-bit control signals `in_valid` / `start` / `out_valid`
+    appear (4-3 references each, the FF enables)
+
+Every assign feeding the gate tree is a giant concat of the form
+
+    {_T__b72896__AUX__B__, _T__b72896__AUX__B__, …,
+     _tie_lo_, _tie123__148278_, _tie122__148276_, …}
+
+i.e. an auxiliary signal that resolves to LOGIC0 plus a string of tie
+cells.  So the 10 387 gates of arithmetic are driving constants —
+electrically valid, but trivially equivalent to all-zero on the
+data path.  RSZ-0104 / RSZ-0020 ("18 floating nets") flag the
+top-level input buses as having no fanout, and CTS / route happily
+pruned everything not reaching an observable, leaving 104 µm² of
+control-path debris.
+
+The user's intuition that "libraries were not searched adequately"
+was the right shape one level out — the library was searched, the
+arch blocks materialised, but the input-bus wiring into those arch
+blocks got lost.  Locus is somewhere in `behavioral_to_hardcaml.ml`'s
+arch-block lowering (or possibly a BIR-level DCE pass that ran before
+hardcaml saw the operand connections).
 
 ## What landed in tree
 
