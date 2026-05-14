@@ -655,7 +655,10 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
     in
     let value =
       try int_of_string ("0" ^ prefix ^ digits)
-      with _ -> 0
+      with _ ->
+        if Lazy.force lenient_mode then 0
+        else raise (Silent_zero_substitution
+          (Printf.sprintf "sized literal int_of_string %S%S failed" prefix digits))
     in
     BConst { value; width }
   in
@@ -677,7 +680,9 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         BConst { value = 0; width = 32 }
       else
         (try BConst { value = int_of_string n; width = 32 }
-         with _ -> BConst { value = 0; width = 32 })
+         with _ ->
+           silent_zero ~width:32
+             ~reason:(Printf.sprintf "TK_DecNumber int_of_string %S failed" n))
   | TUPLE3 (STRING tag, base, digits) when prefix_is "bin_based_number" tag ->
       parse_sized "b" base digits
   | TUPLE3 (STRING tag, base, digits) when prefix_is "hex_based_number" tag ->
@@ -1867,7 +1872,11 @@ let extract_instances ~pkgs ~params tok =
              * for Behavioral_flatten to substitute correctly. *)
             let be =
               try expr_to_bexpr ~pkgs ~params ~arrays expr
-              with _ -> BVar (match expr with
+              (* Re-raise Silent_zero so default-strict actually fires;
+                 only fall back to a BVar reference for genuine other
+                 expr-shape failures. *)
+              with Silent_zero_substitution _ as e -> raise e
+                 | _ -> BVar (match expr with
                               | TUPLE3 (_, SymbolIdentifier id, _) -> id
                               | SymbolIdentifier id -> id
                               | _ -> "?")
@@ -2503,7 +2512,10 @@ let convert_module ~pkgs (mdecl : module_decl)
           let rhs_e =
             try Some (expr_to_bexpr ~pkgs ~params
                         ~arrays:array_names rhs)
-            with _ -> None in
+            (* Let Silent_zero_substitution propagate — default-strict
+               should hit the top, not be silently dropped here. *)
+            with Silent_zero_substitution _ as e -> raise e
+               | _ -> None in
           (match rhs_e with
            | None -> None
            | Some rhs_e ->
