@@ -98,3 +98,64 @@ absolute scale.
   592.67 ps, ratio 1.00005) is the one calibration data point where
   the predictor sees a single-cell swap delta — that's the cleanest
   comparison because clock-to-Q / setup cancel out of the delta.
+
+## Predictor-only side: smollm sweep
+
+A second sweep — `run_smollm_sweep.sh` → `smollm_sweep.tsv` — runs the
+synth pipeline + arch_swap predictor over every standalone module in
+`$HOME/TALOS-V2/rtl/vc707/src/smollm/`, capturing predicted-side
+metrics only (no ORFS layouts have been run for smollm yet).  Useful
+as a "what would the predictor recommend?" inventory until the layout
+side catches up.
+
+Snapshot (per-module 120 s cap):
+
+| | count |
+|---|---:|
+| OK (synth + predictor passed) | 19 |
+| FAIL (frontend gap, mostly `_bfp` variants) | 6 |
+| TIMEOUT@120s (deep hierarchy: `smollm_layer` / `_multilayer` / `_full`) | 10 |
+
+Predicted arch-swap savings on the OK subset (sorted by total Δ-stages):
+
+| Module | Cells | Swaps | Δ-stages |
+|---|---:|---:|---:|
+| `softmax_q15` | 5 | 8 | **10 367** |
+| `smollm_decode_head` | 37 | 31 | 8 976 |
+| `rope` | 10 390 | 40 | 6 933 |
+| `rmsnorm` | 5 | 9 | 6 593 |
+| `matvec_int8_engine` | 3 | 3 | 1 783 |
+| `microgpt_eth_ctrl` | 1 093 | 18 | 1 035 |
+| `cordic_sincos` | 3 | 9 | 690 |
+| `weight_stream_axi` | 665 | 6 | 504 |
+| `weight_streamer` | 51 | 3 | 242 |
+
+(Modules with 0 candidates omitted: 10 of the 19 OK rows are
+arithmetic-light and have no swap candidate above the width
+threshold of 8.  `cordic_sincos`, `rmsnorm`, `softmax_q15`, and
+`matvec_int8_engine` look small in the cells column because most of
+their logic is hidden in arch blocks — the predictor counts the
+arch block as a single cell, not its bit-blasted contents.)
+
+What the predicted Δ-stages mean: each block has a baseline (e.g.
+32-bit ripple add = 96 stages of 2-XOR-cell delay) and an alternative
+(e.g. brent-kung = 11 stages).  Δ-stages is the stage-count drop the
+predictor would gate on if `SV_DECOMP_ARCH_SWAP=1` were set AND the
+slack-feedback gate said it was on the critical path.  No layout has
+yet been run to confirm any of these.
+
+`rope` is the standout: 10 390 cells after lib_map (consistent with
+its complex BFP CORDIC chain) and 40 swap candidates.  Pushing rope
+through ORFS would give the dataset a third large-design data point
+alongside picosoc and (once captured) AES.
+
+Failures and timeouts are inputs to other tracks:
+
+- `_bfp` variants (block-floating-point) fail BIR conversion — most
+  likely a frontend gap around the BFP-specific struct types.  Worth
+  tracking but not a predictor concern.
+- `smollm_layer` / `_multilayer` / `_full` time out at 120 s — these
+  instantiate deep hierarchies with the multi-write-port memlower
+  blocker noted in `memory/project_smollm_multiwrite_blocker.md`.
+  Increasing the timeout to 600 s would probably pull a few more in
+  but not the multilayer family until that blocker is fixed.
