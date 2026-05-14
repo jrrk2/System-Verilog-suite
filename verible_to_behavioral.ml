@@ -956,6 +956,13 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       let array_param_elems = match signal with
         | BVar n -> Hashtbl.find_opt cur_array_params n
         | _ -> None in
+      if Sys.getenv_opt "TRACE_ARRAY_PARAMS" = Some "1" then
+        Printf.eprintf "[ref3] signal=%s array_param_elems=%s table_size=%d\n%!"
+          (match signal with BVar n -> n | _ -> "<other>")
+          (match array_param_elems with
+           | Some es -> Printf.sprintf "Some[%d]" (List.length es)
+           | None -> "None")
+          (Hashtbl.length cur_array_params);
       (match array_param_elems, dim_node with
        | Some elems, TUPLE4 (STRING dt, _, idx, _)
          when prefix_is "select_variable_dimension" dt ->

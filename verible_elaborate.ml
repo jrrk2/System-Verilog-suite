@@ -493,11 +493,19 @@ let rec prune_dead_generates scope tok =
         !id
       in
       let gv_name = extract_id gv_id in
-      let resolve_int e =
+      (* Both helpers take an explicit scope so they can be called
+         with `scope'` (which has the current iteration's genvar
+         value bound) instead of the outer `scope` (which doesn't).
+         Without this, `for (j = 0; j < 8; j = j + 1)` failed to
+         compute step delta on iteration 0 because `j` wasn't in
+         the outer scope and `eval_string "j + 1"` returned None,
+         so the loop exited after one iteration and only j=0 was
+         unrolled.                                                  *)
+      let resolve_int_in sc e =
         let s = !resolver_for_walk e in
-        !evaluator_for_walk scope s
+        !evaluator_for_walk sc s
       in
-      let step_delta name =
+      let step_delta_in sc name =
         match step with
         | TUPLE3 (STRING t, _, _) when prefix_is "inc_or_dec_expression" t ->
             (* `++name` / `name++` / `--name` / `name--`. Polarity
@@ -514,16 +522,18 @@ let rec prune_dead_generates scope tok =
              | None -> ignore name; None)
         | TUPLE4 (STRING t, _, _, rhs)
           when prefix_is "assignment_statement_no_expr" t ->
-            (* `name = expr` — evaluate expr in current scope and
-             * subtract the current name-value to get the delta. *)
-            (match resolve_int rhs with
+            (* `name = expr` — evaluate expr in `sc` (which must
+               carry the current iteration's genvar binding) and
+               subtract the current name-value to get the delta. *)
+            (match resolve_int_in sc rhs with
              | Some new_v ->
-                 (match List.assoc_opt name scope with
+                 (match List.assoc_opt name sc with
                   | Some old_v -> Some (new_v - old_v)
                   | None -> None)
              | None -> None)
         | _ -> None
       in
+      let _ = step_delta_in in
       (* Substitute every reference to `name` (as a SymbolIdentifier)
        * with a decimal numeric leaf carrying the current iteration
        * value. Without this, the unrolled body still has the genvar
@@ -596,7 +606,7 @@ let rec prune_dead_generates scope tok =
         | TLIST xs -> TLIST (List.map (subst_genvar name v) xs)
         | leaf -> leaf
       in
-      (match gv_name, resolve_int init with
+      (match gv_name, resolve_int_in scope init with
        | Some name, Some init_v ->
            let max_iter = 256 in
            let unrolled = ref [] in
@@ -615,8 +625,10 @@ let rec prune_dead_generates scope tok =
              if still_live then begin
                let inst = subst_genvar name !v body in
                unrolled := prune_dead_generates scope' inst :: !unrolled;
-               (* Advance v per step. *)
-               match step_delta name with
+               (* Advance v per step.  Pass scope' (which has the
+                  current iteration's genvar value bound) so that
+                  `j = j + 1`-style steps can resolve `j + 1`.   *)
+               match step_delta_in scope' name with
                | Some d -> v := !v + d
                | None -> live := false
              end else
