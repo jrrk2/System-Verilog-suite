@@ -537,6 +537,29 @@ let param_value_to_bexpr id v =
  * 1-bit zero with a stderr note (when MITER_VERIBLE_DEBUG is set). *)
 let debug_expr = lazy (Sys.getenv_opt "MITER_VERIBLE_DEBUG" <> None)
 
+(* Strict mode — when SV_DECOMP_STRICT=1, every "fall back to BConst 0"
+ * path in the expression walker raises [Silent_zero_substitution]
+ * instead.  Used to surface bugs of the shape "Verible elaborator
+ * silently lost an expression" (task #139): without strict mode they
+ * propagate to downstream synth as multiplications by zero, which DCE
+ * then strips, leaving routed designs that "compile clean" but are
+ * trivially all-zero on the data path.                                 *)
+exception Silent_zero_substitution of string
+
+let strict_mode = lazy (Sys.getenv_opt "SV_DECOMP_STRICT" = Some "1")
+
+(* Either raise (strict) or fall back to BConst 0 with a debug note.
+   [reason] explains what the walker couldn't reduce; appears in the
+   exception message and the MITER_VERIBLE_DEBUG stderr trace. *)
+let silent_zero ~reason ~width =
+  if Lazy.force strict_mode then
+    raise (Silent_zero_substitution reason)
+  else begin
+    if Lazy.force debug_expr then
+      Printf.eprintf "[verible_to_bir] silent zero: %s\n" reason;
+    BConst { value = 0; width }
+  end
+
 (* Recursive width computation over a bexpr against `cur_signal_widths`.
  * Returns `Some w` when computable; `None` when we can't tell (caller
  * falls back to `dummy_bool`, and z3_miter's fixed-point inference
@@ -669,6 +692,25 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       (match List.assoc_opt id params with
        | Some v -> param_value_to_bexpr id v
        | None -> BVar id)
+  (* Array assignment pattern `'{e1, e2, …}` — Verible's
+     `assignment_pattern1` wraps a TLIST of bare expressions (no key
+     prefix, unlike the struct variant).  Distilled use case:
+     array-typed localparam initialiser from an included .svh, as in
+     test/regressions/svh_array_localparam.svh.  Without this case
+     the walker fell into the silent-zero fallback and the whole
+     array localparam value became 0 (task #139).  Emit BConcat of
+     elements in source order; index lookups (`LUT[sel]`) are
+     handled separately by the reference3 → BSelect path.            *)
+  | TUPLE4 (STRING tag, _, body, _)
+    when prefix_is "assignment_pattern1" tag ->
+      let exprs = match body with
+        | TLIST xs -> List.map recurse (List.rev xs)
+        | _ -> []
+      in
+      (match exprs with
+       | [] -> BConst { value = 0; width = 1 }  (* `'{}` — empty *)
+       | [single] -> single
+       | _ -> BConcat exprs)
   (* Struct assignment pattern `'{f1: x, f2: y}`. The Verible parse
    * is `assignment_pattern2` wrapping a TLIST of
    * `structure_or_array_pattern_expression1` nodes — each carries a
@@ -788,7 +830,10 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
             * literal (works for $clog2 et al). *)
            (match eval_int ~pkgs ~params tok with
             | Some n -> BConst { value = n; width = 32 }
-            | None -> BConst { value = 0; width = 1 })
+            | None ->
+                silent_zero ~width:1
+                  ~reason:(Printf.sprintf
+                    "unrecognised system call %s, eval_int returned None" name))
        | Some fname ->
            (* Plain user function call. Emit BCall so the inline pass
             * (Behavioral_inline) can substitute the body in. Pull the
@@ -815,7 +860,9 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
              List.map recurse cands
            in
            BCall { func = fname; args = arg_exprs }
-       | None -> BConst { value = 0; width = 1 })
+       | None ->
+           silent_zero ~width:1
+             ~reason:"function call with no resolvable callee name")
   (* Struct member-select `p.field` — Verible parses as `reference2`:
    *   TUPLE3(tag, reference, hierarchy_extension)
    * with `hierarchy_extension1: TUPLE3(tag, DOT, unqualified_id)`.
@@ -1017,11 +1064,9 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         then bin BEq lhs rhs
       else if prefix_is "logeq_expr3" tag then bin BNe lhs rhs
       else if prefix_is "expr_primary_parens" tag then recurse _op
-      else begin
-        if Lazy.force debug_expr then
-          Printf.eprintf "[verible_to_bir] unhandled TUPLE4 expr %s\n" tag;
-        BConst { value = 0; width = 1 }
-      end
+      else
+        silent_zero ~width:1
+          ~reason:(Printf.sprintf "unhandled TUPLE4 expression tag %s" tag)
   (* unary_prefix_expr handled above the generic TUPLE3 fallback. *)
   (* `cond_expr2`: TUPLE6(tag, cond, QUERY, then_expr, COLON, else_expr).
    * The ternary `?:` operator. *)
@@ -1039,9 +1084,8 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       recurse expr
   | TLIST [single] -> recurse single
   | _ ->
-      if Lazy.force debug_expr then
-        Printf.eprintf "[verible_to_bir] unhandled expr shape\n";
-      BConst { value = 0; width = 1 }
+      silent_zero ~width:1
+        ~reason:"unhandled expression shape (no matching pattern)"
 
 (* ─── Module port + signal extraction ────────────────────────────── *)
 
