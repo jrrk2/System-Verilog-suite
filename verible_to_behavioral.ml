@@ -704,33 +704,28 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
      handled separately by the reference3 → BSelect path.            *)
   | TUPLE4 (STRING tag, _, body, _)
     when prefix_is "assignment_pattern1" tag ->
-      (* The body is one of:
-            TLIST xs                                       (plain)
-            TUPLE4(expression_list_proper1, _, TLIST, _)   (most common)
-            TUPLE4(expression_list_proper1, _, <nested>,_) (8-element
-              array_localparam in tree form — TLIST is absent and
-              elements are nested in non-list TUPLE structures
-              produced by Verible's grammar; we do a recursive
-              scrape that collects every TLIST child no matter how
-              deep, falling back to the empty-pattern case if none
-              are found).                                            *)
-      let rec find_tlists acc = function
-        | TLIST xs -> xs @ acc
-        | TUPLE2 (a, b) -> find_tlists (find_tlists acc b) a
-        | TUPLE3 (a, b, c) ->
-            find_tlists (find_tlists (find_tlists acc c) b) a
-        | TUPLE4 (a, b, c, d) ->
-            List.fold_left find_tlists acc [a; b; c; d]
-        | TUPLE5 (a, b, c, d, e) ->
-            List.fold_left find_tlists acc [a; b; c; d; e]
-        | TUPLE6 (a, b, c, d, e, f) ->
-            List.fold_left find_tlists acc [a; b; c; d; e; f]
-        | _ -> acc
+      (* The body is a left-recursive cons of `expression_list_proper`
+         nodes:  TUPLE4(expression_list_proper, prev_list, comma, new_elem).
+         The grammar grows the list to the LEFT (Verible parses the
+         comma-separated list bottom-up), so the outermost node carries
+         the LAST element on its right, with everything before it
+         nested in the left child.  Walk the left spine accumulating
+         right-side elements, then add the final non-list node
+         (the leftmost element) at the front.                          *)
+      let rec flatten_explist acc t =
+        match t with
+        | TUPLE4 (STRING tag', lhs, _comma, rhs)
+          when prefix_is "expression_list_proper" tag' ->
+            flatten_explist (rhs :: acc) lhs
+        | TLIST xs ->
+            (* Older / different shape — bare TLIST.  Append as-is. *)
+            xs @ acc
+        | other -> other :: acc
       in
-      let tlist = find_tlists [] body in
-      let exprs = List.map recurse (List.rev tlist) in
+      let elems = flatten_explist [] body in
+      let exprs = List.map recurse elems in
       (match exprs with
-       | [] -> BConst { value = 0; width = 1 }
+       | [] -> BConst { value = 0; width = 1 }  (* `'{}` — empty *)
        | [single] -> single
        | _ -> BConcat exprs)
   (* Struct assignment pattern `'{f1: x, f2: y}`. The Verible parse
