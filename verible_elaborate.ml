@@ -1401,11 +1401,20 @@ module Eval = struct
    * lookups that don't resolve via plain scope. *)
   let struct_table = struct_table
 
+  (* When the tokenizer can't make sense of a character or sub-string,
+     it raises this rather than silently substituting TNum 0 — the
+     top-level eval_string catches it via its existing `with _ -> None`
+     and returns None.  Caller sees "I can't evaluate" instead of a
+     fabricated zero (task #139 root cause: `'{...}` array literals
+     were tokenising to TNum 0 from the `'<not-0/1>` fallback).      *)
   let tokenize s =
     let n = String.length s in
     let i = ref 0 in
     let out = ref [] in
     let push t = out := t :: !out in
+    let bail what =
+      raise (Failure
+        (Printf.sprintf "eval_tokenize: %s in %S at offset %d" what s !i)) in
     let is_id_start c =
       (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_' in
     let is_id c = is_id_start c || (c >= '0' && c <= '9') in
@@ -1444,15 +1453,18 @@ module Eval = struct
           push (TDollar (String.sub s (!i + 1) (!j - !i - 1)));
           i := !j
       | '\'' ->
-          (* `'0`, `'1`, `'x`, `'z` — bare unsized literals. *)
+          (* `'0`, `'1`, `'x`, `'z` — bare unsized literals.  Anything
+             else after a leading apostrophe (e.g. `'{` opening an
+             assignment pattern) means this string isn't a plain integer
+             expression and we can't fold it to an int — bail rather
+             than silently emit TNum 0 (task #139).  *)
           if !i + 1 < n then begin
             let nc = s.[!i + 1] in
             (match nc with
-             | '0' -> push (TNum 0)
-             | '1' -> push (TNum 1)
-             | _   -> push (TNum 0));
-            i := !i + 2
-          end else incr i
+             | '0' | 'x' | 'X' | 'z' | 'Z' -> push (TNum 0); i := !i + 2
+             | '1' -> push (TNum 1); i := !i + 2
+             | _ -> bail (Printf.sprintf "unhandled apostrophe-prefix '%c" nc))
+          end else bail "trailing apostrophe"
       | _ when is_dig c ->
           let j = ref !i in
           while !j < n && is_dig s.[!j] do incr j done;
@@ -1476,19 +1488,28 @@ module Eval = struct
                 | 'b' -> int_of_string ("0b" ^ digits)
                 | 'o' -> int_of_string ("0o" ^ digits)
                 | _   -> int_of_string digits
-              with _ -> 0
+              with _ ->
+                bail (Printf.sprintf "sized literal int_of_string %S failed"
+                        digits)
             in
             push (TNum v); i := !k
           end else begin
-            push (TNum (try int_of_string lead with _ -> 0));
-            i := !j
+            let v = try int_of_string lead
+                    with _ -> bail (Printf.sprintf
+                      "decimal literal int_of_string %S failed" lead) in
+            push (TNum v); i := !j
           end
       | _ when is_id_start c ->
           let j = ref !i in
           while !j < n && is_id s.[!j] do incr j done;
           push (TId (String.sub s !i (!j - !i)));
           i := !j
-      | _ -> incr i  (* skip unknown punctuation *)
+      | c ->
+          (* Unknown punctuation (`{`, `}`, `;`, `[`, `]`, …) means
+             this isn't a plain integer expression — bail rather than
+             silently skip and let parse_expr proceed against a
+             mis-tokenised stream (task #139).                        *)
+          bail (Printf.sprintf "unhandled char %C" c)
     done;
     List.rev !out
 
