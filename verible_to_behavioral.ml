@@ -537,28 +537,29 @@ let param_value_to_bexpr id v =
  * 1-bit zero with a stderr note (when MITER_VERIBLE_DEBUG is set). *)
 let debug_expr = lazy (Sys.getenv_opt "MITER_VERIBLE_DEBUG" <> None)
 
-(* Strict mode — when SV_DECOMP_STRICT=1, every "fall back to BConst 0"
- * path in the expression walker raises [Silent_zero_substitution]
- * instead.  Used to surface bugs of the shape "Verible elaborator
- * silently lost an expression" (task #139): without strict mode they
- * propagate to downstream synth as multiplications by zero, which DCE
- * then strips, leaving routed designs that "compile clean" but are
- * trivially all-zero on the data path.                                 *)
+(* Unhandled-syntax safety net.  Each "fall back to BConst 0" path
+ * in the expression walker is routed through [silent_zero], which by
+ * default raises [Silent_zero_substitution] so we see immediately
+ * which shapes we don't handle.  Setting SV_DECOMP_LENIENT=1 reverts
+ * to the historical "log + return BConst 0" behaviour for situations
+ * where surfacing the bug isn't an option (e.g. a downstream consumer
+ * still depends on the wrong-but-survivable BIR).  The flip from
+ * default-lenient to default-strict was task #139: the rope ORFS
+ * layout produced an all-zero data path because Verible silently
+ * substituted 0 for an .svh-defined array localparam; making the
+ * default loud means we catch the next instance at parse time
+ * instead of post-route.                                              *)
 exception Silent_zero_substitution of string
 
-let strict_mode = lazy (Sys.getenv_opt "SV_DECOMP_STRICT" = Some "1")
+let lenient_mode = lazy (Sys.getenv_opt "SV_DECOMP_LENIENT" = Some "1")
 
-(* Either raise (strict) or fall back to BConst 0 with a debug note.
-   [reason] explains what the walker couldn't reduce; appears in the
-   exception message and the MITER_VERIBLE_DEBUG stderr trace. *)
 let silent_zero ~reason ~width =
-  if Lazy.force strict_mode then
-    raise (Silent_zero_substitution reason)
-  else begin
+  if Lazy.force lenient_mode then begin
     if Lazy.force debug_expr then
       Printf.eprintf "[verible_to_bir] silent zero: %s\n" reason;
     BConst { value = 0; width }
-  end
+  end else
+    raise (Silent_zero_substitution reason)
 
 (* Recursive width computation over a bexpr against `cur_signal_widths`.
  * Returns `Some w` when computable; `None` when we can't tell (caller
