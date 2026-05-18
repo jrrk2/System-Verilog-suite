@@ -82,6 +82,17 @@ and next_state_after_one q current = function
 let rec collect_lhs acc = function
   | BAssign { lhs; _ } ->
       if List.mem lhs acc then acc else lhs :: acc
+  | BCallStmt { func; args }
+    when func = "@mem_write" || func = "@slice_write"
+         || func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+      (* Array / part-select writes target their first argument.
+         Without this an array written only via @mem_write (e.g.
+         slib_fifo's iFIFOMem) was missed by ffrip, never lifted to
+         an input, and the Z3 miter then picked unconstrained
+         (different!) initial memory states for the two designs. *)
+      (match args with
+       | BVar arr :: _ when not (List.mem arr acc) -> arr :: acc
+       | _ -> acc)
   | BBlock ss -> List.fold_left collect_lhs acc ss
   | BIf { then_stmts; else_stmts; _ } ->
       let acc = List.fold_left collect_lhs acc then_stmts in

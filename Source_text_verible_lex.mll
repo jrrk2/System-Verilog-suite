@@ -31,12 +31,36 @@
   let verbose = try int_of_string(Sys.getenv "LEXER_VERBOSE") > 0 with _ -> false
   let lincnt = ref 0
 
+  (* System-task / elaboration-builtin identifier whitelist.
+   * Names in this list lex as `SystemTFIdentifier`, which the grammar
+   * routes through `system_tf_call` — and crucially that's one of the
+   * `casting_type` alternatives, so `$clog2(X)'(Y)` size casts parse
+   * cleanly.  Names NOT in the list fall through to SymbolIdentifier
+   * and are handled as ordinary function calls (`reference_or_call_base`).
+   *
+   * Only elaboration-time / constant-foldable system functions belong
+   * here.  Runtime simulation tasks ($display, $write, $readmemh, …)
+   * should NOT be added — their parse-tree shape is consumed
+   * specially by verible_to_behavioral.ml (e.g. $readmemh ROM init). *)
   let systask =
-    let h = Hashtbl.create 17 in
-    List.iter 
+    let h = Hashtbl.create 32 in
+    List.iter
       (fun s -> Hashtbl.add h s s)
       [
-( "$test$plusargs" );
+        "$test$plusargs";
+        (* Width / log queries — constant-foldable at elaboration. *)
+        "$clog2"; "$bits"; "$size";
+        "$left"; "$right"; "$low"; "$high";
+        "$increment"; "$dimensions"; "$unpacked_dimensions";
+        (* Sign casts — value-preserving, take a single expr arg. *)
+        "$signed"; "$unsigned";
+        (* Math elaboration helpers. *)
+        "$ceil"; "$floor"; "$pow"; "$ln"; "$log10"; "$exp"; "$sqrt";
+        (* Bit-pattern queries. *)
+        "$countbits"; "$countones"; "$onehot"; "$onehot0";
+        "$isunknown";
+        (* Real ↔ int casts. *)
+        "$itor"; "$rtoi"; "$realtobits"; "$bitstoreal";
       ];
     fun s -> SystemTFIdentifier (Hashtbl.find h s)
 
@@ -525,7 +549,10 @@ let tok arg =
 let ident = ['a'-'z' 'A'-'Z' '$' '_'] ['a'-'z' 'A'-'Z' '_' '0'-'9' '$']*
 let escaped = '\\'[^' ']*' '
 let fltnum = ['0'-'9']+'.'['E' '-' '+' '0'-'9']*
-let sizednumber = ['0'-'9']*'\''['s']*['b' 'd' 'h' 'o' 'x'][' ']*[ '0'-'9' 'a'-'f' 'x' 'z' 'A'-'F' 'X' 'Z' '_' '?']+
+(* Sized literal: `<W>'<s>?<base><digits>`.  SV allows the base char
+ * in any case (`'H` and `'h` both legal; `'S` is sign-extension);
+ * we accept both. *)
+let sizednumber = ['0'-'9']*'\''['s' 'S']*['b' 'B' 'd' 'D' 'h' 'H' 'o' 'O' 'x' 'X'][' ']*[ '0'-'9' 'a'-'f' 'x' 'z' 'A'-'F' 'X' 'Z' '_' '?']+
 let number = ['0'-'9' '_']+
 let unbased = '''['0'-'9'  'a'-'f' 'x' 'z' 'A'-'F' 'X' 'Z' '_' '?']+
 let space = [' ' '\t' '\r']+
@@ -633,14 +660,20 @@ rule token = parse
   | space
       { token lexbuf }
   | newline
-      { incr lincnt; token lexbuf }
+      (* Advance both our internal counter AND the lexbuf's position
+       * tracking, so parse-error reports show the actual source line
+       * instead of always reporting "line 1". *)
+      { incr lincnt; Lexing.new_line lexbuf; token lexbuf }
   | sizednumber as n
       { match String.split_on_char '\'' n with
       lft::rght::[] -> (
-      let ix = if rght.[0]=='s' then 1 else 0 in
+      let ix = if rght.[0]=='s' || rght.[0]=='S' then 1 else 0 in
       let rght' = String.trim (String.sub rght (ix+1) (String.length rght - ix - 1)) in
       let lft' = lft^"'"^String.sub rght ix 1 in
-      match rght.[ix] with
+      (* Accept both upper- and lower-case base chars (`'H` ≡ `'h`).
+       * SV is case-insensitive on the base letter; the lexer is the
+       * right place to normalise. *)
+      match Char.lowercase_ascii rght.[ix] with
 	| 'b' -> [TK_BinBase lft';TK_BinDigits rght']
 	| 'o' -> [TK_OctBase lft';TK_OctDigits rght']
 	| 'd' -> [TK_DecBase lft';TK_DecDigits rght']
@@ -674,7 +707,7 @@ rule token = parse
 { tok ( failwith ("Source_text_lex: "^String.make 1 oth) ) }
 
 and comment = parse
-| newline { incr lincnt; comment lexbuf }
+| newline { incr lincnt; Lexing.new_line lexbuf; comment lexbuf }
 | '*''/' as com { if false then print_endline ("/*"^com); token lexbuf }
 | '*'')' as com { if false then print_endline ("/*"^com); token lexbuf }
 | _ { comment lexbuf }

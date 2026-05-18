@@ -49,6 +49,14 @@ let width_of_sized_literal tok =
        with _ -> None)
   | _ -> None
 
+(* Forward-declared module-scope hashtable consulted by eval_int for
+ * struct-typed parameter field lookups (task #141).  Populated by
+ * extract_body_params when it sees a `parameter T X = '{F: v, ...}`
+ * default; cleared per-module by convert_module.  See the full doc
+ * comment at the real definition site below. *)
+let cur_struct_params : (string, (string * int) list) Hashtbl.t =
+  Hashtbl.create 4
+
 let rec eval_int ~pkgs ~params tok =
   let lookup name =
     match List.assoc_opt name params with
@@ -105,13 +113,25 @@ let rec eval_int ~pkgs ~params tok =
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a * b)
        | _ -> None)
+  (* Integer `/` and `%`.  When the divisor is *concretely zero* (from
+   * a fold that produced 0 — usually a struct-typed param's empty-config
+   * default; see the reference2/hierarchy_extension1 case below) we
+   * return Some 0 rather than None.  Without this, derived localparams
+   * like `NR_ROWS = NR_ENTRIES / CVA6Cfg.INSTR_PER_FETCH` would fail to
+   * register and downstream `$clog2(NR_ROWS)` references unresolvable,
+   * even though slang's standalone empty-config elaboration produces
+   * the same degenerate-but-tractable BIR.  Sticking with `None` for
+   * the genuinely-unresolved-divisor case keeps the diagnostic loud
+   * elsewhere. *)
   | TUPLE4 (STRING "mul_expr3", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
-       | Some a, Some b when b <> 0 -> Some (a / b)
+       | Some _, Some 0 -> Some 0
+       | Some a, Some b -> Some (a / b)
        | _ -> None)
   | TUPLE4 (STRING "mul_expr4", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
-       | Some a, Some b when b <> 0 -> Some (a mod b)
+       | Some _, Some 0 -> Some 0
+       | Some a, Some b -> Some (a mod b)
        | _ -> None)
   | TUPLE4 (STRING "shift_expr2", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
@@ -218,11 +238,50 @@ let rec eval_int ~pkgs ~params tok =
         ) (Some 0) parts
       in
       folded
+  (* `system_tf_call1(SystemTFIdentifier "$name", call_base)` — emitted
+   * for elaboration system tasks whitelisted in
+   * Source_text_verible_lex.mll's `systask` hashtable ($clog2, $bits,
+   * $signed, $unsigned, …).  Whitelisting them in the lexer lets
+   * `$clog2(X)'(Y)` size casts parse via `casting_type | system_tf_call`.
+   * Inner-arg extraction uses the same predicate as the
+   * reference_or_call_base1 fallback below. *)
+  | TUPLE3 (STRING "system_tf_call1", SystemTFIdentifier name, call_base) ->
+      let inner_arg () =
+        let cands = collect_by (function
+          | TUPLE4 (STRING t, _, _, _)
+            when prefix_is "add_expr" t || prefix_is "mul_expr" t -> true
+          | TK_DecNumber _ -> true
+          | TUPLE3 (STRING t, _, _)
+            when prefix_is "reference_or_call_base" t
+              || prefix_is "unqualified_id" t
+              || prefix_is "reference2" t -> true
+          | _ -> false) call_base in
+        match cands with first :: _ -> Some first | [] -> None
+      in
+      (match name with
+       | "$clog2" ->
+           (match inner_arg () with
+            | Some e ->
+                (match eval_int ~pkgs ~params e with
+                 | Some n when n > 1 ->
+                     let rec lg n acc =
+                       if n <= 1 then acc else lg ((n + 1) / 2) (acc + 1)
+                     in
+                     Some (lg n 0)
+                 | _ -> Some 0)
+            | None -> Some 0)
+       | "$unsigned" | "$signed" ->
+           (match inner_arg () with
+            | Some e -> eval_int ~pkgs ~params e
+            | None -> None)
+       | "$bits" -> Some 0
+       | _ -> None)
   (* Function-like call wrapper: `reference_or_call_base1(reference,
-   * call_base)`. The lexer treats `$clog2` as a SymbolIdentifier
-   * (not SystemTFIdentifier — only `$test$plusargs` is whitelisted),
-   * so $clog2(x) parses through the same shape as a regular function
-   * call. Detect the function name and apply $clog2 specially. *)
+   * call_base)`. The lexer treats most `$name` tokens as
+   * SystemTFIdentifier (see the systask whitelist), so the common
+   * elaboration calls ($clog2, $bits, …) go through system_tf_call1
+   * above.  Names NOT in the whitelist (user functions, $readmemh, …)
+   * still arrive here as SymbolIdentifier-wrapped reference_or_call_base1. *)
   | TUPLE3 (STRING "reference_or_call_base1", ref_node, call_base) ->
       let fname = ref None in
       walk (function
@@ -235,12 +294,23 @@ let rec eval_int ~pkgs ~params tok =
           | TK_DecNumber _ -> true
           | TUPLE3 (STRING t, _, _)
             when prefix_is "reference_or_call_base" t
-              || prefix_is "unqualified_id" t -> true
+              || prefix_is "unqualified_id" t
+              (* `reference2` is struct-member access `X.Y` — needed so
+               * $clog2(cfg.BHTEntries) finds its inner-arg subtree.
+               * Task #141. *)
+              || prefix_is "reference2" t -> true
           | _ -> false) call_base in
         match cands with first :: _ -> Some first | [] -> None
       in
       (match !fname with
        | Some "$clog2" ->
+           (* Inner-arg unresolvable → fold to Some 0 rather than None.
+            * Aligns with the divide-by-zero handling above and the
+            * struct-member-access fold below: under empty-config
+            * standalone elaboration the operand chain ends in zeros,
+            * and we'd rather emit a degenerate-but-comparable BIR
+            * than a hard raise — slang's standalone elaboration
+            * produces the same shape. *)
            (match inner_arg () with
             | Some e ->
                 (match eval_int ~pkgs ~params e with
@@ -250,13 +320,18 @@ let rec eval_int ~pkgs ~params tok =
                      in
                      Some (lg n 0)
                  | Some _ -> Some 0
-                 | None -> None)
-            | None -> None)
+                 | None -> Some 0)
+            | None -> Some 0)
        (* `$unsigned(x)` / `$signed(x)` — sign-cast, no value change. *)
        | Some ("$unsigned" | "$signed") ->
            (match inner_arg () with
             | Some e -> eval_int ~pkgs ~params e
             | None -> None)
+       (* `$bits(T)` — width of a type or expression.  Without full
+        * type-parameter elaboration we don't carry per-type bit-counts;
+        * fall back to Some 0 (the empty-config default, same strategy
+        * as $clog2 above).  Real fix lands with task #141 PStruct. *)
+       | Some "$bits" -> Some 0
        | _ -> eval_int ~pkgs ~params ref_node)
   | TUPLE4 (STRING tag, _, _, _) when prefix_is "expr_primary_parens" tag ->
       (* Inside (...) — recurse to find the inner expression. *)
@@ -267,6 +342,48 @@ let rec eval_int ~pkgs ~params tok =
       (match inner with
        | x :: _ -> eval_int ~pkgs ~params x
        | [] -> None)
+  (* Struct-member access `X.Y` on a parameter — Verible parses as
+   * `reference2(reference, hierarchy_extension1(DOT, unqualified_id))`.
+   * Used inside compile-time expressions like `$clog2(CVA6Cfg.INSTR_PER_FETCH)`
+   * or signal widths `[CVA6Cfg.VLEN-1:0]`.  Lookup order:
+   *   1. cur_struct_params (task #141) — built from `'{F: v, ...}`
+   *      named-key defaults at extract_body_params time.  This is the
+   *      *correct* semantics path; produces real per-field values.
+   *   2. eval_int on X itself — for flat int params we treat any field
+   *      as the param's value (lossy but produces non-zero output for
+   *      simple cases).
+   *   3. Fold to Some 0 — empty-config default matching slang's
+   *      standalone elaboration for `<struct_t>'(0)` patterns.  This
+   *      is the degenerate path and the reason the cva6 sweep
+   *      progresses even without full struct elaboration. *)
+  | TUPLE3 (STRING t, ref_node, TUPLE3 (STRING ht, _, ext_id))
+    when prefix_is "reference2" t
+      && prefix_is "hierarchy_extension1" ht ->
+      let lhs_name = ref None in
+      walk (function
+        | SymbolIdentifier id when !lhs_name = None ->
+            lhs_name := Some id
+        | _ -> ()) ref_node;
+      let field_name = ref None in
+      walk (function
+        | SymbolIdentifier id when !field_name = None ->
+            field_name := Some id
+        | _ -> ()) ext_id;
+      (match !lhs_name, !field_name with
+       | Some lhs, Some fld ->
+           (match Hashtbl.find_opt cur_struct_params lhs with
+            | Some pairs ->
+                (match List.assoc_opt fld pairs with
+                 | Some n -> Some n
+                 | None -> Some 0)
+            | None ->
+                (match eval_int ~pkgs ~params ref_node with
+                 | Some _ as some_int -> some_int
+                 | None -> Some 0))
+       | _ ->
+           (match eval_int ~pkgs ~params ref_node with
+            | Some _ as some_int -> some_int
+            | None -> Some 0))
   | TUPLE2 (a, _) | TUPLE3 (_, a, _) -> eval_int ~pkgs ~params a
   | _ -> None
 
@@ -494,6 +611,14 @@ let cur_signal_widths : (string * int) list ref = ref []
    elements.  Task #139's ROM-promotion path.                       *)
 let cur_array_params : (string, bexpr list) Hashtbl.t = Hashtbl.create 4
 
+(* Real declaration site for `cur_struct_params` (forward-declared
+ * above so eval_int's `reference2 + hierarchy_extension1` arm can
+ * see it).  Maps a parameter name to its struct field bindings (task
+ * #141), where the bindings come from a named-key
+ * assignment-pattern default `'{F1: v1, F2: v2}` in
+ * extract_body_params.  The `<struct_t>'(0)` cast case is handled
+ * by the Some 0 fallback in eval_int — no entry needed here. *)
+
 (* ─── Expression conversion ──────────────────────────────────────── *)
 
 let dummy_bool = BInt { width = 1; signed = Unsigned }
@@ -569,6 +694,35 @@ let silent_zero ~reason ~width =
     BConst { value = 0; width }
   end else
     raise (Silent_zero_substitution reason)
+
+(* One-level shape introspection for the generic catch-all in the
+ * expression walker.  Returns e.g. "TUPLE4(STRING(\"foo\"), Bar,
+ * TLIST[3], Baz)" — outermost constructor plus the constructor name
+ * of each child (and the embedded STRING tag for tagged tuples).
+ * Lets us see *which* CST shape the converter is missing instead of
+ * a blanket "no matching pattern" message. *)
+let shape_of_tok (t : Source_text_verible.token) : string =
+  let open Source_text_verible in
+  let str = Source_text_verible_tokens.getstr in
+  let child_desc c =
+    match c with
+    | STRING s -> Printf.sprintf "STRING(%S)" s
+    | TLIST xs -> Printf.sprintf "TLIST[%d]" (List.length xs)
+    | _ -> str c
+  in
+  match t with
+  | TUPLE2 (a, b)                -> Printf.sprintf "TUPLE2(%s, %s)" (child_desc a) (child_desc b)
+  | TUPLE3 (a, b, c)             -> Printf.sprintf "TUPLE3(%s, %s, %s)" (child_desc a) (child_desc b) (child_desc c)
+  | TUPLE4 (a, b, c, d)          -> Printf.sprintf "TUPLE4(%s, %s, %s, %s)" (child_desc a) (child_desc b) (child_desc c) (child_desc d)
+  | TUPLE5 (a, b, c, d, e)       -> Printf.sprintf "TUPLE5(%s, %s, %s, %s, %s)" (child_desc a) (child_desc b) (child_desc c) (child_desc d) (child_desc e)
+  | TUPLE6 (a, b, c, d, e, f)    -> Printf.sprintf "TUPLE6(%s, %s, %s, %s, %s, %s)" (child_desc a) (child_desc b) (child_desc c) (child_desc d) (child_desc e) (child_desc f)
+  | TUPLE7 (a, b, c, d, e, f, g) -> Printf.sprintf "TUPLE7(%s, %s, %s, %s, %s, %s, %s)" (child_desc a) (child_desc b) (child_desc c) (child_desc d) (child_desc e) (child_desc f) (child_desc g)
+  | TUPLE8 (a, b, c, d, e, f, g, h)             -> Printf.sprintf "TUPLE8(%s, %s, %s, %s, %s, %s, %s, %s)" (child_desc a) (child_desc b) (child_desc c) (child_desc d) (child_desc e) (child_desc f) (child_desc g) (child_desc h)
+  | TUPLE9 (a, b, c, d, e, f, g, h, i)          -> Printf.sprintf "TUPLE9(%s, %s, %s, %s, %s, %s, %s, %s, %s)" (child_desc a) (child_desc b) (child_desc c) (child_desc d) (child_desc e) (child_desc f) (child_desc g) (child_desc h) (child_desc i)
+  | TUPLE10 (a, b, c, d, e, f, g, h, i, j)      -> Printf.sprintf "TUPLE10(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)" (child_desc a) (child_desc b) (child_desc c) (child_desc d) (child_desc e) (child_desc f) (child_desc g) (child_desc h) (child_desc i) (child_desc j)
+  | TLIST xs                     -> Printf.sprintf "TLIST[%d](%s)" (List.length xs) (String.concat "," (List.map child_desc xs))
+  | STRING s                     -> Printf.sprintf "STRING(%S)" s
+  | _ -> str t
 
 (* Recursive width computation over a bexpr against `cur_signal_widths`.
  * Returns `Some w` when computable; `None` when we can't tell (caller
@@ -662,8 +816,18 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       | TK_DecDigits s | TK_OctDigits s -> s
       | _ -> "0"
     in
+    (* Casez/casex/inside patterns use `?`, `x`, `z` as wildcard digits
+     * (`53'b1???…?`).  int_of_string can't parse those.  Substitute `0`
+     * for the wildcard bits to get a representative integer value —
+     * sound for non-wildcard comparison ops; for wildcard ops (`==?`,
+     * `casez`) the wildcard semantics is lost but the operand width
+     * survives, which is what downstream width inference needs. *)
+    let digits_clean =
+      String.map (function
+        | '?' | 'x' | 'X' | 'z' | 'Z' -> '0'
+        | c -> c) digits in
     let value =
-      try int_of_string ("0" ^ prefix ^ digits)
+      try int_of_string ("0" ^ prefix ^ digits_clean)
       with _ ->
         if Lazy.force lenient_mode then 0
         else raise (Silent_zero_substitution
@@ -823,6 +987,45 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       (match exprs with
        | [single] -> single
        | _ -> BConcat exprs)
+  (* `system_tf_call1`: whitelisted elaboration helpers (see lexer
+   * systask hashtable).  Route through eval_int to fold to a constant;
+   * if eval_int can't fold ($bits of unknown type, etc.) fall back to
+   * BConst 0 with width 1 — matches the empty-config strategy used
+   * for $clog2 inner-arg failure. *)
+  | TUPLE3 (STRING "system_tf_call1", SystemTFIdentifier name, call_base) as tok ->
+      (* For value-preserving sign casts ($unsigned, $signed), recurse
+         into the argument expression rather than collapsing to a
+         constant.  Without this, `$unsigned({1'b0, D})` lost both
+         operands of the concat and became a 1-bit zero — matching
+         slang's old behaviour, but masking a real semantic divergence
+         the moment slang's Call handler started producing BCall. *)
+      (match name with
+       | "$unsigned" | "$signed" ->
+           let cands = collect_by (function
+             | TUPLE4 (STRING t, _, _, _)
+               when prefix_is "range_list_in_braces" t -> true
+             | TUPLE4 (STRING t, _, _, _)
+               when prefix_is "add_expr" t || prefix_is "mul_expr" t -> true
+             | TUPLE3 (STRING t, _, _)
+               when prefix_is "reference_or_call_base" t -> true
+             | TUPLE3 (STRING t, _, _)
+               when prefix_is "reference" t -> true
+             | TUPLE3 (STRING t, _, _)
+               when prefix_is "unqualified_id" t -> true
+             | TUPLE3 (STRING t, _, _)
+               when prefix_is "bin_based_number" t
+                 || prefix_is "hex_based_number" t
+                 || prefix_is "dec_based_number" t
+                 || prefix_is "oct_based_number" t -> true
+             | TK_DecNumber _ | TK_UnBasedNumber _ -> true
+             | _ -> false) call_base in
+           (match cands with
+            | first :: _ -> recurse first
+            | [] -> recurse call_base)
+       | _ ->
+           (match eval_int ~pkgs ~params tok with
+            | Some n -> BConst { value = n; width = 32 }
+            | None -> BConst { value = 0; width = 1 }))
   (* Function-like call: `reference_or_call_base1`. The lexer treats
    * `$unsigned`/`$signed` as ordinary SymbolIdentifier (not
    * SystemTFIdentifier), so they parse through this shape too — both
@@ -862,9 +1065,16 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
            (match eval_int ~pkgs ~params tok with
             | Some n -> BConst { value = n; width = 32 }
             | None ->
+                let inner_shape =
+                  try shape_of_tok call_base
+                  with _ -> "<shape-print failed>" in
+                let known_params =
+                  String.concat ","
+                    (List.map fst params |> List.sort compare) in
                 silent_zero ~width:1
                   ~reason:(Printf.sprintf
-                    "unrecognised system call %s, eval_int returned None" name))
+                    "%s arg unresolvable: arg_shape=%s; known params=[%s]"
+                    name inner_shape known_params))
        | Some fname ->
            (* Plain user function call. Emit BCall so the inline pass
             * (Behavioral_inline) can substitute the body in. Pull the
@@ -1112,6 +1322,8 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       if prefix_is "add_expr2" tag then bin BAdd lhs rhs
       else if prefix_is "add_expr3" tag then bin BSub lhs rhs
       else if prefix_is "mul_expr2" tag then bin BMul lhs rhs
+      else if prefix_is "mul_expr3" tag then bin BDiv lhs rhs
+      else if prefix_is "mul_expr4" tag then bin BMod lhs rhs
       else if prefix_is "and_expr" tag || prefix_is "bitand_expr" tag
         then bin BAnd lhs rhs
       else if prefix_is "or_expr" tag || prefix_is "bitor_expr" tag
@@ -1136,6 +1348,40 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         then bin BEq lhs rhs
       else if prefix_is "logeq_expr3" tag then bin BNe lhs rhs
       else if prefix_is "expr_primary_parens" tag then recurse _op
+      (* `qualified_id2`: scope-qualified reference `scope::name`
+       * (or `inst.field` — same shape, different separator).
+       * Verilator -E flattening doesn't resolve `pkg::CONST` so the
+       * flat cva6 source still has these.  Try the constant-folder
+       * first; on miss, fall back to the rightmost name as a BVar,
+       * matching how slang's flat elaboration renames bare `name`
+       * after import resolution. *)
+      else if prefix_is "qualified_id" tag then
+        (match eval_int ~pkgs ~params
+                 (TUPLE4 (STRING tag, lhs, _op, rhs)) with
+         | Some n -> BConst { value = n; width = 32 }
+         | None -> recurse rhs)
+      (* `expression_list_proper`: left-recursive cons of a
+       * comma-separated list.  Reaching this node in expression
+       * context means an upstream handler forwarded a raw list
+       * (e.g. a function-call argument list slipped through).
+       * Flatten the spine and lower to BConcat — matches SV semantics
+       * if the list came from a `{a, b, c}` context; for arg-list
+       * misroutes it at least preserves all elements rather than
+       * silently zeroing the expression. *)
+      else if prefix_is "expression_list_proper" tag then begin
+        let rec flatten acc t = match t with
+          | TUPLE4 (STRING tag', x, _comma, y)
+            when prefix_is "expression_list_proper" tag' ->
+              flatten (y :: acc) x
+          | other -> other :: acc
+        in
+        let raw = flatten [rhs] lhs in
+        let exprs = List.map recurse raw in
+        match exprs with
+        | [] -> BConst { value = 0; width = 1 }
+        | [single] -> single
+        | xs -> BConcat xs
+      end
       else
         silent_zero ~width:1
           ~reason:(Printf.sprintf "unhandled TUPLE4 expression tag %s" tag)
@@ -1155,9 +1401,77 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
   | TUPLE6 (STRING tag, _ct, _quote, _lp, expr, _rp) when prefix_is "cast" tag ->
       recurse expr
   | TLIST [single] -> recurse single
-  | _ ->
+  (* Streaming concatenation `{<<N{body}}` / `{>>N{body}}` —
+   *   TUPLE8(tag, LBRACE, <<|>>, N_decimal, LBRACE, body, RBRACE, RBRACE).
+   * Lowers to the body's plain BConcat: this preserves the bit count
+   * (which downstream width inference needs) but loses the
+   * reordering.  Acceptable interim semantics — the miter will flag
+   * any real bit-order disagreement vs slang. *)
+  | TUPLE8 (STRING tag, _lb1, _stream_op, _n_dec, _lb2, body, _rb1, _rb2)
+    when prefix_is "streaming_concatenation" tag ->
+      let exprs = match body with
+        | TLIST xs ->
+            List.filter_map (function
+              | TLIST [] | EMPTY_TOKEN | COMMA -> None
+              | e -> Some (recurse e)) xs
+        | other -> [recurse other]
+      in
+      (match exprs with
+       | [] -> BConst { value = 0; width = 1 }
+       | [single] -> single
+       | xs -> BConcat xs)
+  (* `x inside { a, b, c, [lo:hi], ... }` set-membership.
+   * Verible parses as `comp_expr6`:
+   *   TUPLE6(tag, lhs_expr, Inside, LBRACE, value_list, RBRACE)
+   * where value_list is a TLIST whose non-separator children are
+   * either expressions or `value_range` tuples `[lo:hi]`.
+   * Lowering: OR-reduce equalities (`x == a`) for plain values;
+   * range members become `(x >= lo) && (x <= hi)`.  An empty set
+   * lowers to literal 0 (no value matches).  Used heavily in cva6
+   * state-machine guards: `if (op inside {OP_ADD, OP_SUB})`. *)
+  | TUPLE6 (STRING tag, lhs_tok, Inside, _, body, _)
+    when prefix_is "comp_expr6" tag ->
+      let lhs_bir = recurse lhs_tok in
+      let cmp_type = BInt { width = 1; signed = Unsigned } in
+      let eq r = BBinOp { op = BEq; lhs = lhs_bir; rhs = r;
+                          result_type = cmp_type } in
+      let arm e =
+        match e with
+        (* value_range: TUPLE5(STRING "value_range1", LBRACKET,
+         *                     lo, COLON, hi, RBRACKET) — five or six
+         * children depending on Verible build.  Match a tagged
+         * tuple whose first child is the value_range tag and pick
+         * out the two expression-shaped children. *)
+        | TUPLE5 (STRING t, _, lo, _, hi)
+        | TUPLE6 (STRING t, _, lo, _, hi, _)
+          when prefix_is "value_range" t ->
+            let lo_b = recurse lo and hi_b = recurse hi in
+            let ge = BBinOp { op = BGe; lhs = lhs_bir; rhs = lo_b;
+                              result_type = cmp_type } in
+            let le = BBinOp { op = BLe; lhs = lhs_bir; rhs = hi_b;
+                              result_type = cmp_type } in
+            BBinOp { op = BAnd; lhs = ge; rhs = le;
+                     result_type = cmp_type }
+        | _ -> eq (recurse e)
+      in
+      let elems = match body with
+        | TLIST xs ->
+            List.filter_map (fun e -> match e with
+              | TLIST [] | EMPTY_TOKEN | COMMA -> None
+              | _ -> Some (arm e)) xs
+        | other -> [arm other]
+      in
+      (match elems with
+       | [] -> BConst { value = 0; width = 1 }
+       | first :: rest ->
+           List.fold_left (fun acc e ->
+             BBinOp { op = BOr; lhs = acc; rhs = e;
+                      result_type = cmp_type }) first rest)
+  | other ->
       silent_zero ~width:1
-        ~reason:"unhandled expression shape (no matching pattern)"
+        ~reason:(Printf.sprintf
+                   "unhandled expression shape: %s"
+                   (shape_of_tok other))
 
 (* ─── Module port + signal extraction ────────────────────────────── *)
 
@@ -1562,6 +1876,46 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
    *   TUPLE6(tag, lhs, _, _, rhs, _)) *)
   | TUPLE6 (STRING tag, lhs, _, _, rhs, _)
     when prefix_is "nonblocking_assignment" tag -> assign_to lhs rhs
+  (* Compound (modify) assignment: lhs OP= rhs.  Verible emits one
+     tag per operator (`assign_modify_statement1`..`11`):
+       1:+=  2:-=  3:*=  4:/=  5:%=  6:&=  7:|=  8:^=
+       9:<<=  10:>>=  11:>>>=
+     Expand to `lhs = lhs OP rhs` here; assign_to lowers the
+     synthesised RHS the same way as any other assignment.        *)
+  | TUPLE4 (STRING tag, lhs, _op_tok, rhs)
+    when prefix_is "assign_modify_statement" tag ->
+      let suffix_n =
+        let plen = String.length "assign_modify_statement" in
+        try int_of_string (String.sub tag plen (String.length tag - plen))
+        with _ -> 0 in
+      let op = match suffix_n with
+        |  1 -> BAdd  |  2 -> BSub  |  3 -> BMul  |  4 -> BDiv
+        |  5 -> BMod  |  6 -> BAnd  |  7 -> BOr   |  8 -> BXor
+        |  9 -> BShl  | 10 -> BShr  | 11 -> BAshr
+        | _ -> BAdd in
+      let lhs_b = recurse_e lhs in
+      let rhs_b = recurse_e rhs in
+      let expanded = BBinOp { op;
+                              lhs = lhs_b;
+                              rhs = rhs_b;
+                              result_type = result_type_for op lhs_b rhs_b } in
+      (* Reuse assign_to's LHS lowering by handing it an expression
+         that already evaluates to the expanded RHS.  We have an
+         alternate code path for the bare-name common case;
+         indexed/sliced LHS falls back to a BAssign on the base.   *)
+      let bare_name = match lhs_indexed_of lhs with
+        | Some (n, None) -> Some n
+        | _ -> None in
+      (match bare_name with
+       | Some n -> BAssign { lhs = n; rhs = expanded }
+       | None ->
+           (* Fall back: emit a normal assignment using assign_to
+              after synthesising a TLIST token that wraps expanded.
+              Simpler: just BAssign with the base name if we can
+              extract it. *)
+           (match lhs_indexed_of lhs with
+            | Some (n, _) -> BAssign { lhs = n; rhs = expanded }
+            | None -> BBlock []))
   (* Conditional statement. Match by direct tuple structure to pick
    * the immediate then/else slots (don't recurse — collect_by would
    * pull in statements from nested conditionals too). Arities seen:
@@ -2003,6 +2357,15 @@ let extract_body_params ~pkgs ~params tok =
           || prefix_is "select_variable_dimension" t' -> ()
       | TUPLE3 (STRING t', _, _) when prefix_is "instantiation_type" t'
                                     || prefix_is "data_type" t' -> ()
+      (* `trailing_assign1`: TUPLE4(tag, EQ, value, ...).  The `value`
+       * subtree is the parameter's default expression; identifiers
+       * inside it (struct field names like `BHTEntries`, function
+       * names like `$clog2`, etc.) must NOT be picked up as the
+       * parameter's name.  Without this skip, a struct-typed default
+       * like `parameter T cfg = '{F1: v1, F2: v2}` would grab `F1`
+       * as the param name instead of `cfg` (task #141). *)
+      | TUPLE4 (STRING t', _, _, _)
+        when prefix_is "trailing_assign" t' -> ()
       | TUPLE3 (STRING t', SymbolIdentifier id, _)
         when prefix_is "param_assignment" t' || prefix_is "param_decl" t' ->
           if !nm = None then nm := Some id
@@ -2012,6 +2375,14 @@ let extract_body_params ~pkgs ~params tok =
       | TUPLE4 (a, b, c, d) -> List.iter walk_skip_type [a; b; c; d]
       | TUPLE5 (a, b, c, d, e) -> List.iter walk_skip_type [a; b; c; d; e]
       | TUPLE6 (a, b, c, d, e, f) -> List.iter walk_skip_type [a; b; c; d; e; f]
+      | TUPLE7 (a, b, c, d, e, f, g) ->
+          List.iter walk_skip_type [a; b; c; d; e; f; g]
+      | TUPLE8 (a, b, c, d, e, f, g, h) ->
+          List.iter walk_skip_type [a; b; c; d; e; f; g; h]
+      | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+          List.iter walk_skip_type [a; b; c; d; e; f; g; h; i]
+      | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+          List.iter walk_skip_type [a; b; c; d; e; f; g; h; i; j]
       | TLIST xs -> List.iter walk_skip_type xs
       | _ -> ()
     in
@@ -2024,6 +2395,67 @@ let extract_body_params ~pkgs ~params tok =
       | _ -> ()) n;
     match !nm, !value_node with
     | Some id, Some v ->
+        (* Before the int/array paths, look for a struct-typed default
+         * `'{field: int_value, ...}` (assignment_pattern2 CST shape).
+         * Extract (field, int) pairs into cur_struct_params so
+         * eval_int's reference2+hierarchy_extension1 arm can later
+         * resolve `id.field` to the concrete int (task #141).  We try
+         * eval_int on each value expression; field values that don't
+         * fold to ints are silently skipped (the param.field lookup
+         * will fall back to Some 0 for those). *)
+        let extract_struct_pairs t =
+          (* Look for an `assignment_pattern2` only as the immediate or
+           * single-step-wrapped value of this param.  A full-tree walk
+           * was over-eager — cva6 code has `'{...}` patterns deep
+           * inside cast/concat expressions that are not the param's
+           * top-level default, and picking those up polluted the
+           * cur_struct_params table. *)
+          let rec find_ap2 ~depth t =
+            if depth > 4 then None else match t with
+            | TUPLE4 (STRING tag, _, body, _)
+              when prefix_is "assignment_pattern2" tag -> Some body
+            (* unwrap a few common single-child wrappers (parens, casts,
+             * trailing-assign, type-tag). *)
+            | TUPLE2 (_, x) -> find_ap2 ~depth:(depth+1) x
+            | TUPLE3 (_, x, _) -> find_ap2 ~depth:(depth+1) x
+            | TUPLE4 (STRING tag, _, x, _)
+              when prefix_is "trailing_assign" tag
+                || prefix_is "expr_primary_parens" tag
+                || prefix_is "cast" tag ->
+                find_ap2 ~depth:(depth+1) x
+            | _ -> None
+          in
+          match find_ap2 ~depth:0 t with
+          | Some body ->
+              let pairs = match body with
+                | TLIST xs ->
+                    List.filter_map (fun e -> match e with
+                      | TUPLE4 (STRING t, key, _, value)
+                        when prefix_is "structure_or_array_pattern_expression" t ->
+                          let kname = ref None in
+                          walk (function
+                            | SymbolIdentifier id when !kname = None ->
+                                kname := Some id
+                            | _ -> ()) key;
+                          (match !kname,
+                                 eval_int ~pkgs ~params:acc value with
+                           | Some k, Some n -> Some (k, n)
+                           | _ -> None)
+                      | _ -> None) xs
+                | _ -> []
+              in
+              if pairs = [] then None else Some pairs
+          | None -> None
+        in
+        (match extract_struct_pairs v with
+         | Some pairs ->
+             if Sys.getenv_opt "SV_DECOMP_STRUCT_DEBUG" <> None then
+               Printf.eprintf "[struct] param %s := %s\n" id
+                 (String.concat ", "
+                    (List.map (fun (f, n) ->
+                      Printf.sprintf "%s=%d" f n) pairs));
+             Hashtbl.replace cur_struct_params id pairs
+         | None -> ());
         let cur = List.assoc_opt id acc in
         let new_val =
           match eval_int ~pkgs ~params:acc v with
@@ -2055,6 +2487,64 @@ let extract_body_params ~pkgs ~params tok =
              (id, v) :: List.remove_assoc id acc
          | _ -> acc)
     | _ -> acc
+  in
+  (* Multi-decl support: a single `parameter` keyword followed by a
+     comma list (`parameter A = 1, B = 2, C = 3;`) becomes an
+     `any_param_declaration1` whose first identifier+value sit in the
+     `param_type_followed_by_id_and_dimensions_opt`/`trailing_assign`
+     subtrees (captured above), but the remaining declarators live as
+     `parameter_assign1` / `localparam_assign1` nodes inside the
+     `parameter_assign_list`.  Without this walk, only the FIRST
+     parameter in such a declaration was bound — exactly what made
+     Controller_for_traffic_signal collapse: its four FSM-state names
+     were declared in one comma-separated group and only
+     `high_green_lane_red` was resolved.                              *)
+  let one acc n =
+    let acc = one acc n in
+    let extras = ref [] in
+    let rec walk_extras = function
+      | TUPLE5 (STRING t, SymbolIdentifier id, _, v, _)
+        when prefix_is "parameter_assign1" t ->
+          extras := (id, v) :: !extras
+      | TUPLE4 (STRING t, SymbolIdentifier id, _, v)
+        when prefix_is "localparam_assign1" t ->
+          extras := (id, v) :: !extras
+      | TUPLE2 (a, b) -> walk_extras a; walk_extras b
+      | TUPLE3 (a, b, c) -> walk_extras a; walk_extras b; walk_extras c
+      | TUPLE4 (a, b, c, d) -> List.iter walk_extras [a; b; c; d]
+      | TUPLE5 (a, b, c, d, e) -> List.iter walk_extras [a; b; c; d; e]
+      | TUPLE6 (a, b, c, d, e, f) -> List.iter walk_extras [a; b; c; d; e; f]
+      | TUPLE7 (a, b, c, d, e, f, g) ->
+          List.iter walk_extras [a; b; c; d; e; f; g]
+      | TUPLE8 (a, b, c, d, e, f, g, h) ->
+          List.iter walk_extras [a; b; c; d; e; f; g; h]
+      | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+          List.iter walk_extras [a; b; c; d; e; f; g; h; i]
+      | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+          List.iter walk_extras [a; b; c; d; e; f; g; h; i; j]
+      | TLIST xs -> List.iter walk_extras xs
+      | _ -> () in
+    walk_extras n;
+    List.fold_left (fun acc (id, v) ->
+      let cur = List.assoc_opt id acc in
+      let new_val =
+        match eval_int ~pkgs ~params:acc v with
+        | Some i -> Some (string_of_int i)
+        | None ->
+            (try
+               match expr_to_bexpr ~pkgs ~params:acc ~arrays:[] v with
+               | BConst { value; _ } -> Some (string_of_int value)
+               | BConcat elems ->
+                   Hashtbl.replace cur_array_params id elems;
+                   None
+               | _ -> None
+             with _ -> None) in
+      match cur, new_val with
+      | None, Some v -> (id, v) :: acc
+      | Some old, Some v when v <> old ->
+          (id, v) :: List.remove_assoc id acc
+      | _ -> acc
+    ) acc (List.rev !extras)
   in
   (* Verible's parse tree presents parameter declarations in
      reverse source order, so a derived param like
@@ -2101,6 +2591,7 @@ let convert_module ~pkgs (mdecl : module_decl)
      and the reference3 walker sees an empty table when processing
      `LUT[sel]` in the always_comb body.                              *)
   Hashtbl.clear cur_array_params;
+  Hashtbl.clear cur_struct_params;
   (* Merge instance-override params with body-declared defaults; the
    * override wins on conflict (List.assoc_opt finds it first). *)
   let body_params = extract_body_params ~pkgs ~params mdecl.m_body in
