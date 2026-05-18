@@ -2032,6 +2032,296 @@ let do_open_orfs_run () =
           (List.length layout.l_components) extra)
     end)
 
+(* ---------- Synthesise to gate-level mapped netlist ----------
+
+   Runs Synth_pipeline on the currently-loaded BIR (re-using the same
+   dependency closure as ATPG), then converts the resulting hierarchy
+   of Lib_map netlists back into a Behavioral_ir.bprogram and replaces
+   current_prog.  The point is to feed Schematic → Show gate-level
+   without making the user shuttle through a Verilog file.            *)
+
+let bir_of_synth_netlists
+    (netlists : Hier_synth.module_netlist list) : Behavioral_ir.bprogram =
+  let mk_signal direction (name, width) : Behavioral_ir.bsignal = {
+    name; direction;
+    stype = Behavioral_ir.BInt { width; signed = Unsigned };
+    initial_value = None;
+    attrs = [];
+  } in
+  let modules = List.map (fun (mn : Hier_synth.module_netlist) ->
+    let signals =
+      List.map (mk_signal `Input)  mn.mn_real_inputs
+      @ List.map (mk_signal `Output) mn.mn_real_outputs
+      @ List.map (fun (w, width) -> mk_signal `Internal (w, width))
+                 mn.mn_netlist.wires in
+    let cell_insts = List.map (fun (i : Lib_map.instance) ->
+      { Behavioral_ir.inst_name = i.inst_name;
+        module_name = i.cell.cell_name;
+        param_values = [];
+        port_connections =
+          List.map (fun (pc : Lib_map.pin_conn) ->
+            (pc.pin, Behavioral_ir.BVar pc.net)) i.conns }
+    ) mn.mn_netlist.insts in
+    let child_insts = List.map (fun (ci : Hier_synth.child_inst_emit) ->
+      { Behavioral_ir.inst_name = ci.ci_inst;
+        module_name = ci.ci_module;
+        param_values = [];
+        port_connections =
+          List.map (fun (p, n) -> (p, Behavioral_ir.BVar n)) ci.ci_conns }
+    ) mn.mn_child_insts in
+    { Behavioral_ir.name = mn.mn_name;
+      params = []; signals; processes = [];
+      instances = cell_insts @ child_insts;
+      funcs = []; mems = []; attrs = [] }
+  ) netlists in
+  let cell_tbl : (string, Behavioral_ir.library_port list) Hashtbl.t =
+    Hashtbl.create 64 in
+  List.iter (fun (mn : Hier_synth.module_netlist) ->
+    List.iter (fun (i : Lib_map.instance) ->
+      if not (Hashtbl.mem cell_tbl i.cell.cell_name) then
+        let ports =
+          List.map (fun p ->
+            { Behavioral_ir.port_name = p;
+              port_direction = `Input;
+              port_width = 1 }) i.cell.in_pins
+          @ [ { Behavioral_ir.port_name = i.cell.out_pin;
+                port_direction = `Output;
+                port_width = 1 } ] in
+        Hashtbl.add cell_tbl i.cell.cell_name ports
+    ) mn.mn_netlist.insts
+  ) netlists;
+  let library_cells =
+    Hashtbl.fold (fun k v acc -> (k, v) :: acc) cell_tbl [] in
+  { modules; library_cells }
+
+(* Core synthesis path: returns the mapped bprogram + a one-line
+   summary string.  Side-effect-free wrt current_prog so callers can
+   decide whether to install the result. *)
+let synthesise_inner (path, p : string * Behavioral_ir.bprogram)
+    : Behavioral_ir.bprogram * string =
+  let pick_top () =
+    let instantiated =
+      List.concat_map (fun (m : Behavioral_ir.bmodule) ->
+        List.map (fun (i : Behavioral_ir.binstance) -> i.module_name)
+          m.instances) p.modules in
+    match List.filter (fun (m : Behavioral_ir.bmodule) ->
+            not (List.mem m.name instantiated)) p.modules with
+    | [t] -> t.name
+    | t :: _ -> t.name
+    | [] -> (List.hd p.modules).name in
+  let top = pick_top () in
+  let name_map = module_name_index_for path in
+  let files, _ =
+    close_verible_dependencies
+      ~seed:path ~on_missing:prompt_locate_module name_map in
+  let out_path =
+    Filename.concat (Filename.get_temp_dir_name ())
+      (Printf.sprintf "sv_gui_synth_%s.v" top) in
+  set_status (Printf.sprintf
+    "Synthesising: top=%s, %d file(s)…" top (List.length files));
+  let netlists, _ =
+    Synth_pipeline.run ~emit_verilog:true ~top ~out_path ~files () in
+  last_synth_out_path := Some out_path;
+  let p' = bir_of_synth_netlists netlists in
+  let n_cells = List.fold_left (fun a (m : Behavioral_ir.bmodule) ->
+    a + List.length m.instances) 0 p'.modules in
+  let summary = Printf.sprintf
+    "Synthesis OK: top=%s, %d module(s), %d cell(s), %d cell types — \
+     Verilog @ %s"
+    top (List.length p'.modules) n_cells
+    (List.length p'.library_cells) out_path in
+  p', summary
+
+let do_synthesise () =
+  with_errors "synthesise" (fun () ->
+    match !current_prog with
+    | None ->
+        info_dialog "Load a SystemVerilog file first (Decompile → Parse…)."
+    | Some (path, _ as cp) ->
+        let p', summary = synthesise_inner cp in
+        current_prog := Some (path ^ " [synthesised]", p');
+        dump_prog ~banner:(summary ^ "\n\ncurrent_prog replaced with the \
+                                       mapped netlist.\n\n") p';
+        set_status summary)
+
+(* ---------- Schematic generation ----------
+
+   Three menu actions feed the new Schematic_layout/Schematic_view
+   modules:
+
+     • Load .slib …          — parse a Synopsys-style symbol library
+                                file and stash it as the active set of
+                                symbols for subsequent renders.
+     • Show RTL schematic …  — render every binstance in a picked
+                                module, falling back to auto-generated
+                                symbols when no .slib entry exists.
+     • Show gate-level …     — render only those binstances whose
+                                module_name appears in [library_cells]
+                                (i.e. post-mapping designs).
+
+   The user picks the target bmodule from a small chooser dialog when
+   the loaded BIR has more than one module.                            *)
+
+let active_slib : Symbol_lib.library ref = ref (Symbol_lib.empty ())
+
+let pick_module_dialog (p : Behavioral_ir.bprogram)
+    : Behavioral_ir.bmodule option =
+  match p.modules with
+  | []  -> None
+  | [m] -> Some m
+  | ms ->
+      let parent = need_window () in
+      let d = GWindow.dialog ~title:"Select module" ~parent
+                ~modal:true ~width:420 () in
+      ignore (GMisc.label ~text:"Choose a module to display:"
+                ~xalign:0.0
+                ~packing:(d#vbox#pack ~padding:6) ());
+      let combo, (store, col) =
+        GEdit.combo_box_text ~strings:(List.map (fun (m : Behavioral_ir.bmodule) -> m.name) ms)
+          ~packing:(d#vbox#pack ~padding:6) () in
+      ignore store; ignore col;
+      combo#set_active 0;
+      d#add_button "Open" `OK;
+      d#add_button "Cancel" `CANCEL;
+      d#vbox#misc#show_all ();
+      let r = d#run () in
+      let idx = combo#active in
+      d#destroy ();
+      match r, idx with
+      | `OK, i when i >= 0 && i < List.length ms ->
+          Some (List.nth ms i)
+      | _ -> None
+
+let do_load_slib () =
+  with_errors "load .slib" (fun () ->
+    let p = open_file_dialog () in
+    if p = "" then ()
+    else begin
+      let lib = Symbol_lib.parse_file p in
+      Symbol_lib.merge ~into:!active_slib lib;
+      let n = Hashtbl.fold (fun _ _ a -> a + 1) lib 0 in
+      set_status (Printf.sprintf
+        "Loaded %d symbols from %s (total active: %d)"
+        n p (Hashtbl.fold (fun _ _ a -> a + 1) !active_slib 0))
+    end)
+
+(* Auto-fill the active library from the cells referenced by [m]:
+   for every instance whose module_name is missing from active_slib,
+   synthesise a stub from either library_cells or the referenced
+   bmodule's signal list. *)
+let auto_fill_missing
+    ~(prog : Behavioral_ir.bprogram)
+    (m : Behavioral_ir.bmodule) =
+  List.iter (fun (i : Behavioral_ir.binstance) ->
+    if not (Hashtbl.mem !active_slib i.module_name) then begin
+      let pins = match List.assoc_opt i.module_name prog.library_cells with
+        | Some lps ->
+            List.map (fun (lp : Behavioral_ir.library_port) ->
+              (lp.port_name,
+               match lp.port_direction with
+               | `Input -> "input" | `Output -> "output")) lps
+        | None ->
+            match List.find_opt (fun (mm : Behavioral_ir.bmodule) ->
+                    mm.name = i.module_name) prog.modules with
+            | Some mm ->
+                List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+                  match s.direction with
+                  | `Input  -> Some (s.name, "input")
+                  | `Output -> Some (s.name, "output")
+                  | `Internal -> None) mm.signals
+            | None ->
+                List.map (fun (p, _) -> (p, "input")) i.port_connections
+      in
+      Hashtbl.replace !active_slib i.module_name
+        (Symbol_lib.auto_generate ~cell_name:i.module_name ~pins)
+    end
+  ) m.instances
+
+let confirm_dialog msg =
+  let d = GWindow.message_dialog
+    ~message:msg ~message_type:`QUESTION
+    ~buttons:GWindow.Buttons.yes_no
+    ~parent:(need_window ()) ~modal:true () in
+  let r = d#run () in
+  d#destroy ();
+  r = `YES
+
+let do_show_schematic ~gate_only () =
+  with_errors "show schematic" (fun () ->
+    match !current_prog with
+    | None ->
+        info_dialog "Load a SystemVerilog file first (File → Open … or \
+                     Decompile → Parse with verible …)."
+    | Some (_label, p) ->
+        (match pick_module_dialog p with
+         | None -> ()
+         | Some m_chosen ->
+             let module_name = m_chosen.name in
+             let needs_synth =
+               m_chosen.instances = []
+               || (gate_only &&
+                   let lib_names = List.map fst p.library_cells in
+                   not (List.exists (fun (i : Behavioral_ir.binstance) ->
+                          List.mem i.module_name lib_names) m_chosen.instances))
+             in
+             let p, m =
+               if needs_synth then begin
+                 let prompt =
+                   if m_chosen.instances = []
+                   then Printf.sprintf
+                          "Module '%s' is pure behavioural RTL (no \
+                           instances to draw). Synthesise it to gates \
+                           now and show the mapped schematic?" module_name
+                   else Printf.sprintf
+                          "Module '%s' has no library-cell instances. \
+                           Synthesise to gates now?" module_name in
+                 if not (confirm_dialog prompt) then (p, m_chosen)
+                 else begin
+                   match !current_prog with
+                   | None -> (p, m_chosen)
+                   | Some cp ->
+                       let p', summary = synthesise_inner cp in
+                       current_prog := Some (fst cp ^ " [synthesised]", p');
+                       set_status summary;
+                       let m' =
+                         match List.find_opt (fun (m : Behavioral_ir.bmodule) ->
+                                 m.name = module_name) p'.modules with
+                         | Some m -> m
+                         | None ->
+                             (* Fall back to the synth top if name was
+                                renamed (shouldn't happen, but be safe). *)
+                             List.hd p'.modules in
+                       (p', m')
+                 end
+               end else (p, m_chosen)
+             in
+             let m =
+               if gate_only then
+                 let lib_names = List.map fst p.library_cells in
+                 let kept = List.filter (fun (i : Behavioral_ir.binstance) ->
+                   List.mem i.module_name lib_names) m.instances in
+                 { m with instances = kept }
+               else m
+             in
+             if m.instances = [] then
+               info_dialog
+                 (Printf.sprintf
+                   "Module '%s' still has nothing to draw after \
+                    synthesis — the design may have optimised away to \
+                    constants, or top selection picked the wrong \
+                    module." m.name)
+             else begin
+               auto_fill_missing ~prog:p m;
+               let sc = Schematic_layout.build
+                          ~slib:!active_slib ~prog:p m in
+               let title = if gate_only then "Gate-level schematic"
+                                         else "RTL schematic" in
+               Schematic_view.open_window ~title sc;
+               set_status (Printf.sprintf
+                 "%s: %s — %d cells, %d nets" title sc.sc_module
+                 (List.length sc.sc_insts) (List.length sc.sc_nets))
+             end))
+
 (* ---------- script discovery / loading ---------- *)
 
 let read_file path =
@@ -2171,6 +2461,7 @@ let () =
   let decompile_menu = mk "Decompile" in
   let verify_menu    = mk "Verify" in
   let topology_menu  = mk "Topology" in
+  let schematic_menu = mk "Schematic" in
   let _scripts       = mk "Scripts" in   (* default landing for add_item *)
   let view_menu      = mk "View" in
   let help_menu      = mk "Help" in
@@ -2224,6 +2515,8 @@ let () =
   ignore (d#add_item "Parse Yosys/RTLIL..."    ~callback:(do_parse "yosys"));
   ignore (d#add_separator ());
   ignore (d#add_item "Optimise loaded BIR" ~callback:do_optim);
+  ignore (d#add_item "Synthesise loaded BIR (gate mapping)"
+            ~callback:do_synthesise);
 
   (* Verify menu. *)
   let m = new GMenu.factory verify_menu ~accel_group in
@@ -2245,6 +2538,15 @@ let () =
   let t = new GMenu.factory topology_menu ~accel_group in
   ignore (t#add_item "Run ORFS layout..."  ~callback:do_orfs_run);
   ignore (t#add_item "Open ORFS run..."    ~callback:do_open_orfs_run);
+
+  (* Schematic menu. *)
+  let s = new GMenu.factory schematic_menu ~accel_group in
+  ignore (s#add_item "Show RTL schematic..."
+            ~callback:(do_show_schematic ~gate_only:false));
+  ignore (s#add_item "Show gate-level schematic..."
+            ~callback:(do_show_schematic ~gate_only:true));
+  ignore (s#add_separator ());
+  ignore (s#add_item "Load .slib..."       ~callback:do_load_slib);
 
   (* DFT menu — scan-chain insert, boundary scan around macros + every
      hierarchical child, IEEE 1149.1 JTAG TAP + BSDL pad insertion at
