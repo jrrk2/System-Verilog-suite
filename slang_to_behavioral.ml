@@ -71,10 +71,16 @@ let strip_addr s =
 (* ─── Type → width ────────────────────────────────────────────────── *)
 
 (* Slang's "type" strings look like "logic", "logic[3:0]", "int",
- * "logic[63:0][7:0]" (2-D packed), "shortint", … Returns
- * (total_bits, elem_bits, ndims). For 1-D packed `logic[3:0]`
- * elem_bits = total_bits (it's a single 4-bit BInt). For 2-D packed
- * `logic[3:0][1:0]` total = 8, elem = 2 (BArray of size 4). *)
+ * "logic[63:0][7:0]"          (2-D packed),
+ * "reg[7:0]$[0:63]"           (unpacked array of packed elements),
+ * "shortint", …               Returns (total_bits, elem_bits, ndims).
+ *
+ * Slang uses '$' as a packed/unpacked separator: anything BEFORE '$'
+ * is the (packed) element type's dimensions, anything AFTER is the
+ * unpacked array dimensions.  Without the separator we used to read
+ * `reg[7:0]$[0:63]` as `8 × 64` (8 elements of 64 bits), exactly
+ * inverted — slib_fifo.sv's iFIFOMem turned into arr[8]bv64 instead
+ * of arr[64]bv8. *)
 let parse_type s =
   let s = String.trim s in
   if s = "logic" || s = "bit" || s = "reg" then (1, 1, 0)
@@ -82,32 +88,49 @@ let parse_type s =
        || s = "longint" then (32, 32, 0)
   else if s = "byte" then (8, 8, 0)
   else
-    let n = String.length s in
-    let dims = ref [] in
-    let i = ref 0 in
-    while !i < n do
-      if s.[!i] = '[' then begin
-        let j = ref (!i + 1) in
-        while !j < n && s.[!j] <> ']' do incr j done;
-        if !j < n then begin
-          let body = String.sub s (!i + 1) (!j - !i - 1) in
-          (match String.split_on_char ':' body with
-           | [a; b] ->
-               (try
-                  let hi = int_of_string (String.trim a) in
-                  let lo = int_of_string (String.trim b) in
-                  dims := (abs (hi - lo) + 1) :: !dims
-                with _ -> ())
-           | _ -> ());
-          i := !j + 1
+    let parse_dims str =
+      let n = String.length str in
+      let dims = ref [] in
+      let i = ref 0 in
+      while !i < n do
+        if str.[!i] = '[' then begin
+          let j = ref (!i + 1) in
+          while !j < n && str.[!j] <> ']' do incr j done;
+          if !j < n then begin
+            let body = String.sub str (!i + 1) (!j - !i - 1) in
+            (match String.split_on_char ':' body with
+             | [a; b] ->
+                 (try
+                    let hi = int_of_string (String.trim a) in
+                    let lo = int_of_string (String.trim b) in
+                    dims := (abs (hi - lo) + 1) :: !dims
+                  with _ -> ())
+             | _ -> ());
+            i := !j + 1
+          end else incr i
         end else incr i
-      end else incr i
-    done;
-    let ds = List.rev !dims in
-    match ds with
-    | [] -> (1, 1, 0)
-    | [w] -> (w, w, 1)
-    | outer :: inner :: _ -> (outer * inner, inner, List.length ds)
+      done;
+      List.rev !dims in
+    let packed_str, unpacked_str =
+      match String.split_on_char '$' s with
+      | [p; u] -> p, u
+      | _      -> s, "" in
+    let pds = parse_dims packed_str in
+    let uds = parse_dims unpacked_str in
+    let prod = List.fold_left ( * ) 1 in
+    if uds <> [] then
+      (* Unpacked array — element type given by packed dims, array
+         size given by unpacked dims (product when nested). *)
+      let elem = if pds = [] then 1 else prod pds in
+      let size = prod uds in
+      (elem * size, elem, List.length pds + List.length uds)
+    else
+      match pds with
+      | []           -> (1, 1, 0)
+      | [w]          -> (w, w, 1)
+      | outer :: inner :: _ ->
+          (* 2-D packed: outer × inner total, inner is the element. *)
+          (outer * inner, inner, List.length pds)
 
 (* ─── Operators ──────────────────────────────────────────────────── *)
 
@@ -179,8 +202,20 @@ let parse_const value_str type_str =
 
 (* ─── Expressions ────────────────────────────────────────────────── *)
 
+(* Slang expands compound assignment `c op= e` into
+     Assignment { left = c; op = Op; right = BinaryOp { left = LValueReference; op = Op; right = e } }
+   The `LValueReference` in the BinaryOp's left is a placeholder for
+   "the current value of the LHS".  We resolve it via this mutable
+   ref, set by the Assignment-statement handler before converting the
+   RHS and restored afterwards.                                       *)
+let lvalue_ref_ctx : Behavioral_ir.bexpr option ref = ref None
+
 let rec expr_to_bexpr j =
   match kind_of j with
+  | "LValueReference" ->
+      (match !lvalue_ref_ctx with
+       | Some e -> e
+       | None -> BConst { value = 0; width = 1 })
   | "NamedValue" ->
       (* Resolve in priority order:
        *   1. Inline `constant` annotation (slang's evaluator certain).
@@ -331,6 +366,25 @@ let rec expr_to_bexpr j =
       (match assoc "right" j with
        | Some j' -> expr_to_bexpr j'
        | None -> BConst { value = 0; width = 1 })
+  | "Call" ->
+      (* Function call: `{ "subroutine": "<addr> <name>", "arguments": [...] }`.
+         z3_miter treats unresolved BCalls as uninterpreted functions —
+         the two designs both producing the same BCall { func; args }
+         then matches by uninterpreted-function equality even before
+         any inliner runs.
+
+         Special case: `$unsigned`/`$signed` are value-preserving sign
+         casts.  Inline them to the first argument so the BIR matches
+         verible's lowering (which also inlines these). *)
+      let func = match str_field "subroutine" j with
+        | Some s -> strip_addr s
+        | None -> "?" in
+      let args = match assoc "arguments" j with
+        | Some (`List xs) -> List.map expr_to_bexpr xs
+        | _ -> [] in
+      (match func, args with
+       | ("$unsigned" | "$signed"), x :: _ -> x
+       | _ -> BCall { func; args })
   | _ ->
       (* Unrecognised — emit a placeholder zero. Matching strict mode
        * here would catch shapes the converter doesn't model. *)
@@ -338,8 +392,97 @@ let rec expr_to_bexpr j =
 
 (* ─── Statements ─────────────────────────────────────────────────── *)
 
+(* Lower the LHS of an Assignment to the appropriate BIR statement.
+
+   - bare `name`            →  BAssign { lhs = name; rhs }
+   - `name[idx]`            →  @mem_write(name, idx, rhs)
+                                 (also covers bit-select into a vector,
+                                  which the BIR convention treats the
+                                  same as a 1-element array write — the
+                                  Hardcaml lowering bit-merges it with
+                                  any concurrent full-bus assignment).
+   - `name[msb:lsb]`        →  @slice_write(name, msb, lsb, rhs)
+   - `name[base +: width]`  →  @part_sel_write_up(name, base, width, rhs)
+   - `name[base -: width]`  →  @part_sel_write_down(name, base, width, rhs)
+   - `Conversion` wrapping  →  recurse on the inner expression
+
+   Mirrors verible_to_behavioral's [assign_to] dispatch.  Without this,
+   `iCounter[WIDTH] <= 0` was widening into `iCounter := 0`, clobbering
+   the rest of the bus on every clock edge — a real semantic bug
+   surfaced by the verible-vs-slang cross-frontend miter on
+   sysver_tests/slib_counter.sv.                                     *)
+let rec lhs_to_bstmt l rhs =
+  let rec base_name j =
+    match str_field "symbol" j with
+    | Some s -> Some (strip_addr s)
+    | None ->
+        (match assoc "value" j with
+         | Some j' -> base_name j'
+         | None ->
+             match assoc "operand" j with
+             | Some j' -> base_name j'
+             | None ->
+                 match assoc "target" j with
+                 | Some j' -> base_name j'
+                 | None -> None)
+  in
+  match kind_of l with
+  | "ElementSelect" ->
+      let name_opt = match assoc "value" l with
+        | Some v -> base_name v
+        | None -> None in
+      let idx = match assoc "selector" l with
+        | Some j' -> expr_to_bexpr j'
+        | None -> BConst { value = 0; width = 1 } in
+      (match name_opt with
+       | Some n -> BCallStmt {
+           func = "@mem_write";
+           args = [BVar n; idx; rhs];
+         }
+       | None -> BBlock [])
+  | "RangeSelect" ->
+      let name_opt = match assoc "value" l with
+        | Some v -> base_name v
+        | None -> None in
+      let sel_kind = match str_field "selectionKind" l with
+        | Some s -> s
+        | None -> "Simple" in
+      let left_e = match assoc "left" l with
+        | Some j' -> expr_to_bexpr j'
+        | None -> BConst { value = 0; width = 1 } in
+      let right_e = match assoc "right" l with
+        | Some j' -> expr_to_bexpr j'
+        | None -> BConst { value = 0; width = 1 } in
+      (match name_opt with
+       | None -> BBlock []
+       | Some n ->
+           let func =
+             match sel_kind with
+             | "IndexedUp"   -> "@part_sel_write_up"
+             | "IndexedDown" -> "@part_sel_write_down"
+             | _             -> "@slice_write" in
+           BCallStmt { func; args = [BVar n; left_e; right_e; rhs] })
+  | "Conversion" ->
+      (match assoc "operand" l with
+       | Some j' -> lhs_to_bstmt j' rhs
+       | None -> BBlock [])
+  | _ ->
+      (match base_name l with
+       | Some n -> BAssign { lhs = n; rhs }
+       | None -> BAssign { lhs = "?"; rhs })
+
 let rec stmt_to_bstmt j =
   match kind_of j with
+  | "Timed" ->
+      (* `always_comb` / `always @(...)` wrap their body in a Timed
+         node carrying the sensitivity in `timing` and the actual
+         body in `stmt`.  The sequential ProceduralBlock path strips
+         Timed before calling here; the combinational path didn't —
+         which dropped every always_comb body to BBlock [], silently
+         losing all combinational logic.  Recurse into stmt.        *)
+      (match assoc "stmt" j with
+       | Some j' -> stmt_to_bstmt j'
+       | None -> BBlock [])
   | "Block" ->
       (* `body` is either a single statement or a List node. *)
       (match assoc "body" j with
@@ -371,28 +514,22 @@ let rec stmt_to_bstmt j =
        | Some inner ->
            (match kind_of inner with
             | "Assignment" ->
-                let lhs = match assoc "left" inner with
-                  | Some l ->
-                      (match str_field "symbol" l with
-                       | Some s -> strip_addr s
-                       | None ->
-                           (* Sliced/indexed LHS — pull the base name. *)
-                           let rec base = function
-                             | "NamedValue" -> str_field "symbol" l
-                             | _ ->
-                                 (match assoc "value" l with
-                                  | Some inner -> str_field "symbol" inner
-                                  | None -> None)
-                           in
-                           (match base (kind_of l) with
-                            | Some s -> strip_addr s
-                            | None -> "?"))
-                  | None -> "?"
-                in
+                let l = match assoc "left" inner with
+                  | Some j' -> j' | None -> `Null in
+                (* For compound `lhs op= rhs`, slang plants an
+                   LValueReference inside the rhs that stands for the
+                   pre-update value of the lhs.  Resolve it by
+                   computing the lhs expression and stashing it in the
+                   shared ref while we convert the rhs.              *)
+                let saved = !lvalue_ref_ctx in
+                (match str_field "op" inner with
+                 | Some _ -> lvalue_ref_ctx := Some (expr_to_bexpr l)
+                 | None -> ());
                 let rhs = match assoc "right" inner with
                   | Some r -> expr_to_bexpr r
                   | None -> BConst { value = 0; width = 1 } in
-                BAssign { lhs; rhs }
+                lvalue_ref_ctx := saved;
+                lhs_to_bstmt l rhs
             | _ -> BBlock [])
        | None -> BBlock [])
   | "Case" ->
@@ -523,6 +660,63 @@ let extract_clock_event timing =
        | Some (`List (e :: _)) -> pick_from_event e
        | _ -> ("clk", `Pos))
   | _ -> ("clk", `Pos)
+
+(* Extract Subroutine (function / task) definitions into bfunc records
+   so downstream inlining or any other pass that walks m.funcs can see
+   them.  Without this slang's BIR had `funcs = []` even though every
+   call site emitted a BCall — the bodies were lost. *)
+let extract_funcs members_raw =
+  let members = flatten_members members_raw in
+  List.filter_map (fun m ->
+    match kind_of m with
+    | "Subroutine" ->
+        let fname = name_of m in
+        if fname = "" then None
+        else
+          let sub_kind = str_field "subroutineKind" m in
+          let is_task = (sub_kind = Some "Task") in
+          let sub_members = list_field "members" m in
+          let parse_btype t =
+            let w, _, _ = parse_type t in
+            Behavioral_ir.BInt { width = w; signed = Unsigned } in
+          let params = List.filter_map (fun mm ->
+            match kind_of mm with
+            | "FormalArgument" ->
+                let n = name_of mm in
+                let t = match str_field "type" mm with
+                  | Some s -> s | None -> "logic" in
+                let dir = match str_field "direction" mm with
+                  | Some "In"    -> `Input
+                  | Some "Out"   -> `Output
+                  | Some "InOut" -> `Inout
+                  | _            -> `Input in
+                Some (n, parse_btype t, dir)
+            | _ -> None
+          ) sub_members in
+          let locals = List.filter_map (fun mm ->
+            match kind_of mm with
+            | "Variable" ->
+                let n = name_of mm in
+                (* Skip the implicit return-value variable that slang
+                   names the same as the function. *)
+                if n = fname then None
+                else
+                  let t = match str_field "type" mm with
+                    | Some s -> s | None -> "logic" in
+                  Some (n, parse_btype t)
+            | _ -> None
+          ) sub_members in
+          let ftype =
+            let t = match str_field "returnType" m with
+              | Some s -> s | None -> "logic" in
+            parse_btype t in
+          let body = match assoc "body" m with
+            | Some j' -> [stmt_to_bstmt j']
+            | None -> [] in
+          Some { Behavioral_ir.fname; is_task; ftype;
+                 params; locals; body }
+    | _ -> None
+  ) members
 
 let extract_processes members_raw =
   let members = flatten_members members_raw in
@@ -805,13 +999,14 @@ let rec collect_instances ~seen acc j =
           let signals = extract_signals members in
           let processes = extract_processes members in
           let instances = extract_instances members in
+          let funcs = extract_funcs members in
           let m = {
             name;
             params = [];
             signals;
             processes;
             instances;
-            funcs = [];
+            funcs;
             mems = []; attrs = [];
           } in
           m :: acc
