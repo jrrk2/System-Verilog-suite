@@ -157,14 +157,44 @@ let rec expr_to_signal ctx = function
                 let s_full = Hardcaml_circuits.Mul.create ~config
                   (module Signal) s_lhs s_rhs in
                 Signal.select s_full (common_w - 1) 0)
-       | BDiv ->
-           (* Division not synthesizable in HardCaml - use placeholder *)
-           Printf.eprintf "Warning: Division not synthesizable, using zero\n";
-           Signal.zero result_width
-       | BMod ->
-           (* Modulo not synthesizable in HardCaml - use placeholder *)
-           Printf.eprintf "Warning: Modulo not synthesizable, using zero\n";
-           Signal.zero result_width
+       | BDiv | BMod ->
+           (* Hardcaml has no native /, %.  Constant/constant case has
+            * already been folded by behavioral_const, so by the time
+            * we get here the rhs is non-constant or the result depends
+            * on a runtime lhs.  We accept one specialisation: divisor
+            * is a positive power-of-two constant AND the operation is
+            * unsigned — then `/` lowers to a logical right-shift and
+            * `%` lowers to a low-bits mask.
+            *
+            * Signed `/` and `%` are NOT equivalent to shr/mask: signed
+            * SV division truncates toward zero, whereas arithmetic
+            * shift floors, so `-5 / 2 = -2` (SV) but `-5 >>> 1 = -3`
+            * (sra).  We refuse the rewrite for signed ops and raise. *)
+           let pow2_log2 n =
+             if n <= 0 then None
+             else if n land (n - 1) <> 0 then None
+             else
+               let rec lg i x = if x = 1 then Some i else lg (i + 1) (x lsr 1) in
+               lg 0 n
+           in
+           let is_unsigned = match result_type with
+             | BInt { signed = Unsigned; _ } -> true
+             | _ -> false in
+           (match rhs, is_unsigned with
+            | BConst { value = c; _ }, true ->
+                (match pow2_log2 c with
+                 | Some k when op = BDiv -> Signal.srl s_lhs k
+                 | Some k (* op = BMod *) ->
+                     let mask = (1 lsl k) - 1 in
+                     Signal.(s_lhs &: of_int ~width:common_w mask)
+                 | None ->
+                     failwith (Printf.sprintf
+                       "behavioral_to_hardcaml: unsupported %s by non-pow2 constant %d"
+                       (if op = BDiv then "/" else "%") c))
+            | _ ->
+                failwith (Printf.sprintf
+                  "behavioral_to_hardcaml: unsupported %s — divisor not a positive power-of-two constant (or operation is signed)"
+                  (if op = BDiv then "/" else "%")))
        | BAnd -> Signal.(s_lhs &: s_rhs)
        | BOr -> Signal.(s_lhs |: s_rhs)
        | BXor -> Signal.(s_lhs ^: s_rhs)
@@ -350,7 +380,9 @@ let rec stmt_to_always ~is_reg ctx alw = function
           Signal.reduce ~f:(Signal.(|:)) bits in
       let then_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] then_stmts in
       let else_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] else_stmts in
-      Always.(if_ cond_signal then_alw else_alw) :: alw
+      (* Restore body order inside each branch — same reasoning as
+         in process_to_always. *)
+      Always.(if_ cond_signal (List.rev then_alw) (List.rev else_alw)) :: alw
 
   | BCase { selector; cases; default } ->
       let sel_signal = expr_to_signal ctx selector in
@@ -369,10 +401,10 @@ let rec stmt_to_always ~is_reg ctx alw = function
       let case_list = List.map (fun (value, stmts) ->
         let val_signal = coerce_to_sel (expr_to_signal ctx value) in
         let case_alw = List.fold_left (stmt_to_always ~is_reg ctx) [] stmts in
-        (val_signal, case_alw)
+        (val_signal, List.rev case_alw)
       ) cases in
       let default_alw =
-        List.fold_left (stmt_to_always ~is_reg ctx) [] default in
+        List.rev (List.fold_left (stmt_to_always ~is_reg ctx) [] default) in
       let rec build_cases = function
         | [] -> default_alw
         | (value, body) :: rest ->
@@ -539,20 +571,22 @@ let process_to_always ctx = function
   | BCombinational { body; _ } ->
       let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:false ctx) [] body in
-      Always.compile alw
+      (* stmt_to_always prepends each compiled statement to the
+         accumulator, so [alw] is in reverse body order.  Hardcaml's
+         Always.compile processes the list forward and lets later
+         statements override earlier ones — reversing here restores
+         Verilog's body-order (last-wins) semantics. *)
+      Always.compile (List.rev alw)
 
   | BSequential { clock; reset; reset_async; body; _ } ->
       let clk_sig = get_signal ctx clock in
       ctx.clock <- Some clk_sig;
-      (* Bind ctx.reset only when the reset is ASYNC.  Sync resets
-         are encoded as data-path muxes in the BIR body and do
-         not belong on the flip-flop's reset port. *)
       (match reset, reset_async with
        | Some rst_name, true -> ctx.reset <- Some (get_signal ctx rst_name)
        | _ -> ());
       let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
-      Always.compile alw
+      Always.compile (List.rev alw)
 
 (* Build input interface from behavioral IR module *)
 let build_input_ports (bmod : Behavioral_ir.bmodule) =

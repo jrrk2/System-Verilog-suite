@@ -237,17 +237,27 @@ let dce_module (nl : netlist) : netlist * int =
       ) i.conns
     ) nl.insts;
     h in
+  let base_of n =
+    try
+      let i = String.index n '[' in
+      String.sub n 0 i
+    with Not_found -> n in
   List.iter (fun (_lhs, rhs) ->
     Hashtbl.iter (fun net _ ->
       if String.length net > 0 then begin
-        let nlen = String.length net in
-        let rlen = String.length rhs in
-        if rlen >= nlen then
-          let rec scan i =
-            if i + nlen > rlen then ()
-            else if String.sub rhs i nlen = net then bump net
-            else scan (i + 1)
-          in scan 0
+        let scan_for str =
+          let nlen = String.length str in
+          let rlen = String.length rhs in
+          if rlen >= nlen then
+            let rec loop i =
+              if i + nlen > rlen then false
+              else if String.sub rhs i nlen = str then true
+              else loop (i + 1)
+            in loop 0
+          else false in
+        let bare = base_of net in
+        if scan_for net then bump net
+        else if bare <> net && scan_for bare then bump net
       end
     ) driven_nets
   ) nl.assigns;

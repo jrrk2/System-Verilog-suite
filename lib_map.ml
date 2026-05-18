@@ -634,34 +634,126 @@ let gen_add_bits ~(a_bits : string list) ~(b_bits : string list) =
    the call site can splice it in alongside [gen_add] / [gen_sub]
    without special-casing widths.  The "ignored cout" is always 0 in
    a well-formed multiplier (a*b < 2^(a_w+b_w)). *)
-let gen_mul ~a_name ~a_w ~b_name ~b_w =
+let gen_mul_array_bits ~(a_bits : string list) ~(b_bits : string list) =
+  let a_w = List.length a_bits in
+  let b_w = List.length b_bits in
   let out_w = a_w + b_w in
   let insts = ref [] and wires = ref [] in
+  let a_arr = Array.of_list a_bits in
+  let b_arr = Array.of_list b_bits in
   (* Build the b_w partial-product rows, each a list of out_w bit
-     names LSB-first.  For row i: bits [i, i + a_w) carry
-     (a[k-i] AND b[i]); the rest are tied to 1'b0. *)
+     names LSB-first. *)
   let pps = List.init b_w (fun i ->
-    let bi = bit_at b_name b_w i in
+    let bi = b_arr.(i) in
     List.init out_w (fun j ->
       if j < i || j >= i + a_w then "1'b0"
       else
-        let aj = bit_at a_name a_w (j - i) in
+        let aj = a_arr.(j - i) in
         let pij = mint "pp" in
         wires := (pij, 1) :: !wires;
         insts := gate_inst ~cell:cell_and ~ipins:cell_and.in_pins
                    ~ins:[aj; bi] ~out:pij :: !insts;
         pij)
   ) in
-  (* Accumulate: start with pp[0], add each subsequent pp.  Each
-     gen_add_bits call discards the carry-out — the math guarantees
-     the running sum stays below 2^out_w. *)
   let acc = ref (List.hd pps) in
   List.iter (fun pp ->
     let s, _co, ai, aw = gen_add_bits ~a_bits:!acc ~b_bits:pp in
     insts := !insts @ ai;
     wires := !wires @ aw;
     acc := s) (List.tl pps);
-  (List.rev !acc, "1'b0", List.rev !insts, !wires)
+  (!acc, "1'b0", List.rev !insts, !wires)
+
+(* Auto-cascade for wide multipliers (task #126).  Z3's monolithic
+   bv-mul SMT performance falls off a cliff past ~16-bit operands;
+   manual decompositions like cascade_mac proved we can get arbitrary
+   widths through the miter by splitting algebraically:
+
+     A · B  where  A = A_hi · 2^k + A_lo
+                   B = B_hi · 2^k + B_lo
+                   k = ⌈max(a_w, b_w) / 2⌉
+       = A_hi·B_hi · 2^(2k)
+       + (A_hi·B_lo + A_lo·B_hi) · 2^k
+       + A_lo·B_lo
+
+   Each sub-multiplication has operand widths half as wide; the
+   recursion bottoms out at the [gen_mul_array_bits] direct array
+   form when both operands fit under SV_DECOMP_MUL_CASCADE_THRESHOLD
+   (default 16).  Setting the threshold to 0 disables the cascade
+   entirely (forces array everywhere); setting it to ∞ via a large
+   value matches the historical pre-#126 behaviour.
+
+   The recursion preserves the same (out_bits_lsb_first, cout, insts,
+   wires) interface, so callers don't need to know they're getting a
+   cascade.  Each leaf array-mul becomes its own block in [Block_tag],
+   so downstream verify-arch / Z3 miter can substitute per-leaf certs.   *)
+let cascade_threshold () =
+  match Sys.getenv_opt "SV_DECOMP_MUL_CASCADE_THRESHOLD" with
+  | Some s -> (try int_of_string s with _ -> 16)
+  | None -> 16
+
+(* Bits-form shifter: prepend [shift] copies of "1'b0" then truncate
+   or pad to [out_w].  No gates — pure renaming.                     *)
+let shift_left_bits ~bits ~shift ~out_w =
+  let n = List.length bits in
+  let total = shift + n in
+  let padded =
+    List.init shift (fun _ -> "1'b0") @ bits in
+  if total >= out_w then
+    List.filteri (fun i _ -> i < out_w) padded
+  else
+    padded @ List.init (out_w - total) (fun _ -> "1'b0")
+
+let rec gen_mul_bits ~(a_bits : string list) ~(b_bits : string list)
+  : string list * string * instance list * (string * int) list =
+  let a_w = List.length a_bits and b_w = List.length b_bits in
+  let out_w = a_w + b_w in
+  let thresh = cascade_threshold () in
+  (* Bottom: both operands under threshold → direct array form. *)
+  if thresh = 0 || (a_w <= thresh && b_w <= thresh) then
+    gen_mul_array_bits ~a_bits ~b_bits
+  else begin
+    let k_a = (a_w + 1) / 2 and k_b = (b_w + 1) / 2 in
+    let k = max k_a k_b in
+    let k = min k (min a_w b_w) in
+    if k = 0 || k = a_w || k = b_w then
+      gen_mul_array_bits ~a_bits ~b_bits
+    else begin
+      let a_lo = List.filteri (fun i _ -> i < k) a_bits in
+      let a_hi = List.filteri (fun i _ -> i >= k) a_bits in
+      let b_lo = List.filteri (fun i _ -> i < k) b_bits in
+      let b_hi = List.filteri (fun i _ -> i >= k) b_bits in
+      (* Four sub-products. *)
+      let p_ll, _, i_ll, w_ll = gen_mul_bits ~a_bits:a_lo ~b_bits:b_lo in
+      let p_hl, _, i_hl, w_hl = gen_mul_bits ~a_bits:a_hi ~b_bits:b_lo in
+      let p_lh, _, i_lh, w_lh = gen_mul_bits ~a_bits:a_lo ~b_bits:b_hi in
+      let p_hh, _, i_hh, w_hh = gen_mul_bits ~a_bits:a_hi ~b_bits:b_hi in
+      let all_insts = ref (i_ll @ i_hl @ i_lh @ i_hh) in
+      let all_wires = ref (w_ll @ w_hl @ w_lh @ w_hh) in
+      (* Position each sub-product:
+           P_LL at offset 0
+           P_HL, P_LH at offset k
+           P_HH at offset 2k                                          *)
+      let shifted_ll = shift_left_bits ~bits:p_ll ~shift:0 ~out_w in
+      let shifted_hl = shift_left_bits ~bits:p_hl ~shift:k ~out_w in
+      let shifted_lh = shift_left_bits ~bits:p_lh ~shift:k ~out_w in
+      let shifted_hh = shift_left_bits ~bits:p_hh ~shift:(2 * k) ~out_w in
+      let add_pair x y =
+        let s, _co, is_, ws_ = gen_add_bits ~a_bits:x ~b_bits:y in
+        all_insts := !all_insts @ is_;
+        all_wires := !all_wires @ ws_;
+        s in
+      let s1 = add_pair shifted_ll shifted_hl in
+      let s2 = add_pair s1 shifted_lh in
+      let s3 = add_pair s2 shifted_hh in
+      (s3, "1'b0", !all_insts, !all_wires)
+    end
+  end
+
+let gen_mul ~a_name ~a_w ~b_name ~b_w =
+  let a_bits = List.init a_w (fun i -> bit_at a_name a_w i) in
+  let b_bits = List.init b_w (fun i -> bit_at b_name b_w i) in
+  let out_bits_lsb, cout, insts, wires = gen_mul_bits ~a_bits ~b_bits in
+  (List.rev out_bits_lsb, cout, insts, wires)
 
 (* DFF mapping.  hardcaml's Reg has a [register] record with
    clock, optional reset, optional clear, optional enable.  For
@@ -1059,9 +1151,32 @@ let extract_idents s =
 let dce ~root_nets (nl : netlist) : netlist =
   let live = Hashtbl.create 256 in
   let mark x = Hashtbl.replace live x () in
-  List.iter mark root_nets;
-  (* Expand multi-bit roots so cells driving `q[3]` survive when
-     `q` is in the root set. *)
+  let base_of n =
+    try
+      let i = String.index n '[' in
+      String.sub n 0 i
+    with Not_found -> n in
+  let live_for n =
+    Hashtbl.mem live n || Hashtbl.mem live (base_of n) in
+  let bus_widths = Hashtbl.create 64 in
+  List.iter (fun (n, w) -> Hashtbl.replace bus_widths n w) nl.wires;
+  List.iter (fun (n, w) -> Hashtbl.replace bus_widths n w) nl.inputs;
+  List.iter (fun (n, w) -> Hashtbl.replace bus_widths n w) nl.outputs;
+
+  let mark_with_bits x =
+    mark x;
+    (* If x is a bare bus name, expand to per-bit so cells driving
+       individual bits survive even when the upstream reference is
+       to the whole bus (e.g. via a concat assign). *)
+    let bare = base_of x in
+    if bare = x then
+      match Hashtbl.find_opt bus_widths bare with
+      | Some w when w > 1 ->
+          for i = 0 to w - 1 do
+            mark (Printf.sprintf "%s[%d]" bare i)
+          done
+      | _ -> () in
+  List.iter mark_with_bits root_nets;
   List.iter (fun (name, w) ->
     if w > 1 then
       for i = 0 to w - 1 do
@@ -1076,29 +1191,51 @@ let dce ~root_nets (nl : netlist) : netlist =
         Hashtbl.add by_out_net c.net inst
     ) inst.conns
   ) nl.insts;
+  (* Build a base-name index so a live bus name finds cells driving
+     any of its bits. *)
+  let by_base_out_net = Hashtbl.create (List.length nl.insts) in
+  List.iter (fun (inst : instance) ->
+    List.iter (fun (c : pin_conn) ->
+      if c.pin = inst.cell.out_pin then
+        Hashtbl.add by_base_out_net (base_of c.net) inst
+    ) inst.conns
+  ) nl.insts;
+
+  (* Same for assigns — index by base name. *)
+  let assigns_by_lhs = Hashtbl.create (List.length nl.assigns) in
+  let assigns_by_base = Hashtbl.create (List.length nl.assigns) in
+  List.iter (fun (lhs, rhs) ->
+    Hashtbl.add assigns_by_lhs lhs rhs;
+    Hashtbl.add assigns_by_base (base_of lhs) rhs
+  ) nl.assigns;
 
   let queue = Queue.create () in
   Hashtbl.iter (fun k () -> Queue.push k queue) live;
   while not (Queue.is_empty queue) do
     let net = Queue.pop queue in
     let push x =
-      if not (Hashtbl.mem live x) then (mark x; Queue.push x queue) in
-    List.iter (fun (inst : instance) ->
+      if not (Hashtbl.mem live x) then (mark_with_bits x; Queue.push x queue) in
+    let visit_inst (inst : instance) =
       List.iter (fun (c : pin_conn) ->
         if c.pin <> inst.cell.out_pin then
           List.iter push (extract_idents c.net)
-      ) inst.conns
-    ) (Hashtbl.find_all by_out_net net);
-    List.iter (fun (lhs, rhs) ->
-      if lhs = net then List.iter push (extract_idents rhs)
-    ) nl.assigns
+      ) inst.conns in
+    List.iter visit_inst (Hashtbl.find_all by_out_net net);
+    let bare = base_of net in
+    if bare <> net then
+      List.iter visit_inst (Hashtbl.find_all by_base_out_net bare);
+    List.iter (fun rhs -> List.iter push (extract_idents rhs))
+      (Hashtbl.find_all assigns_by_lhs net);
+    if bare <> net then
+      List.iter (fun rhs -> List.iter push (extract_idents rhs))
+        (Hashtbl.find_all assigns_by_base bare)
   done;
 
   let inst_alive (i : instance) =
     List.exists (fun (c : pin_conn) ->
-      c.pin = i.cell.out_pin && Hashtbl.mem live c.net) i.conns in
-  let assign_alive (lhs, _) = Hashtbl.mem live lhs in
-  let wire_alive (n, _) = Hashtbl.mem live n in
+      c.pin = i.cell.out_pin && live_for c.net) i.conns in
+  let assign_alive (lhs, _) = live_for lhs in
+  let wire_alive (n, _) = live_for n in
   {
     nl with
     insts   = List.filter inst_alive nl.insts;
