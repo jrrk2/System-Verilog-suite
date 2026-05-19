@@ -130,3 +130,11 @@ test/grlib_z3_sweep/
 test/random/
 test/smollm_vivado/
 test/uart_vhdl_vivado/
+
+# Floorplan analyser (task #142) — large Vivado-flattened RTL dumps
+# and per-run working directories.  The scripts in test/floorplan/
+# (flatten_*, run_*, vivado_dump_rtl.tcl) are tracked; the artifacts
+# they produce are not.
+test/floorplan/talos_vc707_flat.sv
+test/floorplan/talos_vc707_flat.sv.err
+test/floorplan/compare_work/
