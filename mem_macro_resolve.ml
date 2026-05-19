@@ -6,7 +6,7 @@
  * via OpenRAM if it isn't already cached.
  *
  * Cache layout:
- *   ~/.cache/sv_decompiler/openram_macros/<tech>/<key>/
+ *   ~/.cache/sv_suite/openram_macros/<tech>/<key>/
  *      <key>.v      Verilog blackbox/behavioural model
  *      <key>.lib    Liberty for OpenROAD blackbox
  *      <key>.lef    LEF for OpenROAD placement
@@ -108,7 +108,7 @@ let bits_needed n =
 
 let cache_root () =
   let home = try Sys.getenv "HOME" with Not_found -> "/tmp" in
-  Filename.concat home ".cache/sv_decompiler/openram_macros"
+  Filename.concat home ".cache/sv_suite/openram_macros"
 
 let key_of_request r =
   let tech_s = string_of_tech r.tech in

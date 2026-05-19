@@ -51,7 +51,7 @@ type prediction = {
    `verify-arch` is automatically visible here. *)
 let cert_cache_dir () =
   let home = try Sys.getenv "HOME" with Not_found -> "/tmp" in
-  home ^ "/.cache/sv_decompiler/arch"
+  home ^ "/.cache/sv_suite/arch"
 
 let cert_path ~kind ~arch ~width =
   Printf.sprintf "%s/%s_%s_%d.proven"

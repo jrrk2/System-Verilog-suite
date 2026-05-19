@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: ISC
-"""sv-tests runner for the System-Verilog-decompiler
+"""sv-tests runner for the System-Verilog-suite
 Verilator↔Verible Z3 miter.
 
 Passes only when:
@@ -28,7 +28,7 @@ class Decompiler_Miter(BaseRunner):
             "decompiler_miter",
             executable=_EXE,
             supported_features={'parsing', 'elaboration'})
-        self.url = "https://github.com/jonathankimmitt/System-Verilog-decompiler"
+        self.url = "https://github.com/jonathankimmitt/System-Verilog-suite"
 
     def can_run(self):
         import shutil

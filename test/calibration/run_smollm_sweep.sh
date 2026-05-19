@@ -15,7 +15,7 @@
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-SHIM=${SHIM:-$HOME/System-Verilog-decompiler/_build/default/synth_orfs_shim.exe}
+SHIM=${SHIM:-$HOME/System-Verilog-suite/_build/default/synth_orfs_shim.exe}
 PROJ=${PROJ:-$HOME/TALOS-V2/rtl/vc707/src}
 SRC=${SRC:-$PROJ/smollm}
 TIMEOUT=${TIMEOUT:-180}

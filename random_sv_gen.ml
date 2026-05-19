@@ -596,7 +596,7 @@ let repo_root =
   (* Same directory layout as test/regressions/ — assume cwd is repo
    * root or test_verilator_vs_verible.exe is on $PATH. *)
   try Sys.getenv "REPO_ROOT"
-  with Not_found -> "/home/jonathan/System-Verilog-decompiler"
+  with Not_found -> "/home/jonathan/System-Verilog-suite"
 
 let miter_exe =
   Filename.concat repo_root "_build/default/test_verilator_vs_verible.exe"

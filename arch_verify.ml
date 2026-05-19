@@ -5,7 +5,7 @@
  * behavioral spec (`a + b` / `a * b`), runs the boundary-preserving
  * Z3 miter, and on success caches a tiny certificate file:
  *
- *   $HOME/.cache/sv_decompiler/arch/adder_brent_kung_32.proven
+ *   $HOME/.cache/sv_suite/arch/adder_brent_kung_32.proven
  *
  * The certificate is consumed by the parent miter (#81) when a design
  * carries `(* sv_decomp_adder = "brent_kung" *)` on a 32-bit signal:
@@ -130,7 +130,7 @@ let emit_spec_verilog ~op ~width =
 
 let cache_dir () =
   let home = try Sys.getenv "HOME" with Not_found -> "/tmp" in
-  let d = home ^ "/.cache/sv_decompiler/arch" in
+  let d = home ^ "/.cache/sv_suite/arch" in
   let _ = Sys.command (Printf.sprintf "mkdir -p %s"
                          (Filename.quote d)) in
   d

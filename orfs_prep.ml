@@ -37,8 +37,8 @@
        --top picosoc \
        --orfs-flow /home/jonathan/OpenROAD-flow-scripts/flow \
        --platform nangate45 \
-       --design-cfg-dir /home/jonathan/sv_decompiler_orfs/picosoc \
-       --sdc /home/jonathan/sv_decompiler_orfs/picosoc/constraint.sdc \
+       --design-cfg-dir /home/jonathan/sv_suite_orfs/picosoc \
+       --sdc /home/jonathan/sv_suite_orfs/picosoc/constraint.sdc \
        [--variant 20260510_080000] \
        -- file1.sv file2.sv ...
 *)

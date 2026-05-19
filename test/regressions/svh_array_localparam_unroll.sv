@@ -10,7 +10,7 @@
 // the genvar, then a constant-lookup into the array initialiser
 // to fold LUT_Q31[j] to its declared 32-bit constant.
 //
-// Smoke check: `sv_decompiler parse verible ...` should reveal each
+// Smoke check: `sv_suite parse verible ...` should reveal each
 // of the eight LUT values appearing in the BIR after elaboration
 // (not 32'0).
 

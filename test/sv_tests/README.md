@@ -1,6 +1,6 @@
 # sv-tests integration
 
-Wires three System-Verilog-decompiler frontends into the
+Wires three System-Verilog-suite frontends into the
 [chipsalliance/sv-tests](https://github.com/chipsalliance/sv-tests)
 corpus (~616 tests organised by IEEE 1800 chapter) so we can:
 

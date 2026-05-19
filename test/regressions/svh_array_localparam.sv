@@ -11,7 +11,7 @@
 //   becomes 32'h0, so out_y = in_x * 0 = 0 — DCE then strips the
 //   multiplier entirely.
 //
-// Smoke check (after fix): `sv_decompiler parse verible … | grep -F`
+// Smoke check (after fix): `sv_suite parse verible … | grep -F`
 // must show `LUT_Q31` or `lut_lookup`, not `32'h0`.
 
 module svh_array_localparam (

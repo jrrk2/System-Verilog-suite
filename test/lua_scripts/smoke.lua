@@ -1,8 +1,8 @@
--- Smoke test for the sv_decompiler Lua API.
+-- Smoke test for the sv_suite Lua API.
 --
 -- Exercises every callable in the `svd` module:
 --   parse, pick, miter, liberty, expand, gate_miter, bir, name, items.
--- Run with:  sv_decompiler script test/lua_scripts/smoke.lua
+-- Run with:  sv_suite script test/lua_scripts/smoke.lua
 
 print("=== svd Lua API smoke ===")
 

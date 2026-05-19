@@ -423,10 +423,10 @@ type upgrade_suggestion = {
 }
 
 (* Architecture-rank lookup: for a given kind+width, return the
- * fastest certified arch (via $HOME/.cache/sv_decompiler/arch). *)
+ * fastest certified arch (via $HOME/.cache/sv_suite/arch). *)
 let cert_dir () =
   let home = try Sys.getenv "HOME" with Not_found -> "/tmp" in
-  home ^ "/.cache/sv_decompiler/arch"
+  home ^ "/.cache/sv_suite/arch"
 
 let cert_exists ~kind ~arch ~width =
   let p = Printf.sprintf "%s/%s_%s_%d.proven"

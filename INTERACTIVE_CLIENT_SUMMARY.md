@@ -215,7 +215,7 @@ Provides:
 ## Files Modified/Created
 
 ```
-System-Verilog-decompiler/
+System-Verilog-suite/
 ├── interactive_client.ml              (new, 320 lines)
 ├── INTERACTIVE_CLIENT_README.md       (new, comprehensive docs)
 ├── INTERACTIVE_CLIENT_SUMMARY.md      (this file)

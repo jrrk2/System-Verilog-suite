@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: ISC
-"""sv-tests runner for the System-Verilog-decompiler Verible→BIR
+"""sv-tests runner for the System-Verilog-suite Verible→BIR
 frontend.
 
 Passes when `test_verible_to_bir.exe <top> <flat.sv>` exits 0
@@ -29,7 +29,7 @@ class Decompiler_Verible_Parse(BaseRunner):
             "decompiler_verible_parse",
             executable=_EXE,
             supported_features={'parsing', 'elaboration'})
-        self.url = "https://github.com/jonathankimmitt/System-Verilog-decompiler"
+        self.url = "https://github.com/jonathankimmitt/System-Verilog-suite"
 
     def can_run(self):
         return os.access(_EXE, os.X_OK) and os.access(_WRAPPER, os.X_OK)

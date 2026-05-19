@@ -1,7 +1,7 @@
 -- hdl_convert_demo: exercise the new svd Lua API end-to-end.
 --
 -- Run with:
---   sv_decompiler script test/lua/hdl_convert_demo.lua
+--   sv_suite script test/lua/hdl_convert_demo.lua
 --
 -- Demonstrates:
 --   1. parse VHDL via vhdl frontend → BIR program handle

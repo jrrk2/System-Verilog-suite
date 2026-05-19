@@ -1,7 +1,7 @@
 (* Z3 miter for a behavioral source ↔ gate-level netlist pair.
  *
  * Legacy entry point.  All logic lives in shared library modules; the
- * preferred CLI is `sv_decompiler gate-miter <top> <beh.sv> <gate.sv>
+ * preferred CLI is `sv_suite gate-miter <top> <beh.sv> <gate.sv>
  * [<lib>]`. This wrapper stays for older scripts and the
  * test/gate_miter regression runner.
  *

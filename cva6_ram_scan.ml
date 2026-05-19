@@ -111,7 +111,7 @@ let scan_file path =
       List.concat_map (fun t -> scan_one ~top:t ~path) tops
 
 let () =
-  let dir = ref "/home/jonathan/System-Verilog-decompiler/test/cva6_ram" in
+  let dir = ref "/home/jonathan/System-Verilog-suite/test/cva6_ram" in
   let usage = "cva6_ram_scan [-I dir] [-y dir] [-f file] [scan_dir]" in
   let speclist = [
     "-I", Arg.String (fun d -> inc_dirs := d :: !inc_dirs),

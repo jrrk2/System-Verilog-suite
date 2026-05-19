@@ -1,4 +1,4 @@
-(* Lua scripting layer for sv_decompiler.
+(* Lua scripting layer for sv_suite.
  *
  * Modeled directly on hardcaml-lua's myluaclient.ml: a small sum type
  * of artifacts (Prog/Mod/Lib/Bool/Str), a hashtable keyed by string
@@ -69,7 +69,7 @@ let find_lib h =
   | _ -> failwith ("handle " ^ h ^ " is not a library")
 
 (* ──────────────────────────────────────────────────────────────────
- * Frontend / pipeline shims — duplicated from sv_decompiler.ml's
+ * Frontend / pipeline shims — duplicated from sv_suite.ml's
  * load_frontend so the Lua layer doesn't pull in the executable. The
  * shared library functions (Verible_to_behavioral, Slang_to_behavioral,
  * Rtlil_to_behavioral, etc.) do the real work. *)
@@ -180,7 +180,7 @@ let lpick prog_h top =
   | None ->
       failwith (Printf.sprintf "no module '%s' in %s" top prog_h)
 
-(* Verification pipeline (mirrors cmd_miter in sv_decompiler.ml):
+(* Verification pipeline (mirrors cmd_miter in sv_suite.ml):
  *   1. Behavioral_arch_subst — abstract attributed adder/mul leaves
  *      to BBinOp ops gated on a `verify-arch` certificate.
  *   2. Behavioral_hier — transiently flatten what remains for Z3.
@@ -414,7 +414,7 @@ let litems () =
 
 (* ──────────────────────────────────────────────────────────────────
  * GUI hooks — populated by sv_gui.ml at startup so the embedded Lua
- * interpreter can drive lablgtk3 widgets. CLI users (sv_decompiler,
+ * interpreter can drive lablgtk3 widgets. CLI users (sv_suite,
  * sv_main_unified, …) never set these, so the gui.* Lua functions
  * collapse to no-ops there. Hooks stay primitive (string/unit) so this
  * file does NOT depend on lablgtk3. *)

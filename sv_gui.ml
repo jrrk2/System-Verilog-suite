@@ -1,6 +1,6 @@
 (* sv_gui.ml — lablgtk3 shell where Lua scripts are first-class menu items.
 
-   Each *.lua under ./scripts and $XDG_CONFIG_HOME/sv_decompiler/scripts is
+   Each *.lua under ./scripts and $XDG_CONFIG_HOME/sv_suite/scripts is
    dofile'd into a single persistent interpreter at startup. While running it
    can call gui.add_menu / gui.add_item / gui.set_text / … to wire itself
    into the menubar; the registered handler name is invoked as `<name>()` on
@@ -59,7 +59,7 @@ let error_dialog msg =
 (* Sticky directory across all file choosers — opening any picker
    returns to the directory of the last successfully picked file.
    Persisted across sessions in
-   $XDG_CONFIG_HOME/sv_decompiler/last_dir.txt; loaded at startup
+   $XDG_CONFIG_HOME/sv_suite/last_dir.txt; loaded at startup
    and rewritten on every successful pick.                         *)
 let last_chooser_dir : string ref =
   ref (try Sys.getenv "HOME" with Not_found -> "")
@@ -71,7 +71,7 @@ let last_dir_file () =
       try (Sys.getenv "HOME") ^ "/.config"
       with Not_found -> "/tmp"
   in
-  Filename.concat xdg "sv_decompiler/last_dir.txt"
+  Filename.concat xdg "sv_suite/last_dir.txt"
 
 let load_last_chooser_dir () =
   let p = last_dir_file () in
@@ -190,7 +190,7 @@ let add_lua_item menu_name label handler =
    instance.module_name references, add the matching files, and
    re-parse.  When a name still can't be found we ask the user to
    locate it; the chosen file's directory becomes a permanent search
-   path persisted under $XDG_CONFIG_HOME/sv_decompiler/.            *)
+   path persisted under $XDG_CONFIG_HOME/sv_suite/.            *)
 
 let walk_sv_dir_into ?(max_depth = 4) tbl root =
   let rec walk depth dir =
@@ -237,7 +237,7 @@ let search_paths_file () =
       try (Sys.getenv "HOME") ^ "/.config"
       with Not_found -> "/tmp"
   in
-  Filename.concat xdg "sv_decompiler/search_paths.txt"
+  Filename.concat xdg "sv_suite/search_paths.txt"
 
 let load_search_paths () =
   let p = search_paths_file () in
@@ -263,7 +263,7 @@ let save_search_paths () =
   try
     let oc = open_out p in
     output_string oc
-      "# sv_decompiler search paths (one absolute dir per line)\n";
+      "# sv_suite search paths (one absolute dir per line)\n";
     List.iter (fun d -> output_string oc (d ^ "\n")) !search_paths;
     close_out oc
   with _ -> ()
@@ -1186,7 +1186,7 @@ let show_orfs_run_dialog () =
   let default_workdir =
     let home = try Sys.getenv "HOME" with Not_found -> "." in
     let stem = if default_top = "" then "design" else default_top in
-    Filename.concat home (Filename.concat "sv_decompiler_orfs" stem)
+    Filename.concat home (Filename.concat "sv_suite_orfs" stem)
   in
 
   let top_e   = GEdit.entry ~text:default_top ()  in
@@ -1228,7 +1228,7 @@ let show_orfs_run_dialog () =
       let home = try Sys.getenv "HOME" with Not_found -> "." in
       let stem = let t = top_e#text in if t = "" then "design" else t in
       let p = Filename.concat home
-        (Filename.concat "sv_decompiler_orfs" stem) in
+        (Filename.concat "sv_suite_orfs" stem) in
       workdir_pre := p;
       workdir_e#set_text p
     end));
@@ -2368,7 +2368,7 @@ let script_dirs () =
     | Some p -> [p]
     | None   -> []
   in
-  let user = [ Filename.concat xdg "sv_decompiler/scripts" ] in
+  let user = [ Filename.concat xdg "sv_suite/scripts" ] in
   (* De-dup while preserving order. *)
   let seen = Hashtbl.create 4 in
   List.filter (fun d ->
@@ -2440,7 +2440,7 @@ let install_hooks () =
 let () =
   let _ = GMain.init () in
   let window = GWindow.window
-    ~title:"sv_decompiler" ~width:1100 ~height:750 () in
+    ~title:"sv_suite" ~width:1100 ~height:750 () in
   ignore (window#connect#destroy ~callback:GMain.quit);
 
   let vbox = GPack.vbox ~packing:window#add () in
@@ -2587,9 +2587,9 @@ let () =
   ignore (h#add_item "About"
             ~callback:(fun () ->
               info_dialog (
-                "sv_decompiler — GUI shell\n\n\
+                "sv_suite — GUI shell\n\n\
                  Lua scripts under ./scripts and \
-                 $XDG_CONFIG_HOME/sv_decompiler/scripts/\n\
+                 $XDG_CONFIG_HOME/sv_suite/scripts/\n\
                  are loaded at startup. They can register menu items by \
                  calling\n\
                  gui.add_menu(name) and gui.add_item(menu, label, handler) \

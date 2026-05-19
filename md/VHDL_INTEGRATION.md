@@ -75,12 +75,12 @@ make clean
 make vhd_front.cma
 
 # Copy to project (using .mli source files, not .cmi compiled)
-cp ~/gnusynthesis/ver_front/ver_front.cma ~/System-Verilog-decompiler/vhd_libs/
-cp ~/gnusynthesis/vhd_front/vhd_front.cma ~/System-Verilog-decompiler/vhd_libs/
-cp ~/gnusynthesis/ver_front/*.mli ~/System-Verilog-decompiler/vhd_libs/
-cp ~/gnusynthesis/vhd_front/*.mli ~/System-Verilog-decompiler/vhd_libs/
-cp ~/gnusynthesis/vhd_front/VhdlTypes.ml ~/System-Verilog-decompiler/vhd_libs/
-cp ~/gnusynthesis/vhd_front/VhdlTree.ml ~/System-Verilog-decompiler/vhd_libs/
+cp ~/gnusynthesis/ver_front/ver_front.cma ~/System-Verilog-suite/vhd_libs/
+cp ~/gnusynthesis/vhd_front/vhd_front.cma ~/System-Verilog-suite/vhd_libs/
+cp ~/gnusynthesis/ver_front/*.mli ~/System-Verilog-suite/vhd_libs/
+cp ~/gnusynthesis/vhd_front/*.mli ~/System-Verilog-suite/vhd_libs/
+cp ~/gnusynthesis/vhd_front/VhdlTypes.ml ~/System-Verilog-suite/vhd_libs/
+cp ~/gnusynthesis/vhd_front/VhdlTree.ml ~/System-Verilog-suite/vhd_libs/
 ```
 
 **Why .mli not .cmi?**

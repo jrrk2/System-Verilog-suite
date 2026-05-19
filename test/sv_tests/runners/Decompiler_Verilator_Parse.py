@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: ISC
-"""sv-tests runner for the System-Verilog-decompiler Verilator-JSON
+"""sv-tests runner for the System-Verilog-suite Verilator-JSON
 frontend.
 
 Pipeline (in tools/wrappers/decompiler_verilator_parse.sh):
@@ -26,7 +26,7 @@ class Decompiler_Verilator_Parse(BaseRunner):
             "decompiler_verilator_parse",
             executable=_EXE,
             supported_features={'parsing', 'elaboration'})
-        self.url = "https://github.com/jonathankimmitt/System-Verilog-decompiler"
+        self.url = "https://github.com/jonathankimmitt/System-Verilog-suite"
 
     def can_run(self):
         # Need our exe AND verilator on PATH AND the wrapper.

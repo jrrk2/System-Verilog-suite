@@ -121,7 +121,7 @@ let rec count_nodes = function
 let () =
   let sv =
     if Array.length Sys.argv > 1 then Sys.argv.(1)
-    else "/home/jonathan/System-Verilog-decompiler/test/regressions/single_port_bram.sv"
+    else "/home/jonathan/System-Verilog-suite/test/regressions/single_port_bram.sv"
   in
   Printf.printf "Parsing UHDM dump for %s ...\n%!" sv;
   let (_cache, tokens) = parse_file sv in

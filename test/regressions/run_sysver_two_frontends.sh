@@ -6,7 +6,7 @@
 # Output: /tmp/sysver_two_fe/<A>_vs_<B>.csv plus per-test logs.
 
 set -e
-HERE=/home/jonathan/System-Verilog-decompiler
+HERE=/home/jonathan/System-Verilog-suite
 A=${A:-verible}
 B=${B:-slang}
 MITER=$HERE/_build/default/test_two_frontend_miter.exe

@@ -9,7 +9,7 @@
 # Output: /tmp/sysver_miter/results.csv
 
 set -e
-HERE=/home/jonathan/System-Verilog-decompiler
+HERE=/home/jonathan/System-Verilog-suite
 VIVADO=${VIVADO:-/NFS/apps/Xilinx/Vivado/2020.1/bin/vivado}
 TCL=$HERE/test/regressions/sysver_vivado_batch.tcl
 MITER=$HERE/_build/default/test_verible_vhdl_miter.exe

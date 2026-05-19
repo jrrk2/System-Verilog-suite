@@ -14,7 +14,7 @@ open Behavioral_ir
 
 let dump_path =
   if Array.length Sys.argv > 1 then Sys.argv.(1)
-  else "/home/jonathan/System-Verilog-decompiler/test/surelog/apb_uart.dump"
+  else "/home/jonathan/System-Verilog-suite/test/surelog/apb_uart.dump"
 
 let try_module (m : bmodule) =
   Printf.printf "\n─── %s ───\n" m.name;

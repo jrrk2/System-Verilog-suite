@@ -22,7 +22,7 @@ open Behavioral_ir
 
 let cache_dir () =
   let home = try Sys.getenv "HOME" with Not_found -> "/tmp" in
-  home ^ "/.cache/sv_decompiler/arch"
+  home ^ "/.cache/sv_suite/arch"
 
 let cert_exists ~kind ~arch_name ~width =
   let p = Printf.sprintf "%s/%s_%s_%d.proven"

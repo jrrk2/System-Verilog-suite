@@ -13,7 +13,7 @@
 
 set -euo pipefail
 LIB=${LIB:-$HOME/OpenROAD-flow-scripts/flow/platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib}
-PRED=${PRED:-$HOME/System-Verilog-decompiler/_build/default/test_placement_timing.exe}
+PRED=${PRED:-$HOME/System-Verilog-suite/_build/default/test_placement_timing.exe}
 ROOT=${ROOT:-$HOME/OpenROAD-flow-scripts/flow/results/nangate45/picosoc}
 RPT_ROOT=${RPT_ROOT:-$HOME/OpenROAD-flow-scripts/flow/reports/nangate45/picosoc}
 SDC_PERIOD_NS=${SDC_PERIOD_NS:-1.1}

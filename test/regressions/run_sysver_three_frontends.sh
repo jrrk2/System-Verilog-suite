@@ -7,7 +7,7 @@
 # `consensus` is EQ when all three pairs say EQUIVALENT, NEQ otherwise.
 
 set -e
-HERE=/home/jonathan/System-Verilog-decompiler
+HERE=/home/jonathan/System-Verilog-suite
 MITER=$HERE/_build/default/test_three_frontend_miter.exe
 OUT=${OUT:-/tmp/sysver_three_fe}
 mkdir -p "$OUT/logs" "$OUT/json"

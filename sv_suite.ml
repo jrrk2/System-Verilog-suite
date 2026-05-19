@@ -1,18 +1,18 @@
-(* sv_decompiler — coherent CLI for the SV-decompiler/miter toolchain.
+(* sv_suite — coherent CLI for the SV-decompiler/miter toolchain.
  *
  * Verbs are commands; designs (cva6, swerv, picorv32, …) are just
  * file inputs. One executable, multiple subcommands, all calling the
  * shared library functions directly.
  *
- *   sv_decompiler parse       <frontend> <top> <files…>
- *   sv_decompiler miter       <a> <b> <top> <files…>
- *   sv_decompiler gate-miter  <top> <beh.sv> <gate.sv> [<lib>]
- *   sv_decompiler sweep       <a> <b> <flat.sv> [--top T] [--filter S]
- *   sv_decompiler liberty     <file>
- *   sv_decompiler random      [-n N] [-seed S] [-out DIR] [-features M]
- *   sv_decompiler list-mods   <frontend> <top> <files…>
- *   sv_decompiler ff-stats    <frontend> <top> <files…>
- *   sv_decompiler --help
+ *   sv_suite parse       <frontend> <top> <files…>
+ *   sv_suite miter       <a> <b> <top> <files…>
+ *   sv_suite gate-miter  <top> <beh.sv> <gate.sv> [<lib>]
+ *   sv_suite sweep       <a> <b> <flat.sv> [--top T] [--filter S]
+ *   sv_suite liberty     <file>
+ *   sv_suite random      [-n N] [-seed S] [-out DIR] [-features M]
+ *   sv_suite list-mods   <frontend> <top> <files…>
+ *   sv_suite ff-stats    <frontend> <top> <files…>
+ *   sv_suite --help
  *
  * <frontend> ∈ {verible, slang, yosys, verilator, vhdl}.  *)
 
@@ -130,7 +130,7 @@ let cmd_parse args =
       print_endline (string_of_bmodule m)
   | _ ->
       prerr_endline
-        "usage: sv_decompiler parse <frontend> <top> <files…>";
+        "usage: sv_suite parse <frontend> <top> <files…>";
       exit 2
 
 let cmd_miter args =
@@ -174,7 +174,7 @@ let cmd_miter args =
       end
   | _ ->
       prerr_endline
-        "usage: sv_decompiler miter <a> <b> <top> <files…>";
+        "usage: sv_suite miter <a> <b> <top> <files…>";
       exit 2
 
 (* gate-miter: behavioral SV  ↔  gate-level SV (Liberty cells) *)
@@ -184,7 +184,7 @@ let cmd_gate_miter args =
     | [t; b; g; l] -> (t, b, g, Some l)
     | _ ->
         prerr_endline
-          "usage: sv_decompiler gate-miter <top> <beh.sv> <gate.sv> [<lib>]";
+          "usage: sv_suite gate-miter <top> <beh.sv> <gate.sv> [<lib>]";
         exit 2 in
   let lib_file = match lib_opt with
     | Some l -> l
@@ -235,7 +235,7 @@ let cmd_sweep args =
     | [a; b; f] -> (a, b, f)
     | _ ->
         prerr_endline
-          "usage: sv_decompiler sweep <a-frontend> <b-frontend> <flat.sv> \
+          "usage: sv_suite sweep <a-frontend> <b-frontend> <flat.sv> \
            [--top T] [--filter S] [--flatten]";
         exit 2 in
   let contains s sub =
@@ -377,7 +377,7 @@ let cmd_liberty args =
       Printf.printf "\nfunction expressions parsed: %d ok / %d failed\n"
         !parsed !failed
   | _ ->
-      prerr_endline "usage: sv_decompiler liberty <file>"; exit 2
+      prerr_endline "usage: sv_suite liberty <file>"; exit 2
 
 let cmd_list_mods args =
   match args with
@@ -392,7 +392,7 @@ let cmd_list_mods args =
       ) p.modules
   | _ ->
       prerr_endline
-        "usage: sv_decompiler list-mods <frontend> <top> <files…>";
+        "usage: sv_suite list-mods <frontend> <top> <files…>";
       exit 2
 
 let cmd_ff_stats args =
@@ -430,7 +430,7 @@ let cmd_ff_stats args =
       ) ffs
   | _ ->
       prerr_endline
-        "usage: sv_decompiler ff-stats <frontend> <top> <files…>";
+        "usage: sv_suite ff-stats <frontend> <top> <files…>";
       exit 2
 
 (* `random` is a thin shim that re-runs `random_sv_gen` via spawn for
@@ -441,7 +441,7 @@ let cmd_random args =
               "random_sv_gen.exe" in
   if not (Sys.file_exists exe) then begin
     Printf.eprintf
-      "random_sv_gen.exe not found next to sv_decompiler — run dune build\n";
+      "random_sv_gen.exe not found next to sv_suite — run dune build\n";
     exit 2
   end;
   let argv = Array.of_list (exe :: args) in
@@ -456,7 +456,7 @@ let cmd_script args =
   match args with
   | [path] -> exit (Sv_lua.run_script path)
   | _ ->
-      prerr_endline "usage: sv_decompiler script <file.lua>"; exit 2
+      prerr_endline "usage: sv_suite script <file.lua>"; exit 2
 
 let parse_arch_args args =
   let width = ref 8 in
@@ -485,7 +485,7 @@ let cmd_verify_arch args =
               ~kind:(parse_kind k) ~arch_name:arch ~width)
   | _ ->
       prerr_endline
-        "usage: sv_decompiler verify-arch <adder|mul> <arch> [--width N]\n\
+        "usage: sv_suite verify-arch <adder|mul> <arch> [--width N]\n\
         \  adder archs: ripple sklansky brent_kung kogge_stone\n\
         \  mul   archs: ripple wallace dadda";
       exit 2
@@ -508,7 +508,7 @@ let cmd_timing args =
     | t :: fs when fs <> [] -> (t, fs)
     | _ ->
         prerr_endline
-          "usage: sv_decompiler timing <top> <files…> \
+          "usage: sv_suite timing <top> <files…> \
            [--target-depth N] [--default-adder X] [--default-mul Y]";
         exit 2 in
   Printf.printf "═══════════════════════════════════════════════════════\n";
@@ -562,14 +562,14 @@ let cmd_emit_arch args =
       Printf.printf "wrote %s/%s/%d → %s\n" k arch width out_path
   | _ ->
       prerr_endline
-        "usage: sv_decompiler emit-arch <adder|mul> <arch> <out.sv> [--width N]\n\
+        "usage: sv_suite emit-arch <adder|mul> <arch> <out.sv> [--width N]\n\
         \  Writes a SystemVerilog block built via Hardcaml_circuits with\n\
         \  the `(* sv_decomp_<kind> *)` attribute on the module header so\n\
         \  the substitution pass picks it up via the verify-arch cert.";
       exit 2
 
 let usage () =
-  print_endline {|sv_decompiler — SV decompiler / miter toolchain
+  print_endline {|sv_suite — SV decompiler / miter toolchain
 
 Verbs:
   parse       <frontend> <top> <files…>             dump BIR
@@ -599,11 +599,11 @@ Verbs:
   vhdl       — VHDL frontend      → BIR
 
 Examples:
-  sv_decompiler parse  verible top   foo.sv
-  sv_decompiler miter  slang verible top  foo.sv bar.sv
-  sv_decompiler gate-miter and8 and8.sv and8_gate.v
-  sv_decompiler sweep  slang verible test/cva6_ram/cva6_flat.sv --top cva6
-  sv_decompiler liberty ~/hardcaml-lua.0.0.1/liberty/simcells.lib
+  sv_suite parse  verible top   foo.sv
+  sv_suite miter  slang verible top  foo.sv bar.sv
+  sv_suite gate-miter and8 and8.sv and8_gate.v
+  sv_suite sweep  slang verible test/cva6_ram/cva6_flat.sv --top cva6
+  sv_suite liberty ~/hardcaml-lua.0.0.1/liberty/simcells.lib
 
 Env:
   BIR_DUMP=1     — print both sides' BIR before the miter (parse / miter / gate-miter)

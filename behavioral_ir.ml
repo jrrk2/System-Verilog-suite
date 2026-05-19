@@ -96,7 +96,7 @@ type bsignal = {
   direction: [`Input | `Output | `Internal];
   initial_value: bexpr option;
   (* SystemVerilog `(* key = "value" *)` attributes attached to the
-   * signal. sv_decompiler-specific keys: `sv_decomp_adder` /
+   * signal. sv_suite-specific keys: `sv_decomp_adder` /
    * `sv_decomp_mul` (architecture knobs for HardCaml emit and
    * hierarchical substitution). Defaults to []; vendor keys
    * (use_dsp, multstyle, etc.) survive but are ignored. *)

@@ -244,7 +244,7 @@ All verification runs create logs in `/tmp/`:
 
 ### File Structure
 ```
-System-Verilog-decompiler/
+System-Verilog-suite/
 ├── verify_interactive.lua          # Interactive suite (this script)
 ├── sysver_tests/                   # Test modules
 │   ├── *.vhd                      # VHDL sources

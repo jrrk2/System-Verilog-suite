@@ -46,7 +46,7 @@ let dump label (p : Behavioral_ir.bprogram) =
 
 let () =
   let sv = if Array.length Sys.argv >= 3 then Sys.argv.(2)
-           else "/home/jonathan/System-Verilog-decompiler/sysver_tests/slib_counter.sv" in
+           else "/home/jonathan/System-Verilog-suite/sysver_tests/slib_counter.sv" in
   let top = if Array.length Sys.argv >= 2 then Sys.argv.(1)
             else "slib_counter" in
   Printf.printf "=== Verible ===\n";

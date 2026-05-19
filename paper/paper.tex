@@ -646,7 +646,7 @@ in line with the cert-gated swap construction already in tree.
 \end{enumerate}
 
 The codebase is open source at
-\url{https://github.com/jrrk2/System-Verilog-decompiler}.
+\url{https://github.com/jrrk2/System-Verilog-suite}.
 Appendix~\ref{sec:repro} gives full step-by-step instructions to
 install every dependency and reproduce each numbered result above
 on a clean Debian / Ubuntu machine.
@@ -706,8 +706,8 @@ system \texttt{libz3-dev} package.  On macOS the equivalent is
 \subsection{Source checkout and build}
 
 \begin{lstlisting}[language=bash]
-git clone https://github.com/jrrk2/System-Verilog-decompiler.git
-cd System-Verilog-decompiler
+git clone https://github.com/jrrk2/System-Verilog-suite.git
+cd System-Verilog-suite
 eval $(opam env --switch=5.3.0 --set-switch)
 dune build @all
 \end{lstlisting}
@@ -748,7 +748,7 @@ elsewhere.
 After ORFS is installed, apply the Makefile patch that lets
 \texttt{USE\_DECOMP\_SYNTH=1} route \texttt{do-yosys} to our shim:
 \begin{lstlisting}[language=bash]
-cd $HOME/System-Verilog-decompiler
+cd $HOME/System-Verilog-suite
 test/orfs/install.sh                  # apply patch
 test/orfs/install.sh --check          # confirm patched
 \end{lstlisting}
@@ -834,7 +834,7 @@ echo "create_clock -period 4.0 -name clk [get_ports clk]" > \
 # Baseline: Array x Ripple
 cd $HOME/OpenROAD-flow-scripts/flow
 env USE_DECOMP_SYNTH=1 \
-    DECOMP_SHIM=$HOME/System-Verilog-decompiler/_build/default/mac_synth_shim.exe \
+    DECOMP_SHIM=$HOME/System-Verilog-suite/_build/default/mac_synth_shim.exe \
     MAC_WIDTH=8 MAC_MUL=array MAC_ADD=ripple MAC_CLK_NS=4.0 \
   make DESIGN_CONFIG=designs/nangate45/mac/config.mk
 
@@ -842,7 +842,7 @@ env USE_DECOMP_SYNTH=1 \
 $HOME/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/openroad \
   -no_init -exit results/nangate45/mac/base/4_cts.odb -tcl \
   results/nangate45/mac/base/4_cts.def
-cd $HOME/System-Verilog-decompiler
+cd $HOME/System-Verilog-suite
 _build/default/test_mac_postlayout.exe \
   $HOME/OpenROAD-flow-scripts/flow/results/nangate45/mac/base/4_cts.def \
   $HOME/OpenROAD-flow-scripts/flow/results/nangate45/mac/base/1_2_yosys.v 8
@@ -856,7 +856,7 @@ To measure the prediction, repeat the layout with
 want to keep the baseline available):
 \begin{lstlisting}[language=bash]
 env USE_DECOMP_SYNTH=1 \
-    DECOMP_SHIM=$HOME/System-Verilog-decompiler/_build/default/mac_synth_shim.exe \
+    DECOMP_SHIM=$HOME/System-Verilog-suite/_build/default/mac_synth_shim.exe \
     MAC_WIDTH=8 MAC_MUL=array MAC_ADD=sklansky MAC_CLK_NS=4.0 \
     FLOW_VARIANT=sklansky \
   make DESIGN_CONFIG=designs/nangate45/mac/config.mk

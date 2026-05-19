@@ -1,4 +1,4 @@
-# System-Verilog-decompiler
+# System-Verilog-suite
 
 A multi-frontend SystemVerilog elaborator, **proof-driven synthesiser**, and
 equivalence-checking pipeline written in OCaml. Pulls SV/Verilog/RTLIL/UHDM
@@ -413,7 +413,7 @@ Built via `dune build`. The most-used executables:
 | `test_verible_to_bir.exe` | `test_verible_to_bir.ml` | Verible-side BIR dump for a single SV file. Useful for debugging elaboration. `--miter <vhd>` adds Z3 against a Vivado entity |
 | `ff_stats.exe` | `ff_stats.ml` | Run all four frontends on a single testcase and report each one's Q__Q / Q__D set, with pairwise overlap numbers |
 | `random_sv_gen.exe` | `random_sv_gen.ml` | Constrained-random SV generator. `--features mixed` rotates through nine modes |
-| `sv_decompiler.exe script <file.lua>` | `sv_decompiler.ml` + `sv_lua.ml` | Run a Lua script with the `svd.*` API exposed (parse / pick / miter / gate_miter / liberty / expand / bir / insts / timing / emit_verilog / emit_vhdl / write_verilog / write_vhdl / convert_hdl) |
+| `sv_suite.exe script <file.lua>` | `sv_suite.ml` + `sv_lua.ml` | Run a Lua script with the `svd.*` API exposed (parse / pick / miter / gate_miter / liberty / expand / bir / insts / timing / emit_verilog / emit_vhdl / write_verilog / write_vhdl / convert_hdl) |
 | `test_atpg.exe` | `test_atpg.ml` | Run the DFT pipeline (forces `SV_DECOMP_SCAN=1`, honours `SV_DECOMP_MEM_BSR` / `HIER_BSR` / `JTAG` / `PODEM`) on a fileset and print a per-module coverage report. `--top <name>` and `--words <N>` (default 16 = 1024 random patterns) |
 | `sv_gui.exe` | `sv_gui.ml` | lablgtk3 shell. **DFT menu** toggles the four env flags + runs ATPG and shows BSDL. Also has Decompile (Parse Verible/Slang/yosys/verilator/VHDL), Verify (Z3 miter, Cyclesim), and Topology (Run ORFS layout, Open ORFS run) menus. Lua scripts in `gui_scripts/*.lua` auto-register additional menu items via `gui.add_item` |
 

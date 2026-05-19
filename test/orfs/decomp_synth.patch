@@ -7,7 +7,7 @@
 +# When USE_DECOMP_SYNTH=1, substitute our hardcaml-based synth for the
 +# yosys+ABC pipeline.  Hard-fails on any error — yosys is for explicit
 +# oracle/comparison runs, never a silent fallback.
-+DECOMP_SHIM ?= $(HOME)/System-Verilog-decompiler/_build/default/synth_orfs_shim.exe
++DECOMP_SHIM ?= $(HOME)/System-Verilog-suite/_build/default/synth_orfs_shim.exe
 +
  .PHONY: do-yosys
 +ifeq ($(USE_DECOMP_SYNTH),1)

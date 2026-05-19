@@ -377,7 +377,7 @@ cat test/README.md
 ```
 
 ### Support
-- Issues: https://github.com/anthropics/sv-decompiler/issues
+- Issues: https://github.com/anthropics/sv-suite/issues
 - Documentation: See README.md and manual page
 - Examples: See test/ directory
 
