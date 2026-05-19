@@ -953,6 +953,81 @@ let extract_pvalue_from_param_decl node =
        | _ -> PExpr a)
   | [] -> PExpr node
 
+(* Walk the root token but stop descending when we hit a node that
+   has its OWN parameter scope: a module / interface / package
+   declaration.  The nodes we yield are everything else (description
+   items, data_declarations, parameter_declarations) at $unit scope.
+   Used by [extract_file_scope_params] to find `localparam`s declared
+   in `.svh` headers that are textually included into a `.sv` outside
+   any module body — slang and verilator elaborate these via
+   $unit-scope; verible's elaborator was previously missing them. *)
+let collect_outside_module_or_package pred root =
+  let acc = ref [] in
+  let rec go t =
+    let stop = match tag_of t with
+      | Some s ->
+          prefix_is "module_or_interface_declaration" s
+          || prefix_is "package_declaration" s
+      | None -> false in
+    if stop then ()
+    else begin
+      if pred t then acc := t :: !acc;
+      match t with
+      | TUPLE2 (a, b) -> go a; go b
+      | TUPLE3 (a, b, c) -> go a; go b; go c
+      | TUPLE4 (a, b, c, d) -> List.iter go [a; b; c; d]
+      | TUPLE5 (a, b, c, d, e) -> List.iter go [a; b; c; d; e]
+      | TUPLE6 (a, b, c, d, e, f) -> List.iter go [a; b; c; d; e; f]
+      | TUPLE7 (a, b, c, d, e, f, g) -> List.iter go [a; b; c; d; e; f; g]
+      | TUPLE8 (a, b, c, d, e, f, g, h) -> List.iter go [a; b; c; d; e; f; g; h]
+      | TUPLE9 (a, b, c, d, e, f, g, h, i) -> List.iter go [a; b; c; d; e; f; g; h; i]
+      | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+          List.iter go [a; b; c; d; e; f; g; h; i; j]
+      | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+          List.iter go [a; b; c; d; e; f; g; h; i; j; k]
+      | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+          List.iter go [a; b; c; d; e; f; g; h; i; j; k; l]
+      | TUPLE13 (a, b, c, d, e, f, g, h, i, j, k, l, m) ->
+          List.iter go [a; b; c; d; e; f; g; h; i; j; k; l; m]
+      | TUPLE14 (a, b, c, d, e, f, g, h, i, j, k, l, m, n) ->
+          List.iter go [a; b; c; d; e; f; g; h; i; j; k; l; m; n]
+      | TUPLE15 (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ->
+          List.iter go [a; b; c; d; e; f; g; h; i; j; k; l; m; n; o]
+      | TLIST xs -> List.iter go xs
+      | _ -> ()
+    end
+  in
+  go root;
+  List.rev !acc
+
+(* Pull every `any_param_declaration` that sits at $unit scope — i.e.
+   outside any `module ... endmodule` or `package ... endpackage`
+   block.  This catches `localparam int X = ...;` declarations sitting
+   at the top of a `.svh` header file that was `\`include`d into the
+   `.sv` source.  Returns `(name, pvalue)` pairs in the same shape as
+   `package_decl.pkg_params` so `eval_int`'s package-fallback path can
+   find them without any code change there. *)
+let extract_file_scope_params root : (string * pvalue) list =
+  let param_nodes = collect_outside_module_or_package
+    (has_tag (prefix_is "any_param_declaration")) root in
+  List.filter_map (fun node ->
+    let id_subs = collect_by
+      (has_tag (prefix_is "param_type_followed_by_id")) node in
+    let pname = match id_subs with
+      | s :: _ ->
+          let ids = ref [] in
+          walk (function SymbolIdentifier id ->
+                        ids := id :: !ids | _ -> ()) s;
+          (match List.rev !ids with
+           | last :: _ -> Some last
+           | [] -> None)
+      | [] -> None
+    in
+    match pname with
+    | None -> None
+    | Some name -> Some (name, extract_pvalue_from_param_decl node)
+  ) param_nodes
+
 let extract_packages root : package_decl list =
   let pkg_nodes = collect_by
     (has_tag (prefix_is "package_declaration")) root
@@ -2017,13 +2092,26 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
 let parse_files_full files =
   let mods = ref [] in
   let pkgs = ref [] in
+  let file_scope = ref [] in
   List.iter (fun f ->
     match Sv_verible_to_ir.parse_verible_file f with
     | None -> Printf.eprintf "[verible] parse failed for %s\n" f
     | Some root ->
         mods := extract_modules root @ !mods;
-        pkgs := extract_packages root @ !pkgs
+        pkgs := extract_packages root @ !pkgs;
+        file_scope := extract_file_scope_params root @ !file_scope
   ) files;
-  (List.rev !mods, List.rev !pkgs)
+  (* Collapse all file-scope localparams (from `.svh` headers and the
+     `.sv` files themselves outside their `module ... endmodule`
+     blocks) into a single synthetic package called "$unit".  eval_int
+     already searches every package by name when a parameter isn't in
+     the module-local scope, so wrapping these in a pkg is enough —
+     no eval_int change needed.                                     *)
+  let unit_pkg =
+    if !file_scope = [] then []
+    else [{ pkg_name  = "$unit";
+            pkg_params = List.rev !file_scope;
+            pkg_body   = EMPTY_TOKEN }] in
+  (List.rev !mods, List.rev !pkgs @ unit_pkg)
 
 let parse_files files = fst (parse_files_full files)

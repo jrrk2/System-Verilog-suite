@@ -69,12 +69,6 @@
     List.iter 
       (fun (k,s) -> Hashtbl.add h s k)
       [
-( AMPERSAND , "ampersand" );
-( AMPERSAND_AMPERSAND , "ampersand_AMPERSAND" );
-( AMPERSAND_AMPERSAND_AMPERSAND , "ampersand_AMPERSAND_AMPERSAND" );
-( AMPERSAND_EQ , "ampersand_EQ" );
-( AT , "at" );
-( AT_AT , "at_AT" );
 ( Absdelay , "absdelay" );
 ( Abstol , "abstol" );
 ( Ac_stim , "ac_stim" );
@@ -93,8 +87,6 @@
 ( Assign , "assign" );
 ( Assume , "assume" );
 ( Automatic , "automatic" );
-( BACKQUOTE , "backquote" );
-( BACKQUOTE_BACKQUOTE , "backquote_BACKQUOTE" );
 ( BACKQUOTE_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_begin____ , "backquote_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_begin____" );
 ( BACKQUOTE_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_end____ , "backquote_UNDERSCORE_UNDERSCORE_UNDERSCORE_UNDERSCORE_verible_verilog_library_end____" );
 ( BACKQUOTE_begin_keywords , "backquote_begin_keywords" );
@@ -128,7 +120,6 @@
 ( BACKQUOTE_unconnected_drive , "backquote_unconnected_drive" );
 ( BACKQUOTE_undef , "backquote_undef" );
 ( BACKQUOTE_uselib , "backquote_uselib" );
-( BACKSLASH , "backslash" );
 ( Before , "before" );
 ( Begin , "begin" );
 ( Bind , "bind" );
@@ -140,14 +131,6 @@
 ( Bufif0 , "bufif0" );
 ( Bufif1 , "bufif1" );
 ( Byte , "byte" );
-( CARET , "caret" );
-( CARET_EQ , "caret_EQ" );
-( CHAR , "char" );
-( COLON , "colon" );
-( COLON_COLON , "colon_COLON" );
-( COLON_EQ , "colon_EQ" );
-( COLON_SLASH , "colon_SLASH" );
-( COMMA , "comma" );
 ( Case , "case" );
 ( Casex , "casex" );
 ( Casez , "casez" );
@@ -170,7 +153,6 @@
 ( Covergroup , "covergroup" );
 ( Coverpoint , "coverpoint" );
 ( Cross , "cross" );
-( DEFAULT , "default" );
 ( DLR_attribute , "dlr_attribute" );
 ( DLR_fullskew , "dlr_fullskew" );
 ( DLR_hold , "dlr_hold" );
@@ -186,10 +168,6 @@
 ( DLR_timeskew , "dlr_timeskew" );
 ( DLR_unit , "dlr_unit" );
 ( DLR_width , "dlr_width" );
-( DOLLAR , "dollar" );
-( DOT , "dot" );
-( DOT_STAR , "dot_STAR" );
-( DOUBLEQUOTE , "doublequote" );
 ( Ddt_nature , "ddt_nature" );
 ( Deassign , "deassign" );
 ( Default , "default" );
@@ -202,14 +180,6 @@
 ( Do , "do" );
 ( Domain , "domain" );
 ( Driver_update , "driver_update" );
-( EMPTY_TOKEN , "empty_TOKEN" );
-( EOF_TOKEN , "eof_TOKEN" );
-( EQUALS , "equals" );
-( EQ_EQ , "eq_EQ" );
-( EQ_EQ_EQ , "eq_EQ_EQ" );
-( EQ_EQ_QUERY , "eq_EQ_QUERY" );
-( EQ_GT , "eq_GT" );
-( ERROR_TOKEN , "error_TOKEN" );
 ( Edge , "edge" );
 ( Else , "else" );
 ( End , "end" );
@@ -344,16 +314,6 @@
 ( Option , "option" );
 ( Or , "or" );
 ( Output , "output" );
-( PERCENT , "percent" );
-( PERCENT_EQ , "percent_EQ" );
-( PLING , "pling" );
-( PLING_EQ , "pling_EQ" );
-( PLING_EQ_EQ , "pling_EQ_EQ" );
-( PLING_EQ_QUERY , "pling_EQ_QUERY" );
-( PLUS , "plus" );
-( PLUS_COLON , "plus_COLON" );
-( PLUS_EQ , "plus_EQ" );
-( PLUS_PLUS , "plus_PLUS" );
 ( PP_Identifier , "pp_Identifier" );
 ( Package , "package" );
 ( Packed , "packed" );
@@ -378,12 +338,6 @@
 ( Pulsestyle_ondetect , "pulsestyle_ondetect" );
 ( Pulsestyle_onevent , "pulsestyle_onevent" );
 ( Pure , "pure" );
-( QUERY , "query" );
-( QUOTE , "quote" );
-( QUOTE_LBRACE , "quote_LBRACE" );
-( RBRACE , "rbrace" );
-( RBRACK , "rbrack" );
-( RPAREN , "rparen" );
 ( Rand , "rand" );
 ( Randc , "randc" );
 ( Randcase , "randcase" );
@@ -407,17 +361,9 @@
 ( Rtran , "rtran" );
 ( Rtranif0 , "rtranif0" );
 ( Rtranif1 , "rtranif1" );
-( SEMICOLON , "semicolon" );
 ( SEMICOLON_LPAREN_after_HYPHEN_assertion_HYPHEN_variable_HYPHEN_decls_RPAREN , "semicolon_LPAREN_after_HYPHEN_assertion_HYPHEN_variable_HYPHEN_decls_RPAREN" );
-( SLASH , "slash" );
 ( SLASH_AMPERSAND_lowast_SEMICOLON_comment_AMPERSAND_lowast_SEMICOLON_SLASH , "slash_AMPERSAND_lowast_SEMICOLON_comment_AMPERSAND_lowast_SEMICOLON_SLASH" );
-( SLASH_EQ , "slash_EQ" );
 ( SLASH_SLASH_end_of_line_comment , "slash_SLASH_end_of_line_comment" );
-( STAR , "star" );
-( STAR_EQ , "star_EQ" );
-( STAR_GT , "star_GT" );
-( STAR_RPAREN , "star_RPAREN" );
-( STAR_STAR , "star_STAR" );
 ( S_always , "s_always" );
 ( S_eventually , "s_eventually" );
 ( S_nexttime , "s_nexttime" );
@@ -451,16 +397,8 @@
 ( Supply1 , "supply1" );
 ( Sync_accept_on , "sync_accept_on" );
 ( Sync_reject_on , "sync_reject_on" );
-( TILDE , "tilde" );
-( TILDE_AMPERSAND , "tilde_AMPERSAND" );
-( TILDE_CARET , "tilde_CARET" );
-( TILDE_VBAR , "tilde_VBAR" );
 ( TK_AngleBracketInclude , "tk_AngleBracketInclude" );
 ( TK_EvalStringLiteral , "tk_EvalStringLiteral" );
-( TK_LS_EQ , "tk_LS_EQ" );
-( TK_OTHER , "tk_OTHER" );
-( TK_RSS_EQ , "tk_RSS_EQ" );
-( TK_RS_EQ , "tk_RS_EQ" );
 ( TK_TimeLiteral , "tk_TimeLiteral" );
 ( TK_XZDigits , "tk_XZDigits" );
 ( TK_edge_descriptor , "tk_edge_descriptor" );
@@ -487,7 +425,6 @@
 ( Type , "type" );
 ( Type_option , "type_option" );
 ( Typedef , "typedef" );
-( UNDERSCORE , "underscore" );
 ( Union , "union" );
 ( Unique , "unique" );
 ( Unique0 , "unique0" );
@@ -499,11 +436,6 @@
 ( Untyped , "untyped" );
 ( Use , "use" );
 ( Uwire , "uwire" );
-( VBAR , "vbar" );
-( VBAR_EQ , "vbar_EQ" );
-( VBAR_EQ_GT , "vbar_EQ_GT" );
-( VBAR_HYPHEN_GT , "vbar_HYPHEN_GT" );
-( VBAR_VBAR , "vbar_VBAR" );
 ( Var , "var" );
 ( Vectored , "vectored" );
 ( Virtual , "virtual" );

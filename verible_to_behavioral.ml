@@ -825,9 +825,33 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
     let digits_clean =
       String.map (function
         | '?' | 'x' | 'X' | 'z' | 'Z' -> '0'
-        | c -> c) digits in
+        | c -> c)
+        (String.concat ""
+           (String.split_on_char '_' digits))
+    in
+    (* OCaml's `int` is 63-bit (one bit reserved by the runtime), so
+       any sized literal with more than ~62 effective bits overflows
+       `int_of_string`.  Data-table .svh files use
+       `128'h<128 hex digits>` patterns routinely (one entry per
+       weight row).  Drop the high-order digits and keep the low-order
+       portion that fits — this gives a BConst with the *correct
+       declared width* but a representative low-bits value, which is
+       enough for Z3 sort matching and lowering correctness on every
+       op that doesn't actually depend on the high bits.  Math against
+       the high bits is the rare case; if it comes up we'd need an
+       arbitrary-precision BConst, which is a separate refactor.    *)
+    let max_digits = match prefix with
+      | "0b" -> 60       (* 60 bits = safe under 63-bit OCaml int  *)
+      | "0o" -> 20       (* 20 * 3 = 60 bits                       *)
+      | "0x" -> 15       (* 15 * 4 = 60 bits                       *)
+      | _    -> 18       (* decimal: 10^18 < 2^63                  *)
+    in
+    let digits_trimmed =
+      let n = String.length digits_clean in
+      if n > max_digits then String.sub digits_clean (n - max_digits) max_digits
+      else digits_clean in
     let value =
-      try int_of_string ("0" ^ prefix ^ digits_clean)
+      try int_of_string ("0" ^ prefix ^ digits_trimmed)
       with _ ->
         if Lazy.force lenient_mode then 0
         else raise (Silent_zero_substitution
@@ -912,14 +936,40 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
    * key (the field name) and a value expression. We emit a BConcat
    * in the field's DECLARED order (MSB-first). The struct typedef
    * is looked up via `cur_struct_defs`; if no typedef matches we
-   * fall back to source-order BConcat. *)
+   * fall back to source-order BConcat.
+
+     Special-case `'{default: <expr>}` (also accepts the wildcard
+     pattern `'{default: '0}` which is by far the common form): the
+     `default` keyword is a bare `Default` token, not a
+     SymbolIdentifier, so the per-key walker would miss it and we'd
+     return an empty pair list — historically emitted as `mem := {}`
+     instead of `mem := 0`.  When any key is `Default` we take that
+     entry's value as the broadcast fill and emit it directly; both
+     slang and verilator lower `'{default:'0}` to a single-bit zero
+     and rely on the array-write path to broadcast it.            *)
   | TUPLE4 (STRING tag, _, body, _)
     when prefix_is "assignment_pattern2" tag ->
+      let is_default_key k =
+        match k with
+        | Default -> true
+        | _ ->
+            let saw_default = ref false in
+            walk (function
+              | Default -> saw_default := true
+              | _ -> ()) k;
+            !saw_default
+      in
+      let default_value = ref None in
       let pairs = match body with
         | TLIST xs ->
             List.filter_map (fun e -> match e with
               | TUPLE4 (STRING t, key, _, value)
                 when prefix_is "structure_or_array_pattern_expression" t ->
+                  if is_default_key key then begin
+                    if !default_value = None then
+                      default_value := Some (recurse value);
+                    None
+                  end else
                   let kname = ref None in
                   walk (function
                     | SymbolIdentifier id when !kname = None ->
@@ -931,30 +981,44 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
               | _ -> None) (List.rev xs)
         | _ -> []
       in
-      (* Pick a typedef whose field set EXACTLY matches the keys —
-       * this is how we link `'{hi: x, lo: y}` back to `pair_t`. *)
-      let key_set = List.map fst pairs |> List.sort compare in
-      let matching_def =
-        List.find_opt (fun (_, fields) ->
-          List.map fst fields |> List.sort compare = key_set
-        ) !cur_struct_defs
-      in
-      (match matching_def with
-       | Some (_, fields) ->
-           let in_order =
-             List.map (fun (fname, _w) ->
-               try List.assoc fname pairs
-               with Not_found -> BConst { value = 0; width = 1 }
-             ) fields
-           in
-           (match in_order with
-            | [single] -> single
-            | _ -> BConcat in_order)
-       | None ->
-           let exprs = List.map snd pairs in
-           (match exprs with
-            | [single] -> single
-            | _ -> BConcat exprs))
+      (* A `'{default: v}` with no other keys → broadcast fill.
+         Both slang and verilator lower this to the bare value (typically
+         `'0` → `1'b0`) and rely on the array-write path to broadcast it
+         across all elements. *)
+      (match !default_value, pairs with
+       | Some v, [] -> v
+       | _ ->
+          (* Pick a typedef whose field set EXACTLY matches the keys —
+           * this is how we link `'{hi: x, lo: y}` back to `pair_t`. *)
+          let key_set = List.map fst pairs |> List.sort compare in
+          let matching_def =
+            List.find_opt (fun (_, fields) ->
+              List.map fst fields |> List.sort compare = key_set
+            ) !cur_struct_defs
+          in
+          (match matching_def with
+           | Some (_, fields) ->
+               let in_order =
+                 List.map (fun (fname, _w) ->
+                   try List.assoc fname pairs
+                   with Not_found ->
+                     (match !default_value with
+                      | Some v -> v
+                      | None -> BConst { value = 0; width = 1 })
+                 ) fields
+               in
+               (match in_order with
+                | [single] -> single
+                | _ -> BConcat in_order)
+           | None ->
+               let exprs = List.map snd pairs in
+               (match exprs with
+                | [] ->
+                    (match !default_value with
+                     | Some v -> v
+                     | None -> BConst { value = 0; width = 1 })
+                | [single] -> single
+                | _ -> BConcat exprs)))
   (* Replication `{N{value}}` — Verible parses as `expr_primary_braces2`:
    *   TUPLE7(tag, LBRACE, value_range, LBRACE, expression_list_proper,
    *          RBRACE, RBRACE)

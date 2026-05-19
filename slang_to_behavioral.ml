@@ -154,8 +154,12 @@ let bop_of_string = function
   | "ArithmeticShiftRight" -> Some BAshr
   | _ -> None
 
+(* `LogicalNot` is NOT in this table — it's a 1-bit OR-reduction
+   followed by a NOT, which can't be expressed as a single unary op.
+   The UnaryOp case below special-cases it.  Treating LogicalNot as
+   plain BitwiseNot is wrong: `!8'b00000001` is 1'b0, not 8'b11111110. *)
 let uop_of_string = function
-  | "BitwiseNot" | "LogicalNot" -> Some BNot
+  | "BitwiseNot" -> Some BNot
   | "Minus" -> Some BNeg
   | "BitwiseAnd" -> Some BRedAnd
   | "BitwiseOr"  -> Some BRedOr
@@ -209,6 +213,13 @@ let parse_const value_str type_str =
    ref, set by the Assignment-statement handler before converting the
    RHS and restored afterwards.                                       *)
 let lvalue_ref_ctx : Behavioral_ir.bexpr option ref = ref None
+
+(* Function-body lowering context.  Slang emits `return expr;` as a
+   `Return { expr }` node, but the BIR convention (matching verilator
+   and downstream passes) is for a function's return value to be
+   assigned to a variable named the same as the function.  This ref
+   tells the Return-statement handler which name to assign to. *)
+let current_function_name : string option ref = ref None
 
 let rec expr_to_bexpr j =
   match kind_of j with
@@ -269,10 +280,22 @@ let rec expr_to_bexpr j =
         | None -> BConst { value = 0; width = 1 } in
       let t = match str_field "type" j with Some s -> s | None -> "logic" in
       let w, _, _ = parse_type t in
-      (match uop_of_string op_s with
-       | Some op -> BUnOp { op; operand;
-                            result_type = BInt { width = w; signed = Unsigned } }
-       | None -> operand)
+      let result_type =
+        Behavioral_ir.BInt { width = w; signed = Unsigned } in
+      (match op_s with
+       | "LogicalNot" ->
+           (* SV `!v` is a 1-bit logical NOT — equivalent to
+              `~(|v)`: NOT-of-OR-reduction.  The result is 1 bit
+              wide; if the use-site needs N bits the surrounding
+              context widens it.  Matches verilator's emission. *)
+           let bit1 = Behavioral_ir.BInt { width = 1; signed = Unsigned } in
+           BUnOp { op = BNot;
+                   operand = BUnOp { op = BRedOr; operand; result_type = bit1 };
+                   result_type }
+       | _ ->
+           match uop_of_string op_s with
+           | Some op -> BUnOp { op; operand; result_type }
+           | None -> operand)
   | "ConditionalOp" ->
       (* Slang uses `conditions: [{expr: …}]` for the predicate (a
        * list to support `c1 &&& c2 ? a : b` SV-2017 patterns), and
@@ -361,9 +384,18 @@ let rec expr_to_bexpr j =
        | Some j' -> expr_to_bexpr j'
        | None -> BConst { value = 0; width = 1 })
   | "Assignment" ->
-      (* Embedded assignment as an expression — return the RHS. The
-       * outer ExpressionStatement is what creates the BAssign. *)
-      (match assoc "right" j with
+      (* Embedded assignment as an expression — usually return the RHS.
+         But for task-call output arguments, slang wraps the argument as
+         `Assignment { left: <lvalue>, right: EmptyArgument }` to record
+         the back-binding direction.  In that case the *lvalue* is the
+         interesting value (the variable the task writes to), so return
+         it instead — matches verilator's emission. *)
+      let right = assoc "right" j in
+      (match right with
+       | Some j' when kind_of j' = "EmptyArgument" ->
+           (match assoc "left" j with
+            | Some l -> expr_to_bexpr l
+            | None -> BConst { value = 0; width = 1 })
        | Some j' -> expr_to_bexpr j'
        | None -> BConst { value = 0; width = 1 })
   | "Call" ->
@@ -509,7 +541,8 @@ let rec stmt_to_bstmt j =
         | None -> [] in
       BIf { condition = cond; then_stmts; else_stmts }
   | "ExpressionStatement" ->
-      (* The wrapped expression is usually an Assignment. *)
+      (* The wrapped expression is usually an Assignment, but task
+         calls and void function calls also surface here as `Call`. *)
       (match assoc "expr" j with
        | Some inner ->
            (match kind_of inner with
@@ -530,8 +563,40 @@ let rec stmt_to_bstmt j =
                   | None -> BConst { value = 0; width = 1 } in
                 lvalue_ref_ctx := saved;
                 lhs_to_bstmt l rhs
+            | "Call" ->
+                (* Task call or void-function call as a statement.
+                   Mirrors verilator_to_behavioral's TaskRef/FuncRef
+                   StmtExpr path: emit BCallStmt so the call survives
+                   into z3_miter as an uninterpreted statement.
+                   Testbench primitives ($display/$finish/$stop/etc.)
+                   are dropped — they have no synth semantics.       *)
+                let func = match str_field "subroutine" inner with
+                  | Some s -> strip_addr s
+                  | None -> "?" in
+                let args = match assoc "arguments" inner with
+                  | Some (`List xs) -> List.map expr_to_bexpr xs
+                  | _ -> [] in
+                (match func with
+                 | "$display" | "$write" | "$strobe" | "$monitor"
+                 | "$finish" | "$stop" | "$exit"
+                 | "$fdisplay" | "$fwrite" | "$fopen" | "$fclose"
+                 | "$readmemh" | "$readmemb"
+                 | "$dumpfile" | "$dumpvars" | "$dumpon" | "$dumpoff" ->
+                     BBlock []
+                 | _ -> BCallStmt { func; args })
             | _ -> BBlock [])
        | None -> BBlock [])
+  | "Return" ->
+      (* `return expr;` inside a function body.  Lower to an assignment
+         to the implicit return-value variable (named the same as the
+         function).  Matches verilator's `add := (a + b)` shape so
+         z3_miter can equate the two frontends' function bodies.    *)
+      let rhs = match assoc "expr" j with
+        | Some j' -> expr_to_bexpr j'
+        | None -> BConst { value = 0; width = 1 } in
+      (match !current_function_name with
+       | Some fname -> BAssign { lhs = fname; rhs }
+       | None -> BReturn (Some rhs))
   | "Case" ->
       let sel = match assoc "expr" j with
         | Some j' -> expr_to_bexpr j'
@@ -710,9 +775,12 @@ let extract_funcs members_raw =
             let t = match str_field "returnType" m with
               | Some s -> s | None -> "logic" in
             parse_btype t in
+          let saved = !current_function_name in
+          current_function_name := Some fname;
           let body = match assoc "body" m with
             | Some j' -> [stmt_to_bstmt j']
             | None -> [] in
+          current_function_name := saved;
           Some { Behavioral_ir.fname; is_task; ftype;
                  params; locals; body }
     | _ -> None
@@ -979,6 +1047,30 @@ let extract_instances members_raw =
     | _ -> None
   ) members
 
+(* Collect every Package node anywhere in the design, then pull
+   subroutines out of their members.  Mirrors verilator's pre-collect
+   in convert_ast: functions/tasks defined inside `package func_pkg`
+   need to be visible to modules that do `import func_pkg::*`,
+   otherwise the call sites stay as uninterpreted BCalls and z3_miter
+   can't equate them with verilator's inlined bodies.              *)
+let collect_package_funcs j =
+  let acc = ref [] in
+  let rec walk = function
+    | `Assoc fields as node ->
+        (match List.assoc_opt "kind" fields with
+         | Some (`String "Package") ->
+             let members = match List.assoc_opt "members" fields with
+               | Some (`List xs) -> xs | _ -> [] in
+             acc := extract_funcs members @ !acc
+         | _ -> ());
+        List.iter (fun (_, v) -> walk v) fields;
+        ignore node
+    | `List xs -> List.iter walk xs
+    | _ -> ()
+  in
+  walk j;
+  !acc
+
 (* Walk every Instance / InstanceBody under `design.members` and
  * produce one bmodule each. Recurse into the InstanceBody's
  * members too — nested Instance nodes (sub-instances of the parent)
@@ -986,7 +1078,7 @@ let extract_instances members_raw =
  * hierarchy and needs its own bmodule. Each (base, param-suffix)
  * combination becomes one bmodule; duplicate instances of the same
  * specialisation collapse via the seen set. *)
-let rec collect_instances ~seen acc j =
+let rec collect_instances ~seen ~pkg_funcs acc j =
   match kind_of j with
   | "InstanceBody" ->
       let base = name_of j in
@@ -999,7 +1091,17 @@ let rec collect_instances ~seen acc j =
           let signals = extract_signals members in
           let processes = extract_processes members in
           let instances = extract_instances members in
-          let funcs = extract_funcs members in
+          let local_funcs = extract_funcs members in
+          (* Module-local definitions shadow package-level ones with
+             the same name. *)
+          let local_names =
+            List.fold_left (fun s (f : Behavioral_ir.bfunc) ->
+              s @ [f.fname]) [] local_funcs in
+          let funcs =
+            local_funcs @
+            List.filter (fun (f : Behavioral_ir.bfunc) ->
+              not (List.mem f.fname local_names)) pkg_funcs
+          in
           let m = {
             name;
             params = [];
@@ -1014,14 +1116,15 @@ let rec collect_instances ~seen acc j =
       in
       (* Sub-instances live inside members. Recurse to find their
        * InstanceBody too. *)
-      List.fold_left (collect_instances ~seen) acc members
+      List.fold_left (collect_instances ~seen ~pkg_funcs) acc members
   | _ ->
       let acc =
         match assoc "body" j with
-        | Some j' -> collect_instances ~seen acc j'
+        | Some j' -> collect_instances ~seen ~pkg_funcs acc j'
         | None -> acc
       in
-      List.fold_left (collect_instances ~seen) acc (list_field "members" j)
+      List.fold_left (collect_instances ~seen ~pkg_funcs) acc
+        (list_field "members" j)
 
 (* Pre-scan: stuff every InstanceBody's `addr` field into
  * `body_by_addr` so later `Instance.body` string back-references
@@ -1058,8 +1161,9 @@ let convert_json (j : json) : bprogram =
   let design = match assoc "design" j with Some d -> d | None -> j in
   Hashtbl.clear body_by_addr;
   build_addr_table j;
+  let pkg_funcs = collect_package_funcs design in
   let seen = Hashtbl.create 256 in
-  let mods = List.rev (collect_instances ~seen [] design) in
+  let mods = List.rev (collect_instances ~seen ~pkg_funcs [] design) in
   { modules = mods; library_cells = [] }
 
 (* ─── Driver invocation ──────────────────────────────────────────── *)

@@ -95,24 +95,58 @@ let is_signed_dtype = function
 
 (* Parse constant value from Verilator format *)
 let parse_const_value name =
+  (* Wildcard digits (`z`, `?`, `x`) from casez/casex patterns and
+     high-Z init constants (`32'b1zzzzzzz...`) substitute to `0` so
+     int_of_string accepts the digits.  Underscores are SV digit
+     separators — strip them.  OCaml `int` is 63-bit so any literal
+     wider than ~62 effective bits overflows; truncate to the
+     low-order portion (preserving the declared width via the
+     BConst.width field is the caller's job).                       *)
+  let clean digits =
+    String.map (function
+      | '?' | 'x' | 'X' | 'z' | 'Z' -> '0'
+      | c -> c)
+      (String.concat "" (String.split_on_char '_' digits))
+  in
+  let parse_base prefix bits_per_digit digits =
+    let d = clean digits in
+    let max_digits = 63 / bits_per_digit in
+    let n = String.length d in
+    let d = if n > max_digits then String.sub d (n - max_digits) max_digits else d in
+    int_of_string (prefix ^ d)
+  in
+  let parse_dec digits =
+    let d = clean digits in
+    (* For decimal we don't know bits_per_digit exactly (≈3.32), pick a
+       safe ceiling: 18 decimal digits is < 2^60.                   *)
+    let n = String.length d in
+    let d = if n > 18 then String.sub d (n - 18) 18 else d in
+    int_of_string d
+  in
   try
     if String.contains name '\'' then
       let parts = String.split_on_char '\'' name in
       match parts with
-      | width_str :: rest ->
+      | _width_str :: rest ->
           let value_str = String.concat "'" rest in
           if String.length value_str >= 2 then
             match value_str.[0], value_str.[1] with
             | 's', 'h' ->
-                int_of_string ("0x" ^ String.sub value_str 2 (String.length value_str - 2))
+                parse_base "0x" 4 (String.sub value_str 2 (String.length value_str - 2))
             | 's', 'd' ->
-                int_of_string (String.sub value_str 2 (String.length value_str - 2))
+                parse_dec (String.sub value_str 2 (String.length value_str - 2))
+            | 's', 'b' ->
+                parse_base "0b" 1 (String.sub value_str 2 (String.length value_str - 2))
+            | 's', 'o' ->
+                parse_base "0o" 3 (String.sub value_str 2 (String.length value_str - 2))
             | 'h', _ ->
-                int_of_string ("0x" ^ String.sub value_str 1 (String.length value_str - 1))
+                parse_base "0x" 4 (String.sub value_str 1 (String.length value_str - 1))
             | 'd', _ ->
-                int_of_string (String.sub value_str 1 (String.length value_str - 1))
+                parse_dec (String.sub value_str 1 (String.length value_str - 1))
             | 'b', _ ->
-                int_of_string ("0b" ^ String.sub value_str 1 (String.length value_str - 1))
+                parse_base "0b" 1 (String.sub value_str 1 (String.length value_str - 1))
+            | 'o', _ ->
+                parse_base "0o" 3 (String.sub value_str 1 (String.length value_str - 1))
             | _ -> int_of_string value_str
           else int_of_string value_str
       | _ -> int_of_string name
@@ -153,11 +187,17 @@ let rec expr_to_bexpr = function
                            result_type = BInt { width; signed = signedness } }
        | "SUB" -> BBinOp { op = BSub; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
-       | "MUL" -> BBinOp { op = BMul; lhs = lhs_expr; rhs = rhs_expr;
+       (* Verilator splits MUL/DIV/MODDIV into signed-`MULS`/`DIVS`/
+          `MODDIVS` and unsigned variants once V3Width runs.  Both
+          forms compute the same numeric BIR — the result type's
+          signedness already comes from the dtype lookup.  Without
+          `MULS`, `y = a*b` with signed operands fell through to the
+          default zero-emit (sysver_tests/signed_mult.sv).            *)
+       | "MUL" | "MULS" -> BBinOp { op = BMul; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
-       | "DIV" -> BBinOp { op = BDiv; lhs = lhs_expr; rhs = rhs_expr;
+       | "DIV" | "DIVS" -> BBinOp { op = BDiv; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
-       | "MODDIV" -> BBinOp { op = BMod; lhs = lhs_expr; rhs = rhs_expr;
+       | "MODDIV" | "MODDIVS" -> BBinOp { op = BMod; lhs = lhs_expr; rhs = rhs_expr;
                               result_type = BInt { width; signed = signedness } }
        | "AND" -> BBinOp { op = BAnd; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
@@ -196,11 +236,17 @@ let rec expr_to_bexpr = function
                            result_type = BInt { width; signed = signedness } }
        | "SUB" -> BBinOp { op = BSub; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
-       | "MUL" -> BBinOp { op = BMul; lhs = lhs_expr; rhs = rhs_expr;
+       (* Verilator splits MUL/DIV/MODDIV into signed-`MULS`/`DIVS`/
+          `MODDIVS` and unsigned variants once V3Width runs.  Both
+          forms compute the same numeric BIR — the result type's
+          signedness already comes from the dtype lookup.  Without
+          `MULS`, `y = a*b` with signed operands fell through to the
+          default zero-emit (sysver_tests/signed_mult.sv).            *)
+       | "MUL" | "MULS" -> BBinOp { op = BMul; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
-       | "DIV" -> BBinOp { op = BDiv; lhs = lhs_expr; rhs = rhs_expr;
+       | "DIV" | "DIVS" -> BBinOp { op = BDiv; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
-       | "MODDIV" -> BBinOp { op = BMod; lhs = lhs_expr; rhs = rhs_expr;
+       | "MODDIV" | "MODDIVS" -> BBinOp { op = BMod; lhs = lhs_expr; rhs = rhs_expr;
                               result_type = BInt { width; signed = signedness } }
        | "AND" -> BBinOp { op = BAnd; lhs = lhs_expr; rhs = rhs_expr;
                            result_type = BInt { width; signed = signedness } }
