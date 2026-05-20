@@ -424,19 +424,31 @@ let rec expr_to_z3 suffix ctx_sigs = function
          miter share the same [ctx] and the same [bcall_decl_cache]
          entry by name, so the same args produce the same Z3 value
          on each side — exactly the behavioural contract of a proven-
-         equivalent leaf module.  *)
+         equivalent leaf module.
+         The cache key bakes in the argument arity and per-arg bit
+         width so that two call sites of `func` with structurally
+         different argument shapes (e.g. one side spreads a concat
+         across multiple args while the other keeps it as a single
+         BConcat) become distinct uninterpreted functions instead of
+         crashing Z3 with "Wrong number of arguments". *)
       let z3_args = List.map (expr_to_z3 suffix ctx_sigs) args in
       let arg_sorts = List.map Z3.Expr.get_sort z3_args in
       let out_w =
         match Hashtbl.find_opt bcall_out_w func with
         | Some w -> w
         | None -> 32 in
-      let decl = match Hashtbl.find_opt bcall_decl_cache func with
+      let arity_key =
+        String.concat "_" (List.map (fun s ->
+          string_of_int (Z3.BitVector.get_size s)) arg_sorts)
+      in
+      let cache_key = Printf.sprintf "%s/%d:%s" func
+        (List.length arg_sorts) arity_key in
+      let decl = match Hashtbl.find_opt bcall_decl_cache cache_key with
         | Some d -> d
         | None ->
             let d = Z3.FuncDecl.mk_func_decl_s ctx func arg_sorts
               (Z3.BitVector.mk_sort ctx out_w) in
-            Hashtbl.add bcall_decl_cache func d;
+            Hashtbl.add bcall_decl_cache cache_key d;
             d in
       Z3.FuncDecl.apply decl z3_args
 
