@@ -44,6 +44,16 @@ class Decompiler_Miter(BaseRunner):
         tags = params.get('tags', '').split()
         if any(t.startswith('uvm') or t == 'testbench' for t in tags):
             return None
+        # Skip should_fail tests: an equivalence miter cannot prove
+        # negatives. If both frontends silently accept the illegal SV
+        # they will produce identical BIRs and the miter will "prove"
+        # them equivalent, which sv-tests then scores as a false-pass
+        # because the test expected the tool to reject the input.
+        # Either frontend would have to surface the violation as an
+        # error for the miter to flag it, and that's a frontend-quality
+        # issue, not something equivalence checking can address.
+        if params.get('should_fail', '0') == '1':
+            return None
         return super().get_mode(params)
 
     def get_version_cmd(self):

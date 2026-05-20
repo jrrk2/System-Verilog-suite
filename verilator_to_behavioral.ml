@@ -95,6 +95,15 @@ let is_signed_dtype = function
 
 (* Parse constant value from Verilator format *)
 let parse_const_value name =
+  (* String-literal constants: Verilator emits a CONST node whose name
+     starts with a backslash-quote pair when the source value came from
+     a SV string literal (e.g. string-method calls like a.bintoa(12)
+     materialise the resulting text as such a constant). These are not
+     numeric; substitute 0 so the BConst carries a placeholder. Without
+     this the integer parse below raises Silent_zero_substitution and
+     aborts conversion for an otherwise synth-unimportant value. *)
+  if String.length name >= 2 && name.[0] = '\\' && name.[1] = '"' then 0
+  else
   (* Wildcard digits (`z`, `?`, `x`) from casez/casex patterns and
      high-Z init constants (`32'b1zzzzzzz...`) substitute to `0` so
      int_of_string accepts the digits.  Underscores are SV digit

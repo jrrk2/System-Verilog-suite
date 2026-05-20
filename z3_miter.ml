@@ -672,6 +672,43 @@ let get_input_signals bmod =
     | _ -> None
   ) bmod.signals
 
+(* Walk a statement, collecting every BAssign LHS name. *)
+let rec collect_written acc = function
+  | BAssign { lhs; _ } -> lhs :: acc
+  | BBlock ss -> List.fold_left collect_written acc ss
+  | BIf { then_stmts; else_stmts; _ } ->
+      let acc = List.fold_left collect_written acc then_stmts in
+      List.fold_left collect_written acc else_stmts
+  | BCase { cases; default; _ } ->
+      let acc = List.fold_left (fun a (_, ss) ->
+        List.fold_left collect_written a ss) acc cases in
+      List.fold_left collect_written acc default
+  | BWhile { body; _ } | BFor { body; _ } ->
+      List.fold_left collect_written acc body
+  | BCallStmt _ | BReturn _ -> acc
+
+(* Internal signals that no process writes to. Pure undriven reads
+ * (e.g. an uninitialised reg [7:0] mem [0:255] used only as the source
+ * of an assign) end up here. Without explicit matching they would be
+ * encoded as independent Z3 free variables on each side and Z3 would
+ * pick differing arbitrary values, manufacturing a counterexample
+ * even when the two designs are structurally identical. *)
+let get_undriven_internals bmod =
+  let written = List.fold_left (fun acc p ->
+    let body = match p with
+      | BCombinational { body; _ } -> body
+      | BSequential   { body; _ } -> body
+    in
+    List.fold_left collect_written acc body
+  ) [] bmod.processes in
+  let written_set = List.sort_uniq compare written in
+  List.filter_map (fun (s : bsignal) ->
+    if s.direction = `Internal
+       && not (List.mem s.name written_set)
+    then Some (s.name, width_of_btype s.stype)
+    else None
+  ) bmod.signals
+
 (* Create miter circuit and check equivalence *)
 let check_miter_equivalence bmod1 bmod2 =
   Printf.printf "═══════════════════════════════════════════════════════════════\n";
@@ -753,6 +790,32 @@ let check_miter_equivalence bmod1 bmod2 =
       let eq = Z3.Boolean.mk_eq ctx in1 in2 in
       Z3.Solver.add miter_solver [eq]
     ) inputs1;
+
+    (* Match undriven internal signals across designs. These are reads of
+     * a signal that no process writes (e.g. `reg [7:0] mem [0:255];
+     * assign b = mem[a];` — mem is just a source). Without this they
+     * encode as independent Z3 free variables and Z3 manufactures a
+     * counterexample by picking different values per side. *)
+    let undriven1 = get_undriven_internals bmod1 in
+    let undriven2 = get_undriven_internals bmod2 in
+    let shared_undriven =
+      List.filter (fun (n, w) ->
+        match List.assoc_opt n undriven2 with
+        | Some w2 when w2 = w -> true
+        | _ -> false)
+        undriven1
+    in
+    if shared_undriven <> [] then begin
+      Printf.printf "Matching %d undriven internal signal(s) across designs:\n"
+        (List.length shared_undriven);
+      List.iter (fun (name, width) ->
+        Printf.printf "  %s (%d bits)\n" name width;
+        let in1 = bv_var name width "_d1" in
+        let in2 = bv_var name width "_d2" in
+        let eq = Z3.Boolean.mk_eq ctx in1 in2 in
+        Z3.Solver.add miter_solver [eq]
+      ) shared_undriven
+    end;
 
     (* After Behavioral_ffrip every register Q has been turned into
      * a primary input (its current state) and Q__D has been added as
