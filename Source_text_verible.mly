@@ -1969,6 +1969,7 @@ expr_primary_parens: LPAREN expr_mintypmax RPAREN { TUPLE4(STRING("expr_primary_
 expr_primary_braces: LBRACE RBRACE { TUPLE3(STRING("expr_primary_braces1"),LBRACE,RBRACE) }
 	|	LBRACE value_range LBRACE expression_list_proper RBRACE RBRACE { TUPLE7(STRING("expr_primary_braces2"),LBRACE,$2,LBRACE,$4,RBRACE,RBRACE) }
 	|	range_list_in_braces { ($1) }
+	|	range_list_in_braces select_dimensions { TUPLE3(STRING("expr_primary_braces_select1"),$1,$2) }
 	|	streaming_concatenation { ($1) }
 
 range_list_in_braces: LBRACE open_range_list RBRACE { TUPLE4(STRING("range_list_in_braces1"),LBRACE,$2,RBRACE) }
@@ -2273,6 +2274,8 @@ net_declaration: net_type net_variable_or_decl_assigns SEMICOLON { TUPLE4(STRING
 	|	net_type data_type_or_implicit net_variable_or_decl_assigns SEMICOLON { TUPLE5(STRING("net_declaration2"),$1,$2,$3,SEMICOLON) }
 	|	Trireg charge_strength_opt decl_dimensions_opt delay3_opt list_of_identifiers SEMICOLON { TUPLE7(STRING("net_declaration3"),Trireg,$2,$3,$4,$5,SEMICOLON) }
 	|	net_type delay3 net_variable_or_decl_assigns SEMICOLON { TUPLE5(STRING("net_declaration4"),$1,$2,$3,SEMICOLON) }
+	|	net_type Vectored data_type_or_implicit net_variable_or_decl_assigns SEMICOLON { TUPLE6(STRING("net_declaration5"),$1,Vectored,$3,$4,SEMICOLON) }
+	|	net_type Scalared data_type_or_implicit net_variable_or_decl_assigns SEMICOLON { TUPLE6(STRING("net_declaration6"),$1,Scalared,$3,$4,SEMICOLON) }
 
 module_port_declaration: port_direction signed_unsigned_opt qualified_id decl_dimensions_opt list_of_identifiers_unpacked_dimensions SEMICOLON { TUPLE7(STRING("module_port_declaration1"),$1,$2,$3,$4,$5,SEMICOLON) }
 	|	port_direction signed_unsigned_opt unqualified_id decl_dimensions_opt list_of_identifiers_unpacked_dimensions SEMICOLON { TUPLE7(STRING("module_port_declaration2"),$1,$2,$3,$4,$5,SEMICOLON) }

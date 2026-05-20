@@ -480,7 +480,13 @@ let tok arg =
 
 let ident = ['a'-'z' 'A'-'Z' '$' '_'] ['a'-'z' 'A'-'Z' '_' '0'-'9' '$']*
 let escaped = '\\'[^' ']*' '
-let fltnum = ['0'-'9']+'.'['E' '-' '+' '0'-'9']*
+let digits_ = ['0'-'9'] ['0'-'9' '_']*
+let exp_ = ['E' 'e'] ['+' '-']? digits_
+(* SV real literal: D.D | D[.D]E[±]D — underscores allowed for grouping.
+ * The plain `D.D` form has no exponent; the exponent form may skip the
+ * fractional part (e.g. `23E10`). *)
+let fltnum = digits_ '.' digits_ exp_?
+           | digits_ exp_
 (* Sized literal: `<W>'<s>?<base><digits>`.  SV allows the base char
  * in any case (`'H` and `'h` both legal; `'S` is sign-extension);
  * we accept both. *)
@@ -489,7 +495,9 @@ let number = ['0'-'9' '_']+
 let unbased = '''['0'-'9'  'a'-'f' 'x' 'z' 'A'-'F' 'X' 'Z' '_' '?']+
 let space = [' ' '\t' '\r']+
 let newline = ['\n']
-let qstring = '"'[^'"']*'"'
+(* String literal with C-style escapes; backslash-escape clause first
+ * so an escaped quote is consumed as one unit. *)
+let qstring = '"' ( '\\' _ | [^ '"' '\\'] )* '"'
 let comment = '/''/'[^'\n']*
 (* `line` matches ONLY the standard Verilog preprocessor directives,
  * which legitimately consume the rest of the source line. Anything
@@ -619,17 +627,12 @@ rule token = parse
       { tok ( TK_RealTime f) }
   | ident as s
       { tok ( try keyword s with Not_found -> try systask s with Not_found -> SymbolIdentifier s ) }
-(*
-        if Hashtbl.mem typehash s then TYPE_HYPHEN_IDENTIFIER s else
-        if Hashtbl.mem packhash s then IDENTIFIER_HYPHEN_COLON_COLON s else
-        if !import_seen then ( Hashtbl.add packhash s (); IDENTIFIER_HYPHEN_COLON_COLON s) else IDENTIFIER s )
-
   | escaped as s
+      (* Escaped identifier: `\<chars> ` — strip the leading backslash
+       * and the trailing terminator space, keep the inner text as a
+       * normal symbol identifier so downstream references resolve. *)
       { let s = String.sub s 1 (String.length s - 2) in
-        tok ( if Hashtbl.mem typehash s then TYPE_HYPHEN_IDENTIFIER s else
-        if Hashtbl.mem packhash s then IDENTIFIER_HYPHEN_COLON_COLON s else
-        if !import_seen then ( Hashtbl.add packhash s (); IDENTIFIER_HYPHEN_COLON_COLON s) else IDENTIFIER s ) }
-*)
+        tok ( SymbolIdentifier s ) }
   | qstring as s
       { tok ( TK_StringLiteral (String.sub s 1 (String.length s - 2)) ) }
   | eof

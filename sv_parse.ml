@@ -450,14 +450,20 @@ let rec parse_json attr json =
       
   | "SENITEM" ->
       let edge = json |> member "edgeType" |> to_string_option |> Option.value ~default:"" in
-      let signal = json |> member "sensp" |> to_list_safe |> List.hd |> parse' attr name in
       let edge_str = String.lowercase_ascii edge ^ "edge" in
+      (* Verilator emits SENITEM with empty sensp when the trigger signal was
+       * constant-folded away (e.g. wire a = 0; always_ff @(posedge a) ...).
+       * Stub the signal so downstream IR/equivalence passes don't crash. *)
+      let signal = match json |> member "sensp" |> to_list_safe with
+        | [] -> Const' { name = "1'h0"; dtype = "" }
+        | x :: _ -> parse' attr name x
+      in
       SenItem { edge_str; signal }
       
   (* Binary operators *)
   | "AND" | "OR" | "XOR"
   | "LOGAND" | "LOGOR"
-  | "EQ" | "NEQ" | "LT" | "LTE" | "LTES" | "GT" | "GTE" | "GTES" | "LTS" | "GTS"
+  | "EQ" | "NEQ" | "EQN" | "NEQN" | "LT" | "LTE" | "LTES" | "GT" | "GTE" | "GTES" | "LTS" | "GTS"
   | "EQWILD" | "NEQWILD" | "EQCASE" | "NEQCASE"
   | "ADD" | "SUB" | "MUL" | "MULS" | "DIV" | "DIVS" | "MOD" | "MODDIV" | "MODDIV" | "MODDIVS"
   | "POW" | "POWSS" | "POWSU" | "POWUS" | "SHIFTL" | "SHIFTR" | "SHIFTRS"
