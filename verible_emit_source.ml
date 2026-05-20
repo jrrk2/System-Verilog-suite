@@ -84,6 +84,14 @@ let token_to_source : token -> string = function
   | Reg              -> "reg"
   | Logic            -> "logic"
   | Integer          -> "integer"
+  | Int              -> "int"
+  | Signed           -> "signed"
+  | Unsigned         -> "unsigned"
+  | Real             -> "real"
+  | Realtime         -> "realtime"
+  | Shortint         -> "shortint"
+  | Longint          -> "longint"
+  | Shortreal        -> "shortreal"
   | Bit              -> "bit"
   | Byte             -> "byte"
   | Posedge          -> "posedge"
@@ -141,6 +149,7 @@ let token_to_source : token -> string = function
   | COLON            -> ":"
   | DOT              -> "."
   | AT               -> "@"
+  | HASH             -> "#"
   | other -> Source_text_verible_tokens.getstr other
 
 (* ──────────────────────────────────────────────────────────────────
@@ -215,8 +224,20 @@ let rec emit (t : token) : string =
   | EMPTY_TOKEN -> ""
   | End_of_file -> ""
   | SymbolIdentifier s -> s
+  (* Numeric literal pieces — TK_BinBase carries "'b" or "'sb" and
+   * TK_BinDigits carries the actual digit string.  The grammar
+   * concatenates them as adjacent tokens so the emitter just
+   * pastes the payload through. *)
   | TK_DecNumber s -> s
   | TK_UnBasedNumber s -> s
+  | TK_BinBase s -> s
+  | TK_BinDigits s -> s
+  | TK_OctBase s -> s
+  | TK_OctDigits s -> s
+  | TK_HexBase s -> s
+  | TK_HexDigits s -> s
+  | TK_DecBase s -> s
+  | TK_RealTime s -> s
   | TK_StringLiteral s -> "\"" ^ s ^ "\""
   | leaf -> token_to_source leaf
 
