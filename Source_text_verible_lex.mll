@@ -488,9 +488,26 @@ let exp_ = ['E' 'e'] ['+' '-']? digits_
 let fltnum = digits_ '.' digits_ exp_?
            | digits_ exp_
 (* Sized literal: `<W>'<s>?<base><digits>`.  SV allows the base char
- * in any case (`'H` and `'h` both legal; `'S` is sign-extension);
- * we accept both. *)
-let sizednumber = ['0'-'9']*'\''['s' 'S']*['b' 'B' 'd' 'D' 'h' 'H' 'o' 'O' 'x' 'X'][' ']*[ '0'-'9' 'a'-'f' 'x' 'z' 'A'-'F' 'X' 'Z' '_' '?']+
+ * in any case (`'H` and `'h` both legal; `'S` is sign-extension).
+ * The digit set is base-specific — splitting per base means an
+ * illegal literal like `8'd-6` (sv-tests integers-signed-illegal:
+ * the proper form is `-8'd6`) doesn't match any of the four
+ * alternatives, the catch-all `sizednumber_bad` below picks up the
+ * <size>'<base> prefix on its own, and the lexer reports the
+ * error rather than letting the parser swallow `8 'd - 6` as some
+ * accidental expression.  Wildcard digits (`x`, `X`, `z`, `Z`, `?`)
+ * are allowed everywhere per SV LRM. *)
+let sized_bin = ['0'-'9' '_']*'\''['s' 'S']?['b' 'B'][' ']*['0' '1' 'x' 'X' 'z' 'Z' '_' '?']+
+let sized_oct = ['0'-'9' '_']*'\''['s' 'S']?['o' 'O'][' ']*['0'-'7' 'x' 'X' 'z' 'Z' '_' '?']+
+let sized_dec = ['0'-'9' '_']*'\''['s' 'S']?['d' 'D'][' ']*['0'-'9' 'x' 'X' 'z' 'Z' '_' '?']+
+let sized_hex = ['0'-'9' '_']*'\''['s' 'S']?['h' 'H'][' ']*['0'-'9' 'a'-'f' 'A'-'F' 'x' 'X' 'z' 'Z' '_' '?']+
+let sizednumber = sized_bin | sized_oct | sized_dec | sized_hex
+(* Catch-all: `<size>'<s>?<base>` with NO valid digit following.
+ * The longest-match rule means a well-formed sizednumber above
+ * still wins; this fires only when the prefix is correct but the
+ * digits aren't, so the lexer surfaces a clean failure instead of
+ * mis-tokenising the tail as a separate expression. *)
+let sizednumber_bad = ['0'-'9' '_']+'\''['s' 'S']?['b' 'B' 'd' 'D' 'h' 'H' 'o' 'O']
 let number = ['0'-'9' '_']+
 let unbased = '''['0'-'9'  'a'-'f' 'x' 'z' 'A'-'F' 'X' 'Z' '_' '?']+
 let space = [' ' '\t' '\r']+
@@ -623,6 +640,15 @@ rule token = parse
 	| _ -> failwith rght)
       | _ -> failwith n
       }
+  | sizednumber_bad as n
+      (* `<size>'<base>` prefix without valid digits after the base —
+       * e.g. `8'd-6` (the `-` belongs before the size, as `-8'd6`).
+       * The full sizednumber alternatives above already declined to
+       * match, so the lexer falls here and reports a parse failure
+       * instead of breaking the tail off as a separate expression. *)
+      { failwith (Printf.sprintf "malformed sized literal %S \
+                                  (sign must precede size: -8'd6 \
+                                  rather than 8'd-6)" n) }
   | number as n { tok (TK_DecNumber n) }
   | unbased as n { tok (TK_UnBasedNumber n) }
   | fltnum as f
