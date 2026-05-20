@@ -3134,6 +3134,7 @@ property_operator: implication_operator { ($1) }
 
 implication_operator: VBAR_HYPHEN_GT { (VBAR_HYPHEN_GT) }
 	|	VBAR_EQ_GT { (VBAR_EQ_GT) }
+	|	HYPHEN_GT { (HYPHEN_GT) }
 	|	Implies { (Implies) }
 	|	Iff { (Iff) }
 
