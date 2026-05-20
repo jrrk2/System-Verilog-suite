@@ -333,15 +333,22 @@ let rec eval_int ~pkgs ~params tok =
         * as $clog2 above).  Real fix lands with task #141 PStruct. *)
        | Some "$bits" -> Some 0
        | _ -> eval_int ~pkgs ~params ref_node)
-  | TUPLE4 (STRING tag, _, _, _) when prefix_is "expr_primary_parens" tag ->
-      (* Inside (...) — recurse to find the inner expression. *)
-      let inner = collect_by (function
-        | TUPLE4 (STRING t, _, _, _) when prefix_is "add_expr" t -> true
-        | TK_DecNumber _ | SymbolIdentifier _ -> true
-        | _ -> false) tok in
-      (match inner with
-       | x :: _ -> eval_int ~pkgs ~params x
-       | [] -> None)
+  | TUPLE4 (STRING tag, _, inner, _) when prefix_is "expr_primary_parens" tag ->
+      (* `( <expr> )` — TUPLE4(tag, LPAREN, inner_expression, RPAREN).
+         The grammar wraps the body via expr_mintypmax →
+         property_expr_or_assignment_list which collects elements
+         into a singleton TLIST even for a plain parenthesised
+         expression, so unwrap that before recursing. The previous
+         collect_by heuristic skipped past wrappers and picked the
+         first leaf SymbolIdentifier / TK_DecNumber, which made e.g.
+         `(VOCAB_SIZE * 16)` evaluate to 27 instead of 432 because
+         the mul_expr2 wrapper wasn't in the predicate. *)
+      let rec unwrap = function
+        | TLIST [single] -> unwrap single
+        | TLIST (single :: _) -> single
+        | other -> other
+      in
+      eval_int ~pkgs ~params (unwrap inner)
   (* Struct-member access `X.Y` on a parameter — Verible parses as
    * `reference2(reference, hierarchy_extension1(DOT, unqualified_id))`.
    * Used inside compile-time expressions like `$clog2(CVA6Cfg.INSTR_PER_FETCH)`
