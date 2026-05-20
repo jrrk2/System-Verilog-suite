@@ -560,11 +560,15 @@ let rec expr_to_bexpr ~params node =
            | None -> zero)
       | "PrimaryMintypmaxExpression" ->
           (* `( <expr> )`.  The inner Expression is in the
-             MintypmaxExpression child; recurse straight through. *)
+             MintypmaxExpression child.  Wrap in a @paren marker so
+             the precedence rebalance pass treats this as atomic
+             (rotating across explicit parens would change meaning,
+             e.g. `b && (a[0] | a[1])` could become `(b && a[0]) |
+             a[1]`).  The marker is stripped after rebalance. *)
           let inner = find_first node
             ~name_is:(fun n -> n = "Expression") in
           (match inner with
-           | Some e -> recurse e
+           | Some e -> BCall { func = "@paren"; args = [recurse e] }
            | None -> zero)
       | "PrimaryHierarchical" ->
           (* `name[idx]` / `name[hi:lo]` / `name`.  If `name` matches
@@ -772,6 +776,30 @@ let rec rebalance = function
   | BCall r ->
       BCall { r with args = List.map rebalance r.args }
   | (BVar _ | BConst _) as e -> e
+
+(* Drop @paren markers — used by PrimaryMintypmaxExpression to keep
+   `rebalance` from rotating across explicit parentheses.  Applied
+   immediately after rebalance, before the BIR leaves expr_to_bexpr. *)
+let rec strip_paren = function
+  | BCall { func = "@paren"; args = [e] } -> strip_paren e
+  | BBinOp r -> BBinOp { r with
+                         lhs = strip_paren r.lhs;
+                         rhs = strip_paren r.rhs }
+  | BUnOp r -> BUnOp { r with operand = strip_paren r.operand }
+  | BSlice r -> BSlice { r with signal = strip_paren r.signal }
+  | BConcat es -> BConcat (List.map strip_paren es)
+  | BReplicate r -> BReplicate { r with value = strip_paren r.value }
+  | BCond r -> BCond {
+      condition = strip_paren r.condition;
+      then_val  = strip_paren r.then_val;
+      else_val  = strip_paren r.else_val }
+  | BSelect r -> BSelect {
+      array = strip_paren r.array;
+      index = strip_paren r.index }
+  | BCall r -> BCall { r with args = List.map strip_paren r.args }
+  | (BVar _ | BConst _) as e -> e
+
+let rebalance e = strip_paren (rebalance e)
 
 (* ---------------------------------------------------------------- *)
 (* Statement converter — CST Statement → bstmt                       *)

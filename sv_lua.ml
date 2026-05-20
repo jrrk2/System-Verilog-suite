@@ -215,9 +215,14 @@ let load_frontend ~frontend ~top ~files : bprogram =
             acc) { modules = []; library_cells = [] } files in
       if combined.modules = [] then
         failwith "sv-parser frontend produced no modules";
-      combined
-      |> Behavioral_const.fold_ffs_program
-      |> post_load
+      (* fold_ffs_program here is too aggressive: it folds sequential
+         processes whose every leaf BAssign has a constant RHS, even
+         when the BIf guards read mutable inputs (e.g. uart_interrupt
+         picks one of 6 constants per cycle based on iRLSInterrupt
+         &c. — the FF genuinely holds state across cycles).  Leave it
+         to the per-design optimiser; the shared `post_load` pipeline
+         is enough for sv-parser. *)
+      combined |> post_load
   | "vhdl" ->
       (match files with
        | [f] ->
