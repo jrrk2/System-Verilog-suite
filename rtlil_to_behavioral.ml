@@ -219,6 +219,31 @@ let cell_to_bprocess (c : rtlil_cell) =
            comb_sliced (Printf.sprintf "mux_%s" c.cell_inst) lhs_slice
              (BCond { condition = s; then_val = b; else_val = a })
        | _ -> None)
+  (* Parallel mux: case-statement lowering.  yosys emits $pmux for
+     `case (...) ... endcase`.  Pins:
+       A: default value (WIDTH bits, used when no S bit is set)
+       B: concatenation of S_WIDTH chunks, each WIDTH bits — case-arm values
+       S: S_WIDTH one-hot select bits — chunk i is taken when S[i]=1
+     Semantics: Y = S[0] ? B[WIDTH-1:0] : S[1] ? B[2*WIDTH-1:WIDTH] : ... : A *)
+  | "$pmux" ->
+      (match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B", pin_expr c "S" with
+       | Some lhs_slice, Some a, Some b, Some s ->
+           let yw = get_width c "WIDTH" in
+           let sw = get_width c "S_WIDTH" in
+           if yw <= 0 || sw <= 0 then None
+           else
+             let acc = ref a in
+             for i = sw - 1 downto 0 do
+               let s_i = BSlice { signal = s; msb = i; lsb = i } in
+               let b_i = BSlice { signal = b;
+                                  msb = (i + 1) * yw - 1;
+                                  lsb = i * yw } in
+               acc := BCond { condition = s_i;
+                              then_val = b_i;
+                              else_val = !acc }
+             done;
+             comb_sliced (Printf.sprintf "pmux_%s" c.cell_inst) lhs_slice !acc
+       | _ -> None)
   (* Pass-through: Y = A. yosys-slang's `proc; flatten` flow uses
    * `$buf` as the structural placeholder that wires a wide
    * concatenation onto a single output (e.g. `\g = {a_q,b,a,$xor_y}`
