@@ -597,10 +597,14 @@ let normalize_call_args sig_widths formals args =
   if actuals_n = formals_n then
     List.map2 (normalize_one_arg sig_widths) args formals
   else if formals_n = 1 && actuals_n > 1 then
-    (* Concat-spread: one frontend flattens `func({a, b, c})` into
-     * `func(a, b, c)`. Rebuild the implied BConcat (source order:
-     * leftmost = MSB) and treat it as the single formal. *)
-    [normalize_one_arg sig_widths (BConcat args) (List.hd formals)]
+    (* Concat-spread: Verible's IR converter flattens
+     * `func({a, b, c})` into `func(a, b, c)`, and because the Verible
+     * grammar's `expression_list_proper` is left-recursive the args
+     * arrive in REVERSE source order (TLIST [c; b; a]).  Rebuild the
+     * implied BConcat in MSB-first source order by reversing the
+     * collected list, then match it against the single formal. *)
+    [normalize_one_arg sig_widths (BConcat (List.rev args))
+       (List.hd formals)]
   else args
 
 let rec normalize_expr sig_widths func_sigs = function

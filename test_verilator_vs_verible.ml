@@ -80,12 +80,20 @@ let () =
         Printf.eprintf "verilator-side BIR conversion failed\n";
         exit 1
   in
-  let vlt_prog = vlt_prog |> fold_ff_consts |> normalize_bcall_args in
+  let vlt_prog = vlt_prog |> fold_ff_consts in
+  if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
+    Printf.eprintf "==== VLT BIR (pre-normalize) ====\n%s\n"
+      (Behavioral_ir.string_of_bprogram vlt_prog);
+  let vlt_prog = normalize_bcall_args vlt_prog in
   Printf.printf "  %d modules\n" (List.length vlt_prog.modules);
 
   Printf.printf "[2/3] Verible → BIR ...\n%!";
   let vrb_prog = Verible_to_behavioral.convert_files ~top files in
-  let vrb_prog = vrb_prog |> fold_ff_consts |> normalize_bcall_args in
+  let vrb_prog = vrb_prog |> fold_ff_consts in
+  if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
+    Printf.eprintf "==== VRB BIR (pre-normalize) ====\n%s\n"
+      (Behavioral_ir.string_of_bprogram vrb_prog);
+  let vrb_prog = normalize_bcall_args vrb_prog in
   Printf.printf "  %d modules\n" (List.length vrb_prog.modules);
   ignore apply_passes;
 
