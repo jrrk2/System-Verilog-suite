@@ -65,6 +65,21 @@ else
     echo "==> sv-parser oracle skipped (no $sv_parser_exe — run \`cargo build --example parse_sv --release\` in $sv_parser_dir to enable)"
 fi
 
+# Optional sv2v oracle (zachjs/sv2v).  sv-tests ships a
+# tools/runners/Sv2v_zachjs.py runner that invokes `zachjs-sv2v`;
+# wire a sibling ~/sv2v checkout (built with `make` → bin/sv2v) in
+# under that name so the runner picks it up.
+sv2v_dir=${SV2V_DIR:-$HOME/sv2v}
+sv2v_exe="$sv2v_dir/bin/sv2v"
+if [ -x "$sv2v_exe" ]; then
+    mkdir -p "$sv_tests/out/runners/bin"
+    rm -f "$sv_tests/out/runners/bin/zachjs-sv2v"
+    ln -s "$sv2v_exe" "$sv_tests/out/runners/bin/zachjs-sv2v"
+    echo "==> sv2v oracle wired:      $sv2v_exe"
+else
+    echo "==> sv2v oracle skipped (no $sv2v_exe — run \`make\` in $sv2v_dir to enable)"
+fi
+
 echo
 echo "Install complete. Repo: $repo  |  sv-tests: $sv_tests"
 echo "Next: bash $here/run.sh"
