@@ -1628,9 +1628,22 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
    * expression, RPAREN). Drop the cast and recurse on the inner
    * expression. lzc.sv uses `(NumLevels)'(unsigned'(j))` to
    * size-extend the genvar index — without unwrapping these the
-   * expression falls to the BConst{0,1} default. *)
-  | TUPLE6 (STRING tag, _ct, _quote, _lp, expr, _rp) when prefix_is "cast" tag ->
-      recurse expr
+   * expression falls to the BConst{0,1} default.
+   *
+   * When the casting_type evaluates to a positive integer (a size
+   * cast like `LfsrWidth'(RstVal)` or `64'(x)`) and the inner
+   * lowers to a literal constant, stamp the cast width onto the
+   * constant.  Otherwise the unbased `'1` / `'0` shortcut would
+   * keep its 32-bit default and produce the wrong reset value on
+   * any LHS wider than 32 bits.  Z3's BV semantics interpret the
+   * stored integer mod 2^width, so value-truncation falls out
+   * naturally and no manual masking is needed. *)
+  | TUPLE6 (STRING tag, ct, _quote, _lp, expr, _rp) when prefix_is "cast" tag ->
+      let inner = recurse expr in
+      (match eval_int ~pkgs ~params ct, inner with
+       | Some w, BConst { value; _ } when w > 0 ->
+           BConst { value; width = w }
+       | _ -> inner)
   | TLIST [single] -> recurse single
   (* Streaming concatenation `{<<N{body}}` / `{>>N{body}}` —
    *   TUPLE8(tag, LBRACE, <<|>>, N_decimal, LBRACE, body, RBRACE, RBRACE).
