@@ -180,9 +180,23 @@ let emit_children xs =
   in
   drop_first_tag xs
 
+let prefix_is p s =
+  let lp = String.length p and ls = String.length s in
+  ls >= lp && String.sub s 0 lp = p
+
 let rec emit (t : token) : string =
   match t with
   | TLIST xs -> String.concat " " (List.map emit xs)
+  (* `range_list_in_braces1`: LBRACE open_range_list RBRACE.  The
+   * `open_range_list` action in Source_text_verible.mly prepends each
+   * new element onto the TLIST (`$3 :: lst`) and discards the COMMA
+   * token, so the parsed list is reversed and comma-less.  Reverse
+   * the TLIST and re-inject commas on emit so `{e1, e2, e3}` round-
+   * trips faithfully.  Other comma-separated reversed-TLIST
+   * productions follow the same pattern and will be added here as
+   * round-trip diffs surface them. *)
+  | TUPLE4 (STRING tag, lb, body, rb) when prefix_is "range_list_in_braces" tag ->
+      String.concat " " [emit lb; emit_comma_list body; emit rb]
   | TUPLE2 (a, b) ->
       String.concat " " (List.map emit (emit_children [a; b]))
   | TUPLE3 (a, b, c) ->
@@ -240,6 +254,10 @@ let rec emit (t : token) : string =
   | TK_RealTime s -> s
   | TK_StringLiteral s -> "\"" ^ s ^ "\""
   | leaf -> token_to_source leaf
+
+and emit_comma_list = function
+  | TLIST xs -> String.concat " , " (List.map emit (List.rev xs))
+  | single   -> emit single
 
 (* Convenience entry-point.  Eventually:
  *   parse → elaborate → synth_filter → emit
