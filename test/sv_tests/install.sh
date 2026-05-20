@@ -47,6 +47,24 @@ echo
 echo "==> verifying our runners are discoverable"
 cd "$sv_tests"
 ls tools/runners/Decompiler_*.py 2>&1 | sed 's/^/  /'
+
+# Optional sv-parser oracle (dalance/sv-parser).  sv-tests already
+# ships a tools/runners/sv_parser.py runner pointing at the
+# `parse_sv` binary, but expects it on PATH or under
+# out/runners/bin/.  If the user has a sibling sv-parser checkout
+# with `parse_sv` built (`cargo build --example parse_sv --release`),
+# symlink it into the runner-bin directory so the runner finds it.
+sv_parser_dir=${SV_PARSER_DIR:-$HOME/sv-parser}
+sv_parser_exe="$sv_parser_dir/target/release/examples/parse_sv"
+if [ -x "$sv_parser_exe" ]; then
+    mkdir -p "$sv_tests/out/runners/bin"
+    rm -f "$sv_tests/out/runners/bin/parse_sv"
+    ln -s "$sv_parser_exe" "$sv_tests/out/runners/bin/parse_sv"
+    echo "==> sv-parser oracle wired: $sv_parser_exe"
+else
+    echo "==> sv-parser oracle skipped (no $sv_parser_exe — run \`cargo build --example parse_sv --release\` in $sv_parser_dir to enable)"
+fi
+
 echo
 echo "Install complete. Repo: $repo  |  sv-tests: $sv_tests"
 echo "Next: bash $here/run.sh"
