@@ -1589,6 +1589,75 @@ let extract_functions ~params module_node =
 let module_nodes tree =
   find_all tree ~name_is:(fun n -> n = "ModuleDeclaration")
 
+(* K&R-style port extraction.  Module header has a `ListOfPorts`
+ * containing bare PortIdentifiers (no direction or type); the body
+ * has standalone `PortDeclaration → PortDeclaration{Input,Output,Inout}`
+ * entries with the direction, optional packed dimension, and a list
+ * of port names.  Walk both to assemble each port's bsignal. *)
+let extract_kr_ports ~params module_node : bsignal list =
+  (* Collect the port-name order from ListOfPorts (so output matches
+     the source declaration order). *)
+  let header_ports = ref [] in
+  (match find_first module_node
+           ~name_is:(fun n -> n = "ListOfPorts") with
+   | None -> ()
+   | Some lp ->
+       walk lp ~f:(fun n ->
+         match n with
+         | Node { name = "PortIdentifier"; _ } ->
+             (match identifier_name n with
+              | Some nm when not (List.mem nm !header_ports) ->
+                  header_ports := nm :: !header_ports
+              | _ -> ())
+         | _ -> ()));
+  let header_ports = List.rev !header_ports in
+  (* For each body PortDeclaration*, harvest (name → (dir, width, signed)). *)
+  let info : (string, [`Input|`Output|`Internal] * int * signedness) Hashtbl.t =
+    Hashtbl.create 8 in
+  let port_decls = find_all module_node
+    ~name_is:(fun n -> n = "PortDeclaration") in
+  List.iter (fun pd ->
+    let dir = match find_first pd
+                ~name_is:(fun n -> n = "PortDeclarationInput"
+                                || n = "PortDeclarationOutput"
+                                || n = "PortDeclarationInout") with
+      | Some (Node { name = "PortDeclarationOutput"; _ }) -> `Output
+      | Some (Node { name = "PortDeclarationInout"; _ }) -> `Internal
+      | _ -> `Input
+    in
+    let type_node = find_first pd
+      ~name_is:(fun n -> n = "DataTypeOrImplicit"
+                      || n = "NetPortType"
+                      || n = "DataType") in
+    let width = match type_node with
+      | Some t -> signal_width_of ~params t
+      | None -> 1
+    in
+    let signed = match type_node with
+      | Some t -> signal_signed_of t
+      | None -> Unsigned
+    in
+    let names = find_all pd
+      ~name_is:(fun n -> n = "PortIdentifier") in
+    List.iter (fun nid ->
+      match identifier_name nid with
+      | Some nm -> Hashtbl.replace info nm (dir, width, signed)
+      | None -> ()) names) port_decls;
+  (* Emit one bsignal per header port (preserving header order); skip
+     names that have no matching body PortDeclaration (treat as
+     internal). *)
+  List.filter_map (fun nm ->
+    match Hashtbl.find_opt info nm with
+    | Some (dir, width, signed) ->
+        Some {
+          name = nm;
+          stype = BInt { width; signed };
+          direction = dir;
+          initial_value = None;
+          attrs = [];
+        }
+    | None -> None) header_ports
+
 (* Build a bmodule from one ModuleDeclaration node.  Returns None if
  * the node doesn't carry a recognisable module name (defensive — we
  * shouldn't get here for malformed input that sv-parser would have
@@ -1617,7 +1686,13 @@ let module_of_node node : bmodule option =
         ~name_is:(fun n -> n = "ListOfPortDeclarations") in
       let port_signals = match plist with
         | Some p -> extract_port_decls ~params p
-        | None -> []
+        | None ->
+            (* K&R-style header `module foo(a, b);` followed by
+               separate `input a; output b;` declarations in the
+               body.  The header has a `ListOfPorts` (bare names) and
+               the body has `PortDeclaration` nodes giving each
+               name's direction and type. *)
+            extract_kr_ports ~params node
       in
       let port_names = List.map (fun (s : bsignal) -> s.name) port_signals in
       let internal_signals =
