@@ -342,10 +342,13 @@ let string_of_bmodule bmod =
     else
       "\nfuncs:\n" ^
       String.concat "\n" (List.map (fun (f : bfunc) ->
-        Printf.sprintf "  %s%s : %d params, %d locals, %d body stmts"
+        let param_strs = List.map (fun (n, ty, _) ->
+          Printf.sprintf "%s:%s" n (string_of_btype ty)) f.params in
+        Printf.sprintf "  %s%s(%s) : %s, %d locals, %d body stmts"
           (if f.is_task then "task " else "function ")
           f.fname
-          (List.length f.params)
+          (String.concat ", " param_strs)
+          (string_of_btype f.ftype)
           (List.length f.locals)
           (List.length f.body)
       ) bmod.funcs)

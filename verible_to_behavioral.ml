@@ -1180,28 +1180,42 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                     name inner_shape known_params))
        | Some fname ->
            (* Plain user function call. Emit BCall so the inline pass
-            * (Behavioral_inline) can substitute the body in. Pull the
-            * argument expressions out of the call_base. *)
+            * (Behavioral_inline) can substitute the body in.
+            *
+            * Walk the call_base argument list at its structural
+            * boundaries — `call_base1(LPAREN, argument_list_opt,
+            * RPAREN)` carries a TLIST built left-recursively by
+            * any_argument_list_item_last / trailing_comma rules. A
+            * previous version used `collect_by` with a loose-leaf
+            * predicate, which descended INTO each argument and
+            * collected its sub-expressions as additional args (so
+            * `apply_temperature_delta(a - b, c)` produced a 4-arg
+            * call `(a - b, a, b, c)` instead of 2 args).
+            *
+            * The unfold below visits the list spine via the chained
+            * any_argument_list_* tags, pushing the leaf any_argument
+            * payloads to the front in source order. *)
            let arg_exprs =
-             let cands = collect_by (function
-               | TUPLE4 (STRING t, _, _, _)
-                 when prefix_is "add_expr" t || prefix_is "mul_expr" t
-                   || prefix_is "comp_expr" t || prefix_is "logeq_expr" t
-                   || prefix_is "and_expr" t || prefix_is "or_expr" t
-                   || prefix_is "xor_expr" t
-                   || prefix_is "logand_expr" t || prefix_is "logor_expr" t
-                   || prefix_is "shift_expr" t -> true
-               | TUPLE3 (STRING t, _, _)
-                 when prefix_is "unqualified_id" t
-                   || prefix_is "reference" t -> true
-               | TUPLE3 (STRING t, _, _)
-                 when prefix_is "bin_based_number" t
-                   || prefix_is "hex_based_number" t
-                   || prefix_is "dec_based_number" t
-                   || prefix_is "oct_based_number" t -> true
-               | TK_DecNumber _ | TK_UnBasedNumber _ -> true
-               | _ -> false) call_base in
-             List.map recurse cands
+             let arg_list_node = match call_base with
+               | TUPLE4 (STRING t, _, body, _)
+                 when prefix_is "call_base" t -> body
+               | _ -> EMPTY_TOKEN
+             in
+             let rec collect_args = function
+               | TLIST xs -> List.concat_map collect_args xs
+               | TUPLE3 (STRING t, prev, last)
+                 when prefix_is "any_argument_list_item_last" t ->
+                   collect_args prev @ collect_args last
+               | TUPLE3 (STRING t, prev, _)
+                 when prefix_is "any_argument_list_trailing_comma" t ->
+                   collect_args prev
+               | TUPLE3 (STRING t, prev, last)
+                 when prefix_is "any_argument_list_preprocessor_last" t ->
+                   collect_args prev @ collect_args last
+               | EMPTY_TOKEN -> []
+               | other -> [other]
+             in
+             List.map recurse (collect_args arg_list_node)
            in
            BCall { func = fname; args = arg_exprs }
        | None ->
@@ -3885,6 +3899,16 @@ let convert_module ~pkgs (mdecl : module_decl)
            them as 1-bit.  Sweep through and propagate the most-recently
            seen explicit width forward. *)
         let last_w = ref 1 in
+        (* collect_by walks tf_port_list (a left-recursive TLIST) in
+           reverse source order, which both (a) puts func_params in
+           reverse order so a downstream BCall arg-position lookup
+           hits the wrong formal — apply_temperature_delta(delta_q12,
+           temp_q8_8) ended up reading as (temp_q8_8, delta_q12) — and
+           (b) propagates `last_w` backwards across `input [15:0] a, p,
+           b, q;` style decls.  Reverse port_nodes before iterating so
+           both the formal order AND the width propagation match the
+           source. *)
+        let port_nodes = List.rev port_nodes in
         let func_params =
           List.concat_map (fun pn ->
             let signals = extract_port_decl ~pkgs ~params pn in
