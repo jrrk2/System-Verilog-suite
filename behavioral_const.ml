@@ -261,16 +261,75 @@ let rec propagate_stmt ctx = function
       BCase { selector = selector'; cases = cases'; default = default' }
 
   | BWhile { condition; body } ->
+      (* Variables written inside the loop body are not constant for
+       * the duration of the loop — fold-ff_consts' linear scan
+       * already added them to ctx (from a preceding init BAssign that
+       * sits next to this BWhile in a BBlock), but treating them as
+       * constants here folds the loop's exit condition to 1'b1 and
+       * defeats Behavioral_unroll downstream.  Snapshot the ctx,
+       * remove every body-writer from it, then restore on exit. *)
+      let rec collect_lhs acc = function
+        | BAssign { lhs; _ } -> lhs :: acc
+        | BBlock ss -> List.fold_left collect_lhs acc ss
+        | BIf { then_stmts; else_stmts; _ } ->
+            let acc = List.fold_left collect_lhs acc then_stmts in
+            List.fold_left collect_lhs acc else_stmts
+        | BCase { cases; default; _ } ->
+            let acc = List.fold_left (fun a (_, ss) ->
+              List.fold_left collect_lhs a ss) acc cases in
+            List.fold_left collect_lhs acc default
+        | BWhile { body; _ } | BFor { body; _ } ->
+            List.fold_left collect_lhs acc body
+        | _ -> acc
+      in
+      let written = List.sort_uniq compare
+        (List.fold_left collect_lhs [] body) in
+      let saved = List.filter_map (fun n ->
+        match Hashtbl.find_opt ctx.constants n with
+        | Some v -> Hashtbl.remove ctx.constants n; Some (n, v)
+        | None -> None) written in
       let condition' = propagate_expr ctx condition in
       let body' = List.map (propagate_stmt ctx) body in
+      List.iter (fun (n, v) -> Hashtbl.replace ctx.constants n v) saved;
       BWhile { condition = condition'; body = body' }
 
   | BFor { init; condition; update; body } ->
-      let init' = propagate_stmt ctx init in
+      (* Same scoping discipline as BWhile: every signal written inside
+       * the loop (the iterator AND any body-NBA target like `sum`)
+       * must not be treated as a constant during condition/body
+       * propagation, else we fold the loop's exit test to a literal
+       * and Behavioral_unroll can no longer recognise the update.
+       *
+       * Init/update structures are preserved verbatim so the unroller
+       * still sees `BAssign i := 0` / `i := i + step`. *)
+      let rec collect_lhs_for acc = function
+        | BAssign { lhs; _ } -> lhs :: acc
+        | BBlock ss -> List.fold_left collect_lhs_for acc ss
+        | BIf { then_stmts; else_stmts; _ } ->
+            let acc = List.fold_left collect_lhs_for acc then_stmts in
+            List.fold_left collect_lhs_for acc else_stmts
+        | BCase { cases; default; _ } ->
+            let acc = List.fold_left (fun a (_, ss) ->
+              List.fold_left collect_lhs_for a ss) acc cases in
+            List.fold_left collect_lhs_for acc default
+        | BWhile { body; _ } | BFor { body; _ } ->
+            List.fold_left collect_lhs_for acc body
+        | _ -> acc
+      in
+      let iter_name = match init with
+        | BAssign { lhs; _ } -> [lhs]
+        | _ -> []
+      in
+      let body_writers = List.fold_left collect_lhs_for [] body in
+      let scoped = List.sort_uniq compare (iter_name @ body_writers) in
+      let saved = List.filter_map (fun n ->
+        match Hashtbl.find_opt ctx.constants n with
+        | Some v -> Hashtbl.remove ctx.constants n; Some (n, v)
+        | None -> None) scoped in
       let condition' = propagate_expr ctx condition in
       let body' = List.map (propagate_stmt ctx) body in
-      let update' = propagate_stmt ctx update in
-      BFor { init = init'; condition = condition'; update = update'; body = body' }
+      List.iter (fun (n, v) -> Hashtbl.replace ctx.constants n v) saved;
+      BFor { init; condition = condition'; update; body = body' }
 
   | BBlock stmts ->
       BBlock (List.map (propagate_stmt ctx) stmts)

@@ -68,6 +68,14 @@ let normalize_bcall_args (p : Behavioral_ir.bprogram) =
 let expand_fills (p : Behavioral_ir.bprogram) =
   Behavioral_const.expand_fills_program p
 
+(* Constant-bound procedural for-loops: substitute the induction
+ * variable per iteration and lay the body out in sequence. Verilator
+ * pre-unrolls at the JSON stage, so its BIR carries the trailing
+ * `i := <final>` and the body iterations; Verible emits a BFor that
+ * downstream passes can't see through unless we unroll. *)
+let unroll_loops (p : Behavioral_ir.bprogram) =
+  Behavioral_unroll.unroll_program p
+
 let () =
   if Array.length Sys.argv < 3 then usage ();
   let top = Sys.argv.(1) in
@@ -90,7 +98,11 @@ let () =
   if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
     Printf.eprintf "==== VLT BIR (pre-normalize) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vlt_prog);
-  let vlt_prog = vlt_prog |> normalize_bcall_args |> expand_fills in
+  let vlt_prog = vlt_prog |> normalize_bcall_args |> expand_fills
+                          |> unroll_loops in
+  if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
+    Printf.eprintf "==== VLT BIR (post-unroll) ====\n%s\n"
+      (Behavioral_ir.string_of_bprogram vlt_prog);
   Printf.printf "  %d modules\n" (List.length vlt_prog.modules);
 
   Printf.printf "[2/3] Verible → BIR ...\n%!";
@@ -99,7 +111,11 @@ let () =
   if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
     Printf.eprintf "==== VRB BIR (pre-normalize) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vrb_prog);
-  let vrb_prog = vrb_prog |> normalize_bcall_args |> expand_fills in
+  let vrb_prog = vrb_prog |> normalize_bcall_args |> expand_fills
+                          |> unroll_loops in
+  if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
+    Printf.eprintf "==== VRB BIR (post-unroll) ====\n%s\n"
+      (Behavioral_ir.string_of_bprogram vrb_prog);
   Printf.printf "  %d modules\n" (List.length vrb_prog.modules);
   ignore apply_passes;
 

@@ -2154,13 +2154,23 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
              | _ -> ()) lhs;
            init_expr := Some expr
        | _ -> ());
-      let step_node = match step_opt with
+      (* Step shapes:
+           inc_or_dec_expression*  → `IncDec ±1
+           assignment_statement_no_expr1(lpvalue, =, expr)
+             — handles `i = i + 1` style steps used in SV-2005-ish
+             code (categorical_sampler's for-loop) so the unroller
+             can recognise them as `BAssign { lhs; rhs = i ± k }`.
+           assign_modify_statement → `Modify  (currently unsupported) *)
+      let step_kind = match step_opt with
         | TUPLE3 (STRING t, _, _) when prefix_is "inc_or_dec_expression" t ->
-            Some step_opt
-        | _ -> None
+            `IncDec step_opt
+        | TUPLE4 (STRING t, _, _, rhs_e)
+          when prefix_is "assignment_statement_no_expr" t ->
+            `Assign rhs_e
+        | _ -> `None
       in
-      (match !var_name, !init_expr, step_node with
-       | Some name, Some init_e, Some step_e ->
+      (match !var_name, !init_expr, step_kind with
+       | Some name, Some init_e, `IncDec step_e ->
            let delta = match step_e with
              | TUPLE3 (_, PLUS_PLUS, _) -> 1
              | TUPLE3 (_, _, PLUS_PLUS) -> 1
@@ -2179,6 +2189,12 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                result_type = BInt { width = 32; signed = Unsigned };
              }
            } in
+           BFor { init = init_b; condition = cond_b;
+                  update = upd_b; body = [recurse_s body] }
+       | Some name, Some init_e, `Assign rhs_e ->
+           let init_b = BAssign { lhs = name; rhs = recurse_e init_e } in
+           let cond_b = recurse_e cond_opt in
+           let upd_b = BAssign { lhs = name; rhs = recurse_e rhs_e } in
            BFor { init = init_b; condition = cond_b;
                   update = upd_b; body = [recurse_s body] }
        | _ -> BBlock [])
