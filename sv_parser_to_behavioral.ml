@@ -658,6 +658,420 @@ let rec rebalance = function
       BCall { r with args = List.map rebalance r.args }
   | (BVar _ | BConst _) as e -> e
 
+(* ---------------------------------------------------------------- *)
+(* Statement converter — CST Statement → bstmt                       *)
+(* ---------------------------------------------------------------- *)
+
+(* Pull a variable/net lvalue target name. Same shape across
+ * NetLvalue and VariableLvalue subtrees — both descend through a
+ * HierarchicalIdentifier or NetIdentifier wrapper to a
+ * SimpleIdentifier leaf. Doesn't yet support concat-LHS or
+ * struct-field LHS; those are a follow-up. *)
+let extract_lvalue_name node =
+  let id = find_first node
+    ~name_is:(fun n -> n = "NetIdentifier"
+                    || n = "VariableIdentifier"
+                    || n = "HierarchicalIdentifier") in
+  Option.bind id identifier_name
+
+(* Convert a CST Statement subtree to a bstmt. Unsupported shapes
+ * collapse to BBlock [] so the surrounding always-body keeps its
+ * structure but the unknown branch drops to a no-op.  Recognised
+ * shapes (the ones that show up in synthesisable RTL):
+ *   - SeqBlock          → BBlock
+ *   - ConditionalStatement (if/else) → BIf
+ *   - CaseStatement     → BCase
+ *   - NonblockingAssignment → BAssign  (treated as = for the BIR;
+ *     ffrip + share recover the NBA semantics later)
+ *   - BlockingAssignment    → BAssign
+ *   - LoopStatement (for/while) → BFor / BWhile *)
+let rec stmt_to_bstmt ~params node =
+  match node with
+  | Leaf _ -> BBlock []
+  | Node { name; children } ->
+      match name with
+      | "Statement" | "StatementOrNull" | "StatementItem"
+      | "SubroutineCallStatement" ->
+          (* Single-child wrappers — recurse.  When there's more
+             than one child (StatementItem usually has the actual
+             statement + a trailing `;` Symbol), pick the first
+             child that names a statement form. *)
+          (match children with
+           | [c] -> stmt_to_bstmt ~params c
+           | _ ->
+               let is_stmt_kind = function
+                 | Node { name =
+                       ("SeqBlock" | "ConditionalStatement"
+                      | "CaseStatement"
+                      | "NonblockingAssignment" | "BlockingAssignment"
+                      | "ProceduralTimingControlStatement"
+                      | "LoopStatement"
+                      | "SubroutineCallStatement"
+                      | "StatementItem" | "Statement" | "StatementOrNull"
+                      ); _ } -> true
+                 | _ -> false
+               in
+               (match List.find_opt is_stmt_kind children with
+                | Some s -> stmt_to_bstmt ~params s
+                | None -> BBlock []))
+      | "ProceduralTimingControlStatement" ->
+          (* `@(...) <stmt>` or `#<delay> <stmt>` — drop the timing
+             control wrapper, recurse into the StatementOrNull child
+             which carries the real body.  The always-block extractor
+             reads the event control separately for clocking info. *)
+          let body = List.find_opt (function
+            | Node { name = "StatementOrNull"; _ } -> true
+            | _ -> false) children in
+          (match body with
+           | Some s -> stmt_to_bstmt ~params s
+           | None -> BBlock [])
+      | "SeqBlock" ->
+          let stmts = List.filter_map (function
+            | Node { name = "StatementOrNull"; _ } as t ->
+                Some (stmt_to_bstmt ~params t)
+            | _ -> None) children in
+          BBlock stmts
+      | "ConditionalStatement" ->
+          (* sv-parser flattens `if ... else if ... else ...` chains
+             into a single ConditionalStatement whose children are
+             alternating Keyword('if')/Symbol('(')/CondPredicate/
+             Symbol(')')/StatementOrNull/Keyword('else') ... pairs.
+             Walk the child list and collect (predicate, then-body)
+             pairs plus an optional trailing else-body, then build a
+             right-nested BIf cascade. *)
+          let cond_expr_of pred =
+            let inner = find_first pred
+              ~name_is:(fun n -> n = "Expression") in
+            match inner with
+            | Some e -> rebalance (expr_to_bexpr ~params e)
+            | None -> BConst { value = 1; width = 1 }
+          in
+          let is_pred = function
+            | Node { name = ("CondPredicate" | "ExpressionOrCondPattern"); _ } ->
+                true
+            | _ -> false
+          in
+          let rec collect acc cur_pred = function
+            | [] -> (List.rev acc, None)
+            | n :: rest when is_pred n ->
+                collect acc (Some n) rest
+            | (Node { name = "StatementOrNull"; _ } as s) :: rest ->
+                (match cur_pred with
+                 | Some p ->
+                     collect ((p, s) :: acc) None rest
+                 | None ->
+                     (* trailing else body *)
+                     (List.rev acc, Some s))
+            | _ :: rest -> collect acc cur_pred rest
+          in
+          let pairs, final_else = collect [] None children in
+          let final_else_stmts = match final_else with
+            | Some s -> [stmt_to_bstmt ~params s]
+            | None -> []
+          in
+          (* Build right-nested BIf: pair_1 ? ... : (pair_2 ? ... : final_else) *)
+          let rec build = function
+            | [] -> final_else_stmts
+            | (p, t) :: rest ->
+                [BIf {
+                   condition = cond_expr_of p;
+                   then_stmts = [stmt_to_bstmt ~params t];
+                   else_stmts = build rest;
+                 }]
+          in
+          (match build pairs with
+           | [s] -> s
+           | ss -> BBlock ss)
+      | "CaseStatement" ->
+          (match children with
+           | [Node { name = "CaseStatementNormal"; children = c2; _ }] ->
+               extract_case ~params c2
+           | _ -> BBlock [])
+      | "CaseStatementNormal" ->
+          extract_case ~params children
+      | "NonblockingAssignment" | "BlockingAssignment" ->
+          let lhs_node = find_first node
+            ~name_is:(fun n -> n = "VariableLvalue"
+                            || n = "NetLvalue") in
+          let rhs_node = find_first node
+            ~name_is:(fun n -> n = "Expression") in
+          (match Option.bind lhs_node extract_lvalue_name, rhs_node with
+           | Some name, Some r ->
+               BAssign { lhs = name;
+                         rhs = rebalance (expr_to_bexpr ~params r) }
+           | _ -> BBlock [])
+      | "LoopStatement" ->
+          extract_loop ~params children
+      | _ ->
+          (* Try descending into a single statement-bearing child. *)
+          let inner = List.find_opt (function
+            | Node { name = ("SeqBlock" | "ConditionalStatement"
+                            | "CaseStatement" | "NonblockingAssignment"
+                            | "BlockingAssignment" | "LoopStatement"); _ } ->
+                true
+            | _ -> false) children in
+          match inner with
+          | Some s -> stmt_to_bstmt ~params s
+          | None -> BBlock []
+
+and extract_case ~params children =
+  (* CaseStatementNormal children:
+       Keyword 'case' Symbol '(' CaseExpression Symbol ')'
+       CaseItem* Keyword 'endcase'
+     where CaseExpression wraps the Expression we want.  Try direct
+     Expression first (some grammar variants put it directly); fall
+     back to the CaseExpression's nested Expression. *)
+  let selector =
+    let ce_or_expr = List.find_opt (function
+      | Node { name = ("Expression" | "CaseExpression"); _ } -> true
+      | _ -> false) children
+    in
+    let expr_node = match ce_or_expr with
+      | Some (Node { name = "Expression"; _ } as t) -> Some t
+      | Some (Node { name = "CaseExpression"; _ } as t) ->
+          find_first t ~name_is:(fun n -> n = "Expression")
+      | _ -> None
+    in
+    match expr_node with
+    | Some t -> rebalance (expr_to_bexpr ~params t)
+    | None -> BConst { value = 0; width = 1 }
+  in
+  let items = List.filter (function
+    | Node { name = "CaseItem"; _ } -> true
+    | _ -> false) children in
+  let cases, default = List.fold_left (fun (cs, def) it ->
+    match it with
+    | Node { name = "CaseItem"; children = c } ->
+        let kind = List.find_opt (function
+          | Node { name = ("CaseItemNondefault" | "CaseItemDefault"); _ } -> true
+          | _ -> false) c
+        in
+        (match kind with
+         | Some (Node { name = "CaseItemNondefault"; children = cc; _ }) ->
+             let case_exprs = List.filter_map (function
+               | Node { name = "CaseItemExpression"; _ } as t ->
+                   let inner = find_first t
+                     ~name_is:(fun n -> n = "Expression") in
+                   Option.map (fun e ->
+                     rebalance (expr_to_bexpr ~params e)) inner
+               | _ -> None) cc in
+             let body = List.find_opt (function
+               | Node { name = "StatementOrNull"; _ } -> true
+               | _ -> false) cc in
+             let body_stmts = match body with
+               | Some s -> [stmt_to_bstmt ~params s]
+               | None -> []
+             in
+             let entries = List.map (fun ce -> (ce, body_stmts)) case_exprs in
+             (cs @ entries, def)
+         | Some (Node { name = "CaseItemDefault"; children = cc; _ }) ->
+             let body = List.find_opt (function
+               | Node { name = "StatementOrNull"; _ } -> true
+               | _ -> false) cc in
+             let body_stmts = match body with
+               | Some s -> [stmt_to_bstmt ~params s]
+               | None -> []
+             in
+             (cs, def @ body_stmts)
+         | _ -> (cs, def))
+    | _ -> (cs, def)) ([], []) items
+  in
+  BCase { selector; cases; default }
+
+and extract_loop ~params children =
+  (* LoopStatement children include the loop keyword and body.
+     For ForStatement: 'for' '(' for_init ';' expr ';' for_step ')' stmt.
+     For WhileStatement: 'while' '(' expr ')' stmt.
+     The CST tags differ by sub-node; we dispatch on the first
+     statement-shaped wrapper present. *)
+  let kw = List.find_map (function
+    | Node { name = "Keyword"; _ } as t -> first_leaf t
+    | _ -> None) children in
+  match kw with
+  | Some "for" ->
+      (* Initialise: BAssign from ForInitialization → ListOfVariableAssignments.
+         Condition: Expression.  Update: ForStep → ForStepAssignment.
+         Body: the trailing StatementOrNull. *)
+      let init_node = List.find_opt (function
+        | Node { name = "ForInitialization"; _ } -> true
+        | _ -> false) children in
+      let cond_node = List.find_opt (function
+        | Node { name = "Expression"; _ } -> true
+        | _ -> false) children in
+      let step_node = List.find_opt (function
+        | Node { name = "ForStep"; _ } -> true
+        | _ -> false) children in
+      let body_node = List.find_opt (function
+        | Node { name = "StatementOrNull"; _ } -> true
+        | _ -> false) children in
+      let init_b = match init_node with
+        | Some n ->
+            (* Look for the first assignment inside the init. *)
+            let v = find_first n
+              ~name_is:(fun s -> s = "VariableAssignment"
+                              || s = "ListOfVariableAssignments") in
+            (match v with
+             | Some va ->
+                 let id = find_first va
+                   ~name_is:(fun s -> s = "VariableIdentifier") in
+                 let rhs = find_first va
+                   ~name_is:(fun s -> s = "Expression") in
+                 (match Option.bind id identifier_name, rhs with
+                  | Some name, Some e ->
+                      BAssign { lhs = name;
+                                rhs = rebalance (expr_to_bexpr ~params e) }
+                  | _ -> BBlock [])
+             | None -> BBlock [])
+        | None -> BBlock []
+      in
+      let cond_b = match cond_node with
+        | Some e -> rebalance (expr_to_bexpr ~params e)
+        | None -> BConst { value = 1; width = 1 }
+      in
+      let update_b = match step_node with
+        | Some n ->
+            (* ForStep wraps a ForStepAssignment (or
+               OperatorAssignment / IncOrDecExpression). *)
+            let id = find_first n
+              ~name_is:(fun s -> s = "VariableIdentifier") in
+            let rhs = find_first n
+              ~name_is:(fun s -> s = "Expression") in
+            (match Option.bind id identifier_name, rhs with
+             | Some name, Some e ->
+                 BAssign { lhs = name;
+                           rhs = rebalance (expr_to_bexpr ~params e) }
+             | _ -> BBlock [])
+        | None -> BBlock []
+      in
+      let body_stmts = match body_node with
+        | Some s -> [stmt_to_bstmt ~params s]
+        | None -> []
+      in
+      BFor { init = init_b; condition = cond_b;
+             update = update_b; body = body_stmts }
+  | Some "while" ->
+      let cond_node = List.find_opt (function
+        | Node { name = "Expression"; _ } -> true
+        | _ -> false) children in
+      let body_node = List.find_opt (function
+        | Node { name = "StatementOrNull"; _ } -> true
+        | _ -> false) children in
+      let cond_b = match cond_node with
+        | Some e -> rebalance (expr_to_bexpr ~params e)
+        | None -> BConst { value = 1; width = 1 }
+      in
+      let body_stmts = match body_node with
+        | Some s -> [stmt_to_bstmt ~params s]
+        | None -> []
+      in
+      BWhile { condition = cond_b; body = body_stmts }
+  | _ -> BBlock []
+
+(* ---------------------------------------------------------------- *)
+(* Always-block extractor — CST AlwaysConstruct → bprocess           *)
+(* ---------------------------------------------------------------- *)
+
+(* From an EventExpression subtree, collect (edge, signal_name)
+ * pairs.  Order is source order; the caller picks a clock vs reset
+ * by heuristic (clk-named signals or the first posedge are typical
+ * conventions). *)
+let extract_event_items node =
+  let items = find_all node
+    ~name_is:(fun n -> n = "EventExpressionExpression") in
+  List.filter_map (fun it ->
+    let edge = List.find_map (function
+      | Node { name = "EdgeIdentifier"; _ } as t -> first_leaf t
+      | _ -> None) (match it with Node { children; _ } -> children | _ -> []) in
+    let sig_node = find_first it
+      ~name_is:(fun n -> n = "Expression") in
+    let sig_name = Option.bind sig_node (fun e ->
+      let id = find_first e
+        ~name_is:(fun n -> n = "SimpleIdentifier") in
+      Option.bind id first_leaf) in
+    match edge, sig_name with
+    | Some e, Some n -> Some (e, n)
+    | _ -> None) items
+
+let always_kind kw_node =
+  match kw_node with
+  | Some "always_ff" -> `Seq
+  | Some "always_comb" -> `Comb
+  | Some "always_latch" -> `Comb  (* treat latch as comb for now *)
+  | Some "always" -> `Plain
+  | _ -> `Plain
+
+(* Convert one AlwaysConstruct subtree to a bprocess. *)
+let convert_always ~params node =
+  let kw = List.find_map (function
+    | Node { name = "AlwaysKeyword"; _ } as t -> first_leaf t
+    | _ -> None) (match node with Node { children; _ } -> children | _ -> []) in
+  let event_ctrl = find_first node
+    ~name_is:(fun n -> n = "EventControl"
+                    || n = "EventControlEventExpression") in
+  let body_stmt = find_first node
+    ~name_is:(fun n -> n = "Statement") in
+  let body_stmt = match body_stmt with
+    | Some s -> s
+    | None -> Leaf { value = ""; line = 0 }
+  in
+  let body = stmt_to_bstmt ~params body_stmt in
+  let body_stmts = match body with
+    | BBlock ss -> ss
+    | other -> [other]
+  in
+  let kind = always_kind kw in
+  match kind, event_ctrl with
+  | `Seq, Some ec ->
+      let items = extract_event_items ec in
+      (* Pick clock = first posedge or negedge entry; if there's
+         more than one edge, the rest are reset(s). *)
+      (match items with
+       | (clock_edge, clock_sig) :: rest ->
+           let edge_of = function "posedge" -> `Pos | _ -> `Neg in
+           let reset, reset_edge, reset_async =
+             match rest with
+             | (re, rn) :: _ -> Some rn, Some (edge_of re), true
+             | [] -> None, None, false
+           in
+           BSequential {
+             name = "always_ff";
+             clock = clock_sig;
+             clock_edge = edge_of clock_edge;
+             reset;
+             reset_edge;
+             reset_async;
+             body = body_stmts;
+           }
+       | [] ->
+           BCombinational {
+             name = "always_ff_no_edge";
+             sensitivity = [BAny];
+             body = body_stmts;
+           })
+  | (`Comb | `Plain), _ ->
+      BCombinational {
+        name = (match kw with
+                | Some "always_comb" -> "always_comb"
+                | Some "always_latch" -> "always_latch"
+                | _ -> "always");
+        sensitivity = [BAny];
+        body = body_stmts;
+      }
+  | `Seq, None ->
+      (* always_ff without an event control — pathological; treat
+         as combinational so downstream doesn't trip. *)
+      BCombinational {
+        name = "always_ff_unclocked";
+        sensitivity = [BAny];
+        body = body_stmts;
+      }
+
+(* Pull all AlwaysConstruct subtrees out of a module body. *)
+let extract_always_blocks ~params module_node =
+  let nodes = find_all module_node
+    ~name_is:(fun n -> n = "AlwaysConstruct") in
+  List.map (convert_always ~params) nodes
+
 (* Pull a continuous-assign target name out of a NetLvalue subtree.
  * Handles the simple `name = ...` and `name[range] = ...` forms;
  * for the latter we currently target the whole signal (slice
@@ -726,12 +1140,13 @@ let module_of_node node : bmodule option =
         | Some p -> extract_port_decls ~params p
         | None -> []
       in
-      let processes = extract_continuous_assigns ~params node in
+      let assign_procs = extract_continuous_assigns ~params node in
+      let always_procs = extract_always_blocks ~params node in
       Some {
         name;
         params;
         signals;
-        processes;
+        processes = assign_procs @ always_procs;
         instances = [];
         funcs = [];
         mems = [];
