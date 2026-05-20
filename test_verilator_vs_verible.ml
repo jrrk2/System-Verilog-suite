@@ -55,6 +55,13 @@ let apply_passes (p : Behavioral_ir.bprogram) =
 let fold_ff_consts (p : Behavioral_ir.bprogram) =
   Behavioral_const.fold_ffs_program p
 
+(* Truncate/zero-extend each BCall actual to match the formal width
+ * declared in the function. Verilator's JSON pre-folds this cast;
+ * Verible's parse-tree doesn't, so without the pass the two sides
+ * mint distinct uninterpreted-function decls for the same call. *)
+let normalize_bcall_args (p : Behavioral_ir.bprogram) =
+  Behavioral_const.normalize_bcall_args_program p
+
 let () =
   if Array.length Sys.argv < 3 then usage ();
   let top = Sys.argv.(1) in
@@ -73,12 +80,12 @@ let () =
         Printf.eprintf "verilator-side BIR conversion failed\n";
         exit 1
   in
-  let vlt_prog = fold_ff_consts vlt_prog in
+  let vlt_prog = vlt_prog |> fold_ff_consts |> normalize_bcall_args in
   Printf.printf "  %d modules\n" (List.length vlt_prog.modules);
 
   Printf.printf "[2/3] Verible → BIR ...\n%!";
   let vrb_prog = Verible_to_behavioral.convert_files ~top files in
-  let vrb_prog = fold_ff_consts vrb_prog in
+  let vrb_prog = vrb_prog |> fold_ff_consts |> normalize_bcall_args in
   Printf.printf "  %d modules\n" (List.length vrb_prog.modules);
   ignore apply_passes;
 

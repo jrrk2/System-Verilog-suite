@@ -514,3 +514,176 @@ let fold_ffs_module bmod =
 
 let fold_ffs_program (prog : bprogram) : bprogram =
   { prog with modules = List.map fold_ffs_module prog.modules }
+
+(* ========================================================================= *)
+(* BCall argument width normalisation.                                        *)
+(*                                                                            *)
+(* SystemVerilog implicitly truncates or extends a function-call actual to    *)
+(* the formal parameter's declared width at the call boundary. Verilator's    *)
+(* JSON pre-applies that cast as part of its CONST/EXTEND emission, so the    *)
+(* verilator→BIR converter naturally receives correctly-widened args.        *)
+(* Verible's parse-tree carries no such cast — the actual is whatever its    *)
+(* source signal width happens to be — so when the two converters meet at    *)
+(* the Z3 miter they encode the same BCall with different-width arg lists    *)
+(* and the encoder mints two distinct uninterpreted-function decls, after    *)
+(* which Z3 trivially finds a counterexample.                                *)
+(*                                                                            *)
+(* Walk every BCall (in expressions) and every BCallStmt (statement form),   *)
+(* look up the formal parameter widths in bmodule.funcs, and emit a BSlice   *)
+(* or zero-extending BConcat around each actual arg so both sides land on    *)
+(* the same shape regardless of where the cast was supposed to apply.        *)
+(* Signedness-aware widening (sign-extend instead of zero-extend, and the    *)
+(* signed-compare-widening of a follow-up pass) is intentionally not done    *)
+(* here — this pass only equalises bit widths.                               *)
+(* ========================================================================= *)
+
+let rec width_of_btype_full = function
+  | BInt { width; _ } -> width
+  | BBool -> 1
+  | BArray { element; size } -> size * width_of_btype_full element
+  | BStruct _ -> 32
+
+let signal_widths_of_module bmod =
+  let h = Hashtbl.create 32 in
+  List.iter (fun (s : bsignal) ->
+    Hashtbl.replace h s.name (width_of_btype_full s.stype))
+    bmod.signals;
+  h
+
+let func_sigs_of_module bmod =
+  let h = Hashtbl.create 8 in
+  List.iter (fun (f : bfunc) ->
+    let widths =
+      List.map (fun (_, ty, _) -> width_of_btype_full ty) f.params
+    in
+    Hashtbl.replace h f.fname widths)
+    bmod.funcs;
+  h
+
+let rec width_of_expr_with sig_widths = function
+  | BVar n -> Hashtbl.find_opt sig_widths n
+  | BConst { width; _ } -> Some width
+  | BBinOp { result_type; _ } -> Some (width_of_btype_full result_type)
+  | BUnOp { result_type; _ } -> Some (width_of_btype_full result_type)
+  | BCond { then_val; _ } -> width_of_expr_with sig_widths then_val
+  | BSlice { msb; lsb; _ } -> Some (msb - lsb + 1)
+  | BConcat exprs ->
+      let widths = List.map (width_of_expr_with sig_widths) exprs in
+      if List.for_all Option.is_some widths
+      then Some (List.fold_left (+) 0 (List.map Option.get widths))
+      else None
+  | BReplicate { count; value } ->
+      (match width_of_expr_with sig_widths value with
+       | Some w -> Some (count * w)
+       | None -> None)
+  | BSelect _ | BCall _ -> None
+
+let normalize_one_arg sig_widths arg formal_w =
+  match width_of_expr_with sig_widths arg with
+  | None -> arg
+  | Some actual_w when actual_w = formal_w -> arg
+  | Some actual_w when actual_w > formal_w ->
+      (* Implicit truncation: keep low formal_w bits. *)
+      BSlice { signal = arg; msb = formal_w - 1; lsb = 0 }
+  | Some actual_w ->
+      (* actual_w < formal_w: zero-extend. Signedness-aware
+       * extension is deferred to a follow-up pass. *)
+      let pad = BConst { value = 0; width = formal_w - actual_w } in
+      BConcat [pad; arg]
+
+let normalize_call_args sig_widths formals args =
+  let actuals_n = List.length args in
+  let formals_n = List.length formals in
+  if actuals_n = formals_n then
+    List.map2 (normalize_one_arg sig_widths) args formals
+  else if formals_n = 1 && actuals_n > 1 then
+    (* Concat-spread: one frontend flattens `func({a, b, c})` into
+     * `func(a, b, c)`. Rebuild the implied BConcat (source order:
+     * leftmost = MSB) and treat it as the single formal. *)
+    [normalize_one_arg sig_widths (BConcat args) (List.hd formals)]
+  else args
+
+let rec normalize_expr sig_widths func_sigs = function
+  | BCall { func; args } ->
+      let args = List.map (normalize_expr sig_widths func_sigs) args in
+      (match Hashtbl.find_opt func_sigs func with
+       | Some formals ->
+           BCall { func; args = normalize_call_args sig_widths formals args }
+       | None -> BCall { func; args })
+  | BBinOp r ->
+      BBinOp { r with
+        lhs = normalize_expr sig_widths func_sigs r.lhs;
+        rhs = normalize_expr sig_widths func_sigs r.rhs }
+  | BUnOp r ->
+      BUnOp { r with operand = normalize_expr sig_widths func_sigs r.operand }
+  | BSlice r ->
+      BSlice { r with signal = normalize_expr sig_widths func_sigs r.signal }
+  | BConcat es ->
+      BConcat (List.map (normalize_expr sig_widths func_sigs) es)
+  | BReplicate r ->
+      BReplicate { r with value = normalize_expr sig_widths func_sigs r.value }
+  | BCond r ->
+      BCond {
+        condition = normalize_expr sig_widths func_sigs r.condition;
+        then_val  = normalize_expr sig_widths func_sigs r.then_val;
+        else_val  = normalize_expr sig_widths func_sigs r.else_val }
+  | BSelect r ->
+      BSelect {
+        array = normalize_expr sig_widths func_sigs r.array;
+        index = normalize_expr sig_widths func_sigs r.index }
+  | (BVar _ | BConst _) as e -> e
+
+let rec normalize_stmt sig_widths func_sigs = function
+  | BAssign { lhs; rhs } ->
+      BAssign { lhs; rhs = normalize_expr sig_widths func_sigs rhs }
+  | BIf { condition; then_stmts; else_stmts } ->
+      BIf {
+        condition = normalize_expr sig_widths func_sigs condition;
+        then_stmts = List.map (normalize_stmt sig_widths func_sigs) then_stmts;
+        else_stmts = List.map (normalize_stmt sig_widths func_sigs) else_stmts }
+  | BCase { selector; cases; default } ->
+      BCase {
+        selector = normalize_expr sig_widths func_sigs selector;
+        cases = List.map (fun (v, ss) ->
+          (normalize_expr sig_widths func_sigs v,
+           List.map (normalize_stmt sig_widths func_sigs) ss)) cases;
+        default = List.map (normalize_stmt sig_widths func_sigs) default }
+  | BWhile { condition; body } ->
+      BWhile {
+        condition = normalize_expr sig_widths func_sigs condition;
+        body = List.map (normalize_stmt sig_widths func_sigs) body }
+  | BFor { init; condition; update; body } ->
+      BFor {
+        init = normalize_stmt sig_widths func_sigs init;
+        condition = normalize_expr sig_widths func_sigs condition;
+        update = normalize_stmt sig_widths func_sigs update;
+        body = List.map (normalize_stmt sig_widths func_sigs) body }
+  | BBlock ss ->
+      BBlock (List.map (normalize_stmt sig_widths func_sigs) ss)
+  | BCallStmt { func; args } ->
+      let args = List.map (normalize_expr sig_widths func_sigs) args in
+      (match Hashtbl.find_opt func_sigs func with
+       | Some formals ->
+           BCallStmt { func; args = normalize_call_args sig_widths formals args }
+       | None -> BCallStmt { func; args })
+  | BReturn (Some e) ->
+      BReturn (Some (normalize_expr sig_widths func_sigs e))
+  | BReturn None -> BReturn None
+
+let normalize_bcall_args_module bmod =
+  let sig_widths = signal_widths_of_module bmod in
+  let func_sigs = func_sigs_of_module bmod in
+  let processes' = List.map (function
+    | BCombinational { name; sensitivity; body } ->
+        BCombinational { name; sensitivity;
+          body = List.map (normalize_stmt sig_widths func_sigs) body }
+    | BSequential { name; clock; clock_edge; reset; reset_edge;
+                    reset_async; body } ->
+        BSequential { name; clock; clock_edge; reset; reset_edge;
+          reset_async;
+          body = List.map (normalize_stmt sig_widths func_sigs) body }
+  ) bmod.processes in
+  { bmod with processes = processes' }
+
+let normalize_bcall_args_program (prog : bprogram) : bprogram =
+  { prog with modules = List.map normalize_bcall_args_module prog.modules }
