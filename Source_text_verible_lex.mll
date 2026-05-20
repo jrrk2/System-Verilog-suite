@@ -565,6 +565,15 @@ rule token = parse
 | "|->" { tok ( VBAR_HYPHEN_GT ) }
 | "->>" { tok ( HYPHEN_GT_GT ) }
 | "->"  { tok ( HYPHEN_GT ) }
+(* SDF path-delay arrows used inside specify blocks: `(a *> b)` is
+ * an all-paths edge delay, `(a => b)` is a single-edge delay.  Both
+ * tokens are already declared in Source_text_verible.mly's specify
+ * productions but the lexer was previously splitting them into the
+ * single-char STAR/EQUALS + GREATER pair, leaving every specify
+ * block unparseable.  Surfaced when running the verible emitter on
+ * Xilinx unisim primitives (RAMB18E1.v line 967). *)
+| "*>" { tok ( STAR_GT ) }
+| "=>" { tok ( EQ_GT ) }
 | "|=" { tok ( VBAR_EQ ) }
 | "^=" { tok ( CARET_EQ ) }
 | ".*" { tok ( DOT_STAR ) }
