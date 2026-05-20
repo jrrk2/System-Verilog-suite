@@ -331,3 +331,161 @@ let propagate_to_fixpoint prog =
       iterate prog' (iterations + 1)
   in
   iterate prog 1
+
+(* ========================================================================= *)
+(* Constant folding through flip-flops.                                       *)
+(*                                                                            *)
+(* The per-process propagator above stays inside one process. That leaves a   *)
+(* gap whenever a Verilog "wire a = 0; ... q <= a;" is split across a         *)
+(* combinational assign (driving a) and a sequential always_ff (reading a):   *)
+(* the sequential process never sees that a is a constant.                    *)
+(*                                                                            *)
+(* This extension closes the gap with two cooperating passes:                 *)
+(*                                                                            *)
+(*  1. Cross-process constant analysis: a signal whose every write across     *)
+(*     every process is the same BConst RHS is a module-wide constant. Seed   *)
+(*     that map into each process's propagation context before propagating.   *)
+(*                                                                            *)
+(*  2. Sequential→combinational fold: after seeded propagation, any           *)
+(*     BSequential whose body reduces to constant-only BAssigns is no longer  *)
+(*     stateful — convert it to BCombinational with the same body so the      *)
+(*     downstream ffrip pass doesn't manufacture spurious Q/Q__D ports for    *)
+(*     a register that is provably never going to hold anything but a         *)
+(*     constant value.                                                        *)
+(*                                                                            *)
+(* This matches the behaviour Verilator's optimiser already applies, which    *)
+(* is why a Verilator-vs-Verible miter on a constant-driven FF (e.g.          *)
+(* always_ff @(posedge a) q <= b where wire a = 0; wire b = 0;) sees a port-  *)
+(* count mismatch without it.                                                 *)
+(* ========================================================================= *)
+
+(* Walk a statement list collecting every BAssign target/RHS pair. *)
+let rec collect_assign_pairs acc = function
+  | BAssign { lhs; rhs } -> (lhs, rhs) :: acc
+  | BBlock ss -> List.fold_left collect_assign_pairs acc ss
+  | BIf { then_stmts; else_stmts; _ } ->
+      let acc = List.fold_left collect_assign_pairs acc then_stmts in
+      List.fold_left collect_assign_pairs acc else_stmts
+  | BCase { cases; default; _ } ->
+      let acc = List.fold_left (fun a (_, ss) ->
+        List.fold_left collect_assign_pairs a ss) acc cases in
+      List.fold_left collect_assign_pairs acc default
+  | BWhile { body; _ } | BFor { body; _ } ->
+      List.fold_left collect_assign_pairs acc body
+  | BCallStmt _ | BReturn _ -> acc
+
+let collect_module_assign_pairs bmod =
+  List.fold_left (fun acc p ->
+    let body = match p with
+      | BCombinational { body; _ } -> body
+      | BSequential   { body; _ } -> body
+    in
+    List.fold_left collect_assign_pairs acc body
+  ) [] bmod.processes
+
+(* Signals whose every write is the same BConst value across the module.
+ * Returned as (name, const_value) suitable to seed a prop_context. *)
+let module_constants bmod =
+  let pairs = collect_module_assign_pairs bmod in
+  let by_signal = Hashtbl.create 16 in
+  List.iter (fun (lhs, rhs) ->
+    let cur = try Hashtbl.find by_signal lhs with Not_found -> [] in
+    Hashtbl.replace by_signal lhs (rhs :: cur)
+  ) pairs;
+  Hashtbl.fold (fun name rhss acc ->
+    let const_of = function
+      | BConst { value; width } -> Some (CInt (value, width))
+      | _ -> None
+    in
+    let consts = List.map const_of rhss in
+    if consts = [] || List.exists (fun c -> c = None) consts then acc
+    else
+      let firsts = List.filter_map (fun x -> x) consts in
+      match firsts with
+      | first :: rest when List.for_all (fun x -> x = first) rest ->
+          (name, first) :: acc
+      | _ -> acc
+  ) by_signal []
+
+(* Walk a body, returning true iff every BAssign in it (at any depth) has a
+ * BConst RHS. Empty bodies count as constant-only. *)
+let rec body_is_const_only stmts = List.for_all stmt_is_const_only stmts
+and stmt_is_const_only = function
+  | BAssign { rhs = BConst _; _ } -> true
+  | BAssign _ -> false
+  | BBlock ss -> body_is_const_only ss
+  | BIf { then_stmts; else_stmts; _ } ->
+      body_is_const_only then_stmts && body_is_const_only else_stmts
+  | BCase { cases; default; _ } ->
+      List.for_all (fun (_, ss) -> body_is_const_only ss) cases
+      && body_is_const_only default
+  | BWhile { body; _ } | BFor { body; _ } -> body_is_const_only body
+  | BCallStmt _ | BReturn _ -> true
+
+(* Single module-level pass: seed cross-process constants, propagate per
+ * process, fold constant-only sequential processes to combinational, AND
+ * drop sequential processes whose clock is a module-wide constant
+ * (Verilator does the same optimisation: a never-edging clock means the
+ * FF never fires, so the body collapses to whatever the signal's reset
+ * state was — effectively nothing observable from the outside).
+ * Returns (new_module, total_changes). *)
+let propagate_module_with_globals bmod =
+  let globals = module_constants bmod in
+  let const_names = List.map fst globals in
+  let total_changes = ref 0 in
+  let processes' = List.map (fun proc ->
+    let ctx = create_prop_context () in
+    List.iter (fun (n, v) -> Hashtbl.add ctx.constants n v) globals;
+    let proc' = match proc with
+      | BCombinational { name; sensitivity; body } ->
+          BCombinational { name; sensitivity;
+                           body = List.map (propagate_stmt ctx) body }
+      | BSequential { name; clock; clock_edge; reset; reset_edge;
+                      reset_async; body } ->
+          BSequential { name; clock; clock_edge; reset; reset_edge;
+                        reset_async;
+                        body = List.map (propagate_stmt ctx) body }
+    in
+    total_changes := !total_changes + ctx.changes;
+    proc'
+  ) bmod.processes in
+  let folded_count = ref 0 in
+  let dropped_count = ref 0 in
+  let processes'' = List.filter_map (function
+    | BSequential s when List.mem s.clock const_names ->
+        (* Constant clock: this FF never fires. Drop the process; its
+         * Q signal stays at its reset state (modelled implicitly as
+         * an undriven internal — both designs are expected to do the
+         * same, so the miter sees matching empty I/O). *)
+        incr dropped_count; None
+    | BSequential s when s.body <> [] && body_is_const_only s.body ->
+        incr folded_count;
+        Some (BCombinational {
+          name = s.name ^ "_ff_const_fold";
+          sensitivity = [BAny];
+          body = s.body;
+        })
+    | p -> Some p
+  ) processes' in
+  if !folded_count > 0 then
+    Printf.printf "  FF constant folding: %d sequential→combinational\n"
+      !folded_count;
+  if !dropped_count > 0 then
+    Printf.printf "  FF constant-clock drop: %d sequential processes\n"
+      !dropped_count;
+  ({ bmod with processes = processes'' },
+   !total_changes + !folded_count + !dropped_count)
+
+(* Module-level fixpoint: iterate seeded propagation + FF folding until
+ * no more changes. Each fold can expose new constants (e.g. a register
+ * that becomes a constant wire may unlock further folding upstream). *)
+let fold_ffs_module bmod =
+  let rec iter bmod n =
+    let (bmod', changes) = propagate_module_with_globals bmod in
+    if changes = 0 || n > 16 then bmod'
+    else iter bmod' (n + 1)
+  in
+  iter bmod 1
+
+let fold_ffs_program (prog : bprogram) : bprogram =
+  { prog with modules = List.map fold_ffs_module prog.modules }

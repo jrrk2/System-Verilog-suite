@@ -48,6 +48,13 @@ let apply_passes (p : Behavioral_ir.bprogram) =
   |> Behavioral_iflift.lift_program
   |> Behavioral_meminfer.infer_program
 
+(* Constant-fold through flip-flops. Verilator's optimiser already
+ * does this; without it, a constant-driven FF on the Verible side
+ * survives into ffrip and produces phantom Q/Q__D ports that the
+ * Verilator side doesn't have. *)
+let fold_ff_consts (p : Behavioral_ir.bprogram) =
+  Behavioral_const.fold_ffs_program p
+
 let () =
   if Array.length Sys.argv < 3 then usage ();
   let top = Sys.argv.(1) in
@@ -66,10 +73,12 @@ let () =
         Printf.eprintf "verilator-side BIR conversion failed\n";
         exit 1
   in
+  let vlt_prog = fold_ff_consts vlt_prog in
   Printf.printf "  %d modules\n" (List.length vlt_prog.modules);
 
   Printf.printf "[2/3] Verible → BIR ...\n%!";
   let vrb_prog = Verible_to_behavioral.convert_files ~top files in
+  let vrb_prog = fold_ff_consts vrb_prog in
   Printf.printf "  %d modules\n" (List.length vrb_prog.modules);
   ignore apply_passes;
 
