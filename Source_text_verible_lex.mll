@@ -487,6 +487,12 @@ let exp_ = ['E' 'e'] ['+' '-']? digits_
  * fractional part (e.g. `23E10`). *)
 let fltnum = digits_ '.' digits_ exp_?
            | digits_ exp_
+(* SV time literal: <num><unit> where unit is s/ms/us/ns/ps/fs/step.
+ * The number can be integer (300ps) or float (1.5ns).  Match the
+ * combined form before plain number rules so `300ps` doesn't split
+ * into TK_DecNumber + ident. *)
+let timeunit = "ms" | "us" | "ns" | "ps" | "fs" | "step" | "s"
+let timelit = (digits_ '.' digits_ exp_? | digits_ exp_ | digits_) timeunit
 (* Sized literal: `<W>'<s>?<base><digits>`.  SV allows the base char
  * in any case (`'H` and `'h` both legal; `'S` is sign-extension).
  * The digit set is base-specific — splitting per base means an
@@ -651,6 +657,15 @@ rule token = parse
       { failwith (Printf.sprintf "malformed sized literal %S \
                                   (sign must precede size: -8'd6 \
                                   rather than 8'd-6)" n) }
+  | timelit as t
+      (* Time literal: accept and ignore the unit — downstream uses
+       * this only for delay specifications (#(300ps) etc.) which the
+       * BIR doesn't model.  Emit a one-time warning per file so the
+       * user sees the delay is being dropped. *)
+      { Printf.eprintf
+          "[verible-lex] ignoring time literal %S (delays are not modelled)\n"
+          t;
+        tok ( TK_TimeLiteral ) }
   | number as n { tok (TK_DecNumber n) }
   | unbased as n { tok (TK_UnBasedNumber n) }
   | fltnum as f
