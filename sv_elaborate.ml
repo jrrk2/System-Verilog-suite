@@ -297,10 +297,29 @@ let extract_range ctx token =
   | _ -> None
 
 (* Extract width from data_type_primitive1 pattern *)
+(* Standard widths for SystemVerilog's integer_atom_type keywords. *)
+let width_of_integer_atom = function
+  | Byte -> Some 8
+  | Shortint -> Some 16
+  | Int | Integer | Time -> Some 32
+  | Longint -> Some 64
+  | _ -> None
+
 let extract_width_from_primitive ctx data_type =
   match data_type with
-  | TUPLE3 (STRING "data_type_primitive1", _, range_token) ->
-      extract_range ctx range_token
+  | TUPLE3 (STRING "data_type_primitive1", inner, range_token) ->
+      (* Integer atoms (byte/shortint/int/longint/integer/time) carry
+         their bit width implicitly.  Without this branch they fall
+         through to extract_range, which returns None and the caller
+         defaults the signal to 1 bit — visible as the `integer i`
+         iterator in tinyllm-fpga's microgpt_categorical_sampler being
+         declared as uint<1> in BIR. *)
+      (match inner with
+       | TUPLE3 (STRING "data_type_primitive_scalar5", atom_type, _) ->
+           (match width_of_integer_atom atom_type with
+            | Some w -> Some (w - 1, 0)
+            | None -> extract_range ctx range_token)
+       | _ -> extract_range ctx range_token)
   | _ -> None
 
 (* Extract port declaration: direction, name, width *)
@@ -1198,6 +1217,14 @@ let extract_data_declaration ctx token =
                   | Wire -> Some Wire
                   | Logic -> Some Logic
                   | _ -> None)
+             | TUPLE3 (STRING "data_type_primitive_scalar5", atom_type, _) ->
+                 (* integer_atom_type: Byte/Shortint/Int/Longint/Integer/
+                    Time.  All are register-like 4-state types in SV;
+                    treat as Reg so the symbol-table registration in
+                    extract_data_declaration fires. *)
+                 (match width_of_integer_atom atom_type with
+                  | Some _ -> Some Reg
+                  | None -> None)
              | _ -> None)
         | _ -> None) in
 

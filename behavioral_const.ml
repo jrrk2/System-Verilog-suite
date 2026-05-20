@@ -691,3 +691,96 @@ let normalize_bcall_args_module bmod =
 
 let normalize_bcall_args_program (prog : bprogram) : bprogram =
   { prog with modules = List.map normalize_bcall_args_module prog.modules }
+
+(* ========================================================================= *)
+(* Unsized-fill literal expansion.                                            *)
+(*                                                                            *)
+(* The Verible→IR converter emits SV's unsized fills `'0`, `'1`, `'x`, `'z`  *)
+(* as BConst with width=0 — a sentinel meaning "fill at context width".       *)
+(* Verilator's JSON pre-applies the LHS broadcast, so its BConsts already    *)
+(* carry the right width on that side. For the verible side we walk the IR  *)
+(* and rewrite every width=0 BConst to the enclosing BAssign's LHS width,    *)
+(* so `acc_out <= '1` with acc_out being 64 bits becomes                     *)
+(* `acc_out := 64'hFFFFFFFFFFFFFFFF` rather than the silent                  *)
+(* `acc_out := 32'hFFFFFFFF` (zero-extended on assign to 0x00000000FFFFFFFF).*)
+(* ========================================================================= *)
+
+let rec expand_fills_expr target_w = function
+  | BConst { value; width = 0 } -> BConst { value; width = target_w }
+  | BBinOp r ->
+      BBinOp { r with
+        lhs = expand_fills_expr target_w r.lhs;
+        rhs = expand_fills_expr target_w r.rhs }
+  | BUnOp r ->
+      BUnOp { r with operand = expand_fills_expr target_w r.operand }
+  | BSlice r ->
+      BSlice { r with signal = expand_fills_expr target_w r.signal }
+  | BConcat es ->
+      BConcat (List.map (expand_fills_expr target_w) es)
+  | BCond r ->
+      BCond {
+        condition = expand_fills_expr target_w r.condition;
+        then_val  = expand_fills_expr target_w r.then_val;
+        else_val  = expand_fills_expr target_w r.else_val }
+  | BSelect r ->
+      BSelect {
+        array = expand_fills_expr target_w r.array;
+        index = expand_fills_expr target_w r.index }
+  | BReplicate r ->
+      BReplicate { r with value = expand_fills_expr target_w r.value }
+  | BCall r ->
+      BCall { r with args = List.map (expand_fills_expr target_w) r.args }
+  | (BVar _ | BConst _) as e -> e
+
+let rec expand_fills_stmt sig_widths = function
+  | BAssign { lhs; rhs } ->
+      let target_w =
+        match Hashtbl.find_opt sig_widths lhs with
+        | Some w -> w
+        | None -> 32
+      in
+      BAssign { lhs; rhs = expand_fills_expr target_w rhs }
+  | BIf { condition; then_stmts; else_stmts } ->
+      BIf {
+        condition = expand_fills_expr 32 condition;
+        then_stmts = List.map (expand_fills_stmt sig_widths) then_stmts;
+        else_stmts = List.map (expand_fills_stmt sig_widths) else_stmts }
+  | BCase { selector; cases; default } ->
+      BCase {
+        selector = expand_fills_expr 32 selector;
+        cases = List.map (fun (v, ss) ->
+          (expand_fills_expr 32 v,
+           List.map (expand_fills_stmt sig_widths) ss)) cases;
+        default = List.map (expand_fills_stmt sig_widths) default }
+  | BWhile { condition; body } ->
+      BWhile {
+        condition = expand_fills_expr 32 condition;
+        body = List.map (expand_fills_stmt sig_widths) body }
+  | BFor { init; condition; update; body } ->
+      BFor {
+        init = expand_fills_stmt sig_widths init;
+        condition = expand_fills_expr 32 condition;
+        update = expand_fills_stmt sig_widths update;
+        body = List.map (expand_fills_stmt sig_widths) body }
+  | BBlock ss -> BBlock (List.map (expand_fills_stmt sig_widths) ss)
+  | BCallStmt { func; args } ->
+      BCallStmt { func; args = List.map (expand_fills_expr 32) args }
+  | BReturn (Some e) -> BReturn (Some (expand_fills_expr 32 e))
+  | BReturn None -> BReturn None
+
+let expand_fills_module bmod =
+  let sig_widths = signal_widths_of_module bmod in
+  let processes' = List.map (function
+    | BCombinational { name; sensitivity; body } ->
+        BCombinational { name; sensitivity;
+          body = List.map (expand_fills_stmt sig_widths) body }
+    | BSequential { name; clock; clock_edge; reset; reset_edge;
+                    reset_async; body } ->
+        BSequential { name; clock; clock_edge; reset; reset_edge;
+          reset_async;
+          body = List.map (expand_fills_stmt sig_widths) body }
+  ) bmod.processes in
+  { bmod with processes = processes' }
+
+let expand_fills_program (prog : bprogram) : bprogram =
+  { prog with modules = List.map expand_fills_module prog.modules }

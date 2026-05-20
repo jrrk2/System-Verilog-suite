@@ -62,6 +62,12 @@ let fold_ff_consts (p : Behavioral_ir.bprogram) =
 let normalize_bcall_args (p : Behavioral_ir.bprogram) =
   Behavioral_const.normalize_bcall_args_program p
 
+(* Expand verible's width=0 sentinel for SV unsized fills (`'0`, `'1`,
+ * `'x`, `'z`) to the enclosing BAssign LHS width so the broadcast
+ * matches Verilator's pre-applied behaviour. *)
+let expand_fills (p : Behavioral_ir.bprogram) =
+  Behavioral_const.expand_fills_program p
+
 let () =
   if Array.length Sys.argv < 3 then usage ();
   let top = Sys.argv.(1) in
@@ -84,7 +90,7 @@ let () =
   if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
     Printf.eprintf "==== VLT BIR (pre-normalize) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vlt_prog);
-  let vlt_prog = normalize_bcall_args vlt_prog in
+  let vlt_prog = vlt_prog |> normalize_bcall_args |> expand_fills in
   Printf.printf "  %d modules\n" (List.length vlt_prog.modules);
 
   Printf.printf "[2/3] Verible → BIR ...\n%!";
@@ -93,7 +99,7 @@ let () =
   if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
     Printf.eprintf "==== VRB BIR (pre-normalize) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vrb_prog);
-  let vrb_prog = normalize_bcall_args vrb_prog in
+  let vrb_prog = vrb_prog |> normalize_bcall_args |> expand_fills in
   Printf.printf "  %d modules\n" (List.length vrb_prog.modules);
   ignore apply_passes;
 

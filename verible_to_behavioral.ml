@@ -492,19 +492,48 @@ let width_of ?(typedefs = []) ~pkgs ~params tok =
   match extract_range ~pkgs ~params tok with
   | Some (m, l) -> abs (m - l) + 1
   | None ->
-      (* No explicit packed dimension — the type might be a typedef
-       * reference like `state_type CState`. Walk for the first
-       * SymbolIdentifier and look it up in the typedef map. *)
-      let nm = ref None in
-      walk (function
-        | SymbolIdentifier id when !nm = None -> nm := Some id
-        | _ -> ()) tok;
-      (match !nm with
-       | Some id ->
-           (match List.assoc_opt id typedefs with
-            | Some w -> w
-            | None -> 1)
-       | None -> 1)
+      (* No explicit packed dimension — try integer_atom_type next:
+       * `integer i`, `int x`, `byte b`, … carry their bit-width
+       * implicitly. Verible's grammar wraps the atom token inside
+       * `data_type_primitive_scalar5`, so we search for it before
+       * falling back to typedef lookup. *)
+      let atom_w = ref None in
+      let rec scan = function
+        | TUPLE3 (STRING t, atom, _)
+          when prefix_is "data_type_primitive_scalar5" t
+               && !atom_w = None ->
+            (match atom with
+             | Byte -> atom_w := Some 8
+             | Shortint -> atom_w := Some 16
+             | Int | Integer | Time -> atom_w := Some 32
+             | Longint -> atom_w := Some 64
+             | _ -> ())
+        | TUPLE2 (a, b) -> scan a; scan b
+        | TUPLE3 (a, b, c) -> scan a; scan b; scan c
+        | TUPLE4 (a, b, c, d) -> scan a; scan b; scan c; scan d
+        | TUPLE5 (a, b, c, d, e) -> List.iter scan [a; b; c; d; e]
+        | TUPLE6 (a, b, c, d, e, f) -> List.iter scan [a; b; c; d; e; f]
+        | TUPLE7 (a, b, c, d, e, f, g) -> List.iter scan [a; b; c; d; e; f; g]
+        | TLIST xs -> List.iter scan xs
+        | _ -> ()
+      in
+      scan tok;
+      (match !atom_w with
+       | Some w -> w
+       | None ->
+           (* No atom either — the type might be a typedef reference
+            * like `state_type CState`. Walk for the first
+            * SymbolIdentifier and look it up in the typedef map. *)
+           let nm = ref None in
+           walk (function
+             | SymbolIdentifier id when !nm = None -> nm := Some id
+             | _ -> ()) tok;
+           (match !nm with
+            | Some id ->
+                (match List.assoc_opt id typedefs with
+                 | Some w -> w
+                 | None -> 1)
+            | None -> 1))
 
 (* `typedef enum logic [N-1:0] { A, B = 5, C, … } t;` — every enum
  * item folds to its integer value. Default sequential numbering
@@ -865,16 +894,19 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        | Some v -> param_value_to_bexpr id v
        | None -> BVar id)
   | TK_DecNumber n | TK_UnBasedNumber n ->
-      (* SV unbased-unsized literals: `'0`, `'1`, `'x`, `'z`. The
-       * value should be the bit pattern broadcast to the LHS width.
-       * We don't know the LHS width here so emit BConst with -1
-       * (all-ones in two's complement) for `'1` and 0 for the
-       * others; downstream encoders mask to the destination width. *)
+      (* SV unbased-unsized literals: `'0`, `'1`, `'x`, `'z`. The bit
+       * pattern broadcasts to the LHS width.  We don't have the LHS
+       * width here, so tag with width=0 as a "fill at context width"
+       * sentinel.  A later pass (Behavioral_const.expand_fill_consts)
+       * walks the IR and rewrites these to BConsts of the appropriate
+       * width based on the enclosing BAssign / BConcat sibling, so
+       * `'1` becomes `64'hFFFFFFFFFFFFFFFF` on a 64-bit LHS rather
+       * than the silently-truncated `32'hFFFFFFFF`. *)
       let n2 = String.trim n in
-      if n2 = "'1" then BConst { value = -1; width = 32 }
-      else if n2 = "'0" then BConst { value = 0; width = 32 }
+      if n2 = "'1" then BConst { value = -1; width = 0 }
+      else if n2 = "'0" then BConst { value = 0; width = 0 }
       else if n2 = "'x" || n2 = "'z" || n2 = "'X" || n2 = "'Z" then
-        BConst { value = 0; width = 32 }
+        BConst { value = 0; width = 0 }
       else
         (try BConst { value = int_of_string n; width = 32 }
          with _ ->
@@ -1328,7 +1360,53 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
            else
              (match eval_int ~pkgs ~params idx with
               | Some i -> BSlice { signal; msb = i; lsb = i }
-              | None -> signal)
+              | None ->
+                  (* Dynamic-index single-bit select on a packed signal:
+                     SV `signal[idx]` returns one bit.  Lower to
+                     `(signal >> idx[ceil(log2 w)-1:0]) & 1` to match
+                     Verilator, which pre-slices the index to the
+                     minimum width that can address the signal.  Without
+                     the slice an out-of-range index on the verible side
+                     shifts everything out (→ 0) while verilator's
+                     low-bits-only path returns the in-range bit, and
+                     Z3 picks an out-of-range index as the
+                     counterexample.
+
+                     If the signal width is unknown, skip the slice;
+                     same-shape encoding on both sides still beats
+                     dropping the index entirely (the previous bug). *)
+                  let sig_w = match signal with
+                    | BVar n -> List.assoc_opt n !cur_signal_widths
+                    | _ -> None in
+                  let idx_e = recurse idx in
+                  let idx_e =
+                    match sig_w with
+                    | Some w when w > 1 ->
+                        (* Bit-length of (w-1) is the number of bits
+                           needed to index a w-element signal:
+                             w=64 → max idx 63 = 0b111111 → 6 bits. *)
+                        let rec bit_length v =
+                          if v = 0 then 0
+                          else 1 + bit_length (v lsr 1)
+                        in
+                        let need = bit_length (w - 1) in
+                        if need >= 1
+                        then BSlice { signal = idx_e;
+                                      msb = need - 1; lsb = 0 }
+                        else idx_e
+                    | _ -> idx_e
+                  in
+                  let one_bit = BConst { value = 1; width = 1 } in
+                  let res_t = BInt { width = 1; signed = Unsigned } in
+                  let shifted = BBinOp {
+                    op = BShr;
+                    lhs = signal;
+                    rhs = idx_e;
+                    result_type = res_t } in
+                  BBinOp { op = BAnd;
+                           lhs = shifted;
+                           rhs = one_bit;
+                           result_type = res_t })
        | _ -> signal))
   (* `unary_prefix_expr2`: TUPLE3(tag, unary_op_token, operand).
    * Must come before the generic TUPLE3 wrapper below — otherwise the

@@ -121,8 +121,32 @@ let parse_const_value name =
     let d = clean digits in
     let max_digits = 63 / bits_per_digit in
     let n = String.length d in
-    let d = if n > max_digits then String.sub d (n - max_digits) max_digits else d in
-    int_of_string (prefix ^ d)
+    if n > max_digits then
+      (* Literal exceeds OCaml int capacity. If every digit (after the
+         x/z/?→0 wildcard pass) is the all-ones value for this base —
+         hex 'f'/'F', bin '1', oct '7' — return -1 so the BConst value
+         stays "all bits set in 2's complement" at any width.  Z3's
+         mk_numeral "-1" w then produces the correct all-bits-set
+         constant for the declared LHS width.  Otherwise fall back to
+         the low-order truncation that was here before — it may be
+         semantically wrong but matches the historical behaviour. *)
+      let all_max =
+        let max_ch = match prefix with
+          | "0x" -> 'f'
+          | "0b" -> '1'
+          | "0o" -> '7'
+          | _ -> '?'
+        in
+        String.length d > 0 &&
+        String.for_all (fun c ->
+          Char.lowercase_ascii c = max_ch) d
+      in
+      if all_max then -1
+      else
+        let d = String.sub d (n - max_digits) max_digits in
+        int_of_string (prefix ^ d)
+    else
+      int_of_string (prefix ^ d)
   in
   let parse_dec digits =
     let d = clean digits in
