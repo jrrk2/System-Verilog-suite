@@ -449,14 +449,39 @@ let propagate_module_with_globals bmod =
     total_changes := !total_changes + ctx.changes;
     proc'
   ) bmod.processes in
+  (* Count writers per signal across the whole module: needed below to
+   * avoid hiding multi-driver bugs (e.g. illegal SV that mixes a
+   * continuous `assign v = 12;` with an `always @(posedge clk) v <= ~v`
+   * — dropping the constant-clock always block would leave a single,
+   * valid-looking driver and silently mask the error). *)
+  let writers_of = Hashtbl.create 16 in
+  List.iter (fun p ->
+    let body = match p with
+      | BCombinational { body; _ } -> body
+      | BSequential   { body; _ } -> body
+    in
+    List.iter (fun (lhs, _) ->
+      let c = try Hashtbl.find writers_of lhs with Not_found -> 0 in
+      Hashtbl.replace writers_of lhs (c + 1))
+      (List.fold_left collect_assign_pairs [] body)
+  ) processes';
+  let lhses_of_body body =
+    List.map fst (List.fold_left collect_assign_pairs [] body)
+    |> List.sort_uniq compare
+  in
   let folded_count = ref 0 in
   let dropped_count = ref 0 in
   let processes'' = List.filter_map (function
-    | BSequential s when List.mem s.clock const_names ->
-        (* Constant clock: this FF never fires. Drop the process; its
-         * Q signal stays at its reset state (modelled implicitly as
-         * an undriven internal — both designs are expected to do the
-         * same, so the miter sees matching empty I/O). *)
+    | BSequential s when List.mem s.clock const_names
+                         && List.for_all
+                              (fun n ->
+                                 (try Hashtbl.find writers_of n
+                                  with Not_found -> 0) <= 1)
+                              (lhses_of_body s.body) ->
+        (* Constant clock AND every Q has this FF as its sole writer:
+         * the FF never fires, so the signal stays at its reset state.
+         * Drop the process; the signal becomes undriven internal,
+         * matching what Verilator's optimiser already does. *)
         incr dropped_count; None
     | BSequential s when s.body <> [] && body_is_const_only s.body ->
         incr folded_count;
