@@ -151,27 +151,39 @@ let run_synlig_to_rtlil ~top ~files ~out =
   (try Sys.remove script with _ -> ());
   if rc <> 0 then failwith (Printf.sprintf "synlig exit %d" rc)
 
+(* Pipeline applied to every frontend's raw BIR: expand width=0 fill
+ * sentinels against their LHS context, normalise BCall formal-arg
+ * widths, strip @signed markers.  Without expand_fills, an SV `'0`
+ * fill literal lands as a `BConst { value=0; width=0 }` and Z3
+ * rejects it with "bit-vector size must be greater than zero". *)
+let post_load (p : bprogram) =
+  p
+  |> Behavioral_const.normalize_bcall_args_program
+  |> Behavioral_const.expand_fills_program
+  |> Behavioral_const.strip_signed_program
+
 let load_frontend ~frontend ~top ~files : bprogram =
   match frontend with
   | "verible" ->
-      Verible_to_behavioral.convert_files ~top files
+      Verible_to_behavioral.convert_files ~top files |> post_load
   | "verible-ext" ->
       Verible_to_behavioral.convert_files_with_externals ~top files
+      |> post_load
   | "slang" ->
       (match Slang_to_behavioral.convert_files ~top files with
-       | Some p -> p
+       | Some p -> post_load p
        | None -> failwith "slang frontend failed")
   | "yosys" ->
       let tmp = Filename.temp_file "yosys_" ".il" in
       run_yosys_to_rtlil ~top ~files ~out:tmp;
       let p = Rtlil_to_behavioral.convert_file tmp in
       (try Sys.remove tmp with _ -> ());
-      p
+      post_load p
   | "verilator" ->
       (match files with
        | [j] ->
            (match Verilator_to_behavioral.convert_verilator_json_to_behavioral j with
-            | Some p -> p
+            | Some p -> post_load p
             | None -> failwith "verilator JSON parse failed")
        | _ -> failwith "verilator frontend takes a single .json")
   | "synlig" ->
@@ -181,7 +193,7 @@ let load_frontend ~frontend ~top ~files : bprogram =
       run_synlig_to_rtlil ~top ~files ~out:tmp;
       let p = Rtlil_to_behavioral.convert_file tmp in
       (try Sys.remove tmp with _ -> ());
-      p
+      post_load p
   | "sv-parser" ->
       (* dalance/sv-parser oracle: parse via the `parse_sv -t` dump
          and walk the CST into BIR.  Multi-file builds concatenate
@@ -205,9 +217,7 @@ let load_frontend ~frontend ~top ~files : bprogram =
         failwith "sv-parser frontend produced no modules";
       combined
       |> Behavioral_const.fold_ffs_program
-      |> Behavioral_const.normalize_bcall_args_program
-      |> Behavioral_const.expand_fills_program
-      |> Behavioral_const.strip_signed_program
+      |> post_load
   | "vhdl" ->
       (match files with
        | [f] ->
