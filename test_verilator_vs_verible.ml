@@ -76,6 +76,13 @@ let expand_fills (p : Behavioral_ir.bprogram) =
 let unroll_loops (p : Behavioral_ir.bprogram) =
   Behavioral_unroll.unroll_program p
 
+(* Strip residual `@signed(x)` markers so Z3 sees the raw expression
+ * — the markers exist only so normalize_bcall_args could decide
+ * sign-vs-zero extension; anything left after that pass must vanish
+ * before encoding (the Verilator side never emits the marker). *)
+let strip_signed_markers (p : Behavioral_ir.bprogram) =
+  Behavioral_const.strip_signed_program p
+
 let () =
   if Array.length Sys.argv < 3 then usage ();
   let top = Sys.argv.(1) in
@@ -99,7 +106,7 @@ let () =
     Printf.eprintf "==== VLT BIR (pre-normalize) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vlt_prog);
   let vlt_prog = vlt_prog |> normalize_bcall_args |> expand_fills
-                          |> unroll_loops in
+                          |> unroll_loops |> strip_signed_markers in
   if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
     Printf.eprintf "==== VLT BIR (post-unroll) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vlt_prog);
@@ -112,7 +119,7 @@ let () =
     Printf.eprintf "==== VRB BIR (pre-normalize) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vrb_prog);
   let vrb_prog = vrb_prog |> normalize_bcall_args |> expand_fills
-                          |> unroll_loops in
+                          |> unroll_loops |> strip_signed_markers in
   if Sys.getenv_opt "MITER_DUMP_BIR" <> None then
     Printf.eprintf "==== VRB BIR (post-unroll) ====\n%s\n"
       (Behavioral_ir.string_of_bprogram vrb_prog);

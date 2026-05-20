@@ -637,18 +637,100 @@ let rec width_of_expr_with sig_widths = function
        | None -> None)
   | BSelect _ | BCall _ -> None
 
+(* Strip the `@signed(x)` marker that Verible's $signed-cast handler
+   wraps an expression in. Returns (Some inner) when the marker is
+   present at the top, None otherwise. *)
+let rec strip_signed_marker = function
+  | BCall { func = "@signed"; args = [x] } -> Some x
+  | _ -> None
+
+(* Sign-extend `x` from `from_w` bits to `to_w` bits. Builds the bit
+   pattern {{(to_w - from_w){x[from_w-1]}}, x}.  Caller guarantees
+   to_w > from_w > 0. *)
+let sign_extend ~from_w ~to_w x =
+  let top = BSlice { signal = x; msb = from_w - 1; lsb = from_w - 1 } in
+  let pad = BReplicate { count = to_w - from_w; value = top } in
+  BConcat [pad; x]
+
+(* Strip every `@signed(x)` marker that survives inside an expression
+   tree — once we've used it to decide HOW to widen, the marker has
+   served its purpose and downstream encoders shouldn't see a foreign
+   uninterpreted-function call sitting in the middle of an arithmetic
+   tree. *)
+let rec strip_signed_anywhere = function
+  | BCall { func = "@signed"; args = [x] } -> strip_signed_anywhere x
+  | BBinOp r ->
+      BBinOp { r with
+        lhs = strip_signed_anywhere r.lhs;
+        rhs = strip_signed_anywhere r.rhs }
+  | BUnOp r ->
+      BUnOp { r with operand = strip_signed_anywhere r.operand }
+  | BSlice r ->
+      BSlice { r with signal = strip_signed_anywhere r.signal }
+  | BConcat es -> BConcat (List.map strip_signed_anywhere es)
+  | BReplicate r ->
+      BReplicate { r with value = strip_signed_anywhere r.value }
+  | BCond r ->
+      BCond {
+        condition = strip_signed_anywhere r.condition;
+        then_val  = strip_signed_anywhere r.then_val;
+        else_val  = strip_signed_anywhere r.else_val }
+  | BSelect r ->
+      BSelect {
+        array = strip_signed_anywhere r.array;
+        index = strip_signed_anywhere r.index }
+  | BCall r ->
+      BCall { r with args = List.map strip_signed_anywhere r.args }
+  | (BVar _ | BConst _) as e -> e
+
 let normalize_one_arg sig_widths arg formal_w =
-  match width_of_expr_with sig_widths arg with
-  | None -> arg
-  | Some actual_w when actual_w = formal_w -> arg
-  | Some actual_w when actual_w > formal_w ->
-      (* Implicit truncation: keep low formal_w bits. *)
-      BSlice { signal = arg; msb = formal_w - 1; lsb = 0 }
-  | Some actual_w ->
-      (* actual_w < formal_w: zero-extend. Signedness-aware
-       * extension is deferred to a follow-up pass. *)
-      let pad = BConst { value = 0; width = formal_w - actual_w } in
-      BConcat [pad; arg]
+  (* When the actual arg is a BBinOp whose operands carry the
+     `@signed(x)` marker, the SV semantics is "widen each operand
+     to the result-context width using sign-extension, then do the
+     binop at that width". Verilator pre-applies this transformation
+     in its JSON, but Verible parses `$signed(a) - $signed(b)` as a
+     raw 16-bit BSub. Detect the shape and push the formal-width
+     widening into the operands with sign-extension. *)
+  match arg with
+  | BBinOp ({ lhs; rhs; _ } as r)
+    when (strip_signed_marker lhs <> None
+          || strip_signed_marker rhs <> None) ->
+      let widen_signed operand =
+        let inner = match strip_signed_marker operand with
+          | Some x -> x | None -> operand
+        in
+        match width_of_expr_with sig_widths inner with
+        | Some iw when iw < formal_w && iw > 0 ->
+            sign_extend ~from_w:iw ~to_w:formal_w inner
+        | Some iw when iw > formal_w ->
+            BSlice { signal = inner; msb = formal_w - 1; lsb = 0 }
+        | _ -> inner
+      in
+      let lhs' = widen_signed lhs in
+      let rhs' = widen_signed rhs in
+      let result_type = BInt { width = formal_w; signed = Signed } in
+      strip_signed_anywhere
+        (BBinOp { r with lhs = lhs'; rhs = rhs'; result_type })
+  | _ ->
+      let inner = match strip_signed_marker arg with
+        | Some x -> x | None -> arg
+      in
+      let signed_ext = strip_signed_marker arg <> None in
+      match width_of_expr_with sig_widths inner with
+      | None -> strip_signed_anywhere inner
+      | Some actual_w when actual_w = formal_w ->
+          strip_signed_anywhere inner
+      | Some actual_w when actual_w > formal_w ->
+          (* Implicit truncation: keep low formal_w bits. *)
+          BSlice { signal = strip_signed_anywhere inner;
+                   msb = formal_w - 1; lsb = 0 }
+      | Some actual_w when signed_ext && actual_w > 0 ->
+          sign_extend ~from_w:actual_w ~to_w:formal_w
+            (strip_signed_anywhere inner)
+      | Some actual_w ->
+          (* actual_w < formal_w: zero-extend (unsigned actuals). *)
+          let pad = BConst { value = 0; width = formal_w - actual_w } in
+          BConcat [pad; strip_signed_anywhere inner]
 
 let normalize_call_args sig_widths formals args =
   let actuals_n = List.length args in
@@ -843,3 +925,84 @@ let expand_fills_module bmod =
 
 let expand_fills_program (prog : bprogram) : bprogram =
   { prog with modules = List.map expand_fills_module prog.modules }
+
+(* Walk the IR after normalize_bcall_args and strip any leftover
+ * `@signed(x)` markers — they were placed by the Verible-side
+ * $signed-cast handler so normalize_bcall_args could widen with
+ * sign-extension, and now they need to vanish before Z3 encoding
+ * (where an uninterpreted-function call would diverge from the
+ * Verilator side that never had the marker). *)
+let rec strip_signed_program_expr = function
+  | BCall { func = "@signed"; args = [x] } ->
+      strip_signed_program_expr x
+  | BBinOp r ->
+      BBinOp { r with
+        lhs = strip_signed_program_expr r.lhs;
+        rhs = strip_signed_program_expr r.rhs }
+  | BUnOp r ->
+      BUnOp { r with operand = strip_signed_program_expr r.operand }
+  | BSlice r ->
+      BSlice { r with signal = strip_signed_program_expr r.signal }
+  | BConcat es -> BConcat (List.map strip_signed_program_expr es)
+  | BReplicate r ->
+      BReplicate { r with value = strip_signed_program_expr r.value }
+  | BCond r ->
+      BCond {
+        condition = strip_signed_program_expr r.condition;
+        then_val  = strip_signed_program_expr r.then_val;
+        else_val  = strip_signed_program_expr r.else_val }
+  | BSelect r ->
+      BSelect {
+        array = strip_signed_program_expr r.array;
+        index = strip_signed_program_expr r.index }
+  | BCall r ->
+      BCall { r with args = List.map strip_signed_program_expr r.args }
+  | (BVar _ | BConst _) as e -> e
+
+let rec strip_signed_program_stmt = function
+  | BAssign { lhs; rhs } ->
+      BAssign { lhs; rhs = strip_signed_program_expr rhs }
+  | BIf { condition; then_stmts; else_stmts } ->
+      BIf {
+        condition = strip_signed_program_expr condition;
+        then_stmts = List.map strip_signed_program_stmt then_stmts;
+        else_stmts = List.map strip_signed_program_stmt else_stmts }
+  | BCase { selector; cases; default } ->
+      BCase {
+        selector = strip_signed_program_expr selector;
+        cases = List.map (fun (v, ss) ->
+          (strip_signed_program_expr v,
+           List.map strip_signed_program_stmt ss)) cases;
+        default = List.map strip_signed_program_stmt default }
+  | BWhile { condition; body } ->
+      BWhile {
+        condition = strip_signed_program_expr condition;
+        body = List.map strip_signed_program_stmt body }
+  | BFor { init; condition; update; body } ->
+      BFor {
+        init = strip_signed_program_stmt init;
+        condition = strip_signed_program_expr condition;
+        update = strip_signed_program_stmt update;
+        body = List.map strip_signed_program_stmt body }
+  | BBlock ss -> BBlock (List.map strip_signed_program_stmt ss)
+  | BCallStmt { func; args } ->
+      BCallStmt { func;
+        args = List.map strip_signed_program_expr args }
+  | BReturn (Some e) -> BReturn (Some (strip_signed_program_expr e))
+  | BReturn None -> BReturn None
+
+let strip_signed_module bmod =
+  let processes' = List.map (function
+    | BCombinational { name; sensitivity; body } ->
+        BCombinational { name; sensitivity;
+          body = List.map strip_signed_program_stmt body }
+    | BSequential { name; clock; clock_edge; reset; reset_edge;
+                    reset_async; body } ->
+        BSequential { name; clock; clock_edge; reset; reset_edge;
+          reset_async;
+          body = List.map strip_signed_program_stmt body }
+  ) bmod.processes in
+  { bmod with processes = processes' }
+
+let strip_signed_program (prog : bprogram) : bprogram =
+  { prog with modules = List.map strip_signed_module prog.modules }

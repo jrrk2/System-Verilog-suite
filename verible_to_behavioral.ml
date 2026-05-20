@@ -1122,9 +1122,22 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                  || prefix_is "oct_based_number" t -> true
              | TK_DecNumber _ | TK_UnBasedNumber _ -> true
              | _ -> false) call_base in
-           (match cands with
-            | first :: _ -> recurse first
-            | [] -> recurse call_base)
+           let inner_b = match cands with
+             | first :: _ -> recurse first
+             | [] -> recurse call_base
+           in
+           (* Tag $signed(x) with an @signed marker — the downstream
+              Behavioral_const.normalize_bcall_args pass uses it to
+              pick sign-extension over zero-extension when widening
+              the value to a signed formal's width, and to push the
+              widening into the operands of a containing BBinOp so
+              the arithmetic happens at the wide width rather than
+              at the source-operand width.  $unsigned is already a
+              no-op at the BV level. *)
+           if name = "$signed" then
+             BCall { func = "@signed"; args = [inner_b] }
+           else
+             inner_b
        | _ ->
            (match eval_int ~pkgs ~params tok with
             | Some n -> BConst { value = n; width = 32 }
@@ -1140,7 +1153,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         | SymbolIdentifier id when !fname = None -> fname := Some id
         | _ -> ()) ref_node;
       (match !fname with
-       | Some ("$unsigned" | "$signed") ->
+       | Some (("$unsigned" | "$signed") as cast_name) ->
            (* Find the inner expression argument.  `reference` matches
               indexed/struct/bit-select forms (reference2/3/...), and
               `reference_or_call_base` matches nested calls — without
@@ -1159,9 +1172,20 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
              | TUPLE3 (STRING t, _, _) when prefix_is "unqualified_id" t -> true
              | TK_DecNumber _ -> true
              | _ -> false) call_base in
-           (match cands with
-            | first :: _ -> recurse first
-            | [] -> recurse call_base)
+           let inner_b = match cands with
+             | first :: _ -> recurse first
+             | [] -> recurse call_base
+           in
+           (* Mark `$signed(x)` with a BCall sentinel so downstream
+              passes (normalize_bcall_args) can sign-extend instead of
+              zero-extend when widening the value to a wider context
+              (e.g. the formal of a signed [31:0] function input).
+              $unsigned is structurally a no-op for BV semantics — its
+              value already lives in two's complement form. *)
+           if cast_name = "$signed" then
+             BCall { func = "@signed"; args = [inner_b] }
+           else
+             inner_b
        | Some name when (try name.[0] = '$' with _ -> false) ->
            (* Other $foo() — fall back to evaluating the integer
             * literal (works for $clog2 et al). *)
@@ -1334,19 +1358,31 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
            (match tag with
             | "3" ->
                 (* `signal[base +: width]`: bits [base+width-1 : base].
-                   When base is dynamic (e.g. a for-loop variable
-                   that unroll will later substitute), preserve the
-                   shape as a `@part_select_up` BCall so a downstream
-                   pass can fold it once base becomes constant. *)
+                   For dynamic base we lower to `(signal >> base) &
+                   {width{1'b1}}` so Verilator's pre-folded shift+mask
+                   shape and our verible-side encoding land on the
+                   same Z3 expression. A previous version emitted an
+                   `@part_select_up` BCall and relied on a downstream
+                   folder once the base went constant, but the BCall
+                   became an uninterpreted function on the verible
+                   side while Verilator's IR carried explicit
+                   shift+mask, and the two miter sides diverged. *)
                 (match eval_int ~pkgs ~params e1,
                        eval_int ~pkgs ~params e2 with
                  | Some b, Some w when w > 0 ->
                      BSlice { signal; msb = b + w - 1; lsb = b }
                  | _, Some w when w > 0 ->
-                     BCall { func = "@part_select_up";
-                             args = [signal;
-                                     recurse e1;
-                                     BConst { value = w; width = 32 }] }
+                     let base = recurse e1 in
+                     let result_t = BInt { width = w; signed = Unsigned } in
+                     let shifted = BBinOp {
+                       op = BShr; lhs = signal; rhs = base;
+                       result_type = result_t } in
+                     let mask = BConst {
+                       value = (if w >= 63 then -1
+                                else (1 lsl w) - 1);
+                       width = w } in
+                     BBinOp { op = BAnd; lhs = shifted; rhs = mask;
+                              result_type = result_t }
                  | _ -> signal)
             | "4" ->
                 (* `signal[base -: width]`: bits [base : base-width+1]. *)
@@ -1355,10 +1391,24 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                  | Some b, Some w when w > 0 ->
                      BSlice { signal; msb = b; lsb = b - w + 1 }
                  | _, Some w when w > 0 ->
-                     BCall { func = "@part_select_down";
-                             args = [signal;
-                                     recurse e1;
-                                     BConst { value = w; width = 32 }] }
+                     (* signal[base -: width] = bits [base : base-w+1]
+                        = (signal >> (base - w + 1)) & {w{1'b1}}. *)
+                     let base = recurse e1 in
+                     let result_t = BInt { width = w; signed = Unsigned } in
+                     let base_lsb = BBinOp {
+                       op = BSub;
+                       lhs = base;
+                       rhs = BConst { value = w - 1; width = 32 };
+                       result_type = BInt { width = 32; signed = Unsigned } } in
+                     let shifted = BBinOp {
+                       op = BShr; lhs = signal; rhs = base_lsb;
+                       result_type = result_t } in
+                     let mask = BConst {
+                       value = (if w >= 63 then -1
+                                else (1 lsl w) - 1);
+                       width = w } in
+                     BBinOp { op = BAnd; lhs = shifted; rhs = mask;
+                              result_type = result_t }
                  | _ -> signal)
             | _ ->
                 (* dimension 1 (range) or unknown → existing range
@@ -1502,7 +1552,25 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       else if prefix_is "logor_expr" tag then bin BOr lhs rhs
       else if prefix_is "shift_expr2" tag then bin BShl lhs rhs
       else if prefix_is "shift_expr3" tag then bin BShr lhs rhs
-      else if prefix_is "shift_expr4" tag then bin BAshr lhs rhs
+      else if prefix_is "shift_expr4" tag then
+        (* SV `>>>` is arithmetic right-shift but the LRM-spec'd fill
+         * depends on the LHS type: signed operands fill with the
+         * sign bit, unsigned operands fill with 0 (i.e. behave like
+         * `>>`). Verilator pre-applies this distinction; on the
+         * verible side our only signedness signal is whether the
+         * LHS got tagged with `$signed(...)` (an @signed BCall). If
+         * so emit BAshr, otherwise fall back to logical BShr so the
+         * two miter sides match on the common unsigned-RHS shift
+         * idiom `(unsigned_expr >>> k)`. *)
+        let lhs_bexpr = recurse lhs in
+        let is_signed_lhs = match lhs_bexpr with
+          | BCall { func = "@signed"; _ } -> true
+          | _ -> false
+        in
+        let op = if is_signed_lhs then BAshr else BShr in
+        let rhs_bexpr = recurse rhs in
+        BBinOp { op; lhs = lhs_bexpr; rhs = rhs_bexpr;
+                 result_type = result_type_for op lhs_bexpr rhs_bexpr }
       else if prefix_is "comp_expr2" tag then bin BLt lhs rhs
       else if prefix_is "comp_expr3" tag then bin BGt lhs rhs
       else if prefix_is "comp_expr4" tag then bin BLe lhs rhs
