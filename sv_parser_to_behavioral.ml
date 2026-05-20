@@ -75,9 +75,15 @@ let rec eval_const_expr ~params node =
   | Leaf { value; _ } -> int_of_token value
   | Node { name; children } ->
       match name with
-      | "ConstantExpressionBinary" ->
+      | "ConstantExpressionBinary" | "ExpressionBinary" ->
+          (* `ExpressionBinary` shows up inside SystemTfCall args, where
+             sv-parser uses the runtime Expression grammar even though
+             the surrounding context is a constant expression.  Same
+             shape: two Expression / ConstantExpression children and
+             a BinaryOperator. *)
           let exprs = List.filter_map (function
-            | Node { name = "ConstantExpression"; _ } as t -> Some t
+            | Node { name = ("ConstantExpression" | "Expression"); _ } as t ->
+                Some t
             | _ -> None) children in
           let op_str = List.find_map (function
             | Node { name = "BinaryOperator"; _ } as t -> first_leaf t
@@ -118,13 +124,47 @@ let rec eval_const_expr ~params node =
                Option.map lnot (eval_const_expr ~params o)
            | _ -> None)
       | "ConstantFunctionCall" ->
-          (* `W` in `[W-1:0]` lands here as a 1-token "function call"
-             with no arguments — really just a parameter reference. *)
-          let id_node = find_first node
-            ~name_is:(fun n -> n = "SimpleIdentifier") in
-          (match Option.bind id_node first_leaf with
-           | Some name -> List.assoc_opt name params
-           | None -> None)
+          (* Two shapes land here:
+             - `W` in `[W-1:0]` — a 1-token "function call" with no
+               arguments, really a parameter reference;
+             - `$clog2(SIZE+1)` and friends — system task call
+               wrapping a ConstantExpression.  Recognise the system
+               task via SystemTfIdentifier before falling back to the
+               bare-identifier interpretation (which would otherwise
+               grab SIZE from inside the call and evaluate the whole
+               thing as just SIZE). *)
+          let tf_name =
+            Option.bind
+              (find_first node
+                 ~name_is:(fun n -> n = "SystemTfIdentifier"))
+              first_leaf
+          in
+          (match tf_name with
+           | Some "$clog2" ->
+               let arg = find_first node
+                 ~name_is:(fun n -> n = "Expression"
+                                 || n = "ConstantExpression") in
+               (match Option.bind arg (eval_const_expr ~params) with
+                | Some n when n > 1 ->
+                    (* ceil(log2(n)): smallest k such that 2^k >= n. *)
+                    let k = ref 0 in
+                    let v = ref 1 in
+                    while !v < n do incr k; v := !v lsl 1 done;
+                    Some !k
+                | Some _ -> Some 0  (* $clog2(0) = $clog2(1) = 0 per LRM *)
+                | None -> None)
+           | Some ("$bits" | "$size") ->
+               let arg = find_first node
+                 ~name_is:(fun n -> n = "Expression"
+                                 || n = "ConstantExpression") in
+               Option.bind arg (eval_const_expr ~params)
+           | Some _ -> None
+           | None ->
+               let id_node = find_first node
+                 ~name_is:(fun n -> n = "SimpleIdentifier") in
+               (match Option.bind id_node first_leaf with
+                | Some name -> List.assoc_opt name params
+                | None -> None))
       | "SimpleIdentifier" ->
           (match first_leaf node with
            | Some name -> List.assoc_opt name params
@@ -527,14 +567,23 @@ let rec expr_to_bexpr ~params node =
            | Some e -> recurse e
            | None -> zero)
       | "PrimaryHierarchical" ->
-          (* `name[idx]` / `name[hi:lo]` / `name`. *)
+          (* `name[idx]` / `name[hi:lo]` / `name`.  If `name` matches
+             a known parameter, substitute the literal value (with
+             default int width 32) — the Z3 miter sees the substituted
+             constant rather than a free BVar, which would otherwise
+             let the solver assign it any value and find spurious
+             counterexamples. *)
           let id_name = identifier_name node in
           let select_node = find_first node
             ~name_is:(fun n -> n = "Select") in
           (match id_name with
            | None -> zero
            | Some n ->
-               let base = BVar n in
+               let base =
+                 match List.assoc_opt n params with
+                 | Some v -> BConst { value = v; width = 32 }
+                 | None -> BVar n
+               in
                (match select_node with
                 | None -> base
                 | Some s -> apply_select ~params base s))
