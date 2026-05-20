@@ -94,6 +94,44 @@ let pin_lhs cell name =
   | Some s -> sigspec_to_lhs s
   | None -> None
 
+(* Slice-aware lvalue: returns (name, Some (msb, lsb)) when the pin
+ * targets a wire slice (yosys splits multi-bit FFs across cells, each
+ * driving a different slice of the same parent wire), or
+ * (name, None) for whole-wire writes.  Concats/unsupported sigspecs
+ * return None.  Callers use this to decide between a plain BAssign
+ * (whole-wire) and a @slice_write BCallStmt (partial). *)
+let pin_lhs_slice cell name =
+  match pin cell name with
+  | Some (SigWire n) -> Some (n, None)
+  | Some (SigBit (n, b)) -> Some (n, Some (b, b))
+  | Some (SigRange (n, hi, lo)) -> Some (n, Some (hi, lo))
+  | _ -> None
+
+(* Build either a plain `lhs := rhs` or, when the cell drives a slice
+ * of the parent wire, `@slice_write(lhs, hi, lo, rhs)` so multiple
+ * sliced drivers can coexist without clobbering each other.
+ *
+ * When the rhs is a bare `BVar name` (self-read, used by FFs in
+ * their "keep" branches) and the cell writes only a slice, the rhs
+ * width must shrink to the slice width — otherwise the merge pass
+ * concats a wider value than the slice it represents.  Wrap with
+ * BSlice in that case. *)
+let assign_or_slice_write name slice rhs =
+  match slice with
+  | None -> BAssign { lhs = name; rhs }
+  | Some (hi, lo) ->
+      let rhs = match rhs with
+        | BVar n when n = name ->
+            BSlice { signal = BVar n; msb = hi; lsb = lo }
+        | _ -> rhs
+      in
+      BCallStmt {
+        func = "@slice_write";
+        args = [BVar name;
+                BConst { value = hi; width = 32 };
+                BConst { value = lo; width = 32 };
+                rhs] }
+
 let bool_t = BInt { width = 1; signed = Unsigned }
 let int_t w = BInt { width = w; signed = Unsigned }
 
@@ -101,28 +139,32 @@ let get_width cell pname =
   try int_of_string (List.assoc pname cell.cell_params)
   with _ -> 1
 
-(* Build a combinational process that drives `lhs` from `rhs`. *)
-let comb name lhs rhs =
+(* Build a combinational process that drives `lhs` from `rhs`.  When
+ * the cell's Y pin is sliced, emit @slice_write so the cross-cell
+ * merger can stitch sibling cells writing other slices of the same
+ * parent wire (the alternative — multiple BCombinationals all
+ * writing the full parent — clobbers via last-write-wins). *)
+let comb_sliced name (lhs, slice) rhs =
   Some (BCombinational {
     name;
     sensitivity = [BAny];
-    body = [BAssign { lhs; rhs }];
+    body = [assign_or_slice_write lhs slice rhs];
   })
 
 (* Convert a Yosys cell to a BIR process. Returns None when we don't
  * yet model the cell type. *)
 let cell_to_bprocess (c : rtlil_cell) =
   let bin_2 op result_w =
-    match pin_lhs c "Y", pin_expr c "A", pin_expr c "B" with
-    | Some lhs, Some a, Some b ->
-        comb (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst) lhs
+    match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B" with
+    | Some lhs_slice, Some a, Some b ->
+        comb_sliced (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst) lhs_slice
           (BBinOp { op; lhs = a; rhs = b; result_type = int_t result_w })
     | _ -> None
   in
   let un_1 op result_w =
-    match pin_lhs c "Y", pin_expr c "A" with
-    | Some lhs, Some a ->
-        comb (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst) lhs
+    match pin_lhs_slice c "Y", pin_expr c "A" with
+    | Some lhs_slice, Some a ->
+        comb_sliced (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst) lhs_slice
           (BUnOp { op; operand = a; result_type = int_t result_w })
     | _ -> None
   in
@@ -146,34 +188,35 @@ let cell_to_bprocess (c : rtlil_cell) =
   | "$le"               -> bin_2 BLe 1
   | "$gt"               -> bin_2 BGt 1
   | "$ge"               -> bin_2 BGe 1
-  (* Reductions. *)
+  (* Reductions.  `$reduce_bool` is yosys's "is any bit set" cell —
+     semantically equivalent to a 1-bit OR-reduction. *)
   | "$reduce_and"       -> un_1 BRedAnd 1
-  | "$reduce_or"        -> un_1 BRedOr 1
+  | "$reduce_or" | "$reduce_bool" -> un_1 BRedOr 1
   | "$reduce_xor"       -> un_1 BRedXor 1
   (* Logical AND/OR/NOT: SV `&&`, `||`, `!`. yosys reduces each operand
    * to 1 bit (any non-zero ⇒ true) before combining. For 1-bit
    * operands this is just bit-AND/OR/NOT; for wider operands we wrap
    * each input in BRedOr first so the semantics match. *)
   | "$logic_and" | "$logic_or" as ct ->
-      (match pin_lhs c "Y", pin_expr c "A", pin_expr c "B" with
-       | Some lhs, Some a, Some b ->
+      (match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B" with
+       | Some lhs_slice, Some a, Some b ->
            let red x = BUnOp { op = BRedOr; operand = x; result_type = bool_t } in
            let op = if ct = "$logic_and" then BAnd else BOr in
-           comb (Printf.sprintf "%s_%s" (strip_dollar ct) c.cell_inst) lhs
+           comb_sliced (Printf.sprintf "%s_%s" (strip_dollar ct) c.cell_inst) lhs_slice
              (BBinOp { op; lhs = red a; rhs = red b; result_type = bool_t })
        | _ -> None)
   | "$logic_not" ->
-      (match pin_lhs c "Y", pin_expr c "A" with
-       | Some lhs, Some a ->
+      (match pin_lhs_slice c "Y", pin_expr c "A" with
+       | Some lhs_slice, Some a ->
            let red = BUnOp { op = BRedOr; operand = a; result_type = bool_t } in
-           comb (Printf.sprintf "logic_not_%s" c.cell_inst) lhs
+           comb_sliced (Printf.sprintf "logic_not_%s" c.cell_inst) lhs_slice
              (BUnOp { op = BNot; operand = red; result_type = bool_t })
        | _ -> None)
   (* Mux: Y = S ? B : A *)
   | "$mux" | "$_MUX_" ->
-      (match pin_lhs c "Y", pin_expr c "A", pin_expr c "B", pin_expr c "S" with
-       | Some lhs, Some a, Some b, Some s ->
-           comb (Printf.sprintf "mux_%s" c.cell_inst) lhs
+      (match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B", pin_expr c "S" with
+       | Some lhs_slice, Some a, Some b, Some s ->
+           comb_sliced (Printf.sprintf "mux_%s" c.cell_inst) lhs_slice
              (BCond { condition = s; then_val = b; else_val = a })
        | _ -> None)
   (* Pass-through: Y = A. yosys-slang's `proc; flatten` flow uses
@@ -183,14 +226,14 @@ let cell_to_bprocess (c : rtlil_cell) =
    * this case those concat-driven outputs were unwired on the
    * yosys-slang side. *)
   | "$buf" | "$_BUF_" | "$pos" ->
-      (match pin_lhs c "Y", pin_expr c "A" with
-       | Some lhs, Some a ->
-           comb (Printf.sprintf "buf_%s" c.cell_inst) lhs a
+      (match pin_lhs_slice c "Y", pin_expr c "A" with
+       | Some lhs_slice, Some a ->
+           comb_sliced (Printf.sprintf "buf_%s" c.cell_inst) lhs_slice a
        | _ -> None)
   (* Flip-flops (positive-edge variants). *)
   | "$dff" | "$_DFF_P_" ->
-      (match pin_lhs c "Q", pin_expr c "D", pin c "CLK" with
-       | Some lhs, Some d, Some clk ->
+      (match pin_lhs_slice c "Q", pin_expr c "D", pin c "CLK" with
+       | Some (lhs, slice), Some d, Some clk ->
            let clk_name = match clk with SigWire n -> n | _ -> "clk" in
            Some (BSequential {
              name = Printf.sprintf "dff_%s" c.cell_inst;
@@ -199,14 +242,14 @@ let cell_to_bprocess (c : rtlil_cell) =
              reset = None;
              reset_edge = None;
              reset_async = false;
-             body = [BAssign { lhs; rhs = d }];
+             body = [assign_or_slice_write lhs slice d];
            })
        | _ -> None)
   (* Sync-reset flip-flop. Vivado calls this RTL_REG_SYNC; yosys emits
    * `$sdff`. Body: if (SRST==SRST_POL) q<=val; else q<=D. *)
   | "$sdff" ->
-      (match pin_lhs c "Q", pin_expr c "D", pin c "CLK", pin c "SRST" with
-       | Some lhs, Some d, Some clk, Some srst ->
+      (match pin_lhs_slice c "Q", pin_expr c "D", pin c "CLK", pin c "SRST" with
+       | Some (lhs, slice), Some d, Some clk, Some srst ->
            let clk_name = match clk with SigWire n -> n | _ -> "clk" in
            let rst_name = match srst with SigWire n -> n | _ -> "rst" in
            let rst_val = try
@@ -223,16 +266,16 @@ let cell_to_bprocess (c : rtlil_cell) =
              reset_async = false;
              body = [BIf {
                condition = BVar rst_name;
-               then_stmts = [BAssign { lhs; rhs = rst_val }];
-               else_stmts = [BAssign { lhs; rhs = d }];
+               then_stmts = [assign_or_slice_write lhs slice rst_val];
+               else_stmts = [assign_or_slice_write lhs slice d];
              }];
            })
        | _ -> None)
   (* Clock-enable flip-flop, no reset. Body: if (EN) q<=D. The else
    * branch keeps q (lhs <= lhs). *)
   | "$dffe" ->
-      (match pin_lhs c "Q", pin_expr c "D", pin c "CLK", pin_expr c "EN" with
-       | Some lhs, Some d, Some clk, Some en ->
+      (match pin_lhs_slice c "Q", pin_expr c "D", pin c "CLK", pin_expr c "EN" with
+       | Some (lhs, slice), Some d, Some clk, Some en ->
            let clk_name = match clk with SigWire n -> n | _ -> "clk" in
            Some (BSequential {
              name = Printf.sprintf "dffe_%s" c.cell_inst;
@@ -243,16 +286,16 @@ let cell_to_bprocess (c : rtlil_cell) =
              reset_async = false;
              body = [BIf {
                condition = en;
-               then_stmts = [BAssign { lhs; rhs = d }];
-               else_stmts = [BAssign { lhs; rhs = BVar lhs }];
+               then_stmts = [assign_or_slice_write lhs slice d];
+               else_stmts = [assign_or_slice_write lhs slice (BVar lhs)];
              }];
            })
        | _ -> None)
   (* Async-reset flip-flop. *)
   | "$adff" | "$_DFF_PP0_" | "$_DFF_PP1_" ->
-      (match pin_lhs c "Q", pin_expr c "D",
+      (match pin_lhs_slice c "Q", pin_expr c "D",
              pin c "CLK", pin c "ARST" with
-       | Some lhs, Some d, Some clk, Some arst ->
+       | Some (lhs, slice), Some d, Some clk, Some arst ->
            let clk_name = match clk with SigWire n -> n | _ -> "clk" in
            let rst_name = match arst with SigWire n -> n | _ -> "rst" in
            let rst_val = try
@@ -261,17 +304,27 @@ let cell_to_bprocess (c : rtlil_cell) =
              pv
            with Not_found -> BConst { value = 0; width = yw }
            in
+           let rst_pol =
+             try int_of_string (List.assoc "ARST_POLARITY" c.cell_params)
+             with _ -> 1
+           in
+           let rst_cond =
+             let v = BVar rst_name in
+             if rst_pol = 0
+             then BUnOp { op = BNot; operand = v; result_type = bool_t }
+             else v
+           in
            Some (BSequential {
              name = Printf.sprintf "adff_%s" c.cell_inst;
              clock = clk_name;
              clock_edge = `Pos;
              reset = Some rst_name;
-             reset_edge = Some `Pos;
+             reset_edge = Some (if rst_pol = 0 then `Neg else `Pos);
              reset_async = true;
              body = [BIf {
-               condition = BVar rst_name;
-               then_stmts = [BAssign { lhs; rhs = rst_val }];
-               else_stmts = [BAssign { lhs; rhs = d }];
+               condition = rst_cond;
+               then_stmts = [assign_or_slice_write lhs slice rst_val];
+               else_stmts = [assign_or_slice_write lhs slice d];
              }];
            })
        | _ -> None)
@@ -292,9 +345,9 @@ let cell_to_bprocess (c : rtlil_cell) =
    * free wire with no D-side process, which made every Z3 miter on
    * yosys-slang output mis-compute the next-state. *)
   | "$aldff" ->
-      (match pin_lhs c "Q", pin_expr c "D",
+      (match pin_lhs_slice c "Q", pin_expr c "D",
              pin c "CLK", pin c "ALOAD", pin_expr c "AD" with
-       | Some lhs, Some d, Some clk, Some aload, Some ad ->
+       | Some (lhs, slice), Some d, Some clk, Some aload, Some ad ->
            let clk_name = match clk with SigWire n -> n | _ -> "clk" in
            let aload_name = match aload with SigWire n -> n | _ -> "aload" in
            let aload_pol =
@@ -316,15 +369,15 @@ let cell_to_bprocess (c : rtlil_cell) =
              reset_async = true;
              body = [BIf {
                condition = cond;
-               then_stmts = [BAssign { lhs; rhs = ad }];
-               else_stmts = [BAssign { lhs; rhs = d }];
+               then_stmts = [assign_or_slice_write lhs slice ad];
+               else_stmts = [assign_or_slice_write lhs slice d];
              }];
            })
        | _ -> None)
   | "$adffe" ->
-      (match pin_lhs c "Q", pin_expr c "D",
+      (match pin_lhs_slice c "Q", pin_expr c "D",
              pin c "CLK", pin c "ARST", pin_expr c "EN" with
-       | Some lhs, Some d, Some clk, Some arst, Some en ->
+       | Some (lhs, slice), Some d, Some clk, Some arst, Some en ->
            let clk_name = match clk with SigWire n -> n | _ -> "clk" in
            let rst_name = match arst with SigWire n -> n | _ -> "rst" in
            let rst_val = try
@@ -332,21 +385,69 @@ let cell_to_bprocess (c : rtlil_cell) =
              sigspec_to_bexpr (SigConst v)
            with Not_found -> BConst { value = 0; width = yw }
            in
+           let rst_pol =
+             try int_of_string (List.assoc "ARST_POLARITY" c.cell_params)
+             with _ -> 1
+           in
+           let rst_cond =
+             let v = BVar rst_name in
+             if rst_pol = 0
+             then BUnOp { op = BNot; operand = v; result_type = bool_t }
+             else v
+           in
+           let en_pol =
+             try int_of_string (List.assoc "EN_POLARITY" c.cell_params)
+             with _ -> 1
+           in
+           let en_cond =
+             if en_pol = 0
+             then BUnOp { op = BNot; operand = en; result_type = bool_t }
+             else en
+           in
            Some (BSequential {
              name = Printf.sprintf "adffe_%s" c.cell_inst;
              clock = clk_name;
              clock_edge = `Pos;
              reset = Some rst_name;
-             reset_edge = Some `Pos;
+             reset_edge = Some (if rst_pol = 0 then `Neg else `Pos);
              reset_async = true;
              body = [BIf {
-               condition = BVar rst_name;
-               then_stmts = [BAssign { lhs; rhs = rst_val }];
+               condition = rst_cond;
+               then_stmts = [assign_or_slice_write lhs slice rst_val];
                else_stmts = [BIf {
-                 condition = en;
-                 then_stmts = [BAssign { lhs; rhs = d }];
-                 else_stmts = [BAssign { lhs; rhs = BVar lhs }];
+                 condition = en_cond;
+                 then_stmts = [assign_or_slice_write lhs slice d];
+                 else_stmts = [assign_or_slice_write lhs slice (BVar lhs)];
                }];
+             }];
+           })
+       | _ -> None)
+  (* D-latch. `$dlatch` is a level-sensitive transparent latch:
+       Q := EN_active ? D : prev_Q
+     Yosys emits these for SV `always_latch` blocks.  Model in BIR
+     as a BCombinational with an if-then keeping the prior value in
+     the else — Z3 sees q_next = en ? d : q.  Latches in SV-RTL are
+     usually unintentional; treating them this way lets the miter
+     match other frontends that lower the same construct. *)
+  | "$dlatch" ->
+      (match pin_lhs_slice c "Q", pin_expr c "D", pin_expr c "EN" with
+       | Some (lhs, slice), Some d, Some en ->
+           let en_pol =
+             try int_of_string (List.assoc "EN_POLARITY" c.cell_params)
+             with _ -> 1
+           in
+           let en_cond =
+             if en_pol = 0
+             then BUnOp { op = BNot; operand = en; result_type = bool_t }
+             else en
+           in
+           Some (BCombinational {
+             name = Printf.sprintf "dlatch_%s" c.cell_inst;
+             sensitivity = [BAny];
+             body = [BIf {
+               condition = en_cond;
+               then_stmts = [assign_or_slice_write lhs slice d];
+               else_stmts = [assign_or_slice_write lhs slice (BVar lhs)];
              }];
            })
        | _ -> None)
@@ -376,6 +477,311 @@ let sigspec_to_partial_lhs = function
   | SigBit (n, b) -> Some (n, Some (b, b))
   | SigRange (n, hi, lo) -> Some (n, Some (hi, lo))
   | _ -> None
+
+(* ── Cross-cell sliced-FF merge ─────────────────────────────────────
+   yosys's `opt -fast` (and the underlying opt_dff sub-pass) splits a
+   single multi-bit always-block into one $adff/$adffe/$dff/$dffe per
+   slice of the parent wire — e.g. iCounter[3:0] driven by an $adffe,
+   iCounter[4] driven by an $adff.  Our cell handlers honour the Q
+   pin's slice info and emit @slice_write inside the BSequential body,
+   but behavioral_to_z3 doesn't model @slice_write — without merging,
+   the Z3 lowering silently drops both slices and iCounter has no
+   driver, mis-computing every next-state.
+
+   Strategy: group BSequentials by clocking signature (clock name +
+   edge, reset name + edge + sync/async); for each group, gather every
+   @slice_write leaf with its target name, slice bounds, and full
+   cond-chain from the body's root.  If a group writes a single target
+   with disjoint slices that together cover the wire's width, rebuild
+   the body as a single full-width BAssign whose RHS is the BConcat of
+   each cell's contribution per cond-chain.  Other groups are left
+   intact (the per-cell processes pass through unchanged).             *)
+
+type clock_sig = {
+  clock : string;
+  clock_edge : [`Pos | `Neg];
+  reset : string option;
+  reset_edge : [`Pos | `Neg] option;
+  reset_async : bool;
+}
+
+let clock_sig_of (s : sensitivity list) = ignore s; ()
+let clock_sig_of_seq (clock, clock_edge, reset, reset_edge, reset_async) =
+  { clock; clock_edge; reset; reset_edge; reset_async }
+
+(* Walk a stmt list, accumulating @slice_write leaves with the
+   sequence of (cond, is_then) branches taken to reach each one. *)
+type slice_leaf = {
+  cond_chain : (bexpr * bool) list;
+  target : string;
+  hi : int;
+  lo : int;
+  rhs : bexpr;
+}
+
+let rec collect_slices chain acc = function
+  | [] -> acc
+  | s :: rest ->
+      let acc = collect_one chain acc s in
+      collect_slices chain acc rest
+
+and collect_one chain acc = function
+  | BCallStmt { func = "@slice_write";
+                args = [BVar t;
+                        BConst { value = hi; _ };
+                        BConst { value = lo; _ };
+                        rhs] } ->
+      { cond_chain = List.rev chain; target = t; hi; lo; rhs } :: acc
+  | BBlock ss -> collect_slices chain acc ss
+  | BIf { condition; then_stmts; else_stmts } ->
+      let acc = collect_slices ((condition, true) :: chain) acc then_stmts in
+      collect_slices ((condition, false) :: chain) acc else_stmts
+  | _ -> acc
+
+(* Evaluate a body under a cond-chain, returning the slice-write rhs
+   the cell would commit, or None if the chain doesn't lead to a
+   slice-write leaf.  Used to fill in a cell's value at a refined
+   cond-chain produced by another cell's branching. *)
+let rec eval_body_at chain stmts =
+  let rec walk = function
+    | [] -> None
+    | s :: rest ->
+        (match walk_one s with
+         | Some r -> Some r
+         | None -> walk rest)
+  and walk_one = function
+    | BCallStmt { func = "@slice_write";
+                  args = [_; _; _; rhs] } -> Some rhs
+    | BBlock ss -> walk ss
+    | BIf { condition; then_stmts; else_stmts } ->
+        (match List.assoc_opt condition chain with
+         | Some true -> walk then_stmts
+         | Some false -> walk else_stmts
+         | None ->
+             (* Cell doesn't case-split on this condition; if both
+                branches yield the same value, take it.  Otherwise
+                we can't summarise. *)
+             (match walk then_stmts, walk else_stmts with
+              | Some a, Some b when a = b -> Some a
+              | _ -> None))
+    | _ -> None
+  in
+  walk stmts
+
+(* Given a list of leaves from one cell, return the unique cond-chains
+   (in body order). *)
+let unique_chains leaves =
+  let seen = Hashtbl.create 8 in
+  List.fold_left (fun acc l ->
+    if Hashtbl.mem seen l.cond_chain then acc
+    else (Hashtbl.add seen l.cond_chain (); l.cond_chain :: acc))
+    [] leaves
+  |> List.rev
+
+(* Reconstruct a BIf-tree from a list of (cond_chain, leaf_stmt)
+   pairs.  Walks the chains as a decision tree, building BIf nodes
+   for each split point.  Assumes chains share a common prefix
+   structure (the first differing condition becomes the BIf). *)
+let rec rebuild_tree groups =
+  match groups with
+  | [] -> []
+  | [(([], stmt))] -> [stmt]
+  | _ ->
+      (* All entries should start with the same head condition; split
+         by then/else and recurse. *)
+      let heads = List.map (fun (chain, _) -> List.nth_opt chain 0) groups in
+      let common_cond = match heads with
+        | Some (c, _) :: _ -> Some c
+        | _ -> None
+      in
+      (match common_cond with
+       | None ->
+           (* Mixed empty + non-empty: just emit the first stmt; loses
+              info but is safe. *)
+           (match groups with
+            | (_, s) :: _ -> [s]
+            | [] -> [])
+       | Some c ->
+           let strip = List.map (fun (chain, s) ->
+             match chain with
+             | (c0, _) :: rest when c0 = c -> rest, s
+             | _ -> chain, s) groups in
+           let then_g = List.filter (fun (chain, _) ->
+             match chain with (_, true) :: _ -> false | _ -> true) groups in
+           let else_g = List.filter (fun (chain, _) ->
+             match chain with (_, false) :: _ -> false | _ -> true) groups in
+           ignore strip;
+           let then_stmts = rebuild_tree (List.map (fun (chain, s) ->
+             match chain with (_, true) :: rest -> rest, s | _ -> chain, s)
+             then_g) in
+           let else_stmts = rebuild_tree (List.map (fun (chain, s) ->
+             match chain with (_, false) :: rest -> rest, s | _ -> chain, s)
+             else_g) in
+           [BIf { condition = c;
+                  then_stmts; else_stmts }])
+
+(* Convert a cell's body (a BIf tree whose leaves are @slice_write)
+   into a single bexpr that returns the slice's next-state value.
+   Each BIf becomes a BCond.  Returns None when the body has shape
+   we don't recognise (multiple leaves at the same conditional path,
+   non-slice-write leaves, etc.). *)
+let rec body_to_slice_expr stmts =
+  match stmts with
+  | [BCallStmt { func = "@slice_write";
+                 args = [_; _; _; rhs] }] -> Some rhs
+  | [BBlock ss] -> body_to_slice_expr ss
+  | [BIf { condition; then_stmts; else_stmts }] ->
+      (match body_to_slice_expr then_stmts,
+             body_to_slice_expr else_stmts with
+       | Some t, Some e ->
+           Some (BCond { condition; then_val = t; else_val = e })
+       | _ -> None)
+  | _ -> None
+
+(* Build the merged body of a group of co-clocked BSequentials that
+   together write disjoint slices of a single target signal.  Returns
+   None when slices aren't a clean disjoint cover or any cell body
+   doesn't reduce to a single BCond chain. *)
+let merge_one_group ~width ~target processes =
+  (* Each cell: extract its slice span (from its first leaf) and its
+     body-as-expression.  Synth tools always emit one slice per
+     cell, so all leaves of one cell share (hi, lo). *)
+  let cell_info = List.map (fun proc ->
+    let body = match proc with
+      | BSequential { body; _ } -> body
+      | BCombinational { body; _ } -> body
+    in
+    let leaves = collect_slices [] [] body in
+    match leaves with
+    | [] -> None
+    | l0 :: _ ->
+        if List.for_all (fun l ->
+              l.target = target && l.hi = l0.hi && l.lo = l0.lo) leaves
+        then
+          (match body_to_slice_expr body with
+           | Some expr -> Some (l0.hi, l0.lo, expr)
+           | None -> None)
+        else None) processes
+  in
+  if List.exists Option.is_none cell_info then None
+  else
+    let cells = List.map Option.get cell_info in
+    (* Sort by descending hi (msb first for concat). *)
+    let sorted = List.sort (fun (a, _, _) (b, _, _) -> compare b a) cells in
+    (* Disjoint-cover check from msb down to 0. *)
+    let rec check_cover cursor = function
+      | [] -> cursor = -1
+      | (hi, lo, _) :: rest ->
+          if hi = cursor && lo <= hi
+          then check_cover (lo - 1) rest
+          else false
+    in
+    if not (check_cover (width - 1) sorted) then None
+    else
+      let parts = List.map (fun (_, _, expr) -> expr) sorted in
+      let rhs = match parts with
+        | [single] -> single
+        | many -> BConcat many in
+      Some [BAssign { lhs = target; rhs }]
+
+let merge_sliced_ff_processes ~wire_widths processes =
+  let seq_key = function
+    | BSequential { clock; clock_edge; reset; reset_edge; reset_async; _ } ->
+        Some (clock_sig_of_seq (clock, clock_edge, reset, reset_edge, reset_async))
+    | BCombinational _ -> None
+  in
+  (* Bucket BSequentials by clocking signature.  BCombinationals
+     don't share clocks, so group them by target instead — combine
+     all combinational processes whose @slice_write writes touch the
+     same wire.  We tag the comb bucket with a synthetic clock_sig
+     where `clock` carries the target name; that's only used as a
+     hash key, not interpreted as a signal. *)
+  let by_clock : (clock_sig, bprocess list) Hashtbl.t = Hashtbl.create 8 in
+  let body_of = function
+    | BSequential { body; _ } | BCombinational { body; _ } -> body
+  in
+  let target_of_proc p =
+    let leaves = collect_slices [] [] (body_of p) in
+    match leaves with
+    | [] -> None
+    | l0 :: _ ->
+        if List.for_all (fun l -> l.target = l0.target) leaves
+        then Some l0.target else None
+  in
+  List.iter (fun p ->
+    match seq_key p with
+    | Some k ->
+        let cur = try Hashtbl.find by_clock k with Not_found -> [] in
+        Hashtbl.replace by_clock k (p :: cur)
+    | None ->
+        (* Combinational: only consider for merging if its body has
+           a @slice_write leaf with a recoverable target. *)
+        (match target_of_proc p with
+         | None -> ()
+         | Some t ->
+             let synthetic = {
+               clock = "@comb:" ^ t; clock_edge = `Pos;
+               reset = None; reset_edge = None; reset_async = false } in
+             let cur = try Hashtbl.find by_clock synthetic with Not_found -> [] in
+             Hashtbl.replace by_clock synthetic (p :: cur))) processes;
+  (* Find groups whose every member's @slice_write leaves all reference
+     the same target.  Single-process buckets are still pushed through
+     to normalise their bodies (replacing @slice_write with an
+     RMW-style BAssign so behavioral_to_z3 sees a concrete driver). *)
+  let merged : (bprocess, bprocess) Hashtbl.t = Hashtbl.create 8 in
+  let dropped : bprocess list ref = ref [] in
+  Hashtbl.iter (fun k procs ->
+    if List.length procs < 2 then ()
+    else begin
+      ignore k;
+      (* All procs must have a single target; collect the target sets
+         per proc; if they all share exactly one target, merge. *)
+      let targets = List.map (fun p ->
+        let body = match p with
+          | BSequential { body; _ } | BCombinational { body; _ } -> body in
+        let leaves = collect_slices [] [] body in
+        match leaves with
+        | [] -> None
+        | l0 :: _ ->
+            if List.for_all (fun l -> l.target = l0.target) leaves
+            then Some l0.target else None) procs in
+      let common_target = match targets with
+        | Some t :: rest when List.for_all (fun o -> o = Some t) rest -> Some t
+        | _ -> None
+      in
+      (match common_target with
+      | None -> ()
+      | Some target ->
+          let w = try List.assoc target wire_widths with Not_found -> 0 in
+          if w = 0 then ()
+          else
+            (match merge_one_group ~width:w ~target procs with
+            | None -> ()
+            | Some body ->
+                let template = List.hd procs in
+                let merged_proc =
+                  (match template with
+                  | BSequential s ->
+                      BSequential { s with
+                        name = Printf.sprintf "merged_%s" target;
+                        body }
+                  | BCombinational c ->
+                      BCombinational { c with
+                        name = Printf.sprintf "merged_%s" target;
+                        body })
+                in
+                Hashtbl.add merged template merged_proc;
+                List.iter (fun p -> dropped := p :: !dropped)
+                  (List.tl procs)))
+    end) by_clock;
+  (* Walk the original list, replacing merged-template procs and
+     dropping the rest of each merged group. *)
+  let dropset = !dropped in
+  List.filter_map (fun p ->
+    if List.exists (fun d -> d == p) dropset then None
+    else match Hashtbl.find_opt merged p with
+      | Some replacement -> Some replacement
+      | None -> Some p) processes
 
 (* Top-level: convert one RTLIL module → bmodule. Direct wire-to-wire
  * connections (`connect \dst \src`) become BCombinational with a
@@ -462,6 +868,10 @@ let module_to_bmodule (m : rtlil_module) : bmodule =
     ) groups []
   in
   ignore !unsupported_connects;
+  (* Build a lookup of every wire's declared width — feed to the
+     cross-cell sliced-FF merger so it can verify disjoint coverage. *)
+  let wire_widths = List.map (fun w -> w.wire_name, w.wire_width) m.mod_wires in
+  let cell_procs = merge_sliced_ff_processes ~wire_widths cell_procs in
   {
     name = m.mod_name;
     params = [];

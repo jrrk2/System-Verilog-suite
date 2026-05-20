@@ -110,6 +110,47 @@ let run_yosys_to_rtlil ~top ~files ~out =
   (try Sys.remove script with _ -> ());
   if rc <> 0 then failwith (Printf.sprintf "yosys exit %d" rc)
 
+(* synlig is a yosys fork that reads SystemVerilog through Surelog,
+ * emitting yosys-compatible RTLIL.  Same downstream consumer
+ * (Rtlil_to_behavioral); the only difference is the read script. *)
+let find_synlig () =
+  let env_override = Sys.getenv_opt "SYNLIG_BIN" in
+  let home = try Sys.getenv "HOME" with Not_found -> "" in
+  let candidates =
+    (match env_override with Some s -> [s] | None -> [])
+    @ [
+      home ^ "/synlig/build/release/synlig/synlig";
+      "/usr/local/bin/synlig";
+      "/usr/bin/synlig";
+      "synlig";
+    ]
+  in
+  List.find_opt (fun p ->
+    Sys.file_exists p
+    || (try
+          let ic = Unix.open_process_in
+                     (Printf.sprintf "command -v %s 2>/dev/null" (Filename.quote p)) in
+          let r = (try input_line ic with End_of_file -> "") in
+          ignore (Unix.close_process_in ic); r <> ""
+        with _ -> false)) candidates
+
+let run_synlig_to_rtlil ~top ~files ~out =
+  let synlig = match find_synlig () with
+    | Some s -> s
+    | None -> failwith "synlig not found (set SYNLIG_BIN)" in
+  let script = Filename.temp_file "synlig_" ".ys" in
+  let oc = open_out script in
+  Printf.fprintf oc "read_systemverilog %s\n" (String.concat " " files);
+  Printf.fprintf oc
+    "hierarchy -top %s\nproc\nopt -fast\nflatten\nopt -fast\n" top;
+  Printf.fprintf oc "write_rtlil %s\n" out;
+  close_out oc;
+  let rc = Sys.command
+             (Printf.sprintf "%s -q -s %s 2>&1"
+                (Filename.quote synlig) (Filename.quote script)) in
+  (try Sys.remove script with _ -> ());
+  if rc <> 0 then failwith (Printf.sprintf "synlig exit %d" rc)
+
 let load_frontend ~frontend ~top ~files : bprogram =
   match frontend with
   | "verible" ->
@@ -133,6 +174,40 @@ let load_frontend ~frontend ~top ~files : bprogram =
             | Some p -> p
             | None -> failwith "verilator JSON parse failed")
        | _ -> failwith "verilator frontend takes a single .json")
+  | "synlig" ->
+      (* synlig (yosys fork using Surelog SV frontend).  Same RTLIL
+         path as the yosys frontend; different read script. *)
+      let tmp = Filename.temp_file "synlig_" ".il" in
+      run_synlig_to_rtlil ~top ~files ~out:tmp;
+      let p = Rtlil_to_behavioral.convert_file tmp in
+      (try Sys.remove tmp with _ -> ());
+      p
+  | "sv-parser" ->
+      (* dalance/sv-parser oracle: parse via the `parse_sv -t` dump
+         and walk the CST into BIR.  Multi-file builds concatenate
+         each file's modules into one bprogram so the miter can
+         find the requested top.  Falls back to a no-op program on
+         per-file parse failure so a partial set still resolves.
+         Same normalisation pipeline that test_verilator_vs_verible
+         runs on the verilator/verible IRs — sv-parser's MVP emits
+         unsized literals at their nominal 32-bit width, so the
+         expand_fills + normalize_bcall_args + strip_signed_markers
+         passes fix LHS-width / formal-width / sign-marker shape
+         before the miter sees them. *)
+      let combined = List.fold_left (fun acc f ->
+        match Sv_parser_to_behavioral.convert_file f with
+        | Ok p -> { modules = acc.modules @ p.modules;
+                    library_cells = acc.library_cells }
+        | Error e ->
+            Printf.eprintf "sv-parser: %s: %s\n" f e;
+            acc) { modules = []; library_cells = [] } files in
+      if combined.modules = [] then
+        failwith "sv-parser frontend produced no modules";
+      combined
+      |> Behavioral_const.fold_ffs_program
+      |> Behavioral_const.normalize_bcall_args_program
+      |> Behavioral_const.expand_fills_program
+      |> Behavioral_const.strip_signed_program
   | "vhdl" ->
       (match files with
        | [f] ->

@@ -129,6 +129,32 @@ let rec eval_const_expr ~params node =
           (match first_leaf node with
            | Some name -> List.assoc_opt name params
            | None -> None)
+      | "PrimaryHierarchical" ->
+          (* Bare identifier reference appearing inside an Expression
+             (not a ConstantExpression).  Only constant-foldable when
+             the Select subtree carries no actual bit/part selectors
+             — otherwise the value is a runtime indexed lookup, which
+             we can't fold. *)
+          let id_node = find_first node
+            ~name_is:(fun n -> n = "SimpleIdentifier") in
+          let has_real_select =
+            match find_first node ~name_is:(fun n -> n = "Select") with
+            | Some s ->
+                let inner = find_first s
+                  ~name_is:(fun n -> n = "BitSelect"
+                                  || n = "PartSelectRange"
+                                  || n = "ConstantBitSelect"
+                                  || n = "ConstantPartSelectRange") in
+                (match inner with
+                 | Some (Node { children; _ }) -> children <> []
+                 | _ -> false)
+            | None -> false
+          in
+          if has_real_select then None
+          else
+            (match Option.bind id_node first_leaf with
+             | Some name -> List.assoc_opt name params
+             | None -> None)
       | "UnsignedNumber" | "DecimalNumber"
       | "IntegralNumber" | "Number"
       | "PrimaryLiteral" ->
@@ -418,18 +444,30 @@ let rec expr_to_bexpr ~params node =
           (match children with
            | [c] -> recurse c
            | _ ->
-               (* Multi-child: typically Expression ? Expression : Expression
-                  (conditional). Look for "Expression" children, "?", ":". *)
+               (* ConditionalExpression in sv-parser's CST is laid out
+                  as: CondPredicate, '?', Expression, ':', Expression.
+                  The condition lives in CondPredicate (which itself
+                  wraps an ExpressionOrCondPattern→Expression), NOT in
+                  a top-level "Expression" child.  Pick it explicitly. *)
+               let cond_node = List.find_opt (function
+                 | Node { name = ("CondPredicate"
+                               | "ExpressionOrCondPattern"); _ } -> true
+                 | _ -> false) children in
                let exprs = List.filter (function
                  | Node { name = "Expression"; _ } -> true
                  | _ -> false) children in
-               (match exprs with
-                | [cond; t; e] ->
+               (match cond_node, exprs with
+                | Some c, [t; e] ->
+                    BCond {
+                      condition = recurse c;
+                      then_val  = recurse t;
+                      else_val  = recurse e }
+                | None, [cond; t; e] ->
                     BCond {
                       condition = recurse cond;
                       then_val  = recurse t;
                       else_val  = recurse e }
-                | [single] -> recurse single
+                | _, [single] -> recurse single
                 | _ -> zero))
       | "ExpressionBinary" ->
           let exprs = List.filter (function
@@ -512,6 +550,34 @@ let rec expr_to_bexpr ~params node =
                 | [] -> zero
                 | _ -> BConcat parts)
            | _ -> zero)
+      | "SystemTfCallArgExpression" | "SystemTfCall"
+      | "FunctionSubroutineCall" | "SubroutineCall" ->
+          (* `$name(arg, ...)` system task call.  SystemTfCall has a
+             single SystemTfCallArgExpression child; the identifier
+             and arguments live there.  Walk the subtree to find the
+             identifier and the first inner Expression — that's the
+             argument for cast-style ($signed/$unsigned/$clog2) calls.
+             For sign casts we wrap in a @signed marker BCall; for
+             $unsigned we just recurse (our IR is width-typed without
+             explicit signedness on expressions, so $unsigned is a
+             no-op at this level). *)
+          let self = Node { name; children } in
+          let id_name =
+            Option.bind
+              (find_first self ~name_is:(fun n -> n = "SystemTfIdentifier"))
+              first_leaf
+          in
+          let inner = find_first self ~name_is:(fun n -> n = "Expression") in
+          (match id_name, inner with
+           | Some "$signed", Some e ->
+               BCall { func = "@signed"; args = [recurse e] }
+           | Some "$unsigned", Some e ->
+               recurse e
+           | _, Some e ->
+               (* Other tasks: recurse so something flows downstream,
+                  but downstream may not model the semantics. *)
+               recurse e
+           | _, None -> zero)
       | "PrimaryMultipleConcatenation" ->
           (* `{N{value}}` — outer concat with one inner expr_list. *)
           let nodes_named name =
@@ -674,6 +740,50 @@ let extract_lvalue_name node =
                     || n = "HierarchicalIdentifier") in
   Option.bind id identifier_name
 
+(* Pull a (msb, lsb) pair out of an Lvalue's Select subtree.  Only
+ * succeeds for *constant* bit/part-selects (variable indices fall
+ * back to whole-signal write — semantically wrong, but the same
+ * limitation as the Verible frontend's dynamic LHS path).  Returns
+ * None when the Lvalue is a plain identifier (no bit/part select). *)
+let extract_lvalue_const_slice ~params node =
+  let sel = find_first node ~name_is:(fun n -> n = "Select") in
+  match sel with
+  | None -> None
+  | Some s ->
+      (* Two shapes: ConstantBitSelect [k] or ConstantPartSelectRange [hi:lo]
+         — also the unconstrained-name "BitSelect" (empty child list) shows
+         up when there's no actual select. *)
+      let bit = find_first s ~name_is:(fun n -> n = "ConstantBitSelect"
+                                            || n = "BitSelect") in
+      let range = find_first s ~name_is:(fun n -> n = "ConstantPartSelectRange"
+                                             || n = "PartSelectRange") in
+      (match bit, range with
+       | Some (Node { children = []; _ }), None -> None
+       | Some b, _ ->
+           (* Single bit: [k] *)
+           let e = find_first b ~name_is:(fun n -> n = "Expression"
+                                              || n = "ConstantExpression") in
+           (match Option.bind e (eval_const_expr ~params) with
+            | Some k -> Some (k, k)
+            | None -> None)
+       | None, Some r ->
+           let exprs = match r with
+             | Node { children; _ } ->
+                 List.filter_map (function
+                   | Node { name = ("Expression" | "ConstantExpression"); _ } as t ->
+                       Some t
+                   | _ -> None) children
+             | _ -> []
+           in
+           (match exprs with
+            | [hi_e; lo_e] ->
+                (match eval_const_expr ~params hi_e,
+                       eval_const_expr ~params lo_e with
+                 | Some hi, Some lo -> Some (hi, lo)
+                 | _ -> None)
+            | _ -> None)
+       | _ -> None)
+
 (* Convert a CST Statement subtree to a bstmt. Unsupported shapes
  * collapse to BBlock [] so the surrounding always-body keeps its
  * structure but the unknown branch drops to a no-op.  Recognised
@@ -691,6 +801,7 @@ let rec stmt_to_bstmt ~params node =
   | Node { name; children } ->
       match name with
       | "Statement" | "StatementOrNull" | "StatementItem"
+      | "FunctionStatementOrNull" | "FunctionStatement"
       | "SubroutineCallStatement" ->
           (* Single-child wrappers — recurse.  When there's more
              than one child (StatementItem usually has the actual
@@ -708,6 +819,7 @@ let rec stmt_to_bstmt ~params node =
                       | "LoopStatement"
                       | "SubroutineCallStatement"
                       | "StatementItem" | "Statement" | "StatementOrNull"
+                      | "FunctionStatement" | "FunctionStatementOrNull"
                       ); _ } -> true
                  | _ -> false
                in
@@ -790,15 +902,50 @@ let rec stmt_to_bstmt ~params node =
       | "CaseStatementNormal" ->
           extract_case ~params children
       | "NonblockingAssignment" | "BlockingAssignment" ->
-          let lhs_node = find_first node
-            ~name_is:(fun n -> n = "VariableLvalue"
-                            || n = "NetLvalue") in
-          let rhs_node = find_first node
-            ~name_is:(fun n -> n = "Expression") in
+          (* CST shape differs by kind:
+               BlockingAssignment    → [OperatorAssignment]
+               OperatorAssignment    → VariableLvalue '=' Expression
+               NonblockingAssignment → VariableLvalue '<=' Expression
+             In both cases the LHS+RHS live as *direct* children of one
+             specific level — picking them via a recursive `find_first`
+             on the outer node would mis-land on an Expression nested
+             inside the LHS bit-select (e.g. `a[i] <= e` puts `i` in
+             pre-order before `e`).  So drill to the right level first
+             and then select direct children there. *)
+          let pick_level () =
+            (* For BlockingAssignment, unwrap a single OperatorAssignment
+               child; for NonblockingAssignment, use the node itself. *)
+            match children with
+            | [Node { name = "OperatorAssignment"; children = oc }] -> oc
+            | _ -> children
+          in
+          let level = pick_level () in
+          let direct kind = List.find_opt (function
+            | Node { name; _ } -> name = kind
+            | _ -> false) level in
+          let lhs_node = match direct "VariableLvalue", direct "NetLvalue" with
+            | Some t, _ -> Some t
+            | _, Some t -> Some t
+            | _ -> None
+          in
+          let rhs_node = direct "Expression" in
           (match Option.bind lhs_node extract_lvalue_name, rhs_node with
            | Some name, Some r ->
-               BAssign { lhs = name;
-                         rhs = rebalance (expr_to_bexpr ~params r) }
+               let rhs_e = rebalance (expr_to_bexpr ~params r) in
+               (* If the LHS has a constant bit/part-select, emit a
+                  @slice_write so behavioral_mem_merge's RMW lowering
+                  reads/writes only the addressed slice instead of
+                  clobbering the whole signal. *)
+               (match Option.bind lhs_node
+                        (extract_lvalue_const_slice ~params) with
+                | Some (hi, lo) ->
+                    BCallStmt {
+                      func = "@slice_write";
+                      args = [BVar name;
+                              BConst { value = hi; width = 32 };
+                              BConst { value = lo; width = 32 };
+                              rhs_e] }
+                | None -> BAssign { lhs = name; rhs = rhs_e })
            | _ -> BBlock [])
       | "LoopStatement" ->
           extract_loop ~params children
@@ -1020,7 +1167,19 @@ let convert_always ~params node =
     | other -> [other]
   in
   let kind = always_kind kw in
-  match kind, event_ctrl with
+  (* For plain `always`, the event control decides:
+   *   - any posedge/negedge → sequential (FF)
+   *   - level-sensitive only @ star or @(a or b) → combinational *)
+  let plain_event_kind ec =
+    let items = extract_event_items ec in
+    if List.exists (fun (e, _) -> e = "posedge" || e = "negedge") items
+    then `Seq else `Comb
+  in
+  let effective_kind = match kind, event_ctrl with
+    | `Plain, Some ec -> plain_event_kind ec
+    | _ -> kind
+  in
+  match effective_kind, event_ctrl with
   | `Seq, Some ec ->
       let items = extract_event_items ec in
       (* Pick clock = first posedge or negedge entry; if there's
@@ -1107,6 +1266,246 @@ let extract_continuous_assigns ~params module_node =
          | None -> None)
     | _ -> None) assigns
 
+(* ---------------------------------------------------------------- *)
+(* Module-body declarations: localparam/parameter, signals, funcs    *)
+(* ---------------------------------------------------------------- *)
+
+(* Pick out body-level localparam / parameter declarations as
+ * (name, value) pairs, ordered left-to-right so each entry can
+ * reference earlier ones. *)
+let extract_body_params ~init_params module_node =
+  let nodes = find_all module_node
+    ~name_is:(fun n ->
+      n = "LocalParameterDeclaration"
+      || n = "ParameterDeclaration") in
+  let acc = ref init_params in
+  List.iter (fun n ->
+    walk n ~f:(fun child ->
+      match child with
+      | Node { name = "ParamAssignment"; _ } ->
+          let id_node = find_first child
+            ~name_is:(fun s -> s = "ParameterIdentifier") in
+          let nm = Option.bind id_node identifier_name in
+          let val_node = find_first child
+            ~name_is:(fun s -> s = "ConstantParamExpression"
+                            || s = "ConstantExpression") in
+          let v = match val_node with
+            | Some t -> eval_const_expr ~params:!acc t
+            | None -> None
+          in
+          (match nm, v with
+           | Some n, Some v when not (List.mem_assoc n !acc) ->
+               acc := (n, v) :: !acc
+           | _ -> ())
+      | _ -> ())) nodes;
+  List.rev !acc
+
+(* Compute the width of a packed-dim list from a DataType subtree.
+ * Walks for a (singular) PackedDimension; multi-dim packed arrays
+ * aren't modelled here yet. *)
+let signal_width_of ~params type_node =
+  match find_first type_node
+          ~name_is:(fun n -> n = "PackedDimension") with
+  | None ->
+      (* Maybe an integer atom (`int`, `integer`, …) with implicit
+         width.  Read the atom type to pick standard widths. *)
+      let atom = find_first type_node
+        ~name_is:(fun n -> n = "IntegerAtomType") in
+      (match atom with
+       | Some t ->
+           (match first_leaf t with
+            | Some "byte" -> 8
+            | Some "shortint" -> 16
+            | Some "int" | Some "integer" | Some "time" -> 32
+            | Some "longint" -> 64
+            | _ -> 1)
+       | None -> 1)
+  | Some pdim ->
+      (match extract_packed_range ~params pdim with
+       | Some (m, l) -> abs (m - l) + 1
+       | None -> 1)
+
+let signal_signed_of type_node =
+  let signing = find_first type_node
+    ~name_is:(fun n -> n = "Signing") in
+  match signing with
+  | Some t ->
+      (match first_leaf t with
+       | Some "signed" -> Signed
+       | _ -> Unsigned)
+  | None -> Unsigned
+
+(* Extract internal signals from DataDeclaration / NetDeclaration
+ * nodes in the module body.  Each declaration may carry multiple
+ * variable / net identifiers; emit one bsignal per name with the
+ * shared type+width.  Skip names that are already in the port list
+ * (the caller passes them in `port_names` so we don't duplicate
+ * ports as internal signals).
+ *
+ * `cur_signal_widths` lookups are populated downstream by the
+ * miter; we just produce bsignal records here. *)
+let extract_internal_signals ~params ~port_names module_node =
+  let data_decls = find_all module_node
+    ~name_is:(fun n -> n = "DataDeclarationVariable") in
+  let net_decls = find_all module_node
+    ~name_is:(fun n -> n = "NetDeclarationNetType") in
+  let from_data acc node =
+    let type_node = find_first node
+      ~name_is:(fun n -> n = "DataTypeOrImplicit"
+                      || n = "DataType") in
+    let width, signed = match type_node with
+      | Some t -> signal_width_of ~params t, signal_signed_of t
+      | None -> 1, Unsigned
+    in
+    let names = find_all node
+      ~name_is:(fun n -> n = "VariableIdentifier"
+                      || n = "VariableDeclAssignmentVariable") in
+    List.fold_left (fun acc nid ->
+      match identifier_name nid with
+      | Some nm when not (List.mem nm port_names)
+                   && not (List.mem nm (List.map fst acc)) ->
+          (nm, {
+            name = nm;
+            stype = BInt { width; signed };
+            direction = `Internal;
+            initial_value = None;
+            attrs = [];
+          }) :: acc
+      | _ -> acc) acc names
+  in
+  let from_net acc node =
+    let type_node = find_first node
+      ~name_is:(fun n -> n = "DataTypeOrImplicit") in
+    let width, signed = match type_node with
+      | Some t -> signal_width_of ~params t, signal_signed_of t
+      | None -> 1, Unsigned
+    in
+    let names = find_all node
+      ~name_is:(fun n -> n = "NetIdentifier"
+                      || n = "NetDeclAssignment") in
+    List.fold_left (fun acc nid ->
+      match identifier_name nid with
+      | Some nm when not (List.mem nm port_names)
+                   && not (List.mem nm (List.map fst acc)) ->
+          (nm, {
+            name = nm;
+            stype = BInt { width; signed };
+            direction = `Internal;
+            initial_value = None;
+            attrs = [];
+          }) :: acc
+      | _ -> acc) acc names
+  in
+  let acc = List.fold_left from_data [] data_decls in
+  let acc = List.fold_left from_net acc net_decls in
+  List.rev_map snd acc
+
+(* ---------------------------------------------------------------- *)
+(* Function declarations → bfunc                                      *)
+(* ---------------------------------------------------------------- *)
+
+(* Extract input ports from a FunctionBodyDeclarationWithoutPort.
+ * Each TfPortDeclaration carries TfPortDirection + DataTypeOrImplicit
+ * + a list of PortIdentifier(s).  Returns (name, btype, dir) tuples
+ * in source order. *)
+let extract_function_ports ~params body =
+  let port_decls = find_all body
+    ~name_is:(fun n -> n = "TfPortDeclaration") in
+  List.concat_map (fun pd ->
+    let dir = match find_first pd
+                ~name_is:(fun n -> n = "TfPortDirection") with
+      | Some t ->
+          (match first_leaf t with
+           | Some "output" -> `Output
+           | Some "inout" -> `Inout
+           | _ -> `Input)
+      | None -> `Input
+    in
+    let type_node = find_first pd
+      ~name_is:(fun n -> n = "DataTypeOrImplicit") in
+    let width = match type_node with
+      | Some t -> signal_width_of ~params t
+      | None -> 1
+    in
+    let signed = match type_node with
+      | Some t -> signal_signed_of t
+      | None -> Unsigned
+    in
+    let ports = find_all pd
+      ~name_is:(fun n -> n = "PortIdentifier"
+                      || n = "TfPortItem") in
+    List.filter_map (fun p ->
+      match identifier_name p with
+      | Some name -> Some (name, BInt { width; signed }, dir)
+      | None -> None) ports
+  ) port_decls
+
+let extract_functions ~params module_node =
+  let funcs = find_all module_node
+    ~name_is:(fun n -> n = "FunctionDeclaration") in
+  List.filter_map (fun fn ->
+    let body = find_first fn
+      ~name_is:(fun n -> n = "FunctionBodyDeclaration"
+                      || n = "FunctionBodyDeclarationWithoutPort") in
+    match body with
+    | None -> None
+    | Some b ->
+        let fname_node = find_first b
+          ~name_is:(fun n -> n = "FunctionIdentifier") in
+        let fname = Option.bind fname_node identifier_name in
+        (match fname with
+         | None -> None
+         | Some fname ->
+             let return_type =
+               let dt = find_first b
+                 ~name_is:(fun n -> n = "FunctionDataTypeOrImplicit"
+                                 || n = "DataTypeOrVoid") in
+               match dt with
+               | Some t ->
+                   BInt {
+                     width = signal_width_of ~params t;
+                     signed = signal_signed_of t;
+                   }
+               | None -> BInt { width = 1; signed = Unsigned }
+             in
+             let ftype = return_type in
+             let f_params = extract_function_ports ~params b in
+             (* Function body: in sv-parser the body is a list of
+                FunctionStatementOrNull directly under the body decl
+                (or under a nested SeqBlock if begin/end was used).
+                Pick the outermost wrappers only so we don't process
+                the same statement twice via the inner FunctionStatement. *)
+             let body_children = match b with
+               | Node { children; _ } -> children
+               | _ -> []
+             in
+             let rec collect_top_stmts nodes =
+               List.concat_map (function
+                 | Node { name =
+                     ("FunctionStatementOrNull" | "FunctionStatement"); _ } as t ->
+                     [t]
+                 | Node { name =
+                     ("FunctionBodyDeclarationWithoutPort"
+                    | "FunctionBodyDeclarationWithPort"
+                    | "FunctionBodyDeclaration"); children } ->
+                     collect_top_stmts children
+                 | _ -> []) nodes
+             in
+             let stmts = collect_top_stmts body_children in
+             let body_stmts = List.concat_map (fun s ->
+               match stmt_to_bstmt ~params s with
+               | BBlock ss -> ss
+               | other -> [other]) stmts in
+             Some {
+               fname;
+               is_task = false;
+               ftype;
+               params = f_params;
+               locals = [];
+               body = body_stmts;
+             }))
+    funcs
+
 (* Find every ModuleDeclaration in the tree.  sv-parser nests them
  * under SourceText → Description → ModuleDeclaration.  We don't
  * try to handle nested modules; the LRM forbids them anyway. *)
@@ -1126,29 +1525,38 @@ let module_of_node node : bmodule option =
   match name with
   | None -> None
   | Some name ->
-      (* Parameters first, then ports (port packed dims may use
-         parameter values). *)
+      (* Parameter port list first (#(...)) so port packed dims
+         can reference them.  Then body-level localparam/parameter
+         (extracted with the port-list scope already in `params`
+         so a body localparam can build on a port param). *)
       let ppl = find_first node
         ~name_is:(fun n -> n = "ParameterPortList") in
-      let params = match ppl with
+      let header_params = match ppl with
         | Some p -> extract_param_decls p
         | None -> []
       in
+      let params = extract_body_params ~init_params:header_params node in
       let plist = find_first node
         ~name_is:(fun n -> n = "ListOfPortDeclarations") in
-      let signals = match plist with
+      let port_signals = match plist with
         | Some p -> extract_port_decls ~params p
         | None -> []
       in
+      let port_names = List.map (fun (s : bsignal) -> s.name) port_signals in
+      let internal_signals =
+        extract_internal_signals ~params ~port_names node
+      in
+      let signals = port_signals @ internal_signals in
       let assign_procs = extract_continuous_assigns ~params node in
       let always_procs = extract_always_blocks ~params node in
+      let funcs = extract_functions ~params node in
       Some {
         name;
         params;
         signals;
         processes = assign_procs @ always_procs;
         instances = [];
-        funcs = [];
+        funcs;
         mems = [];
         attrs = [];
       }
