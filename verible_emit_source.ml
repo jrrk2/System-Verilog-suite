@@ -638,6 +638,62 @@ let rec prune_dead_procedural scope tok =
       TUPLE15 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i, pp j, pp k, pp l, pp m, pp n, pp o)
   | leaf -> leaf
 
+(* ──────────────────────────────────────────────────────────────────
+ * Flatten redundant nested generate blocks.  After prune_dead_generates
+ * folds an `if (cond) begin:gen_wide … end else begin:gen_narrow … end`
+ * that was the sole content of an enclosing `begin:gen_sdp … end`, the
+ * result is `begin:gen_sdp begin:gen_narrow … end end` — a generate
+ * block whose only item is another generate block.  verible's grammar
+ * accepts this (generate_block is a generate_item), and slang/verilator
+ * tolerate it, but the dalance sv-parser rejects the nesting.  Inline
+ * the inner block's items into the outer, keeping the outer label.
+ *)
+let rec flatten_generate_blocks t =
+  let fb = flatten_generate_blocks in
+  (* If [items] is a list (or bare block) whose only non-empty element
+   * is a generate_block, return that inner block's item list. *)
+  let single_inner = function
+    | TLIST xs ->
+        (match List.filter (function EMPTY_TOKEN | TLIST [] -> false | _ -> true) xs with
+         | [TUPLE4 (STRING "generate_block1", _, inner, _)] -> Some inner
+         | _ -> None)
+    | TUPLE4 (STRING "generate_block1", _, inner, _) -> Some inner
+    | _ -> None
+  in
+  match t with
+  | TUPLE4 (STRING "generate_block1", b, items, e) ->
+      (* Collapse repeatedly: a chain begin:A begin:B begin:C … folds
+       * to begin:A …C's items. *)
+      let rec collapse it =
+        let it = fb it in
+        match single_inner it with Some inner -> collapse inner | None -> it
+      in
+      TUPLE4 (STRING "generate_block1", b, collapse items, e)
+  | TLIST xs -> TLIST (List.map fb xs)
+  | TUPLE2 (a, b) -> TUPLE2 (fb a, fb b)
+  | TUPLE3 (a, b, c) -> TUPLE3 (fb a, fb b, fb c)
+  | TUPLE4 (a, b, c, d) -> TUPLE4 (fb a, fb b, fb c, fb d)
+  | TUPLE5 (a, b, c, d, e) -> TUPLE5 (fb a, fb b, fb c, fb d, fb e)
+  | TUPLE6 (a, b, c, d, e, f) -> TUPLE6 (fb a, fb b, fb c, fb d, fb e, fb f)
+  | TUPLE7 (a, b, c, d, e, f, g) -> TUPLE7 (fb a, fb b, fb c, fb d, fb e, fb f, fb g)
+  | TUPLE8 (a, b, c, d, e, f, g, h) ->
+      TUPLE8 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h)
+  | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+      TUPLE9 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h, fb i)
+  | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+      TUPLE10 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h, fb i, fb j)
+  | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+      TUPLE11 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h, fb i, fb j, fb k)
+  | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+      TUPLE12 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h, fb i, fb j, fb k, fb l)
+  | TUPLE13 (a, b, c, d, e, f, g, h, i, j, k, l, m) ->
+      TUPLE13 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h, fb i, fb j, fb k, fb l, fb m)
+  | TUPLE14 (a, b, c, d, e, f, g, h, i, j, k, l, m, n) ->
+      TUPLE14 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h, fb i, fb j, fb k, fb l, fb m, fb n)
+  | TUPLE15 (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ->
+      TUPLE15 (fb a, fb b, fb c, fb d, fb e, fb f, fb g, fb h, fb i, fb j, fb k, fb l, fb m, fb n, fb o)
+  | leaf -> leaf
+
 let emit_elaborated ?(overrides = []) ?(apply_to = []) files : string =
   let mods, pkgs = Verible_elaborate.parse_files_full files in
   Verible_elaborate.resolver_for_walk :=
@@ -651,6 +707,7 @@ let emit_elaborated ?(overrides = []) ?(apply_to = []) files : string =
       m.m_body
       |> Verible_elaborate.prune_dead_generates scope
       |> prune_dead_procedural scope
+      |> flatten_generate_blocks
     in
     emit_program pruned
   ) mods
