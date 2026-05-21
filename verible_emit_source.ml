@@ -57,6 +57,16 @@ let token_to_source : token -> string = function
   | Endfunction      -> "endfunction"
   | Task             -> "task"
   | Endtask          -> "endtask"
+  | Automatic        -> "automatic"
+  | Static           -> "static"
+  | Return           -> "return"
+  | Void             -> "void"
+  | Genvar           -> "genvar"
+  | Repeat           -> "repeat"
+  | Forever          -> "forever"
+  | Foreach          -> "foreach"
+  | Break            -> "break"
+  | Continue         -> "continue"
   | Begin            -> "begin"
   | End              -> "end"
   | If               -> "if"
@@ -160,6 +170,8 @@ let token_to_source : token -> string = function
   | RBRACK           -> "]"
   | LBRACE           -> "{"
   | RBRACE           -> "}"
+  | QUOTE_LBRACE     -> "'{"   (* assignment pattern `'{...}` *)
+  | QUOTE            -> "'"
   (* Newline after every statement/declaration terminator: verilator
    * caps preprocessor tokens at 40000 per line, and the whole emit
    * is otherwise one giant line.  The trailing \n is cosmetic for the
@@ -451,6 +463,7 @@ let rec emit (t : token) : string =
   | TK_HexBase s -> s
   | TK_HexDigits s -> s
   | TK_DecBase s -> s
+  | TK_DecDigits s -> s
   | TK_RealTime s -> s
   | TK_StringLiteral s -> "\"" ^ s ^ "\""
   | leaf -> token_to_source leaf
@@ -470,10 +483,62 @@ and emit_sep_list sep = function
 and emit_comma_list t = emit_sep_list " , " t
 and emit_or_list t = emit_sep_list " or " t
 
-(* Convenience entry-point.  Eventually:
- *   parse → elaborate → synth_filter → emit
- * For now the test driver supplies the parsed tree directly so we
- * can wire the emit step before the elaborator gets a corresponding
- * CST-preserving variant.
- *)
 let emit_program (t : token) : string = emit (synth_filter t)
+
+(* ──────────────────────────────────────────────────────────────────
+ * Elaborating entry-point: parse → verible_elaborate → synth_filter
+ * → emit.  Mirrors the int-scope construction that
+ * verible_to_behavioral.convert_files uses (a copy of
+ * verible_elaborate's module-local `int_scope_of`, which isn't
+ * exported), then prunes dead generate branches per module before
+ * the synth filter and source emit run.
+ *
+ * `overrides` are top-level parameter values (e.g. RAMB18E1 as
+ * instantiated by RAMB16_S9_S9 with READ_WIDTH_A=9): they seed the
+ * scope for every module whose name is in `apply_to` (or all modules
+ * when `apply_to` is empty).  Modules without an override fall back
+ * to their declared defaults.
+ *)
+let int_scope_of ~pkgs ~overrides (body : token) : (string * int) list =
+  let eval sc s = Verible_elaborate.Eval.eval_string sc s in
+  let resolve rhs = Verible_elaborate.resolve_value pkgs rhs in
+  let scope =
+    List.filter_map (fun (k, v) -> Option.map (fun n -> (k, n)) (eval [] v))
+      overrides in
+  (* Port-parameter defaults for any param not overridden. *)
+  let defaults = Verible_elaborate.extract_module_port_param_defaults body in
+  let scope =
+    List.fold_left (fun sc (name, rhs) ->
+      if List.mem_assoc name sc then sc
+      else match eval sc (resolve rhs) with
+        | Some n -> (name, n) :: sc
+        | None -> sc) scope defaults in
+  (* Internal localparams resolved to a fixed point (parse-tree order
+   * is reversed, so a single pass can miss forward references). *)
+  let lps = Verible_elaborate.extract_module_internal_params body in
+  let rec fixed_point sc remaining =
+    let sc', remaining' =
+      List.fold_left (fun (sc, rem) (name, rhs) ->
+        if List.mem_assoc name sc then (sc, rem)
+        else match eval sc (resolve rhs) with
+          | Some n -> ((name, n) :: sc, rem)
+          | None -> (sc, (name, rhs) :: rem)) (sc, []) remaining in
+    if List.length sc' > List.length sc && remaining' <> [] then
+      fixed_point sc' remaining'
+    else sc'
+  in
+  fixed_point scope lps
+
+let emit_elaborated ?(overrides = []) ?(apply_to = []) files : string =
+  let mods, pkgs = Verible_elaborate.parse_files_full files in
+  Verible_elaborate.resolver_for_walk :=
+    (fun t -> Verible_elaborate.resolve_value pkgs t);
+  Verible_elaborate.evaluator_for_walk := Verible_elaborate.Eval.eval_string;
+  List.map (fun (m : Verible_elaborate.module_decl) ->
+    let ov = if apply_to = [] || List.mem m.m_name apply_to
+             then overrides else [] in
+    let scope = int_scope_of ~pkgs ~overrides:ov m.m_body in
+    let pruned = Verible_elaborate.prune_dead_generates scope m.m_body in
+    emit_program pruned
+  ) mods
+  |> String.concat "\n\n"
