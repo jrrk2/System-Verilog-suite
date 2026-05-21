@@ -919,6 +919,19 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
          with _ ->
            silent_zero ~width:32
              ~reason:(Printf.sprintf "TK_DecNumber int_of_string %S failed" n))
+  | TK_StringLiteral s ->
+      (* SV string literal in an expression: a packed byte vector,
+       * first character in the MSB, 8 bits per char (1800-2017
+       * §5.9).  Pack the bytes into the BConst value (mod 2^63 for
+       * strings longer than 7 chars — only equality against another
+       * identically-packed literal needs to hold, which it does since
+       * both operands flow through this same encoding) and set the
+       * width to 8·len.  Most occurrences are `$error`/`$display`
+       * arguments (irrelevant to synthesis) or string-parameter
+       * comparisons like `WRITE_MODE_A == "WRITE_FIRST"`. *)
+      let v = ref 0 in
+      String.iter (fun c -> v := (!v lsl 8) lor (Char.code c land 0xff)) s;
+      BConst { value = !v; width = 8 * String.length s }
   | TUPLE3 (STRING tag, base, digits) when prefix_is "bin_based_number" tag ->
       parse_sized "b" base digits
   | TUPLE3 (STRING tag, base, digits) when prefix_is "hex_based_number" tag ->
@@ -1578,6 +1591,15 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       else if prefix_is "logeq_expr2" tag || prefix_is "binary_eq_expr1" tag
         then bin BEq lhs rhs
       else if prefix_is "logeq_expr3" tag then bin BNe lhs rhs
+      (* Case equality `===`/`!==` (caseeq_expr2/3) and wildcard
+       * equality `==?`/`!=?` (logeq_expr4/5) degenerate to plain
+       * `==`/`!=` in synthesis — X/Z don't exist in the synthesizable
+       * subset, so the 4-state distinction collapses.  Xilinx unisim
+       * sim models lean on `=== 1'b1` heavily. *)
+      else if prefix_is "caseeq_expr2" tag || prefix_is "logeq_expr4" tag
+        then bin BEq lhs rhs
+      else if prefix_is "caseeq_expr3" tag || prefix_is "logeq_expr5" tag
+        then bin BNe lhs rhs
       else if prefix_is "expr_primary_parens" tag then recurse _op
       (* `qualified_id2`: scope-qualified reference `scope::name`
        * (or `inst.field` — same shape, different separator).
