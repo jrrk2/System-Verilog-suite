@@ -83,12 +83,20 @@ let token_to_source : token -> string = function
   | Wire             -> "wire"
   | Reg              -> "reg"
   | Logic            -> "logic"
+  | Tri             -> "tri"
+  | Tri0            -> "tri0"
+  | Tri1            -> "tri1"
+  | Wand            -> "wand"
+  | Wor             -> "wor"
+  | Supply0         -> "supply0"
+  | Supply1         -> "supply1"
   | Integer          -> "integer"
   | Int              -> "int"
   | Signed           -> "signed"
   | Unsigned         -> "unsigned"
   | Real             -> "real"
   | Realtime         -> "realtime"
+  | Time             -> "time"
   | Shortint         -> "shortint"
   | Longint          -> "longint"
   | Shortreal        -> "shortreal"
@@ -152,7 +160,11 @@ let token_to_source : token -> string = function
   | RBRACK           -> "]"
   | LBRACE           -> "{"
   | RBRACE           -> "}"
-  | SEMICOLON        -> ";"
+  (* Newline after every statement/declaration terminator: verilator
+   * caps preprocessor tokens at 40000 per line, and the whole emit
+   * is otherwise one giant line.  The trailing \n is cosmetic for the
+   * other frontends but required for verilator. *)
+  | SEMICOLON        -> ";\n"
   | COMMA            -> ","
   | COLON            -> ":"
   | DOT              -> "."
@@ -161,12 +173,155 @@ let token_to_source : token -> string = function
   | other -> Source_text_verible_tokens.getstr other
 
 (* ──────────────────────────────────────────────────────────────────
- * Synth-subset filter.  Currently a no-op; downstream passes will
- * pattern-match the relevant CST shapes (initial_construct,
- * specify_block, always_construct with @(GSR), $display calls,
- * deassign_statement, procedural-continuous-assign) and elide them.
+ * Synth-subset filter.  Recursively replaces non-synthesizable CST
+ * subtrees with EMPTY_TOKEN (which emits as ""), so the round-tripped
+ * source is acceptable to the strict frontends (slang especially).
+ *
+ * Dropped by grammar-production tag prefix:
+ *   - initial_construct*        — `initial begin … end` (mem init,
+ *                                 X-prop scaffolding)
+ *   - specify_block*            — `specify … endspecify` path delays
+ *   - system_tf_call*           — `$display`/`$finish`/`$readmemh`/…
+ *   - procedural_continuous_assignment*
+ *                               — procedural `assign`/`deassign`/
+ *                                 `force`/`release` (the `always @(GSR)`
+ *                                 X-prop block reduces to empty if/else
+ *                                 once these are gone)
+ *
+ * Leftover separators (a stray `;` where a $display statement was, an
+ * empty `begin end`) are legal SystemVerilog, so we don't need to
+ * prune the enclosing wrappers.
  *)
-let synth_filter (t : token) : token = t
+let prefix_is p s =
+  let lp = String.length p and ls = String.length s in
+  ls >= lp && String.sub s 0 lp = p
+
+let droppable_tag tag =
+  prefix_is "initial_construct" tag
+  || prefix_is "specify_block" tag
+  || prefix_is "system_tf_call" tag
+  || prefix_is "procedural_continuous_assignment" tag
+
+(* True when a tuple's leading STRING tag marks a droppable shape. *)
+let tagged_droppable = function
+  | STRING tag -> droppable_tag tag
+  | _ -> false
+
+(* Leftmost SymbolIdentifier in a subtree, skipping STRING grammar
+ * tags.  Used to spot `$`-prefixed call statements ($display,
+ * $finish, $write, $fatal, …) that lex as ordinary SymbolIdentifier
+ * calls — they aren't on the lexer's elaboration-builtin whitelist
+ * so they don't become system_tf_call nodes. *)
+let rec leftmost_ident = function
+  | SymbolIdentifier s -> Some s
+  | STRING _ -> None
+  | TLIST xs -> List.find_map leftmost_ident xs
+  | TUPLE2 (a, b) -> List.find_map leftmost_ident [a; b]
+  | TUPLE3 (a, b, c) -> List.find_map leftmost_ident [a; b; c]
+  | TUPLE4 (a, b, c, d) -> List.find_map leftmost_ident [a; b; c; d]
+  | TUPLE5 (a, b, c, d, e) -> List.find_map leftmost_ident [a; b; c; d; e]
+  | _ -> None
+
+let is_dollar_call t =
+  match leftmost_ident t with
+  | Some s -> String.length s > 0 && s.[0] = '$'
+  | None -> false
+
+(* Replacement for a dropped node.  Statements that were the sole
+ * body of an `if`/`else`/`for`/`while` can't vanish entirely or the
+ * enclosing clause is left dangling (`if (c)` with no statement), so
+ * we substitute an empty statement `;` rather than EMPTY_TOKEN.  A
+ * stray `;` is a legal null statement / module item in either
+ * context. *)
+let dropped = STRING ";"
+
+let rec synth_filter (t : token) : token =
+  match t with
+  | TLIST xs -> TLIST (List.map synth_filter xs)
+  (* Call statements whose target is a `$`-prefixed runtime task
+   * ($display/$finish/$write/$fatal/…).  These lex as ordinary
+   * SymbolIdentifier calls, so they surface in several wrapper
+   * shapes depending on whether they have an argument list:
+   *   - statement3                      `$display(args);`
+   *   - statement_item19                subroutine_call SEMICOLON
+   *   - block_item_or_statement_or_null6  bare `$finish;`
+   *   - data_declaration_or_module_instantiation1
+   *       a `$display(args);` inside a begin-block parses here —
+   *       verible can't tell a bare call from a module instance in
+   *       that context, so it lands in the instantiation shape.
+   * Drop the whole statement only when the call target is a `$`-task
+   * (a real module instantiation keeps its non-`$` identifier). *)
+  | TUPLE3 (STRING tag, call, _)
+    when (tag = "statement3"
+          || tag = "statement_item19"
+          || tag = "block_item_or_statement_or_null6"
+          || tag = "data_declaration_or_module_instantiation1")
+         && is_dollar_call call ->
+      dropped
+  (* `net_decl_assign1`: <id> = <expr>.  Xilinx unisims source the
+   * Global Set/Reset net from the top-level `glbl` module via a
+   * hierarchical reference (`tri0 GSR = glbl.GSR;`).  That reference
+   * can't resolve when a primitive is elaborated standalone, and the
+   * synth-correct behaviour is GSR tied low (tri0 default).  Drop the
+   * `= glbl.<x>` initializer, leaving the bare net name. *)
+  | TUPLE4 (STRING "net_decl_assign1", id, _eq, rhs)
+    when leftmost_ident rhs = Some "glbl" ->
+      synth_filter id
+  | TUPLE2 (a, _) when tagged_droppable a -> dropped
+  | TUPLE3 (a, _, _) when tagged_droppable a -> dropped
+  | TUPLE4 (a, _, _, _) when tagged_droppable a -> dropped
+  | TUPLE5 (a, _, _, _, _) when tagged_droppable a -> dropped
+  | TUPLE6 (a, _, _, _, _, _) when tagged_droppable a -> dropped
+  | TUPLE7 (a, _, _, _, _, _, _) when tagged_droppable a -> dropped
+  | TUPLE8 (a, _, _, _, _, _, _, _) when tagged_droppable a -> dropped
+  | TUPLE2 (a, b) -> TUPLE2 (synth_filter a, synth_filter b)
+  | TUPLE3 (a, b, c) -> TUPLE3 (synth_filter a, synth_filter b, synth_filter c)
+  | TUPLE4 (a, b, c, d) ->
+      TUPLE4 (synth_filter a, synth_filter b, synth_filter c, synth_filter d)
+  | TUPLE5 (a, b, c, d, e) ->
+      TUPLE5 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+              synth_filter e)
+  | TUPLE6 (a, b, c, d, e, f) ->
+      TUPLE6 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+              synth_filter e, synth_filter f)
+  | TUPLE7 (a, b, c, d, e, f, g) ->
+      TUPLE7 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+              synth_filter e, synth_filter f, synth_filter g)
+  | TUPLE8 (a, b, c, d, e, f, g, h) ->
+      TUPLE8 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+              synth_filter e, synth_filter f, synth_filter g, synth_filter h)
+  | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+      TUPLE9 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+              synth_filter e, synth_filter f, synth_filter g, synth_filter h,
+              synth_filter i)
+  | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+      TUPLE10 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+               synth_filter e, synth_filter f, synth_filter g, synth_filter h,
+               synth_filter i, synth_filter j)
+  | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+      TUPLE11 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+               synth_filter e, synth_filter f, synth_filter g, synth_filter h,
+               synth_filter i, synth_filter j, synth_filter k)
+  | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+      TUPLE12 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+               synth_filter e, synth_filter f, synth_filter g, synth_filter h,
+               synth_filter i, synth_filter j, synth_filter k, synth_filter l)
+  | TUPLE13 (a, b, c, d, e, f, g, h, i, j, k, l, m) ->
+      TUPLE13 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+               synth_filter e, synth_filter f, synth_filter g, synth_filter h,
+               synth_filter i, synth_filter j, synth_filter k, synth_filter l,
+               synth_filter m)
+  | TUPLE14 (a, b, c, d, e, f, g, h, i, j, k, l, m, n) ->
+      TUPLE14 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+               synth_filter e, synth_filter f, synth_filter g, synth_filter h,
+               synth_filter i, synth_filter j, synth_filter k, synth_filter l,
+               synth_filter m, synth_filter n)
+  | TUPLE15 (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ->
+      TUPLE15 (synth_filter a, synth_filter b, synth_filter c, synth_filter d,
+               synth_filter e, synth_filter f, synth_filter g, synth_filter h,
+               synth_filter i, synth_filter j, synth_filter k, synth_filter l,
+               synth_filter m, synth_filter n, synth_filter o)
+  | leaf -> leaf
 
 (* ──────────────────────────────────────────────────────────────────
  * CST walker.  Emits children in tree order, joined by a single
@@ -188,13 +343,16 @@ let emit_children xs =
   in
   drop_first_tag xs
 
-let prefix_is p s =
-  let lp = String.length p and ls = String.length s in
-  ls >= lp && String.sub s 0 lp = p
-
 let rec emit (t : token) : string =
   match t with
-  | TLIST xs -> String.concat " " (List.map emit xs)
+  (* Every multi-element TLIST in Source_text_verible.mly is built by
+   * prepending (`$3 :: lst`), so storage order is reversed from source
+   * order.  Reverse on emit to recover source order — this fixes
+   * statement/item lists (where order is semantically load-bearing)
+   * globally.  Comma/or-separated lists additionally need their
+   * separator re-injected, handled by the per-parent cases below via
+   * emit_comma_list / emit_or_list. *)
+  | TLIST xs -> String.concat " " (List.map emit (List.rev xs))
   (* `range_list_in_braces1`: LBRACE open_range_list RBRACE.  The
    * `open_range_list` action in Source_text_verible.mly prepends each
    * new element onto the TLIST (`$3 :: lst`) and discards the COMMA
@@ -205,6 +363,27 @@ let rec emit (t : token) : string =
    * round-trip diffs surface them. *)
   | TUPLE4 (STRING tag, lb, body, rb) when prefix_is "range_list_in_braces" tag ->
       String.concat " " [emit lb; emit_comma_list body; emit rb]
+  (* `event_control2`: AT LPAREN event_expression_list RPAREN.  The
+   * list production prepends elements and drops the Or/COMMA token,
+   * so `@(a or b or c)` parses to a reversed comma-less TLIST.
+   * Reverse and rejoin with `or` (the canonical separator). *)
+  | TUPLE5 (STRING "event_control2", at, lp, body, rp) ->
+      String.concat " " [emit at; emit lp; emit_or_list body; emit rp]
+  (* `instantiation_base1`: instantiation_type <var/instance list>.
+   * Covers both `reg a, b, c;` (register-variable list) and
+   * `foo u1(...), u2(...);` (multi-instance).  The list production
+   * (non_anonymous_gate_instance_or_register_variable_list) reverses
+   * and drops COMMA, so reverse and recomma.  Single-element lists
+   * (the common one-instance case) emit unchanged. *)
+  | TUPLE3 (STRING tag, ty, lst)
+    when tag = "instantiation_base1"
+      || tag = "non_anonymous_instantiation_base1" ->
+      emit ty ^ " " ^ emit_comma_list lst
+  (* `module_port_declaration5`: port_direction signed_unsigned_opt
+   * list_of_module_item_identifiers SEMICOLON — `input a, b, c;`.
+   * The identifier list reverses + drops COMMA. *)
+  | TUPLE5 (STRING "module_port_declaration5", dir, su, lst, semi) ->
+      String.concat " " [emit dir; emit su; emit_comma_list lst; emit semi]
   (* Sized literals: `dec_/bin_/oct_/hex_based_number` wrap a base
    * token (which already carries `<size>'<base>`, e.g. "1'b") and a
    * digits token ("0").  They must be concatenated with NO separator
@@ -276,9 +455,20 @@ let rec emit (t : token) : string =
   | TK_StringLiteral s -> "\"" ^ s ^ "\""
   | leaf -> token_to_source leaf
 
-and emit_comma_list = function
-  | TLIST xs -> String.concat " , " (List.map emit (List.rev xs))
-  | single   -> emit single
+(* Reverse, emit each element, drop any that render empty (the list
+ * productions sometimes carry an EMPTY_TOKEN sentinel as the base of
+ * the prepend chain — emitting it would leave a dangling separator),
+ * then join with [sep]. *)
+and emit_sep_list sep = function
+  | TLIST xs ->
+      List.rev xs
+      |> List.map emit
+      |> List.filter (fun s -> String.trim s <> "")
+      |> String.concat sep
+  | single -> emit single
+
+and emit_comma_list t = emit_sep_list " , " t
+and emit_or_list t = emit_sep_list " or " t
 
 (* Convenience entry-point.  Eventually:
  *   parse → elaborate → synth_filter → emit
