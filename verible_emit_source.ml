@@ -205,6 +205,19 @@ let rec emit (t : token) : string =
    * round-trip diffs surface them. *)
   | TUPLE4 (STRING tag, lb, body, rb) when prefix_is "range_list_in_braces" tag ->
       String.concat " " [emit lb; emit_comma_list body; emit rb]
+  (* Sized literals: `dec_/bin_/oct_/hex_based_number` wrap a base
+   * token (which already carries `<size>'<base>`, e.g. "1'b") and a
+   * digits token ("0").  They must be concatenated with NO separator
+   * so `1'b0` emits as `1'b0`, not `1'b 0`.  `number3` is the split
+   * form `<size> <based_number>` (size lexed as a separate decimal
+   * token) and likewise glues with no space. *)
+  | TUPLE3 (STRING tag, a, b)
+    when prefix_is "dec_based_number" tag
+      || prefix_is "bin_based_number" tag
+      || prefix_is "oct_based_number" tag
+      || prefix_is "hex_based_number" tag
+      || tag = "number3" ->
+      emit a ^ emit b
   | TUPLE2 (a, b) ->
       String.concat " " (List.map emit (emit_children [a; b]))
   | TUPLE3 (a, b, c) ->
