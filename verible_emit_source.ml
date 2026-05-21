@@ -529,6 +529,115 @@ let int_scope_of ~pkgs ~overrides (body : token) : (string * int) list =
   in
   fixed_point scope lps
 
+(* ──────────────────────────────────────────────────────────────────
+ * Procedural dead-code elimination.  prune_dead_generates only folds
+ * `generate` constructs; this folds *procedural* `if`/`case` whose
+ * controlling expression resolves to a constant in [scope] (after
+ * parameter elaboration).  Xilinx unisim primitives gate width-
+ * specific code on localparams derived from READ_WIDTH/WRITE_WIDTH
+ * (`case (rb_width) … 16: mem[..][..*16 +: 16] … endcase`), so the
+ * out-of-bounds slices that slang rejects live in `case`/`if` arms
+ * that are dead once rb_width is known — but they aren't generate
+ * blocks, so only this pass removes them.
+ *
+ * Uses the same resolver/evaluator refs that emit_elaborated sets up
+ * for prune_dead_generates.
+ *)
+let eval_const scope tok =
+  !Verible_elaborate.evaluator_for_walk scope
+    (!Verible_elaborate.resolver_for_walk tok)
+
+(* Collect the value expressions of a case_item's
+ * expression_list_proper (`1, 2, 4 :` → [1;2;4]).  The production is
+ * left-recursive (expression_list_proper1: list COMMA expr), single
+ * value bottoms out as the bare expression. *)
+let rec case_values = function
+  | TUPLE4 (STRING tag, lst, _comma, e) when prefix_is "expression_list_proper" tag ->
+      case_values lst @ [e]
+  | other -> [other]
+
+let dropped_stmt = STRING ";"
+
+let rec prune_dead_procedural scope tok =
+  let pp = prune_dead_procedural scope in
+  match tok with
+  (* if (cond) then  — no else *)
+  | TUPLE5 (STRING "conditional_statement1", _up, _if, cond, then_s) ->
+      (match eval_const scope cond with
+       | Some 0 -> dropped_stmt
+       | Some _ -> pp then_s
+       | None -> TUPLE5 (STRING "conditional_statement1", _up, _if,
+                         pp cond, pp then_s))
+  (* if (cond) then else else_s *)
+  | TUPLE7 (STRING "conditional_statement2", _up, _if, cond, then_s, _else, else_s) ->
+      (match eval_const scope cond with
+       | Some 0 -> pp else_s
+       | Some _ -> pp then_s
+       | None -> TUPLE7 (STRING "conditional_statement2", _up, _if,
+                         pp cond, pp then_s, _else, pp else_s))
+  (* case (sel) … endcase *)
+  | TUPLE8 (STRING "case_statement1", up, ca, lp, sel, rp, items, ec) ->
+      (match eval_const scope sel with
+       | None ->
+           TUPLE8 (STRING "case_statement1", up, ca, lp, pp sel, rp, pp items, ec)
+       | Some v ->
+           (* Flatten case_items (left-recursive case_items1) into a
+            * list, find the arm matching v, else the Default arm. *)
+           let rec flat = function
+             | TUPLE3 (STRING t, rest, item) when prefix_is "case_items" t ->
+                 flat rest @ [item]
+             | other -> [other] in
+           let items_l = flat items in
+           let matches item =
+             match item with
+             | TUPLE4 (STRING t, vals, _colon, _stmt) when prefix_is "case_item1" t ->
+                 List.exists (fun ve -> eval_const scope ve = Some v)
+                   (case_values vals)
+             | _ -> false in
+           let stmt_of = function
+             | TUPLE4 (STRING t, _vals, _colon, s)
+               when prefix_is "case_item1" t || prefix_is "case_item2" t -> Some s
+             | TUPLE3 (STRING t, _default, s) when prefix_is "case_item3" t -> Some s
+             | _ -> None in
+           let is_default = function
+             | TUPLE4 (STRING t, _, _, _) when prefix_is "case_item2" t -> true
+             | TUPLE3 (STRING t, _, _) when prefix_is "case_item3" t -> true
+             | _ -> false in
+           let chosen =
+             match List.find_opt matches items_l with
+             | Some it -> stmt_of it
+             | None ->
+                 (match List.find_opt is_default items_l with
+                  | Some it -> stmt_of it
+                  | None -> None) in
+           (match chosen with
+            | Some s -> pp s
+            | None -> dropped_stmt))
+  | TLIST xs -> TLIST (List.map pp xs)
+  | TUPLE2 (a, b) -> TUPLE2 (pp a, pp b)
+  | TUPLE3 (a, b, c) -> TUPLE3 (pp a, pp b, pp c)
+  | TUPLE4 (a, b, c, d) -> TUPLE4 (pp a, pp b, pp c, pp d)
+  | TUPLE5 (a, b, c, d, e) -> TUPLE5 (pp a, pp b, pp c, pp d, pp e)
+  | TUPLE6 (a, b, c, d, e, f) -> TUPLE6 (pp a, pp b, pp c, pp d, pp e, pp f)
+  | TUPLE7 (a, b, c, d, e, f, g) -> TUPLE7 (pp a, pp b, pp c, pp d, pp e, pp f, pp g)
+  | TUPLE8 (a, b, c, d, e, f, g, h) ->
+      TUPLE8 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h)
+  | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+      TUPLE9 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i)
+  | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+      TUPLE10 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i, pp j)
+  | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+      TUPLE11 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i, pp j, pp k)
+  | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+      TUPLE12 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i, pp j, pp k, pp l)
+  | TUPLE13 (a, b, c, d, e, f, g, h, i, j, k, l, m) ->
+      TUPLE13 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i, pp j, pp k, pp l, pp m)
+  | TUPLE14 (a, b, c, d, e, f, g, h, i, j, k, l, m, n) ->
+      TUPLE14 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i, pp j, pp k, pp l, pp m, pp n)
+  | TUPLE15 (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) ->
+      TUPLE15 (pp a, pp b, pp c, pp d, pp e, pp f, pp g, pp h, pp i, pp j, pp k, pp l, pp m, pp n, pp o)
+  | leaf -> leaf
+
 let emit_elaborated ?(overrides = []) ?(apply_to = []) files : string =
   let mods, pkgs = Verible_elaborate.parse_files_full files in
   Verible_elaborate.resolver_for_walk :=
@@ -538,7 +647,11 @@ let emit_elaborated ?(overrides = []) ?(apply_to = []) files : string =
     let ov = if apply_to = [] || List.mem m.m_name apply_to
              then overrides else [] in
     let scope = int_scope_of ~pkgs ~overrides:ov m.m_body in
-    let pruned = Verible_elaborate.prune_dead_generates scope m.m_body in
+    let pruned =
+      m.m_body
+      |> Verible_elaborate.prune_dead_generates scope
+      |> prune_dead_procedural scope
+    in
     emit_program pruned
   ) mods
   |> String.concat "\n\n"
