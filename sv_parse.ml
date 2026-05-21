@@ -400,6 +400,15 @@ let rec parse_json attr json =
       let expr = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
       expr
 
+  | "RESIZELVALUE" ->
+      (* Verilator wraps an assignment target in RESIZELVALUE when the
+       * lvalue width differs from the RHS (it inserts an EXTEND/SEL
+       * around the underlying VARREF).  The resize is transparent for
+       * BIR purposes — the Z3 encoder does its own width matching — so
+       * unwrap to the inner lvalue expression. *)
+      let expr = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
+      expr
+
   | "FUNCREF" ->
       let args = json |> member "pinsp" |> to_list_safe |> 
         List.filter_map (fun pin -> 
