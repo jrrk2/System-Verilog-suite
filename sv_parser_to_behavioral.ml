@@ -242,6 +242,62 @@ let extract_packed_range ~params pdim =
        | _ -> None)
   | _ -> None
 
+(* --------------------------------------------------------------- *)
+(* Enum typedefs                                                    *)
+(* --------------------------------------------------------------- *)
+
+(* Module-local enum tables, repopulated per module by populate_enums.
+ *   enum_type_tbl   : type name → bit width  (`tx_state_type` → 2)
+ *   enum_member_tbl : member   → (ordinal, width)  (`TXSTART` → (1, 2))
+ * Used by signal_width_of (to size enum-typed signals) and
+ * expr_to_bexpr (to resolve member names to sized constants).  Without
+ * this an `enum logic [1:0]` register comes out 1-bit and its members
+ * stay symbolic BVars, which collides with verilator's correctly-sized
+ * BIR in the Z3 miter ("Sorts BitVec 2 and BitVec 1 incompatible"). *)
+let enum_type_tbl : (string, int) Hashtbl.t = Hashtbl.create 16
+let enum_member_tbl : (string, int * int) Hashtbl.t = Hashtbl.create 64
+
+let populate_enums ~params node =
+  Hashtbl.clear enum_type_tbl;
+  Hashtbl.clear enum_member_tbl;
+  let typedecls = find_all node ~name_is:(fun n -> n = "TypeDeclaration") in
+  List.iter (fun td ->
+    match find_first td ~name_is:(fun n -> n = "DataTypeEnum") with
+    | None -> ()
+    | Some en ->
+        (* Base width: EnumBaseType's packed dimension, default 1
+           (`enum logic` with no [hi:lo] is a single bit). *)
+        let width =
+          match find_first en ~name_is:(fun n -> n = "EnumBaseType") with
+          | Some bt ->
+              (match find_first bt ~name_is:(fun n -> n = "PackedDimension") with
+               | Some pd ->
+                   (match extract_packed_range ~params pd with
+                    | Some (m, l) -> abs (m - l) + 1
+                    | None -> 1)
+               | None -> 1)
+          | None -> 1
+        in
+        (* Members in source order → ordinals 0,1,2,…  (Explicit
+           `= value` assignments aren't handled yet — none of the
+           unisim/uart enums use them.) *)
+        let members = find_all en ~name_is:(fun n -> n = "EnumIdentifier") in
+        List.iteri (fun i m ->
+          match identifier_name m with
+          | Some nm -> Hashtbl.replace enum_member_tbl nm (i, width)
+          | None -> ()) members;
+        (* The new type name is a TypeIdentifier sibling of DataType,
+           after the enum body — take the last TypeIdentifier in the
+           declaration. *)
+        let tids = find_all td ~name_is:(fun n -> n = "TypeIdentifier") in
+        (match List.rev tids with
+         | last :: _ ->
+             (match identifier_name last with
+              | Some tn -> Hashtbl.replace enum_type_tbl tn width
+              | None -> ())
+         | [] -> ())
+  ) typedecls
+
 (* Extract direction (`Input | `Output | `Internal) from a NetPortHeader
  * subtree by looking for a PortDirection child whose keyword token
  * is input/output/inout.  Returns None when direction is inherited
@@ -584,9 +640,16 @@ let rec expr_to_bexpr ~params node =
            | None -> zero
            | Some n ->
                let base =
-                 match List.assoc_opt n params with
-                 | Some v -> BConst { value = v; width = 32 }
-                 | None -> BVar n
+                 (* Enum member → its ordinal at the enum's width
+                    (must precede the param/BVar fallback so the
+                    member resolves to a sized constant matching the
+                    enum-typed signal). *)
+                 match Hashtbl.find_opt enum_member_tbl n with
+                 | Some (ord, width) -> BConst { value = ord; width }
+                 | None ->
+                     (match List.assoc_opt n params with
+                      | Some v -> BConst { value = v; width = 32 }
+                      | None -> BVar n)
                in
                (match select_node with
                 | None -> base
@@ -1473,8 +1536,41 @@ let extract_internal_signals ~params ~port_names module_node =
           }) :: acc
       | _ -> acc) acc names
   in
+  (* User-type-named declarations: `tx_state_type tx_State;` parses as
+     NetDeclarationNetTypeIdentifier (NetTypeIdentifier = the type name,
+     ListOfNetDeclAssignments = the names).  Size from the enum table
+     when the type is an enum, else default 1. *)
+  let typed_net_decls = find_all module_node
+    ~name_is:(fun n -> n = "NetDeclarationNetTypeIdentifier") in
+  let from_typed_net acc node =
+    let width =
+      match find_first node ~name_is:(fun n -> n = "NetTypeIdentifier") with
+      | Some tid ->
+          (match identifier_name tid with
+           | Some tn -> (match Hashtbl.find_opt enum_type_tbl tn with
+                         | Some w -> w | None -> 1)
+           | None -> 1)
+      | None -> 1
+    in
+    let names = find_all node
+      ~name_is:(fun n -> n = "NetIdentifier"
+                      || n = "NetDeclAssignment") in
+    List.fold_left (fun acc nid ->
+      match identifier_name nid with
+      | Some nm when not (List.mem nm port_names)
+                   && not (List.mem nm (List.map fst acc)) ->
+          (nm, {
+            name = nm;
+            stype = BInt { width; signed = Unsigned };
+            direction = `Internal;
+            initial_value = None;
+            attrs = [];
+          }) :: acc
+      | _ -> acc) acc names
+  in
   let acc = List.fold_left from_data [] data_decls in
   let acc = List.fold_left from_net acc net_decls in
+  let acc = List.fold_left from_typed_net acc typed_net_decls in
   List.rev_map snd acc
 
 (* ---------------------------------------------------------------- *)
@@ -1682,6 +1778,10 @@ let module_of_node node : bmodule option =
         | None -> []
       in
       let params = extract_body_params ~init_params:header_params node in
+      (* Build the module-local enum tables before any signal/expr
+         conversion so enum-typed signals size correctly and member
+         references resolve to sized constants. *)
+      populate_enums ~params node;
       let plist = find_first node
         ~name_is:(fun n -> n = "ListOfPortDeclarations") in
       let port_signals = match plist with
