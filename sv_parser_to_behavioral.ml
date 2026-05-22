@@ -1685,6 +1685,88 @@ let extract_functions ~params module_node =
 let module_nodes tree =
   find_all tree ~name_is:(fun n -> n = "ModuleDeclaration")
 
+(* --------------------------------------------------------------- *)
+(* Module instantiations → binstance                                *)
+(* --------------------------------------------------------------- *)
+
+(* Extract every ModuleInstantiation under a module body into a
+ * binstance.  CST shape (1800-2017 §A.4.1.1):
+ *   ModuleInstantiation
+ *     ModuleIdentifier               → child module type
+ *     ParameterValueAssignment?      → #(.P(v), …) overrides
+ *     HierarchicalInstance+          → one per instance label
+ *       NameOfInstance/InstanceIdentifier → inst name
+ *       ListOfPortConnections
+ *         ListOfPortConnectionsNamed → NamedPortConnection (.p(expr))
+ *         ListOfPortConnectionsOrdered → OrderedPortConnection (expr)
+ * Positional (ordered) connections get synthetic `$pos<N>` keys,
+ * resolved to formal names by name_positional_ports in convert_tree
+ * (the same scheme verible_to_behavioral uses) before prep_for_z3
+ * flattens. *)
+let extract_instances ~params module_node : binstance list =
+  let insts = find_all module_node
+    ~name_is:(fun n -> n = "ModuleInstantiation") in
+  List.concat_map (fun inst ->
+    let mod_name =
+      match find_first inst ~name_is:(fun n -> n = "ModuleIdentifier") with
+      | Some t -> identifier_name t
+      | None -> None in
+    let param_values =
+      match find_first inst
+              ~name_is:(fun n -> n = "ParameterValueAssignment") with
+      | None -> []
+      | Some pva ->
+          find_all pva ~name_is:(fun n -> n = "NamedParameterAssignment")
+          |> List.filter_map (fun np ->
+               let pn = match find_first np
+                 ~name_is:(fun n -> n = "ParameterIdentifier") with
+                 | Some t -> identifier_name t | None -> None in
+               let pe = find_first np
+                 ~name_is:(fun n -> n = "ParamExpression") in
+               match pn, pe with
+               | Some name, Some e ->
+                   Option.map (fun v -> (name, v)) (eval_const_expr ~params e)
+               | _ -> None) in
+    let conns_of hi =
+      let named = find_all hi
+        ~name_is:(fun n -> n = "NamedPortConnection") in
+      if named <> [] then
+        List.filter_map (fun np ->
+          let pn = match find_first np
+            ~name_is:(fun n -> n = "PortIdentifier") with
+            | Some t -> identifier_name t | None -> None in
+          match pn, find_first np ~name_is:(fun n -> n = "Expression") with
+          | Some name, Some ex -> Some (name, expr_to_bexpr ~params ex)
+          (* `.p` implicit connect → net of the same name *)
+          | Some name, None -> Some (name, BVar name)
+          | _ -> None) named
+      else
+        find_all hi ~name_is:(fun n -> n = "OrderedPortConnection")
+        |> List.mapi (fun i op ->
+             let be = match find_first op
+               ~name_is:(fun n -> n = "Expression") with
+               | Some ex -> expr_to_bexpr ~params ex
+               | None -> BConst { value = 0; width = 1 } in
+             (Printf.sprintf "$pos%d" i, be))
+    in
+    match mod_name with
+    | None -> []
+    | Some mname ->
+        find_all inst ~name_is:(fun n -> n = "HierarchicalInstance")
+        |> List.filter_map (fun hi ->
+             match find_first hi
+                     ~name_is:(fun n -> n = "InstanceIdentifier") with
+             | Some t ->
+                 (match identifier_name t with
+                  | Some iname ->
+                      Some { inst_name = iname;
+                             module_name = mname;
+                             param_values;
+                             port_connections = conns_of hi }
+                  | None -> None)
+             | None -> None)
+  ) insts
+
 (* K&R-style port extraction.  Module header has a `ListOfPorts`
  * containing bare PortIdentifiers (no direction or type); the body
  * has standalone `PortDeclaration → PortDeclaration{Input,Output,Inout}`
@@ -1807,15 +1889,44 @@ let module_of_node node : bmodule option =
         params;
         signals;
         processes = assign_procs @ always_procs;
-        instances = [];
+        instances = extract_instances ~params node;
         funcs;
         mems = [];
         attrs = [];
       }
 
+(* Resolve positional ($posN) instance port connections to the child's
+ * formal port names — must run before any consumer flattens (prep_for_z3),
+ * since the flattener substitutes pins by name.  Port order is taken
+ * from each module's port signals in declaration order.  (Mirrors
+ * verible_to_behavioral.name_positional_ports.) *)
+let name_positional_ports (mods : bmodule list) : bmodule list =
+  let is_pos k = String.length k > 4 && String.sub k 0 4 = "$pos" in
+  let port_order = Hashtbl.create 32 in
+  List.iter (fun (m : bmodule) ->
+    let ports = List.filter_map (fun (s : bsignal) ->
+      match s.direction with `Input | `Output -> Some s.name | _ -> None)
+      m.signals in
+    Hashtbl.replace port_order m.name ports) mods;
+  let resolve_inst (i : binstance) =
+    if not (List.exists (fun (k, _) -> is_pos k) i.port_connections) then i
+    else
+      let formals = Option.value ~default:[]
+        (Hashtbl.find_opt port_order i.module_name) in
+      let n = List.length formals in
+      let pc = List.map (fun (k, be) ->
+        if not (is_pos k) then (k, be)
+        else match int_of_string_opt (String.sub k 4 (String.length k - 4)) with
+          | Some idx when idx < n -> (List.nth formals idx, be)
+          | _ -> (k, be)) i.port_connections in
+      { i with port_connections = pc }
+  in
+  List.map (fun (m : bmodule) ->
+    { m with instances = List.map resolve_inst m.instances }) mods
+
 let convert_tree (t : Sv_parser_dump.t) : bprogram =
   let mods = List.filter_map module_of_node (module_nodes t) in
-  { modules = mods; library_cells = [] }
+  { modules = name_positional_ports mods; library_cells = [] }
 
 (* Convenience: parse a file via sv_parser_dump and convert. *)
 let convert_file ?bin ?(incdirs = []) ?(defines = []) file =
