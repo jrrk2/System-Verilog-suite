@@ -28,6 +28,13 @@ type json = Yojson.Safe.t
  * references back to a full InstanceBody node. *)
 let body_by_addr : (string, Yojson.Safe.t) Hashtbl.t = Hashtbl.create 64
 
+(* Enum-typedef name → base-type string (e.g. "state_type" →
+ * "logic[3:0]").  Slang prints an enum-typed signal's `type` as
+ * "<id> [scope.]typename" rather than the resolved width, so parse_type
+ * resolves the typename through this table.  Populated by
+ * build_enum_table from every EnumType node before conversion. *)
+let enum_base_tbl : (string, string) Hashtbl.t = Hashtbl.create 32
+
 (* Parameter symbol address → (resolved value string, type string).
  * Slang prints `Parameter` members with `addr` + `value` for any
  * specialised instance. NamedValue references to those symbols don't
@@ -81,8 +88,25 @@ let strip_addr s =
  * `reg[7:0]$[0:63]` as `8 × 64` (8 elements of 64 bits), exactly
  * inverted — slib_fifo.sv's iFIFOMem turned into arr[8]bv64 instead
  * of arr[64]bv8. *)
-let parse_type s =
+let rec parse_type s =
   let s = String.trim s in
+  (* Resolve an enum-typedef name to its base type.  Slang emits an
+     enum-typed signal's type as "<id> [scope.]typename"; map the bare
+     typename to its EnumType baseType (logic[3:0] etc.) and re-parse,
+     so `state_type` sizes to 4 bits instead of defaulting to 1. *)
+  (match
+     let tok = match List.rev (String.split_on_char ' ' s) with
+       | t :: _ -> t | [] -> s in
+     let name = match List.rev (String.split_on_char '.' tok) with
+       | n :: _ -> n | [] -> tok in
+     (* Qualified name (module.typedef) first — disambiguates same-named
+        typedefs across modules — then the bare name as fallback. *)
+     (match Hashtbl.find_opt enum_base_tbl tok with
+      | Some _ as r -> r
+      | None -> Hashtbl.find_opt enum_base_tbl name)
+   with
+   | Some base when base <> s -> parse_type base
+   | _ ->
   if s = "logic" || s = "bit" || s = "reg" then (1, 1, 0)
   else if s = "int" || s = "integer" || s = "shortint"
        || s = "longint" then (32, 32, 0)
@@ -130,7 +154,7 @@ let parse_type s =
       | [w]          -> (w, w, 1)
       | outer :: inner :: _ ->
           (* 2-D packed: outer × inner total, inner is the element. *)
-          (outer * inner, inner, List.length pds)
+          (outer * inner, inner, List.length pds))
 
 (* ─── Operators ──────────────────────────────────────────────────── *)
 
@@ -1157,10 +1181,45 @@ let rec build_addr_table j =
   | `List xs -> List.iter build_addr_table xs
   | _ -> ()
 
+(* Populate enum_base_tbl from every EnumType node: baseType keyed by
+ * both the bare typedef name and the module-qualified name (e.g.
+ * "state_type" and "uart_transmitter.state_type" → "logic[3:0]").
+ * The qualified key is essential because distinct modules reuse the
+ * same typedef name with different widths (uart_receiver's state_type
+ * is enum logic [2:0], uart_transmitter's is enum logic [3:0]); a
+ * bare-name table would collide.  parse_type tries the qualified name
+ * (which slang emits in the signal's type string) first. *)
+let build_enum_table (j : json) =
+  Hashtbl.clear enum_base_tbl;
+  let rec walk scope = function
+    | `Assoc fields ->
+        let scope' =
+          match List.assoc_opt "kind" fields, List.assoc_opt "name" fields with
+          | Some (`String ("Instance" | "InstanceBody")), Some (`String nm)
+            when nm <> "" -> nm
+          | _ -> scope
+        in
+        (match List.assoc_opt "kind" fields with
+         | Some (`String "EnumType") ->
+             (match List.assoc_opt "name" fields,
+                    List.assoc_opt "baseType" fields with
+              | Some (`String name), Some (`String base) when name <> "" ->
+                  Hashtbl.replace enum_base_tbl name base;
+                  if scope' <> "" then
+                    Hashtbl.replace enum_base_tbl (scope' ^ "." ^ name) base
+              | _ -> ())
+         | _ -> ());
+        List.iter (fun (_, v) -> walk scope' v) fields
+    | `List xs -> List.iter (walk scope) xs
+    | _ -> ()
+  in
+  walk "" j
+
 let convert_json (j : json) : bprogram =
   let design = match assoc "design" j with Some d -> d | None -> j in
   Hashtbl.clear body_by_addr;
   build_addr_table j;
+  build_enum_table j;
   let pkg_funcs = collect_package_funcs design in
   let seen = Hashtbl.create 256 in
   let mods = List.rev (collect_instances ~seen ~pkg_funcs [] design) in
