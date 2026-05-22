@@ -2513,6 +2513,32 @@ let extract_always ~pkgs ~params ~arrays tok =
  * as a port connection. Returns Behavioral_ir.binstance, with the
  * containing module name picked up from the surrounding
  * instantiation_base1. *)
+(* Flatten an `any_port_list` (the `(...)` of an instantiation) into
+ * its `any_port` items in SOURCE order.  The grammar is left-recursive
+ * — `any_port_list_item_last1(rest, last)` and
+ * `any_port_list_trailing_comma1(list, COMMA)` — so the textually-first
+ * port is the deepest `rest`; recurse rest-first then append `last`. *)
+let rec flatten_any_port_list = function
+  | TLIST xs -> List.concat_map flatten_any_port_list xs
+  | TUPLE3 (STRING t, rest, last) when prefix_is "any_port_list_item_last" t ->
+      flatten_any_port_list rest @ [last]
+  | TUPLE3 (STRING t, lst, _comma) when prefix_is "any_port_list_trailing_comma" t ->
+      flatten_any_port_list lst
+  | COMMA | EMPTY_TOKEN -> []
+  | any_port -> [any_port]
+
+(* Direct children of a CST tuple, as a list (for locating the
+ * any_port_list element after the instance's LPAREN). *)
+let children_of = function
+  | TUPLE2 (a,b) -> [a;b]
+  | TUPLE3 (a,b,c) -> [a;b;c]
+  | TUPLE4 (a,b,c,d) -> [a;b;c;d]
+  | TUPLE5 (a,b,c,d,e) -> [a;b;c;d;e]
+  | TUPLE6 (a,b,c,d,e,f) -> [a;b;c;d;e;f]
+  | TUPLE7 (a,b,c,d,e,f,g) -> [a;b;c;d;e;f;g]
+  | TLIST xs -> xs
+  | _ -> []
+
 let extract_instances ~pkgs ~params tok =
   let arrays = [] in
   (* Use the labeled walker so each instance picks up the
@@ -2570,6 +2596,42 @@ let extract_instances ~pkgs ~params tok =
             port_conns := (port, be) :: !port_conns
         | _ -> ()
       ) pn_tags;
+      (* Positional connections (`sub u1 (a, b, c)`): no port_named
+       * children, so capture the actuals in source order under
+       * synthetic `$pos<N>` keys.  convert_files_inner resolves these
+       * to the child's formal port names once every module's port
+       * order is known.  Without this, positionally-connected
+       * instances (e.g. apb_uart's slib_input_filter UART_IF_CTS) lose
+       * all connectivity: the child's output never reaches the parent
+       * net and Behavioral_hier promotes it as inst__port. *)
+      if !port_conns = [] then begin
+        let portlist =
+          let rec after_lparen = function
+            | LPAREN :: pl :: _ -> Some pl
+            | _ :: rest -> after_lparen rest
+            | [] -> None
+          in after_lparen (children_of in_)
+        in
+        match portlist with
+        | None -> ()
+        | Some pl ->
+            List.iteri (fun idx ap ->
+              match ap with
+              | TUPLE6 (STRING t, _, _, _, _, _) when prefix_is "port_named" t ->
+                  ()  (* named — handled above *)
+              | EMPTY_TOKEN | COMMA -> ()
+              | expr ->
+                  let be =
+                    try expr_to_bexpr ~pkgs ~params ~arrays expr
+                    with Silent_zero_substitution _ as e -> raise e
+                       | _ -> BVar (match expr with
+                                    | TUPLE3 (_, SymbolIdentifier id, _) -> id
+                                    | SymbolIdentifier id -> id
+                                    | _ -> "?")
+                  in
+                  port_conns := (Printf.sprintf "$pos%d" idx, be) :: !port_conns
+            ) (flatten_any_port_list pl)
+      end;
       (match in_ with
        | TUPLE6 (_, SymbolIdentifier id, _, _, _, _)
        | TUPLE5 (_, SymbolIdentifier id, _, _, _) ->
@@ -4130,6 +4192,51 @@ let discover_init_dirs files =
 
 (* Parse a list of SV files via Verible, find the top module, and
  * convert it (and its specialised children) to BIR. *)
+(* Normalisation pass: rewrite positional instance port connections
+ * (captured by extract_instances under synthetic `$pos<N>` keys) into
+ * named form, using each module's formal port order.  This runs once,
+ * up front, BEFORE any destructive manipulation (Behavioral_hier
+ * flattening, Behavioral_ffrip, Behavioral_share in prep_for_z3): those
+ * passes substitute and rename by formal/actual name, so every
+ * connection must already be named — a leftover `$posN` would lose the
+ * connection (the child output never reaches the parent net).  Verilog
+ * itself forbids mixing named and positional in one instance, so a
+ * given instance's keys are uniformly `$posN` or uniformly named.
+ *
+ * Port order is taken from each (specialised) module's port signals in
+ * declaration order.  A `$posN` that can't be resolved (child module
+ * absent, or index past the port count) is left as-is and reported —
+ * it then drops harmlessly in the flattener, but the warning flags a
+ * real arity mismatch worth investigating. *)
+let name_positional_ports (bmods : bmodule list) : bmodule list =
+  let is_pos k = String.length k > 4 && String.sub k 0 4 = "$pos" in
+  let port_order = Hashtbl.create 32 in
+  List.iter (fun (m : bmodule) ->
+    let ports = List.filter_map (fun (s : bsignal) ->
+      match s.direction with
+      | `Input | `Output -> Some s.name
+      | _ -> None) m.signals in
+    Hashtbl.replace port_order m.name ports) bmods;
+  let resolve_inst (i : Behavioral_ir.binstance) =
+    if not (List.exists (fun (k, _) -> is_pos k) i.port_connections) then i
+    else
+      let formals = Option.value ~default:[]
+        (Hashtbl.find_opt port_order i.module_name) in
+      let n = List.length formals in
+      let pc = List.map (fun (k, be) ->
+        if not (is_pos k) then (k, be)
+        else match int_of_string_opt (String.sub k 4 (String.length k - 4)) with
+          | Some idx when idx < n -> (List.nth formals idx, be)
+          | _ ->
+              Printf.eprintf
+                "[verible_to_bir] %s: positional port %s of %s unresolved \
+                 (%d formals)\n" i.inst_name k i.module_name n;
+              (k, be)) i.port_connections in
+      { i with port_connections = pc }
+  in
+  List.map (fun (m : bmodule) ->
+    { m with instances = List.map resolve_inst m.instances }) bmods
+
 let convert_files_inner ~keep_external ~top files : bprogram =
   mem_init_search_paths := discover_init_dirs files;
   if Sys.getenv_opt "MEM_INIT_DEBUG" <> None && !mem_init_search_paths <> [] then
@@ -4171,6 +4278,9 @@ let convert_files_inner ~keep_external ~top files : bprogram =
         ) m.instances in
         Some { m with name = s.s_name; instances = rewritten }
   ) specs in
+  (* Positional → named port connections, before prep_for_z3's
+   * destructive flatten/ffrip/share. *)
+  let bmods = name_positional_ports bmods in
   let prog = { modules = bmods; library_cells = [] } in
   (* Stamp `(* sv_decomp_* *)` attributes from each source file's
    * pre-scan. Sv_attr_extract is a regex-based side pass that runs
