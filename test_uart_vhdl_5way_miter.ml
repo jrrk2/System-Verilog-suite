@@ -44,12 +44,27 @@ let () =
   let sv  = Sys.argv.(2) in
   let vj  = Sys.argv.(3) in
   let vhd = Sys.argv.(4) in
+  (* Load every .vhd in the top's directory, not just the named file,
+     so the top architecture's component instantiations resolve against
+     their sibling entities and the VHDL design flattens like the SV
+     frontends (otherwise the sub-entities are missing and vhdl comes
+     out a hollow top). *)
+  let vhd_files =
+    let dir = Filename.dirname vhd in
+    match Sys.readdir dir with
+    | entries ->
+        Array.to_list entries
+        |> List.filter (fun f -> Filename.check_suffix f ".vhd")
+        |> List.map (fun f -> Filename.concat dir f)
+        |> (fun fs -> if fs = [] then [vhd] else fs)
+    | exception _ -> [vhd]
+  in
 
   let p_v = load_bir ~frontend:"verible"   ~top ~files:[sv] in
   let p_s = load_bir ~frontend:"slang"     ~top ~files:[sv] in
   let p_l = load_bir ~frontend:"verilator" ~top ~files:[vj] in
   let p_p = load_bir ~frontend:"sv-parser" ~top ~files:[sv] in
-  let p_h = load_bir ~frontend:"vhdl"      ~top ~files:[vhd] in
+  let p_h = load_bir ~frontend:"vhdl"      ~top ~files:vhd_files in
 
   let m_v = Option.bind p_v (prep ~top) in
   let m_s = Option.bind p_s (prep ~top) in

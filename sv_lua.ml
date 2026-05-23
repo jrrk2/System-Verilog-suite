@@ -225,11 +225,14 @@ let load_frontend ~frontend ~top ~files : bprogram =
       combined |> post_load
   | "vhdl" ->
       (match files with
-       | [f] ->
-           (match Vhdl_to_behavioral.convert_vhdl_file_to_behavioral f with
+       | [] -> failwith "vhdl frontend needs at least one .vhd"
+       | fs ->
+           (* Parse all given .vhd together so a top architecture's
+              component instantiations resolve against sibling entities
+              and prep_for_z3 can flatten the hierarchy. *)
+           (match Vhdl_to_behavioral.convert_vhdl_files_to_behavioral fs with
             | Some p -> p
-            | None -> failwith "vhdl frontend failed")
-       | _ -> failwith "vhdl frontend takes a single .vhd")
+            | None -> failwith "vhdl frontend failed"))
   | "surelog" ->
       (* Surelog UHDM dump path.  The frontend currently extracts
          module-level port surface only; processes/cont_assigns are

@@ -1080,7 +1080,9 @@ let extract_architecture ctx entity_name = function
            Double (VhdSecondaryUnit,
                   Double (VhdArchitectureBody,
                          Quintuple (Vhdarchitecture_body, Str arch_name,
-                                   Str _entity_ref, decls, stmts)))) ->
+                                   Str entity_ref, decls, stmts))))
+    when String.lowercase_ascii entity_ref
+         = String.lowercase_ascii entity_name ->
 
       (* Extract internal signals from declarations *)
       let internal_signals = ref [] in
@@ -1385,39 +1387,41 @@ let extract_architecture ctx entity_name = function
 
 (* Main conversion function *)
 let convert_vhdl_to_behavioral vhdl_ast =
-  let ctx = create_context () in
-
-  (* Extract entity and ports *)
-  let (entity_name, entity_ports) =
-    List.fold_left (fun (name, ports) design_unit ->
-      let (n, p) = extract_entity_ports ctx design_unit in
-      if n <> "" then (n, p) else (name, ports)
-    ) ("", []) vhdl_ast
+  (* The input may carry several designs (entity+architecture pairs)
+     when multiple .vhd files were parsed together.  Build one bmodule
+     per entity rather than folding everything into a single module
+     (the old behaviour mashed all units together — for a multi-file
+     parse that produced one giant self-referential module that hung
+     the flattener). *)
+  let entities =
+    List.filter_map (fun du ->
+      let (n, p) = extract_entity_ports (create_context ()) du in
+      if n <> "" then Some (n, p) else None) vhdl_ast
   in
-
-  (* Extract architecture *)
-  let (internal_signals, processes, instances) =
-    List.fold_left (fun (sigs, procs, insts) design_unit ->
-      let (s, p, i) = extract_architecture ctx entity_name design_unit in
-      (s @ sigs, p @ procs, i @ insts)
-    ) ([], [], []) vhdl_ast
+  let modules =
+    List.map (fun (entity_name, entity_ports) ->
+      (* Fresh context per module so signal-name state doesn't bleed
+         across designs.  extract_architecture filters by entity_name,
+         so folding over all units picks this entity's architecture. *)
+      let ctx = create_context () in
+      let (internal_signals, processes, instances) =
+        List.fold_left (fun (sigs, procs, insts) design_unit ->
+          let (s, p, i) = extract_architecture ctx entity_name design_unit in
+          (s @ sigs, p @ procs, i @ insts)
+        ) ([], [], []) vhdl_ast
+      in
+      {
+        name = entity_name;
+        params = [];
+        signals = entity_ports @ internal_signals;
+        processes;
+        instances;
+        funcs = [];
+        mems = []; attrs = [];
+      }
+    ) entities
   in
-
-  (* Combine all signals *)
-  let all_signals = entity_ports @ internal_signals in
-
-  (* Build module *)
-  let bmodule = {
-    name = entity_name;
-    params = [];
-    signals = all_signals;
-    processes;
-    instances;
-    funcs = [];
-    mems = []; attrs = [];
-  } in
-
-  { modules = [bmodule]; library_cells = [] }
+  { modules; library_cells = [] }
 
 (* Convert multiple VHDL ASTs to behavioral IR *)
 let convert_multiple vhdl_asts =
@@ -1427,8 +1431,12 @@ let convert_multiple vhdl_asts =
   ) vhdl_asts in
   { Behavioral_ir.modules = all_modules; library_cells = [] }
 
-(* Helper: Convert VHDL file to behavioral IR *)
-let convert_vhdl_file_to_behavioral filename =
+(* Convert one or more VHDL files to a single behavioral IR program.
+ * Parsing all files together puts every entity/architecture in one
+ * bprogram, so a top whose architecture instantiates sub-entities
+ * (component port maps) can be flattened by prep_for_z3 — otherwise
+ * the sub-entities are missing and the top comes out hollow. *)
+let convert_vhdl_files_to_behavioral filenames =
   (* Create a fresh hashtable for this parse to ensure isolation *)
   let fresh_hash = Hashtbl.create 256 in
   let old_hash = !Vhd_front.Vabstraction.vhdlhash in
@@ -1442,9 +1450,9 @@ let convert_vhdl_file_to_behavioral filename =
   };
 
   try
-    (* Parse the file *)
+    (* Parse the files *)
     let succ = ref true in
-    Vhd_front.VhdlMain.main succ [filename];
+    Vhd_front.VhdlMain.main succ filenames;
 
     if not !succ then begin
       Vhd_front.Vabstraction.vhdlhash := old_hash;
@@ -1467,7 +1475,11 @@ let convert_vhdl_file_to_behavioral filename =
 
       Some result
     end
-  with e ->
+  with _ ->
     Vhd_front.Vabstraction.vhdlhash := old_hash;
     Vhd_front.VhdlSettings.settings := old_settings;
     None
+
+(* Helper: Convert a single VHDL file to behavioral IR *)
+let convert_vhdl_file_to_behavioral filename =
+  convert_vhdl_files_to_behavioral [filename]
