@@ -927,6 +927,28 @@ let cell_to_bprocess = function
        | _ -> None)
   | _ -> None
 
+(* Convert a generic module Cell (a real sub-module instantiation, not
+ * a Vivado RTL_* primitive) into a binstance so prep_for_z3's
+ * Behavioral_hier flattener inlines the child — matching the
+ * verible/slang/sv-parser hierarchy contract.  Previously these cells
+ * produced neither a process (cell_to_bprocess returns None for
+ * non-RTL_* names) nor an instance, so verilator's apb_uart was a
+ * hollow top missing all submodule state.  RTL_* primitives are left
+ * to cell_to_bprocess. *)
+let cell_to_binstance = function
+  | Cell { name = inst_name;
+           modp_addr = Some (Module { name = mod_name; _ }); pins } ->
+      let is_rtl = String.length mod_name >= 4
+                   && String.sub mod_name 0 4 = "RTL_" in
+      if is_rtl then None
+      else
+        let conns = List.filter_map (function
+          | Pin { name; expr = Some e } -> Some (name, expr_to_bexpr e)
+          | _ -> None) pins in
+        Some { inst_name; module_name = mod_name;
+               param_values = []; port_connections = conns }
+  | _ -> None
+
 (* Extract function/task definitions from a list of stmts. Called at
  * both Module scope (functions defined inside the module) and Package
  * scope (functions exported via `import pkg::*`). The same routine is
@@ -1178,7 +1200,7 @@ let module_to_bmodule_with_funcs extra_funcs = function
         params = [];
         signals;
         processes;
-        instances = [];
+        instances = List.filter_map cell_to_binstance flat_stmts;
         funcs;
         mems = []; attrs = [];
       }
