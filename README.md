@@ -37,10 +37,11 @@ every backend reads `bmodule`s.
 | Frontend | Module | Reads | Notes |
 |---|---|---|---|
 | Verible | `verible_to_behavioral.ml` + `verible_elaborate.ml` | SV source via OCaml port of Verible's grammar | Full elaboration: parameter overrides, generate unrolling, const-fn evaluation, struct-typed parameters. `\`include` resolution is in-OCaml via `Sv_preproc` (no shell-out to verilator -E) |
-| Verilator JSON | `verilator_to_behavioral.ml` | `verilator --json-only` AST dump | Already-elaborated, monomorphic. Walks procedural-scope `Var` declarations (named-begin / `unnamedblkN`) so locals carry source-stated widths into the BIR |
-| Slang | `slang_to_behavioral.ml` | `slang --ast-json` | Independent SV elaborator, parses CVA6 (handles type parameters Surelog can't); first-class Z3 oracle peer |
+| Verilator JSON | `verilator_to_behavioral.ml` | `verilator --json-only` AST dump | Already-elaborated, monomorphic. Walks procedural-scope `Var` declarations (named-begin / `unnamedblkN`) so locals carry source-stated widths into the BIR. Generic submodule `Cell`s become `binstance`s (`cell_to_binstance`) so the hierarchy survives into the BIR; Vivado RTL_* primitive cells still lower to processes |
+| Slang | `slang_to_behavioral.ml` | `slang --ast-json` | Independent SV elaborator, parses CVA6 (handles type parameters Surelog can't); first-class Z3 oracle peer. Enum-typed signals are sized from their `EnumType` base via `build_enum_table` (keyed by module-qualified name so same-named typedefs in different modules don't collide) |
+| sv-parser | `sv_parser_to_behavioral.ml` | dalance/sv-parser CST dump (`parse_sv -t`) | Independent CST parser as a third SV oracle. Extracts module instances (named + positional port maps → `binstance`), enum typedefs, and resolves positional connections to named form before flattening. Param specialisation across instances is still TODO |
 | Vivado RTL VHDL | `vhdl_to_ver_front.ml` → `ver_front_to_behavioral.ml` | Structural VHDL emitted by Vivado's `synth_design -rtl` (after Vivado has parsed and elaborated the original SV source) | Treats RTL_REG_SYNC/ASYNC/_CE cells as `BSequential` processes; the structural oracle |
-| GRLIB / VHDL native | `vhdl_to_behavioral.ml` | VHDL source via the `vhd_front` parser | Records, enums, conditional concurrent assigns. 1072/1105 GRLIB files (97%) emit clean BIR; first Z3 ✅ EQUIVALENT on `eth_rstgen` against ghdl-synth (verilator/slang oracles) |
+| GRLIB / VHDL native | `vhdl_to_behavioral.ml` | VHDL source via the `vhd_front` parser | Records, enums, conditional concurrent assigns. Emits one bmodule per entity and parses a file-list together (`convert_vhdl_files_to_behavioral`), so a top architecture's component instantiations resolve against sibling entities and flatten. 1072/1105 GRLIB files (97%) emit clean BIR; first Z3 ✅ EQUIVALENT on `eth_rstgen` against ghdl-synth (verilator/slang oracles) |
 | Yosys RTLIL | `rtlil_to_behavioral.ml` | `read_verilog`-then-`write_rtlil` | Used for the four-way miter |
 | Surelog UHDM | `surelog_to_behavioral.ml` | UHDM dump from Surelog | **Parked at port-surface only** — slang covers a strict superset (CVA6's type parameters work) and is already a Z3 oracle. Use slang for new oracle work |
 
@@ -48,6 +49,19 @@ Each frontend produces a `bprogram = { modules: bmodule list; library_cells: ...
 A `bmodule` is `{ name; params; signals; processes; instances; funcs; mems }`
 where `processes` is a list of `BCombinational` / `BSequential` blocks
 holding `bstmt` trees over `bexpr` trees.
+
+**Uniform hierarchy contract.** Every frontend records the module
+hierarchy as `binstance`s (instance name, child module, port
+connections) rather than pre-inlining it — verible, slang, sv-parser,
+verilator and native VHDL all populate `instances` on hierarchical
+designs. Flattening is *not* destructive: `prep_for_z3` runs
+`Behavioral_arch_subst.substitute_program` (the operator-architecture
+swap — see below) on the recorded hierarchy, then
+`Behavioral_hier.flatten_for_z3` produces a *transient* flat module for
+the Z3 leaf check while the hierarchical `bprogram` is left intact. So
+operator-architecture substitution (`sv_decomp_adder`/`sv_decomp_mul`
+instances → abstract `BBinOp`) slots in at the instance boundary on the
+recorded representation, ahead of and independent of the flatten.
 
 ## Verible elaborator (`verible_elaborate.ml`)
 
@@ -407,6 +421,8 @@ Built via `dune build`. The most-used executables:
 | `test_yosys_oracle_sweep.exe` | `test_yosys_oracle_sweep.ml` | Parallel-correctness sweep across a corpus. `--oracle / --peer` for any frontend pair; `--incdir` threads through to verilator and our `Sv_preproc`. Two modes: per-file iteration (auto-top), or one elaboration set per `--top` |
 | `test_cva6_slang_diff.exe` | `test_cva6_slang_diff.ml` | Slang ↔ Verible per-entity miter on the cva6 flat SV. Slang as the primary elaborator; pairs by base-name + port-shape across both frontends' specialisations |
 | `test_grlib_vhdl_z3.exe` | `test_grlib_vhdl_z3.ml` | GRLIB bottom-up Z3 sweep: per leaf, our VHDL→BIR vs ghdl-synth→Verilog→{verilator JSON, slang}→BIR through the Z3 miter |
+| `test_uart_vhdl_5way_miter.exe` | `test_uart_vhdl_5way_miter.ml` | 5-way cross-language miter: all four SV frontends (verible/slang/verilator/sv-parser) plus a parallel VHDL implementation, ten pairwise Z3 miters. Loads every `.vhd` in the top's directory so the VHDL hierarchy flattens. Used to drive the apb_uart convergence (all five frontends flatten to ~103-109 registers) |
+| `test_dump_four.exe` | `test_dump_four.ml` | Side-by-side BIR dump from verible/slang/verilator/sv-parser for one design — the first stop when a miter pair disagrees |
 | `test_vhdl_bir_dump.exe` | `test_vhdl_bir_dump.ml` | Single-VHDL-file BIR dump. `--multi <top> <files>` walks the instance graph for hierarchy dumps |
 | `test_cva6_ff_diff.exe` | `test_cva6_ff_diff.ml` | Per-entity FF-set diff between Vivado's elaborated form and Verible-elaborated SV. `MITER_Z3=1` runs Z3 on FF-matching pairs |
 | `test_cva6_bottom_up.exe` | `test_cva6_bottom_up.ml` | Pairwise Z3 miter for every Verilator-JSON module against the matching entity in Vivado's elaborated VHDL output |
@@ -614,3 +630,13 @@ Pending in the task tracker, in rough priority order:
    blocked. Slang covers the same cases (and more) and is already a
    working Z3 oracle; revisit only if the UHDM ecosystem grows a
    feature slang doesn't have
+9. **apb_uart 5-way convergence tail** — all five frontends now flatten
+   into the same ~103-109 register band, but a few residuals remain
+   before they miter to EQUIVALENT: the slang↔sv-parser pair reaches
+   "interfaces match" then hits an *expression*-width mismatch (Z3
+   BitVec 2 vs 3; per-module signal widths already agree); sv-parser
+   needs `specialise_design`-style param specialisation (the WIDTH=11
+   RX FIFO currently uses slib_fifo's default WIDTH=8); and the
+   verible⊂slang 4-signal input-filter register residual (slang keeps
+   a register per filter where verible aliases the output onto the
+   parent net)
