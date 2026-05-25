@@ -220,30 +220,62 @@ let bits_needed n =
 (* Walk every statement in a process body. When we find a BCase that
  * matches the constant-rom shape, lift it to a BAssign + record a
  * bmem. Returns rewritten body and the list of inferred bmems. *)
-let rewrite_body_for_rom body =
+let rewrite_body_for_rom ~is_seq body =
+  (* FPGA flow wants the read to survive as a [BSelect] of an
+     INIT-initialised BRom so memlower can map it to a block RAM; the
+     miter/z3 flow wants the explicit BCond mux (it does not interpret a
+     BRom's init_values).  Gate the shape on MEMLOWER_FPGA so the miter
+     path is byte-for-byte unchanged. *)
+  let fpga = Sys.getenv_opt "MEMLOWER_FPGA" = Some "1" in
   let mems = ref [] in
   let rec walk_s = function
     | BCase { selector; cases; default } as orig ->
         (match try_extract_const_rom selector cases default with
          | Some (lhs, sel, pairs, def) ->
              let rom_name = "rom_" ^ lhs in
-             let depth = List.length pairs in
-             let addr_w = bits_needed (depth - 1) in
              let data_w =
                match pairs with (_, _, w) :: _ -> w | _ -> 1
              in
-             let init_values = List.map (fun (_, v, _) -> v) pairs in
-             mems := { mname = rom_name;
-                       data_width = data_w;
-                       addr_width = addr_w;
-                       depth;
-                       kind = BRom;
-                       init_values;
-                       n_write_ports = 0;
-                       n_read_ports = 1;
-                       read_is_sync = false } :: !mems;
-             BAssign { lhs;
-                       rhs = build_rom_lookup sel pairs def }
+             if fpga then begin
+               (* Index the INIT by case key (address), sized to the full
+                  address space so reads in the gaps return the default,
+                  matching the source `default:` arm.  read_is_sync tracks
+                  the process: a clocked case (e.g. progmem's
+                  `always @(posedge clk) case ... mem <= v`) is a sync ROM
+                  read that maps directly onto a BRAM output register. *)
+               let max_key =
+                 List.fold_left (fun a (k, _, _) -> max a k) 0 pairs in
+               let addr_w = bits_needed max_key in
+               let depth = 1 lsl addr_w in
+               let def_val = match def with Some (v, _) -> v | None -> 0 in
+               let init = Array.make depth def_val in
+               List.iter (fun (k, v, _) ->
+                 if k >= 0 && k < depth then init.(k) <- v) pairs;
+               mems := { mname = rom_name;
+                         data_width = data_w;
+                         addr_width = addr_w;
+                         depth;
+                         kind = BRom;
+                         init_values = Array.to_list init;
+                         n_write_ports = 0;
+                         n_read_ports = 1;
+                         read_is_sync = is_seq } :: !mems;
+               BAssign { lhs; rhs = BSelect { array = BVar rom_name; index = sel } }
+             end else begin
+               let depth = List.length pairs in
+               let addr_w = bits_needed (depth - 1) in
+               let init_values = List.map (fun (_, v, _) -> v) pairs in
+               mems := { mname = rom_name;
+                         data_width = data_w;
+                         addr_width = addr_w;
+                         depth;
+                         kind = BRom;
+                         init_values;
+                         n_write_ports = 0;
+                         n_read_ports = 1;
+                         read_is_sync = false } :: !mems;
+               BAssign { lhs; rhs = build_rom_lookup sel pairs def }
+             end
          | None ->
              let cases' = List.map (fun (k, ss) ->
                (k, List.map walk_s ss)) cases in
@@ -267,10 +299,10 @@ let rewrite_body_for_rom body =
 
 let rewrite_process_for_rom = function
   | BCombinational c ->
-      let (body', mems) = rewrite_body_for_rom c.body in
+      let (body', mems) = rewrite_body_for_rom ~is_seq:false c.body in
       (BCombinational { c with body = body' }, mems)
   | BSequential s ->
-      let (body', mems) = rewrite_body_for_rom s.body in
+      let (body', mems) = rewrite_body_for_rom ~is_seq:true s.body in
       (BSequential { s with body = body' }, mems)
 
 (* ─── Port-count + sync/async classification ─────────────────────────── *)
