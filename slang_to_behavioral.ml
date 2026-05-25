@@ -1242,8 +1242,14 @@ let convert_files ~top files : bprogram option =
       None
   | Some slang ->
       let json_path = Filename.temp_file "slang_" ".json" in
+      (* `--timescale` supplies a default for modules that lack a
+         `\`timescale` directive, so a fileset where only some files
+         carry one (e.g. picosoc: picorv32.v has one, the rest don't)
+         doesn't trip slang's "design element does not have a time
+         scale defined but others do" error.  Timescale is irrelevant
+         to the synthesisable BIR. *)
       let cmd = Printf.sprintf
-        "%s --ast-json %s --top %s %s 2>/dev/null"
+        "%s --ast-json %s --timescale 1ns/1ps --top %s %s 2>/dev/null"
         (Filename.quote slang)
         (Filename.quote json_path)
         (Filename.quote top)
