@@ -92,14 +92,28 @@ let rec sub_bstmt ~subst ~lhs_subst ~prefix = function
   | BReturn None -> BReturn None
   | BReturn (Some e) -> BReturn (Some (sub_bexpr ~subst ~prefix e))
 
+(* Resolve a bare signal NAME (clock / reset / sensitivity) through the
+   port connections: an input port wired to a parent net [BVar pn] becomes
+   [pn], an output port becomes its lhs_subst actual, otherwise it's an
+   internal signal and gets the instance prefix.  Without this, an inlined
+   module's `@posedge clk` becomes `@posedge inst__clk` with no driver. *)
+let sub_name ~subst ~lhs_subst ~prefix n =
+  match List.assoc_opt n subst with
+  | Some (BVar pn) -> pn
+  | Some _ -> pname prefix n
+  | None ->
+    (match List.assoc_opt n lhs_subst with
+     | Some pn -> pn
+     | None -> pname prefix n)
+
 let sub_process ~subst ~lhs_subst ~prefix = function
   | BCombinational { name; sensitivity; body } ->
       BCombinational {
         name = pname prefix name;
         sensitivity = List.map (function
-          | BPosEdge n -> BPosEdge (pname prefix n)
-          | BNegEdge n -> BNegEdge (pname prefix n)
-          | BLevel   n -> BLevel   (pname prefix n)
+          | BPosEdge n -> BPosEdge (sub_name ~subst ~lhs_subst ~prefix n)
+          | BNegEdge n -> BNegEdge (sub_name ~subst ~lhs_subst ~prefix n)
+          | BLevel   n -> BLevel   (sub_name ~subst ~lhs_subst ~prefix n)
           | BAny       -> BAny
         ) sensitivity;
         body = List.map (sub_bstmt ~subst ~lhs_subst ~prefix) body }
@@ -107,11 +121,11 @@ let sub_process ~subst ~lhs_subst ~prefix = function
                   reset; reset_edge; reset_async; body } ->
       BSequential {
         name        = pname prefix name;
-        clock       = pname prefix clock;
+        clock       = sub_name ~subst ~lhs_subst ~prefix clock;
         clock_edge;
         reset       = (match reset with
                        | None -> None
-                       | Some n -> Some (pname prefix n));
+                       | Some n -> Some (sub_name ~subst ~lhs_subst ~prefix n));
         reset_edge;
         reset_async;
         body        = List.map (sub_bstmt ~subst ~lhs_subst ~prefix) body }
