@@ -18,15 +18,23 @@ open Hardcaml
 let map_lowered ?(io = false) ~(k : int) ~(name : string) (l : Bir_to_aig.lowered)
   : Circuit.t =
   let g = l.Bir_to_aig.graph in
-  (* feedback wire per register Q bit. *)
+  (* feedback wire per boundary output bit: register Q + instance output
+     ports.  signal_of_node routes an AIG input to its wire when present. *)
   let q_wire = Hashtbl.create (module String) in
   List.iter l.regs ~f:(fun r ->
     List.iter r.Bir_to_aig.rb_q_names ~f:(fun nm ->
       Hashtbl.set q_wire ~key:nm ~data:(Signal.wire 1)));
-  (* names that are register D-cone outputs (not real circuit outputs). *)
+  List.iter l.insts ~f:(fun ib ->
+    List.iter ib.Bir_to_aig.ib_out_ports ~f:(fun (_, bits) ->
+      List.iter bits ~f:(fun nm -> Hashtbl.set q_wire ~key:nm ~data:(Signal.wire 1))));
+  (* boundary-output names (drive an FF D or an instance input, not a real
+     circuit output): register D-cones + instance input-port cones. *)
   let d_names = Hash_set.create (module String) in
   List.iter l.regs ~f:(fun r ->
     List.iter r.Bir_to_aig.rb_d_names ~f:(Hash_set.add d_names));
+  List.iter l.insts ~f:(fun ib ->
+    List.iter ib.Bir_to_aig.ib_in_ports ~f:(fun (_, bits) ->
+      List.iter bits ~f:(Hash_set.add d_names)));
   (* clock names, for IO-buffer kind selection. *)
   let clock_names = Hash_set.create (module String) in
   List.iter l.regs ~f:(fun r -> Hash_set.add clock_names r.Bir_to_aig.rb_clock);
@@ -112,4 +120,30 @@ let map_lowered ?(io = false) ~(k : int) ~(name : string) (l : Bir_to_aig.lowere
         in
         let w = Hashtbl.find_exn q_wire qn in
         Signal.(w <== q)));
+  (* ---- re-instantiate each black box, wire its boundary buses ---- *)
+  let bus_of_bits bit_names =
+    match
+      List.map bit_names ~f:(fun nm ->
+        Option.value (Hashtbl.find d_sig nm) ~default:Signal.gnd)
+    with
+    | [] -> Signal.empty
+    | bits -> Signal.concat_lsb bits (* bit_names are LSB-first *)
+  in
+  List.iter l.insts ~f:(fun ib ->
+    let inputs =
+      List.map ib.Bir_to_aig.ib_in_ports ~f:(fun (p, bits) -> p, bus_of_bits bits)
+    in
+    let outputs =
+      List.map ib.Bir_to_aig.ib_out_ports ~f:(fun (p, bits) -> p, List.length bits)
+    in
+    let omap =
+      Instantiation.create () ~name:ib.Bir_to_aig.ib_name
+        ~instance:ib.Bir_to_aig.ib_instance ~parameters:ib.Bir_to_aig.ib_generics
+        ~inputs ~outputs
+    in
+    List.iter ib.Bir_to_aig.ib_out_ports ~f:(fun (p, bits) ->
+      let bus = Map.find_exn omap p in
+      List.iteri bits ~f:(fun i nm ->
+        let wfb = Hashtbl.find_exn q_wire nm in
+        Signal.(wfb <== select bus i i))));
   Circuit.create_exn ~name (List.rev !real_outs)

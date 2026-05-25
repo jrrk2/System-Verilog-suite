@@ -187,9 +187,24 @@ type reg_boundary =
   ; rb_width : int
   }
 
+(* A black-box instance, lowered as a generalized boundary: its OUTPUT
+   ports' bits are AIG primary inputs (like a register Q), and each INPUT
+   port's cone bits are AIG primary outputs (like a register D).  fpga_map
+   re-instantiates the box and wires these buses. *)
+type inst_boundary =
+  { ib_name : string (* module / cell type, e.g. "RAMB18E1" *)
+  ; ib_instance : string
+  ; ib_generics : Hardcaml.Parameter.t list
+  ; ib_in_ports : (string * string list) list
+      (* input port -> per-bit AIG-output names (cone driving the box), LSB-first *)
+  ; ib_out_ports : (string * string list) list
+      (* output port -> per-bit AIG-input names (box output), LSB-first *)
+  }
+
 type lowered =
   { graph : Lut_cover.graph
   ; regs : reg_boundary list
+  ; insts : inst_boundary list
   ; inputs : (string * int) list (* primary input ports (name, width) *)
   }
 
@@ -217,6 +232,8 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
   let memo = Hashtbl.create (module Int) in
   let reg_queue = Queue.create () in
   let regs = ref [] in
+  let insts = ref [] in
+  let inst_outs = ref [] in
   let rec walk sig_ : lit array =
     if T.is_empty sig_ then [||]
     else begin
@@ -286,8 +303,44 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
               :: !regs;
             Queue.enqueue reg_queue (d, d_names);
             q_lits
-          | Multiport_mem _ | Mem_read_port _ | Inst _ ->
-            failwith "bir_to_aig: memories / instances not yet lowered (DSP/BRAM)"
+          | Inst { instantiation = inst; _ } ->
+            let base = Printf.sprintf "i%d" key in
+            (* output ports -> AIG primary inputs (the box's output bus). *)
+            let out_lits = Array.create ~len:w const_false in
+            let ob_out =
+              List.map inst.inst_outputs ~f:(fun (pname, (pw, off)) ->
+                let names =
+                  List.init pw ~f:(fun bit -> Printf.sprintf "%s_%s_o%d" base pname bit)
+                in
+                List.iteri names ~f:(fun bit nm -> out_lits.(off + bit) <- aig_input b nm);
+                pname, names)
+            in
+            Hashtbl.set memo ~key ~data:out_lits;
+            (* input ports -> AIG primary outputs (cones into the box). *)
+            let ob_in =
+              List.map inst.inst_inputs ~f:(fun (pname, s) ->
+                let lits = walk s in
+                let names =
+                  List.mapi (Array.to_list lits) ~f:(fun bit lit ->
+                    let nm = Printf.sprintf "%s_%s_i%d" base pname bit in
+                    inst_outs := (nm, lit) :: !inst_outs;
+                    nm)
+                in
+                pname, names)
+            in
+            insts :=
+              { ib_name = inst.inst_name
+              ; ib_instance = inst.inst_instance
+              ; ib_generics = inst.inst_generics
+              ; ib_in_ports = ob_in
+              ; ib_out_ports = ob_out
+              }
+              :: !insts;
+            out_lits
+          | Multiport_mem _ | Mem_read_port _ ->
+            failwith
+              "bir_to_aig: raw hardcaml memory not lowered — route memories \
+               through behavioral_memlower to fixed-shape BRAM binstances"
         in
         Hashtbl.set memo ~key ~data:v;
         v
@@ -310,8 +363,10 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
       drain ()
   in
   drain ();
-  let graph = finalize b ~outputs:(main_outs @ List.rev !reg_outs) in
+  let graph =
+    finalize b ~outputs:(main_outs @ List.rev !reg_outs @ List.rev !inst_outs)
+  in
   let inputs =
     List.map (Hardcaml.Circuit.inputs circ) ~f:(fun s -> signal_name s, S.width s)
   in
-  { graph; regs = !regs; inputs }
+  { graph; regs = !regs; insts = !insts; inputs }
