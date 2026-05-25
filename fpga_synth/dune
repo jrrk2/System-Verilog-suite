@@ -1,0 +1,15 @@
+; In-suite FPGA technology mapper: BIR/hardcaml -> Xilinx-primitive
+; netlist (LUTk/FDRE/CARRY4/RAMB/DSP48/IBUF/BUFG...) for nextpnr-xilinx.
+; Isolated in its own library so [@@deriving hardcaml] can be enabled
+; here (the main executables stanza only preprocesses ppx_deriving_yojson).
+(library
+ (name fpga_synth)
+ (modules xil_prim lut_cover unisim_scan fpga_emit)
+ (libraries hardcaml base)
+ (preprocess (pps ppx_hardcaml)))
+
+(executable
+ (name test_fpga_prim)
+ (modules test_fpga_prim)
+ (libraries hardcaml base fpga_synth)
+ (preprocess (pps ppx_hardcaml)))
