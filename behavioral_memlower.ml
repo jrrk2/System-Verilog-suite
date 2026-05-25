@@ -403,6 +403,91 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
          | Some (we_expr, w_addr, w_data), Some r_addr ->
              let aw = bits_needed mm.depth in
              let dw = mm.data_width in
+             if Sys.getenv_opt "MEMLOWER_FPGA" = Some "1" then begin
+               (* ── FPGA path: byte-lane RAMB18E1 (Fpga_bram_resolve) ──
+                  A single true-dual-port port serves read+write: each
+                  cycle addr = we ? w_addr : r_addr (degenerates to a wire
+                  when w_addr ≡ r_addr — the CPU case).  No OpenRAM macro,
+                  no stub module; RAMB18E1 is a nextpnr primitive. *)
+               ignore aw;
+               if mm.depth > 2048 then
+                 skip "depth>2048 (FPGA byte-lane deep-tiling TODO)"
+               else if dw mod 8 <> 0 then
+                 skip "width not a multiple of 8 (FPGA byte-lane)"
+               else begin
+                 let read_pin = mname ^ "_rdata_a" in
+                 let rw_e = rewrite_reads_e mname read_pin in
+                 let w_addr = rw_e w_addr and r_addr = rw_e r_addr in
+                 let w_data = rw_e w_data and we_expr = rw_e we_expr in
+                 let muxed_addr =
+                   BCond { condition = we_expr; then_val = w_addr; else_val = r_addr }
+                 in
+                 let orig_clk =
+                   match w_proc with BSequential s -> s.clock | _ -> "clk"
+                 in
+                 let init =
+                   if mm.init_values <> [] then Some (Array.of_list mm.init_values)
+                   else None
+                 in
+                 let port =
+                   Fpga_bram_resolve.(
+                     { p_clk = BVar orig_clk; p_addr = muxed_addr; p_we = we_expr;
+                       p_wdata = w_data })
+                 in
+                 let insts, new_sigs, drv_stmts, _ =
+                   Fpga_bram_resolve.build_byte_lane_ram ~name:mname ~depth:mm.depth
+                     ~width:dw ?init ~ports:[ port ] ()
+                 in
+                 let driver =
+                   BCombinational
+                     { name = mname ^ "_drv"; sensitivity = [ BAny ]; body = drv_stmts }
+                 in
+                 let rewrite_body body =
+                   List.map (rewrite_reads_s mname read_pin) (strip_mem_writes mname body)
+                 in
+                 let processes' =
+                   List.mapi (fun i p ->
+                     let do_strip = i = w_idx || i = r_idx in
+                     match p with
+                     | BSequential s ->
+                       BSequential
+                         { s with body =
+                             (if do_strip then rewrite_body s.body
+                              else List.map (rewrite_reads_s mname read_pin) s.body) }
+                     | BCombinational c ->
+                       BCombinational
+                         { c with body =
+                             (if do_strip then rewrite_body c.body
+                              else List.map (rewrite_reads_s mname read_pin) c.body) })
+                     m.processes
+                 in
+                 let instances' =
+                   List.map (fun (i : binstance) ->
+                     { i with port_connections =
+                         List.map (fun (p, e) -> (p, rewrite_reads_e mname read_pin e))
+                           i.port_connections })
+                     m.instances
+                 in
+                 let funcs' =
+                   List.map (fun (f : bfunc) ->
+                     { f with body = List.map (rewrite_reads_s mname read_pin) f.body })
+                     m.funcs
+                 in
+                 let signals' =
+                   List.filter (fun (s : bsignal) -> s.name <> mname) m.signals @ new_sigs
+                 in
+                 let m' =
+                   { m with
+                     signals = signals'
+                   ; processes = processes' @ [ driver ]
+                   ; instances = insts @ instances'
+                   ; funcs = funcs'
+                   ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
+                 in
+                 `Lowered (m', None)
+               end
+             end
+             else begin
              (* Even when the source has a separate read site that
                 always fires (rdata <= mem[r_addr]) and a write site
                 guarded by we_expr, a 1RW cell can serve both: each
@@ -616,14 +701,16 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                funcs = funcs';
                mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems;
              } in
-             `Lowered (m', art))
+             `Lowered (m', Some art)
+             end)
 
 (* ──────────── per-module pass ──────────── *)
 
 let lower_module ~tech (m : bmodule) =
   List.fold_left (fun (m, arts) mm ->
     match try_lower_one_mem ~tech m mm with
-    | `Lowered (m', art) -> m', art :: arts
+    | `Lowered (m', Some art) -> m', art :: arts
+    | `Lowered (m', None) -> m', arts
     | `Skipped -> m, arts
   ) (m, []) m.mems
 
