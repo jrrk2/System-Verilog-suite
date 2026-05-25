@@ -65,4 +65,15 @@ if [[ "${MAKE_BIT:-0}" == 1 ]]; then
     --part_file "$DBF/$PART/part.yaml" --part_name "$PART" \
     --frm_file "$OUT/top.frames" --output_file "$OUT/top.bit"
   echo ">> BITSTREAM: $OUT/top.bit ($(stat -c%s "$OUT/top.bit") bytes)"
+
+  # Package for the Sonata board: it programs by copying a UF2 onto the
+  # USB mass-storage drive it exposes (NOT openFPGALoader).  uf2conv with
+  # the Sonata family id; *.slotN.uf2 selects the bitstream slot.
+  if [[ "${UF2:-0}" == 1 ]]; then
+    UF2_FAMILY=${UF2_FAMILY:-0x6ce29e6b}
+    UF2_SLOT=${UF2_SLOT:-slot1}
+    UF2_OUT="$OUT/top.$UF2_SLOT.uf2"
+    uf2conv -b 0x00000000 -f "$UF2_FAMILY" "$OUT/top.bit" -co "$UF2_OUT"
+    echo ">> UF2: $UF2_OUT  (copy this onto the Sonata mass-storage drive)"
+  fi
 fi
