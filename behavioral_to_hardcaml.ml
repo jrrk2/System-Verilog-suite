@@ -577,6 +577,34 @@ let thread_body body =
   let env : (string, bexpr) Hashtbl.t = Hashtbl.create 64 in
   let snapshot () = Hashtbl.fold (fun k v a -> (k, v) :: a) env [] in
   let restore snap = Hashtbl.reset env; List.iter (fun (k, v) -> Hashtbl.replace env k v) snap in
+  (* Un-lift iflift's no-else encoding: a self-referencing conditional
+     `lhs := (c ? v : lhs)` is `if (c) lhs := v;` with the else meaning
+     "keep prior".  Emitting it as a flat (unconditional) assignment makes
+     Hardcaml's last-write-wins OVERRIDE any earlier conditional drive of
+     lhs (e.g. picorv32's `if (ecall) cpu_state <= trap` would wipe out
+     the whole FSM `case`).  Re-expressing it as a guarded `if_` lets
+     Hardcaml's priority chain compose it on top of the prior value. *)
+  let rec unlift lhs rhs =
+    match rhs with
+    | BCond { condition; then_val; else_val = BVar n } when n = lhs ->
+        Some (BIf { condition; then_stmts = [ BAssign { lhs; rhs = then_val } ];
+                    else_stmts = [] })
+    | BCond { condition; then_val = BVar n; else_val } when n = lhs ->
+        Some (BIf { condition = BUnOp { op = BNot; operand = condition; result_type = BBool };
+                    then_stmts = [ BAssign { lhs; rhs = else_val } ]; else_stmts = [] })
+    | BCond { condition; then_val; else_val } ->
+        (match unlift lhs else_val with
+         | Some inner ->
+             Some (BIf { condition; then_stmts = [ BAssign { lhs; rhs = then_val } ];
+                         else_stmts = [ inner ] })
+         | None -> None)
+    | _ -> None
+  in
+  let emit_assign out lhs rhs =
+    match unlift lhs rhs with
+    | Some bif -> out := bif :: !out
+    | None -> out := BAssign { lhs; rhs } :: !out
+  in
   (* Emit the value-so-far of each [name] still pending in env, as the
      materialised default for the implicit else of a following
      conditional.  Keep it in env so the branches inherit it; the caller
@@ -584,7 +612,7 @@ let thread_body body =
   let materialise out names =
     List.iter (fun k ->
       match Hashtbl.find_opt env k with
-      | Some v -> out := BAssign { lhs = k; rhs = v } :: !out
+      | Some v -> emit_assign out k v
       | None -> ()) names
   in
   let rec thread stmts =
@@ -619,11 +647,12 @@ let thread_body body =
       | other -> out := other :: !out
     ) (flatten_top stmts);
     (* flush signals assigned at this level that survived to the end *)
-    let finals = List.filter_map (fun k ->
+    let finals = ref [] in
+    List.iter (fun k ->
       match Hashtbl.find_opt env k with
-      | Some v -> Some (BAssign { lhs = k; rhs = v })
-      | None -> None) (List.rev !local) in
-    List.rev !out @ finals
+      | Some v -> emit_assign finals k v
+      | None -> ()) (List.rev !local);
+    List.rev !out @ List.rev !finals
   in
   thread body
 
