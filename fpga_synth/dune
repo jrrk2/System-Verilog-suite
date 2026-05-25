@@ -8,8 +8,8 @@
  (libraries hardcaml base)
  (preprocess (pps ppx_hardcaml)))
 
-(executable
- (name test_fpga_prim)
- (modules test_fpga_prim)
- (libraries hardcaml base fpga_synth)
+(executables
+ (names test_fpga_prim test_lut_cover)
+ (modules test_fpga_prim test_lut_cover)
+ (libraries hardcaml base stdio fpga_synth)
  (preprocess (pps ppx_hardcaml)))
