@@ -504,6 +504,129 @@ let rec stmt_to_always ~is_reg ctx alw = function
   | BCallStmt _ | BReturn _ ->
       alw
 
+(* Thread Verilog blocking-assignment semantics over a process body.
+ *
+ * Hardcaml's [Always] reads a variable's [.value] as its *final*
+ * post-compile wire and lets a later *unconditional* assignment override
+ * an earlier one.  But iflift encodes a no-else `if (c) x = v;` as the
+ * unconditional self-referencing assignment `x := (c ? v : x)`.  Fed
+ * naively to [Always] a `default; conditional-override` run collapses to
+ * just the last assignment with [x.value] in its else — a combinational
+ * *loop* (and the default is silently dropped).  The same happens for a
+ * signal re-assigned several times inside one `if`/`case` branch (e.g.
+ * picorv32's unrolled nibble-carry multiplier `next_rd = f(next_rd,…)`).
+ *
+ * This pass threads a value-so-far environment (signal -> expression)
+ * through the body, *including into* BIf/BCase branches (each branch
+ * inherits the entering environment), so every read resolves to the
+ * value computed so far and each straight-line run collapses to one
+ * self-reference-free assignment.  Crucially it *keeps* the BIf/BCase
+ * control flow rather than flattening it to BConds: a branch that
+ * assigns a signal with no prior default must fall through to Hardcaml's
+ * implicit-keep, which bottoms out at the wire's 0 default (matching a
+ * `(* full_case *)` synthesis) instead of a self-referencing latch.
+ *
+ * Before each conditional we materialise the current value of every
+ * signal the conditional re-assigns (so the implicit else picks up the
+ * intended default), then drop those signals from the environment so
+ * later reads fall through to [BVar] (= Hardcaml's merged value / a
+ * register's Q).  Array/slice [BCallStmt]s pass through with their
+ * argument expressions threaded.  Works for both combinational and
+ * sequential bodies. *)
+let thread_body body =
+  let rec subst env e =
+    match e with
+    | BVar n -> (match Hashtbl.find_opt env n with Some v -> v | None -> e)
+    | BConst _ -> e
+    | BBinOp { op; lhs; rhs; result_type } ->
+        BBinOp { op; lhs = subst env lhs; rhs = subst env rhs; result_type }
+    | BUnOp { op; operand; result_type } ->
+        BUnOp { op; operand = subst env operand; result_type }
+    | BCond { condition; then_val; else_val } ->
+        BCond { condition = subst env condition;
+                then_val = subst env then_val;
+                else_val = subst env else_val }
+    | BConcat es -> BConcat (List.map (subst env) es)
+    | BReplicate { count; value } -> BReplicate { count; value = subst env value }
+    | BSelect { array; index } ->
+        BSelect { array = subst env array; index = subst env index }
+    | BSlice { signal; msb; lsb } -> BSlice { signal = subst env signal; msb; lsb }
+    | BCall { func; args } -> BCall { func; args = List.map (subst env) args }
+  in
+  (* All signal names assigned anywhere in a stmt list, incl. nested. *)
+  let assigned_scalars stmts =
+    let acc = ref [] in
+    let rec go = function
+      | BAssign { lhs; _ } -> if not (List.mem lhs !acc) then acc := lhs :: !acc
+      | BIf { then_stmts; else_stmts; _ } -> List.iter go then_stmts; List.iter go else_stmts
+      | BCase { cases; default; _ } ->
+          List.iter (fun (_, ss) -> List.iter go ss) cases; List.iter go default
+      | BBlock ss -> List.iter go ss
+      | _ -> ()
+    in
+    List.iter go stmts; !acc
+  in
+  (* Splice top-level begin/end groups so a run is seen as one list. *)
+  let rec flatten_top = function
+    | [] -> []
+    | BBlock ss :: rest -> flatten_top (ss @ rest)
+    | s :: rest -> s :: flatten_top rest
+  in
+  (* env: shared mutable value-so-far, snapshotted/restored across branches
+     so each branch threads from the entering environment. *)
+  let env : (string, bexpr) Hashtbl.t = Hashtbl.create 64 in
+  let snapshot () = Hashtbl.fold (fun k v a -> (k, v) :: a) env [] in
+  let restore snap = Hashtbl.reset env; List.iter (fun (k, v) -> Hashtbl.replace env k v) snap in
+  (* Emit the value-so-far of each [name] still pending in env, as the
+     materialised default for the implicit else of a following
+     conditional.  Keep it in env so the branches inherit it; the caller
+     drops them after threading the branches. *)
+  let materialise out names =
+    List.iter (fun k ->
+      match Hashtbl.find_opt env k with
+      | Some v -> out := BAssign { lhs = k; rhs = v } :: !out
+      | None -> ()) names
+  in
+  let rec thread stmts =
+    let out = ref [] in
+    let local = ref [] in   (* signals flat-assigned at this level *)
+    List.iter (fun s ->
+      match s with
+      | BAssign { lhs; rhs } ->
+          Hashtbl.replace env lhs (subst env rhs);
+          if not (List.mem lhs !local) then local := lhs :: !local
+      | BIf { condition; then_stmts; else_stmts } ->
+          let assigned = assigned_scalars [s] in
+          materialise out assigned;
+          let cond' = subst env condition in
+          let snap = snapshot () in
+          let te = thread then_stmts in restore snap;
+          let ee = thread else_stmts in restore snap;
+          out := BIf { condition = cond'; then_stmts = te; else_stmts = ee } :: !out;
+          List.iter (Hashtbl.remove env) assigned
+      | BCase { selector; cases; default } ->
+          let assigned = assigned_scalars [s] in
+          materialise out assigned;
+          let sel' = subst env selector in
+          let snap = snapshot () in
+          let cases' = List.map (fun (k, ss) ->
+            let k' = subst env k in let ss' = thread ss in restore snap; (k', ss')) cases in
+          let default' = thread default in restore snap;
+          out := BCase { selector = sel'; cases = cases'; default = default' } :: !out;
+          List.iter (Hashtbl.remove env) assigned
+      | BCallStmt { func; args } ->
+          out := BCallStmt { func; args = List.map (subst env) args } :: !out
+      | other -> out := other :: !out
+    ) (flatten_top stmts);
+    (* flush signals assigned at this level that survived to the end *)
+    let finals = List.filter_map (fun k ->
+      match Hashtbl.find_opt env k with
+      | Some v -> Some (BAssign { lhs = k; rhs = v })
+      | None -> None) (List.rev !local) in
+    List.rev !out @ finals
+  in
+  thread body
+
 (* Pre-process a process body to merge @slice_write calls per
    target into single full-bus read-modify-write BAssigns.  Each
    `name[hi:lo] <= data` pattern at the converter level becomes
@@ -571,6 +694,7 @@ let merge_slice_writes ctx body =
    of all the always-blocks that make up the module. *)
 let process_to_always ctx = function
   | BCombinational { body; _ } ->
+      let body = thread_body body in
       let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:false ctx) [] body in
       (* stmt_to_always prepends each compiled statement to the
@@ -586,6 +710,7 @@ let process_to_always ctx = function
       (match reset, reset_async with
        | Some rst_name, true -> ctx.reset <- Some (get_signal ctx rst_name)
        | _ -> ());
+      let body = thread_body body in
       let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
       Always.compile (List.rev alw)
@@ -655,7 +780,8 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
 (* Convert a bmodule into a hardcaml [Circuit.t].  Produces a
    real circuit that can be passed to [Rtl.print] for Verilog
    emission and [Lib_map.map_bexpr] for technology mapping. *)
-let create_circuit ?(emit_instances = false) (bmod : Behavioral_ir.bmodule) =
+let create_circuit ?(emit_instances = false) ?(detect_loops = true)
+    (bmod : Behavioral_ir.bmodule) =
   let scope = Scope.create () in
   let inputs = build_inputs bmod in
   let ctx = {
@@ -922,7 +1048,8 @@ let create_circuit ?(emit_instances = false) (bmod : Behavioral_ir.bmodule) =
         Some (Signal.output s.name driver)
     | _ -> None) bmod.signals in
 
-  Circuit.create_exn ~name:bmod.name outputs
+  let config = { Circuit.Config.default with detect_combinational_loops = detect_loops } in
+  Circuit.create_exn ~config ~name:bmod.name outputs
 
 (* Top-level: convert a whole bprogram, returning the FIRST
    module's circuit information.  Kept this shape for backward
