@@ -71,16 +71,28 @@ let choose_prim ?prim_hint ~depth ~width () =
     then RAMB18E1
     else RAMB36E1
 
+(* largest supported width <= [u] (>=1). *)
+let largest_supported_le u =
+  List.fold_left (fun acc s -> if s <= u && s > acc then s else acc) 1 supported_widths
+
 let plan ?prim_hint ~(depth : int) ~(width : int) () : plan =
   if depth <= 0 || width <= 0 then
     failwith (Printf.sprintf "fpga_bram_resolve.plan: depth=%d width=%d invalid" depth width);
   let prim = choose_prim ?prim_hint ~depth ~width () in
   let maxw = prim_max_width prim in
-  (* width-tiling: split the word into chunks of <= maxw. *)
-  let n_width_tiles = (width + maxw - 1) / maxw in
-  let tile_width = round_up_width (min width maxw) in
-  let tile_depth = prim_capacity prim / tile_width in
+  let cap = prim_capacity prim in
+  (* Depth expansion is MUX-FREE: a narrower per-tile data width gives the
+     same physical BRAM a deeper address space (cap/w words), so pick the
+     widest supported width whose tile-depth still covers [depth] (capped
+     at the primitive max and the data width).  This turns depth into
+     extra WIDTH-tiles instead of an address-mux'd depth cascade — up to
+     cap deep (32K for RAMB36) in a single depth-tile.  Only when
+     depth > cap (>32K) do we fall back to depth tiles. *)
+  let max_for_depth = max 1 (cap / depth) in
+  let tile_width = largest_supported_le (min (min maxw width) max_for_depth) in
+  let tile_depth = cap / tile_width in
   let n_depth_tiles = (depth + tile_depth - 1) / tile_depth in
+  let n_width_tiles = (width + tile_width - 1) / tile_width in
   { depth
   ; width
   ; n_width_tiles

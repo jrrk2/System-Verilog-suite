@@ -15,6 +15,13 @@ let () =
   check "regfile 32x32" (plan ~depth:32 ~width:32 ()) ~exp_tiles:1;
   check "wide 1024x64" (plan ~depth:1024 ~width:64 ()) ~exp_tiles:2;
   check "deep+wide 8192x64" (plan ~depth:8192 ~width:64 ()) ~exp_tiles:16;
+  (* depth expansion is mux-free: deep memories fit one depth-tile by
+     narrowing the per-tile width (up to 32K on RAMB36). *)
+  let deep = plan ~depth:8192 ~width:64 () in
+  if deep.n_depth_tiles <> 1 then (Printf.printf "FAIL: 8192-deep not mux-free (%d depth tiles)\n" deep.n_depth_tiles; exit 1);
+  let deep32k = plan ~depth:32768 ~width:32 () in
+  Printf.printf "32K deep: %s\n" (string_of_plan deep32k);
+  if deep32k.n_depth_tiles <> 1 then (print_endline "FAIL: 32K not mux-free"; exit 1);
   (* port directions: write pins are inputs, read data is the only output. *)
   let p = plan ~depth:4096 ~width:32 () in
   let ports = tile_ports p.tile in
