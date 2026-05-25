@@ -47,7 +47,10 @@ let param_value (p : Parameter.t) : string =
   let open Parameter.Value in
   match p.value with
   | String v -> v
-  | Int v -> Int.to_string v
+  (* yosys/nextpnr read an all-0/1 value as a bit-vector and anything else
+     as a string, so an integer param must be emitted as binary (e.g.
+     WRITE_WIDTH_A=36 -> "...0100100"), not decimal. *)
+  | Int v -> String.init 32 ~f:(fun i -> if (v lsr (31 - i)) land 1 = 1 then '1' else '0')
   | Real v -> Float.to_string v
   | Bool b | Bit b -> if b then "1" else "0"
   | Std_logic v | Std_ulogic v -> String.make 1 (Logic.Std_logic.to_char v)
