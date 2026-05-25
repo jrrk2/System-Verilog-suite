@@ -4,12 +4,12 @@
 ; here (the main executables stanza only preprocesses ppx_deriving_yojson).
 (library
  (name fpga_synth)
- (modules xil_prim lut_cover bir_to_aig unisim_scan fpga_emit)
+ (modules xil_prim lut_cover bir_to_aig fpga_map unisim_scan fpga_emit)
  (libraries hardcaml base)
  (preprocess (pps ppx_hardcaml)))
 
 (executables
- (names test_fpga_prim test_lut_cover test_bir_to_aig)
- (modules test_fpga_prim test_lut_cover test_bir_to_aig)
+ (names test_fpga_prim test_lut_cover test_bir_to_aig test_fpga_map)
+ (modules test_fpga_prim test_lut_cover test_bir_to_aig test_fpga_map)
  (libraries hardcaml base stdio fpga_synth)
  (preprocess (pps ppx_hardcaml)))
