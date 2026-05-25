@@ -48,3 +48,21 @@ echo ">> nextpnr-xilinx: $JSON  ($DEVICE)"
 
 echo
 echo ">> PASS: placed & routed -> $OUT/top.fasm ($(grep -cvE '^\s*#|^\s*$' "$OUT/top.fasm") FASM features)"
+
+# Optional FASM -> bitstream via prjxray (MAKE_BIT=1).  MUST use the same
+# prjxray DB the chipdb was built from, else FASM features mismap.
+if [[ "${MAKE_BIT:-0}" == 1 ]]; then
+  PRJXRAY=${PRJXRAY:-$HOME/prjxray}
+  PRJXRAY_DB=${PRJXRAY_DB:-$HOME/nextpnr-xilinx/xilinx/external/prjxray-db}
+  FAMILY=${FAMILY:-artix7}
+  PART=${PART:-xc7a50tcsg324-1}
+  DBF="$PRJXRAY_DB/$FAMILY"
+  echo ">> fasm2frames ($PART, db=$DBF)"
+  "$PRJXRAY/env/bin/python3" "$PRJXRAY/utils/fasm2frames.py" \
+    --part "$PART" --db-root "$DBF" "$OUT/top.fasm" "$OUT/top.frames"
+  echo ">> xc7frames2bit"
+  "$PRJXRAY/build/tools/xc7frames2bit" \
+    --part_file "$DBF/$PART/part.yaml" --part_name "$PART" \
+    --frm_file "$OUT/top.frames" --output_file "$OUT/top.bit"
+  echo ">> BITSTREAM: $OUT/top.bit ($(stat -c%s "$OUT/top.bit") bytes)"
+fi
