@@ -9,7 +9,7 @@
  (preprocess (pps ppx_hardcaml)))
 
 (executables
- (names test_fpga_prim test_lut_cover test_bir_to_aig test_fpga_map)
- (modules test_fpga_prim test_lut_cover test_bir_to_aig test_fpga_map)
+ (names test_fpga_prim test_lut_cover test_bir_to_aig test_fpga_map test_artyz7)
+ (modules test_fpga_prim test_lut_cover test_bir_to_aig test_fpga_map test_artyz7)
  (libraries hardcaml base stdio fpga_synth)
  (preprocess (pps ppx_hardcaml)))

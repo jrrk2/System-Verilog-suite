@@ -15,7 +15,8 @@
 open! Base
 open Hardcaml
 
-let map_lowered ~(k : int) ~(name : string) (l : Bir_to_aig.lowered) : Circuit.t =
+let map_lowered ?(io = false) ~(k : int) ~(name : string) (l : Bir_to_aig.lowered)
+  : Circuit.t =
   let g = l.Bir_to_aig.graph in
   (* feedback wire per register Q bit. *)
   let q_wire = Hashtbl.create (module String) in
@@ -26,10 +27,18 @@ let map_lowered ~(k : int) ~(name : string) (l : Bir_to_aig.lowered) : Circuit.t
   let d_names = Hash_set.create (module String) in
   List.iter l.regs ~f:(fun r ->
     List.iter r.Bir_to_aig.rb_d_names ~f:(Hash_set.add d_names));
-  (* lazy real input ports (data ports, clocks, resets). *)
+  (* clock names, for IO-buffer kind selection. *)
+  let clock_names = Hash_set.create (module String) in
+  List.iter l.regs ~f:(fun r -> Hash_set.add clock_names r.Bir_to_aig.rb_clock);
+  (* lazy real input ports.  With [io], wrap each pad in an input buffer:
+     a data/reset pad through IBUF, a clock pad through IBUF then BUFG. *)
   let ports = Hashtbl.create (module String) in
   let port_input nm =
-    Hashtbl.find_or_add ports nm ~default:(fun () -> Signal.input nm 1)
+    Hashtbl.find_or_add ports nm ~default:(fun () ->
+      let pad = Signal.input nm 1 in
+      if not io then pad
+      else if Hash_set.mem clock_names nm then Xil_prim.bufg (Xil_prim.ibuf pad)
+      else Xil_prim.ibuf pad)
   in
   (* ---- LUT-map the combinational logic ---- *)
   let chosen = Lut_cover.cover ~k g in
@@ -86,7 +95,9 @@ let map_lowered ~(k : int) ~(name : string) (l : Bir_to_aig.lowered) : Circuit.t
     (* if the driving LUT was complemented, it already yields ~node. *)
     let s = if inv && not (Hash_set.mem complement id) then Signal.( ~: ) base else base in
     if Hash_set.mem d_names nm then Hashtbl.set d_sig ~key:nm ~data:s
-    else real_outs := Signal.output nm s :: !real_outs);
+    else (
+      let pad = if io then Xil_prim.obuf s else s in
+      real_outs := Signal.output nm pad :: !real_outs));
   (* ---- instantiate one FF per register bit, close feedback ---- *)
   List.iter l.regs ~f:(fun r ->
     let clk = port_input r.Bir_to_aig.rb_clock in
