@@ -24,9 +24,14 @@ let run label circ =
   let l = Bir_to_aig.lower_circuit circ in
   Stdio.printf "%s: regs=%d  AIG outputs=%d\n" label
     (List.length l.regs) (List.length l.graph.outputs);
-  Stdio.printf "---- %s primitive netlist ----\n" label;
-  Fpga_emit.emit_verilog (Fpga_map.map_lowered ~k:6 ~name:label l)
+  let mapped = Fpga_map.map_lowered ~k:6 ~name:label l in
+  let path = Printf.sprintf "/tmp/%s.json" label in
+  Fpga_emit.write_yosys_json ~path mapped;
+  Stdio.printf "  wrote %s\n" path;
+  mapped
 
 let () =
-  run "counter4" (counter ());
-  run "counter4_rst" (counter_rst ())
+  let c = run "counter4" (counter ()) in
+  Stdio.print_endline "---- counter4 yosys-json ----";
+  Stdio.print_endline (Fpga_emit.yosys_json_string c);
+  ignore (run "counter4_rst" (counter_rst ()))
