@@ -37,4 +37,28 @@ let () =
   if List.assoc "WRITE_WIDTH_A" inst.param_values <> 36 then (print_endline "FAIL: WW_A"; exit 1);
   if List.assoc "READ_WIDTH_B" inst.param_values <> 36 then (print_endline "FAIL: RW_B"; exit 1);
   if List.length inst.port_connections <> 18 then (print_endline "FAIL: port count"; exit 1);
+  (* byte-lane builder + INIT packing. *)
+  let words = [| 0xAB; 0x1234; 0xDEAD; 0x55 |] in
+  let lane0 = lane_init_strings ~words ~lane:0 in
+  let _, s00 = List.hd lane0 in
+  Printf.printf "INIT_00 lane0 low8 = %s (word0 byte0 = 0xAB)\n" (String.sub s00 248 8);
+  if String.sub s00 248 8 <> "10101011" then (print_endline "FAIL: INIT byte pack"; exit 1);
+  let port a = { p_clk = BVar "clk"; p_addr = BVar a; p_we = BVar "we"; p_wdata = BVar "wd" } in
+  let bi, bsig, bst, brd =
+    build_byte_lane_ram ~name:"pm" ~depth:4 ~width:32 ~init:words ~ports:[ port "a" ] ()
+  in
+  Printf.printf "byte-lane ROM: insts=%d (%s) param_strs=%d sigs=%d stmts=%d rports=%d\n"
+    (List.length bi) (List.hd bi).module_name (List.length (List.hd bi).param_strs)
+    (List.length bsig) (List.length bst) (List.length brd);
+  if List.length bi <> 4 then (print_endline "FAIL: lane count"; exit 1);
+  if (List.hd bi).module_name <> "RAMB18E1" then (print_endline "FAIL: not RAMB18E1"; exit 1);
+  (* 3 base string params (RAM_MODE, WRITE_MODE_A/B) + 64 INIT_xx = 67. *)
+  if List.length (List.hd bi).param_strs <> 67 then (print_endline "FAIL: param_strs"; exit 1);
+  let _, _, _, brd2 =
+    build_byte_lane_ram ~name:"dp" ~depth:8 ~width:32
+      ~ports:[ port "ca"; { p_clk = BVar "hclk"; p_addr = BVar "ha"; p_we = BVar "hwe"; p_wdata = BVar "hwd" } ]
+      ()
+  in
+  Printf.printf "dual-port RAM: rdata ports = %d\n" (List.length brd2);
+  if List.length brd2 <> 2 then (print_endline "FAIL: dual-port rdata"; exit 1);
   print_endline "PASS"
