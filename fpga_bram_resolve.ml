@@ -235,8 +235,12 @@ let build_single_ramb36 ~(name : string) ~(depth : int) ~(width : int)
 type ram_port =
   { p_clk : bexpr
   ; p_addr : bexpr
-  ; p_we : bexpr (* 1-bit write enable *)
+  ; p_we : bexpr (* 1-bit word write enable (used when p_wstrb = None) *)
   ; p_wdata : bexpr (* [width] bits *)
+  ; p_wstrb : bexpr option
+      (* per-byte write strobe ([width]/8 bits, bit b = byte b). When set,
+         forces 8-bit tiles and drives byte tile b's WE from strobe bit b,
+         so the CPU's mem_wstrb gives correct sb/sh/sw. *)
   }
 
 (* 64 INIT_xx (256-bit binary strings) for byte [lane] of [words]; entry A
@@ -290,14 +294,34 @@ let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
     ?(init : int array option) ~(ports : ram_port list) ()
     : binstance list * bsignal list * bstmt list * string list =
   (match ports with [ _ ] | [ _; _ ] -> () | _ -> failwith "build_byte_lane_ram: 1 or 2 ports");
-  let pl = plan ~depth ~width () in
-  if pl.n_depth_tiles > 1 then
-    failwith
-      (Printf.sprintf "build_byte_lane_ram: depth %d exceeds one tile (%d) — deep tiling TODO"
-         depth pl.tile.tile_depth);
-  let prim = pl.tile.prim in
-  let tw = pl.tile.tile_width in
-  let n = pl.n_width_tiles in
+  (* per-byte write strobes force 8-bit (one tile per byte) so each byte
+     tile's WE comes from one strobe bit. *)
+  let byte_mode = List.exists (fun p -> Option.is_some p.p_wstrb) ports in
+  let prim, tw, n =
+    if byte_mode then begin
+      if width mod 8 <> 0 then failwith "build_byte_lane_ram: byte strobes need width%8=0";
+      let prim = if depth <= 2048 then RAMB18E1 else RAMB36E1 in
+      if depth > prim_capacity prim / 8 then
+        failwith
+          (Printf.sprintf "build_byte_lane_ram: byte-write depth %d > %d (deep tiling TODO)"
+             depth (prim_capacity prim / 8));
+      prim, 8, width / 8
+    end
+    else begin
+      let pl = plan ~depth ~width () in
+      if pl.n_depth_tiles > 1 then
+        failwith
+          (Printf.sprintf "build_byte_lane_ram: depth %d exceeds one tile (%d) — deep tiling TODO"
+             depth pl.tile.tile_depth);
+      pl.tile.prim, pl.tile.tile_width, pl.n_width_tiles
+    end
+  in
+  (* per-tile WE: a byte strobe bit when present, else the word we. *)
+  let we_of (p : ram_port) t =
+    match p.p_wstrb with
+    | Some ws -> BSlice { signal = ws; msb = t; lsb = t }
+    | None -> p.p_we
+  in
   let aw = bits_needed depth in
   let cap = prim_capacity prim in
   let n_init = cap / 256 in
@@ -353,10 +377,10 @@ let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
             ; ("REGCEAREGCE", kconst 0 1); ("REGCEB", kconst 0 1)
             ; ("RSTRAMARSTRAM", kconst 0 1); ("RSTRAMB", kconst 0 1)
             ; ("RSTREGARSTREG", kconst 0 1); ("RSTREGB", kconst 0 1)
-            ; ("WEA", BReplicate { count = wea_w; value = pa.p_we })
+            ; ("WEA", BReplicate { count = wea_w; value = we_of pa t })
             ; ( "WEBWE"
               , match pb with
-                | Some p -> BReplicate { count = webwe_w; value = p.p_we }
+                | Some p -> BReplicate { count = webwe_w; value = we_of p t }
                 | None -> kconst 0 webwe_w )
             ; ("ADDRARDADDR", addr_expr pa.p_addr)
             ; ( "ADDRBWRADDR"

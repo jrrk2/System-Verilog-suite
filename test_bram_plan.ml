@@ -50,7 +50,9 @@ let () =
   let _, s00 = List.hd lane0 in
   Printf.printf "INIT_00 lane0 low8 = %s (word0 byte0 = 0xAB)\n" (String.sub s00 248 8);
   if String.sub s00 248 8 <> "10101011" then (print_endline "FAIL: INIT byte pack"; exit 1);
-  let port a = { p_clk = BVar "clk"; p_addr = BVar a; p_we = BVar "we"; p_wdata = BVar "wd" } in
+  let port a =
+    { p_clk = BVar "clk"; p_addr = BVar a; p_we = BVar "we"; p_wdata = BVar "wd"; p_wstrb = None }
+  in
   (* 4096x32: planner -> 8-bit tiles on RAMB36 (mux-free), 4 wide. *)
   let bi, bsig, bst, brd =
     build_byte_lane_ram ~name:"pm" ~depth:4096 ~width:32 ~init:words ~ports:[ port "a" ] ()
@@ -68,9 +70,23 @@ let () =
   if List.length dbi <> 8 then (print_endline "FAIL: deep tile count"; exit 1);
   let _, _, _, brd2 =
     build_byte_lane_ram ~name:"dp" ~depth:8 ~width:32
-      ~ports:[ port "ca"; { p_clk = BVar "hclk"; p_addr = BVar "ha"; p_we = BVar "hwe"; p_wdata = BVar "hwd" } ]
+      ~ports:[ port "ca"; { p_clk = BVar "hclk"; p_addr = BVar "ha"; p_we = BVar "hwe"; p_wdata = BVar "hwd"; p_wstrb = None } ]
       ()
   in
   Printf.printf "dual-port RAM: rdata ports = %d\n" (List.length brd2);
   if List.length brd2 <> 2 then (print_endline "FAIL: dual-port rdata"; exit 1);
+  (* per-byte strobes: 1024x32 forced to 4x 8-bit tiles; each tile's WEA
+     references one bit of wstrb. *)
+  let bw, _, _, _ =
+    build_byte_lane_ram ~name:"bw" ~depth:1024 ~width:32
+      ~ports:[ { p_clk = BVar "clk"; p_addr = BVar "a"; p_we = BVar "we"; p_wdata = BVar "wd"; p_wstrb = Some (BVar "wstrb") } ]
+      ()
+  in
+  Printf.printf "byte-strobe RAM 1024x32: tiles=%d (%s)\n" (List.length bw) (List.hd bw).module_name;
+  if List.length bw <> 4 then (print_endline "FAIL: byte-strobe tile count"; exit 1);
+  let wea_of inst = List.assoc "WEA" inst.port_connections in
+  let tile1_wea = wea_of (List.nth bw 1) in
+  (match tile1_wea with
+   | BReplicate { value = BSlice { signal = BVar "wstrb"; msb = 1; lsb = 1 }; _ } -> ()
+   | _ -> print_endline "FAIL: tile1 WEA not wstrb[1]"; exit 1);
   print_endline "PASS"

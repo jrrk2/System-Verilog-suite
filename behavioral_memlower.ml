@@ -377,8 +377,13 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
       m.name mname;
     `Skipped
   end
-  else if mm.n_write_ports < 1 || mm.n_write_ports > 1 then
-    skip (Printf.sprintf "w_ports=%d (only 1 supported in v2)" mm.n_write_ports)
+  else if
+    mm.n_write_ports < 1
+    || (mm.n_write_ports > 1 && Sys.getenv_opt "MEMLOWER_FPGA" <> Some "1")
+  then
+    skip
+      (Printf.sprintf "w_ports=%d (1 in v2; FPGA allows byte-masked multi-write)"
+         mm.n_write_ports)
   else if mm.n_read_ports < 1 || mm.n_read_ports > 2 then
     skip (Printf.sprintf "r_ports=%d (only 1–2 supported in v2)" mm.n_read_ports)
   else
@@ -410,53 +415,96 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                   when w_addr ≡ r_addr — the CPU case).  No OpenRAM macro,
                   no stub module; RAMB18E1 is a nextpnr primitive. *)
                ignore aw;
-               if mm.depth > 2048 then
-                 skip "depth>2048 (FPGA byte-lane deep-tiling TODO)"
-               else if dw mod 8 <> 0 then
-                 skip "width not a multiple of 8 (FPGA byte-lane)"
-               else begin
-                 let read_pin = mname ^ "_rdata_a" in
-                 (* find a top-level registered read [rd <= mem[addr]] in the
-                    sequential read process — its FF is redundant once the
-                    BRAM's own output register provides that cycle. *)
-                 let rec find_unconditional_read = function
-                   | [] -> None
-                   | BAssign { lhs; rhs = BSelect { array = BVar n; _ } } :: _
-                     when n = mname -> Some lhs
-                   | BBlock b :: rest ->
-                     (match find_unconditional_read b with
-                      | Some r -> Some r
-                      | None -> find_unconditional_read rest)
-                   | _ :: rest -> find_unconditional_read rest
-                 in
-                 let read_reg =
-                   match r_proc with
-                   | BSequential _ -> find_unconditional_read r_body
-                   | _ -> None
-                 in
-                 let rw_e = rewrite_reads_e mname read_pin in
-                 let w_addr = rw_e w_addr and r_addr = rw_e r_addr in
-                 let w_data = rw_e w_data and we_expr = rw_e we_expr in
-                 (* absorb the read FF only when read addr ≡ write addr (a
-                    single CPU bus): then the BRAM read of that address each
-                    cycle already yields the registered value, so rd can be a
-                    combinational alias of the BRAM dout (1-cycle, not 2). *)
-                 let absorb = Option.is_some read_reg && w_addr = r_addr in
-                 let muxed_addr =
-                   BCond { condition = we_expr; then_val = w_addr; else_val = r_addr }
-                 in
-                 let orig_clk =
-                   match w_proc with BSequential s -> s.clock | _ -> "clk"
-                 in
-                 let init =
-                   if mm.init_values <> [] then Some (Array.of_list mm.init_values)
+               let read_pin = mname ^ "_rdata_a" in
+               (* find a top-level registered read [rd <= mem[addr]] in the
+                  sequential read process — its FF is redundant once the
+                  BRAM's own output register provides that cycle. *)
+               let rec find_unconditional_read = function
+                 | [] -> None
+                 | BAssign { lhs; rhs = BSelect { array = BVar n; _ } } :: _
+                   when n = mname -> Some lhs
+                 | BBlock b :: rest ->
+                   (match find_unconditional_read b with
+                    | Some r -> Some r
+                    | None -> find_unconditional_read rest)
+                 | _ :: rest -> find_unconditional_read rest
+               in
+               let read_reg =
+                 match r_proc with
+                 | BSequential _ -> find_unconditional_read r_body
+                 | _ -> None
+               in
+               let rw_e = rewrite_reads_e mname read_pin in
+               let r_addr = rw_e r_addr in
+               let orig_clk = match w_proc with BSequential s -> s.clock | _ -> "clk" in
+               let init =
+                 if mm.init_values <> [] then Some (Array.of_list mm.init_values) else None
+               in
+               (* byte-write pattern: every write site is a byte-aligned 8-bit
+                  slice of a common base at a common address -> per-byte write
+                  strobes (sb/sh/sw write only their bytes, no read-modify-write). *)
+               let byte_info =
+                 match w_sites with
+                 | [] | [ _ ] -> None
+                 | (_, a0, _) :: _ ->
+                   let parsed =
+                     List.map (fun (pred, a, data) ->
+                       match data with
+                       | BSlice { signal; msb; lsb }
+                         when a = a0 && msb - lsb = 7 && lsb mod 8 = 0 ->
+                         Some
+                           ( lsb / 8
+                           , (match pred with Some p -> p | None -> one_lit 1)
+                           , signal )
+                       | _ -> None) w_sites
+                   in
+                   if List.for_all Option.is_some parsed then begin
+                     let bytes = List.map Option.get parsed in
+                     let base = let _, _, s = List.hd bytes in s in
+                     if List.for_all (fun (_, _, s) -> s = base) bytes then
+                       Some (a0, bytes, base)
+                     else None
+                   end
                    else None
+               in
+               let too_deep =
+                 match byte_info with Some _ -> mm.depth > 4096 | None -> mm.depth > 32768
+               in
+               if too_deep then skip "FPGA BRAM depth exceeds one tile (deep tiling TODO)"
+               else begin
+                 ignore aw;
+                 let port, w_addr_used =
+                   match byte_info with
+                   | Some (a0, bytes, base) ->
+                     let w_addr = rw_e a0 and base = rw_e base in
+                     let nbytes = dw / 8 in
+                     let strobe b =
+                       match List.find_opt (fun (bl, _, _) -> bl = b) bytes with
+                       | Some (_, p, _) -> rw_e p
+                       | None -> zero_lit 1
+                     in
+                     let wstrb = BConcat (List.rev (List.init nbytes strobe)) in
+                     let we_any =
+                       List.fold_left (fun acc (_, p, _) -> bool_or acc (rw_e p))
+                         (zero_lit 1) bytes
+                     in
+                     ( Fpga_bram_resolve.(
+                         { p_clk = BVar orig_clk
+                         ; p_addr =
+                             BCond { condition = we_any; then_val = w_addr; else_val = r_addr }
+                         ; p_we = we_any; p_wdata = base; p_wstrb = Some wstrb })
+                     , w_addr )
+                   | None ->
+                     let w_addr = rw_e w_addr and w_data = rw_e w_data
+                     and we_expr = rw_e we_expr in
+                     ( Fpga_bram_resolve.(
+                         { p_clk = BVar orig_clk
+                         ; p_addr =
+                             BCond { condition = we_expr; then_val = w_addr; else_val = r_addr }
+                         ; p_we = we_expr; p_wdata = w_data; p_wstrb = None })
+                     , w_addr )
                  in
-                 let port =
-                   Fpga_bram_resolve.(
-                     { p_clk = BVar orig_clk; p_addr = muxed_addr; p_we = we_expr;
-                       p_wdata = w_data })
-                 in
+                 let absorb = Option.is_some read_reg && w_addr_used = r_addr in
                  let insts, new_sigs, drv_stmts, _ =
                    Fpga_bram_resolve.build_byte_lane_ram ~name:mname ~depth:mm.depth
                      ~width:dw ?init ~ports:[ port ] ()
