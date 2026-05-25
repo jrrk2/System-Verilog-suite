@@ -653,7 +653,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
 (* Convert a bmodule into a hardcaml [Circuit.t].  Produces a
    real circuit that can be passed to [Rtl.print] for Verilog
    emission and [Lib_map.map_bexpr] for technology mapping. *)
-let create_circuit (bmod : Behavioral_ir.bmodule) =
+let create_circuit ?(emit_instances = false) (bmod : Behavioral_ir.bmodule) =
   let scope = Scope.create () in
   let inputs = build_inputs bmod in
   let ctx = {
@@ -767,6 +767,46 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
       ctx.variables <- (s.name, var) :: ctx.variables
     end) bmod.signals;
 
+  (* Black-box instances (binstances) -> hardcaml Inst.  Opt-in via
+     [emit_instances] (the FPGA back end); the ASIC/miter paths handle
+     instances elsewhere (hier_synth) and keep the historical drop.
+     Self-contained direction inference: a port is an OUTPUT iff its
+     connected net is a simple name that no process writes and that isn't
+     a module input — so it can only be driven by the box (exactly how
+     behavioral_memlower wires a macro: inputs via combinational assigns,
+     outputs left undriven).  Output wires are pre-created and registered
+     in ctx.signals so reads inside the processes resolve to them; the
+     Inst itself is built after the processes run (its inputs need the
+     process-computed driver signals). *)
+  let inst_infos =
+    if not emit_instances then []
+    else begin
+      let module_inputs =
+        List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+          if s.direction = `Input then Some s.name else None) bmod.signals in
+      let sig_decl_width nm =
+        match
+          List.find_opt (fun (s : Behavioral_ir.bsignal) -> s.name = nm) bmod.signals
+        with
+        | Some s -> width_of_btype s.stype
+        | None -> 1 in
+      let conn_is_output = function
+        | BVar v -> not (Hashtbl.mem driver_proc v) && not (List.mem v module_inputs)
+        | _ -> false in
+      List.map (fun (i : Behavioral_ir.binstance) ->
+        let outs, ins =
+          List.partition (fun (_, e) -> conn_is_output e) i.port_connections in
+        let out_wires =
+          List.filter_map (fun (port, e) ->
+            match e with
+            | BVar v ->
+                let wire = Signal.wire (sig_decl_width v) in
+                ctx.signals <- (v, wire) :: ctx.signals;
+                Some (port, wire)
+            | _ -> None) outs in
+        (i, out_wires, ins)) bmod.instances
+    end in
+
   (* Coalesce all BCombinational processes into a single one before
      lowering.  Each [Always.compile] call drives the underlying wire
      of every Always.Variable assigned in its body — so two separate
@@ -832,6 +872,23 @@ let create_circuit (bmod : Behavioral_ir.bmodule) =
   let _always_blocks =
     List.map (process_to_always ctx) processes_to_run in
   let _ = _always_blocks in    (* compiled side-effects are in ctx *)
+
+  (* Build each opt-in instance now that the processes have computed its
+     input drivers; drive the pre-created output wires from the Inst. *)
+  List.iter (fun ((i : Behavioral_ir.binstance), out_wires, ins) ->
+    if out_wires <> [] then begin
+      let inputs = List.map (fun (port, e) -> port, expr_to_signal ctx e) ins in
+      let outputs = List.map (fun (port, w) -> port, Signal.width w) out_wires in
+      let parameters =
+        List.map (fun (n, v) ->
+          Parameter.create ~name:n ~value:(Parameter.Value.Int v)) i.param_values in
+      let omap =
+        Instantiation.create () ~name:i.module_name ~instance:i.inst_name
+          ~parameters ~inputs ~outputs in
+      List.iter (fun (port, ow) ->
+        let osig = Base.Map.find_exn omap port in
+        Signal.(ow <== osig)) out_wires
+    end) inst_infos;
 
   (* Wire up declared outputs to whatever variable / signal carries
      their final value.  An output that's never written becomes a
