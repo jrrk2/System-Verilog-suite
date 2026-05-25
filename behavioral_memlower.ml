@@ -416,9 +416,32 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                  skip "width not a multiple of 8 (FPGA byte-lane)"
                else begin
                  let read_pin = mname ^ "_rdata_a" in
+                 (* find a top-level registered read [rd <= mem[addr]] in the
+                    sequential read process — its FF is redundant once the
+                    BRAM's own output register provides that cycle. *)
+                 let rec find_unconditional_read = function
+                   | [] -> None
+                   | BAssign { lhs; rhs = BSelect { array = BVar n; _ } } :: _
+                     when n = mname -> Some lhs
+                   | BBlock b :: rest ->
+                     (match find_unconditional_read b with
+                      | Some r -> Some r
+                      | None -> find_unconditional_read rest)
+                   | _ :: rest -> find_unconditional_read rest
+                 in
+                 let read_reg =
+                   match r_proc with
+                   | BSequential _ -> find_unconditional_read r_body
+                   | _ -> None
+                 in
                  let rw_e = rewrite_reads_e mname read_pin in
                  let w_addr = rw_e w_addr and r_addr = rw_e r_addr in
                  let w_data = rw_e w_data and we_expr = rw_e we_expr in
+                 (* absorb the read FF only when read addr ≡ write addr (a
+                    single CPU bus): then the BRAM read of that address each
+                    cycle already yields the registered value, so rd can be a
+                    combinational alias of the BRAM dout (1-cycle, not 2). *)
+                 let absorb = Option.is_some read_reg && w_addr = r_addr in
                  let muxed_addr =
                    BCond { condition = we_expr; then_val = w_addr; else_val = r_addr }
                  in
@@ -438,9 +461,15 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                    Fpga_bram_resolve.build_byte_lane_ram ~name:mname ~depth:mm.depth
                      ~width:dw ?init ~ports:[ port ] ()
                  in
+                 let absorb_assign =
+                   match read_reg with
+                   | Some rd when absorb -> [ BAssign { lhs = rd; rhs = BVar read_pin } ]
+                   | _ -> []
+                 in
                  let driver =
                    BCombinational
-                     { name = mname ^ "_drv"; sensitivity = [ BAny ]; body = drv_stmts }
+                     { name = mname ^ "_drv"; sensitivity = [ BAny ]
+                     ; body = drv_stmts @ absorb_assign }
                  in
                  let rewrite_body body =
                    List.map (rewrite_reads_s mname read_pin) (strip_mem_writes mname body)
@@ -460,6 +489,28 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                              (if do_strip then rewrite_body c.body
                               else List.map (rewrite_reads_s mname read_pin) c.body) })
                      m.processes
+                 in
+                 (* drop the now-redundant [rd <= read_pin] from the read
+                    process; rd is driven combinationally by [driver]. *)
+                 let processes' =
+                   match read_reg with
+                   | Some rd when absorb ->
+                     List.mapi (fun i p ->
+                       if i <> r_idx then p
+                       else begin
+                         let rec drop body =
+                           List.filter_map (function
+                             | BAssign { lhs; rhs = BVar n }
+                               when lhs = rd && n = read_pin -> None
+                             | BBlock b -> Some (BBlock (drop b))
+                             | s -> Some s) body
+                         in
+                         match p with
+                         | BSequential s -> BSequential { s with body = drop s.body }
+                         | BCombinational c -> BCombinational { c with body = drop c.body }
+                       end)
+                       processes'
+                   | _ -> processes'
                  in
                  let instances' =
                    List.map (fun (i : binstance) ->
