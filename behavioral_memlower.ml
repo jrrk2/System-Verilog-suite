@@ -367,7 +367,103 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
     `Skipped
   in
   let async_ok = Sys.getenv_opt "MEMLOWER_ASYNC_OK" = Some "1" in
-  if mm.kind <> BRam then `Skipped  (* ROM lowering: deferred to phase 4 *)
+  let fpga = Sys.getenv_opt "MEMLOWER_FPGA" = Some "1" in
+  (* FPGA ROM path: a sync-read BRom (case-statement lookup, e.g. progmem)
+     -> an INIT-initialised read-only BRAM (write enable tied 0).  No
+     writer required. *)
+  if fpga && mm.kind = BRom && mm.read_is_sync && mm.init_values <> [] then begin
+    let dw = mm.data_width in
+    if mm.depth > 32768 then skip "ROM depth>32K (deep tiling TODO)"
+    else
+      match find_reading_process mname m.processes with
+      | None -> skip "ROM: no reading process"
+      | Some r_idx ->
+        let r_proc = List.nth m.processes r_idx in
+        let r_body =
+          match r_proc with BSequential s -> s.body | BCombinational c -> c.body
+        in
+        (match fold_read_sites (collect_read_sites mname r_body) with
+         | None -> skip "ROM: no read site"
+         | Some r_addr0 ->
+           let read_pin = mname ^ "_rdata_a" in
+           let rec find_uncond = function
+             | [] -> None
+             | BAssign { lhs; rhs = BSelect { array = BVar n; _ } } :: _
+               when n = mname -> Some lhs
+             | BBlock b :: rest ->
+               (match find_uncond b with Some r -> Some r | None -> find_uncond rest)
+             | _ :: rest -> find_uncond rest
+           in
+           let read_reg = match r_proc with BSequential _ -> find_uncond r_body | _ -> None in
+           let rw_e = rewrite_reads_e mname read_pin in
+           let r_addr = rw_e r_addr0 in
+           let read_clk = match r_proc with BSequential s -> s.clock | _ -> "clk" in
+           let port =
+             Fpga_bram_resolve.(
+               { p_clk = BVar read_clk; p_addr = r_addr; p_we = zero_lit 1;
+                 p_wdata = zero_lit dw; p_wstrb = None })
+           in
+           let absorb = Option.is_some read_reg in
+           let insts, new_sigs, drv_stmts, _ =
+             Fpga_bram_resolve.build_byte_lane_ram ~name:mname ~depth:mm.depth ~width:dw
+               ~init:(Array.of_list mm.init_values) ~ports:[ port ] ()
+           in
+           let absorb_assign =
+             match read_reg with
+             | Some rd when absorb -> [ BAssign { lhs = rd; rhs = BVar read_pin } ]
+             | _ -> []
+           in
+           let driver =
+             BCombinational
+               { name = mname ^ "_drv"; sensitivity = [ BAny ]
+               ; body = drv_stmts @ absorb_assign }
+           in
+           let processes' =
+             List.mapi (fun i p ->
+               let body = match p with BSequential s -> s.body | BCombinational c -> c.body in
+               let body = List.map (rewrite_reads_s mname read_pin) body in
+               let body =
+                 if i = r_idx then
+                   match read_reg with
+                   | Some rd when absorb ->
+                     let rec drop bb =
+                       List.filter_map (function
+                         | BAssign { lhs; rhs = BVar n } when lhs = rd && n = read_pin -> None
+                         | BBlock x -> Some (BBlock (drop x))
+                         | s -> Some s) bb
+                     in
+                     drop body
+                   | _ -> body
+                 else body
+               in
+               match p with
+               | BSequential s -> BSequential { s with body }
+               | BCombinational c -> BCombinational { c with body })
+               m.processes
+           in
+           let instances' =
+             List.map (fun (i : binstance) ->
+               { i with port_connections =
+                   List.map (fun (p, e) -> (p, rewrite_reads_e mname read_pin e))
+                     i.port_connections })
+               m.instances
+           in
+           let funcs' =
+             List.map (fun (f : bfunc) ->
+               { f with body = List.map (rewrite_reads_s mname read_pin) f.body })
+               m.funcs
+           in
+           let signals' =
+             List.filter (fun (s : bsignal) -> s.name <> mname) m.signals @ new_sigs
+           in
+           let m' =
+             { m with signals = signals'; processes = processes' @ [ driver ]
+             ; instances = insts @ instances'; funcs = funcs'
+             ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
+           in
+           `Lowered (m', None))
+  end
+  else if mm.kind <> BRam then `Skipped  (* non-FPGA ROM: deferred to phase 4 *)
   else if not mm.read_is_sync && not async_ok then begin
     Printf.eprintf
       "[memlower] %s.%s: async read — keeping bit-blast.  This memory is read \
