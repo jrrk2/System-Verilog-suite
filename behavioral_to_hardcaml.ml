@@ -89,7 +89,9 @@ let rec expr_to_signal ctx = function
        | None -> get_signal ctx name)
 
   | BConst { value; width } ->
-      Signal.of_int ~width value
+      (* clamp to >=1: a 0-width constant (degenerate slice / empty
+         literal in flattened picorv32) would crash hardcaml's of_int. *)
+      Signal.of_int ~width:(max 1 width) value
 
   | BBinOp { op; lhs; rhs; result_type } ->
       let s_lhs0 = expr_to_signal ctx lhs in

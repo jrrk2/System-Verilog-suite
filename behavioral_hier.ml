@@ -143,9 +143,15 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
     | `Output -> Some (s.name, `Output)
     | _ -> None
   ) child.signals in
+  (* subst routes READS of a child port to its parent net.  Inputs map to
+     the connected actual; OUTPUTS that are read internally (mem_addr,
+     pcpi_*, …) must also map to their parent net — otherwise an internal
+     read becomes inst__port (prefixed, undriven) while the driver uses the
+     parent net via lhs_subst, splitting them. *)
   let subst = List.filter_map (fun (formal, actual) ->
-    match List.assoc_opt formal port_dirs with
-    | Some `Input -> Some (formal, actual)
+    match List.assoc_opt formal port_dirs, actual with
+    | Some `Input, _ -> Some (formal, actual)
+    | Some `Output, BVar _ -> Some (formal, actual)
     | _ -> None
   ) inst.port_connections in
   let lhs_subst = List.filter_map (fun (formal, actual) ->
@@ -161,14 +167,17 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
   ) inst.port_connections in
   (* Promote child's internal signals to parent-scope with prefix. Skip
    * port pins — their names already resolve via subst / lhs_subst. *)
+  (* Promote every child signal (incl. port pins) under the prefix as an
+     internal net.  Connected ports are remapped to parent nets via
+     subst/lhs_subst (leaving the promoted copy dead), but UNconnected or
+     conditionally-undriven pins (e.g. external pcpi/trace when those
+     features are off) stay declared so create_circuit ties them to 0 at
+     the right width instead of leaving a dangling reference. *)
   let new_signals =
     List.fold_left (fun acc (s : bsignal) ->
-      match s.direction with
-      | `Input | `Output -> acc
-      | `Internal ->
-          { s with name = pname prefix s.name; direction = `Internal }
-          :: acc
-    ) parent.signals child.signals in
+      { s with name = pname prefix s.name; direction = `Internal } :: acc)
+      parent.signals child.signals
+  in
   let new_processes =
     List.fold_left (fun acc proc ->
       sub_process ~subst ~lhs_subst ~prefix proc :: acc
