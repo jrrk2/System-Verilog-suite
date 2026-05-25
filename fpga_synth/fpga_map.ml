@@ -33,6 +33,25 @@ let map_lowered ~(k : int) ~(name : string) (l : Bir_to_aig.lowered) : Circuit.t
   in
   (* ---- LUT-map the combinational logic ---- *)
   let chosen = Lut_cover.cover ~k g in
+  (* Inverter folding: an output / FF-D that needs ~root can absorb the
+     inversion into the driving LUT's INIT instead of spending a LUT1 —
+     but only when [root] is a LUT root with NO positive consumer (LUT
+     inputs are always positive references; a positive output ref would
+     break if we flipped the INIT). *)
+  let pos_ref = Hash_set.create (module Int) in
+  List.iter chosen ~f:(fun c ->
+    List.iter c.Lut_cover.leaves ~f:(Hash_set.add pos_ref));
+  let out_pos = Hash_set.create (module Int) in
+  let out_inv = Hash_set.create (module Int) in
+  List.iter g.Lut_cover.outputs ~f:(fun (_, id, inv) ->
+    if inv then Hash_set.add out_inv id else Hash_set.add out_pos id);
+  let complement = Hash_set.create (module Int) in
+  List.iter chosen ~f:(fun c ->
+    let r = c.Lut_cover.root in
+    if (not (Hash_set.mem pos_ref r))
+       && (not (Hash_set.mem out_pos r))
+       && Hash_set.mem out_inv r
+    then Hash_set.add complement r);
   let n = Array.length g.Lut_cover.nodes in
   let sig_of = Array.create ~len:n None in
   let signal_of_node id =
@@ -54,13 +73,18 @@ let map_lowered ~(k : int) ~(name : string) (l : Bir_to_aig.lowered) : Circuit.t
   List.iter chosen ~f:(fun c ->
     let ins = List.map c.Lut_cover.leaves ~f:signal_of_node in
     let truth = Lut_cover.truth_table_of_cut g c in
+    let truth =
+      if Hash_set.mem complement c.Lut_cover.root then List.map truth ~f:not
+      else truth
+    in
     sig_of.(c.Lut_cover.root) <- Some (Xil_prim.lutk ~truth ins));
   (* ---- route outputs: register D-cones vs real outputs ---- *)
   let d_sig = Hashtbl.create (module String) in
   let real_outs = ref [] in
   List.iter g.Lut_cover.outputs ~f:(fun (nm, id, inv) ->
-    let s = signal_of_node id in
-    let s = if inv then Signal.( ~: ) s else s in
+    let base = signal_of_node id in
+    (* if the driving LUT was complemented, it already yields ~node. *)
+    let s = if inv && not (Hash_set.mem complement id) then Signal.( ~: ) base else base in
     if Hash_set.mem d_names nm then Hashtbl.set d_sig ~key:nm ~data:s
     else real_outs := Signal.output nm s :: !real_outs);
   (* ---- instantiate one FF per register bit, close feedback ---- *)
