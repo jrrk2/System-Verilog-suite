@@ -578,7 +578,7 @@ let convert_cell (edif : edif_data) =
       Some {
         inst_name = inst.name;
         module_name = inst.cell_type;  (* Use full name as-is *)
-        param_values = [];  (* No parameters - already elaborated *)
+        param_values = []; param_strs = [];  (* No parameters - already elaborated *)
         port_connections = get_port_connections inst.name;
       }
     else None

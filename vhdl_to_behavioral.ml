@@ -1293,7 +1293,7 @@ let extract_architecture ctx entity_name = function
             let port_connections = connect_ports port_assoc_list in
             instances := {
               inst_name; module_name = ref_name;
-              param_values = [];
+              param_values = []; param_strs = [];
               port_connections;
             } :: !instances
 
@@ -1316,7 +1316,7 @@ let extract_architecture ctx entity_name = function
             let port_connections = connect_ports port_assoc_list in
             instances := {
               inst_name; module_name = ref_name;
-              param_values = [];
+              param_values = []; param_strs = [];
               port_connections;
             } :: !instances
 

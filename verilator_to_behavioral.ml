@@ -946,7 +946,7 @@ let cell_to_binstance = function
           | Pin { name; expr = Some e } -> Some (name, expr_to_bexpr e)
           | _ -> None) pins in
         Some { inst_name; module_name = mod_name;
-               param_values = []; port_connections = conns }
+               param_values = []; param_strs = []; port_connections = conns }
   | _ -> None
 
 (* Extract function/task definitions from a list of stmts. Called at

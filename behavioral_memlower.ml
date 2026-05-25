@@ -477,7 +477,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
              let inst = {
                inst_name = mname ^ "_macro";
                module_name = ps.module_name;
-               param_values = [];
+               param_values = []; param_strs = [];
                port_connections = pc;
              } in
              let clk0   = suffix (List.nth ps.clk 0) in

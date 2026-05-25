@@ -1761,7 +1761,7 @@ let extract_instances ~params module_node : binstance list =
                   | Some iname ->
                       Some { inst_name = iname;
                              module_name = mname;
-                             param_values;
+                             param_values; param_strs = [];
                              port_connections = conns_of hi }
                   | None -> None)
              | None -> None)

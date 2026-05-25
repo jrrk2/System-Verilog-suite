@@ -2057,7 +2057,7 @@ let bir_of_synth_netlists
     let cell_insts = List.map (fun (i : Lib_map.instance) ->
       { Behavioral_ir.inst_name = i.inst_name;
         module_name = i.cell.cell_name;
-        param_values = [];
+        param_values = []; param_strs = [];
         port_connections =
           List.map (fun (pc : Lib_map.pin_conn) ->
             (pc.pin, Behavioral_ir.BVar pc.net)) i.conns }
@@ -2065,7 +2065,7 @@ let bir_of_synth_netlists
     let child_insts = List.map (fun (ci : Hier_synth.child_inst_emit) ->
       { Behavioral_ir.inst_name = ci.ci_inst;
         module_name = ci.ci_module;
-        param_values = [];
+        param_values = []; param_strs = [];
         port_connections =
           List.map (fun (p, n) -> (p, Behavioral_ir.BVar n)) ci.ci_conns }
     ) mn.mn_child_insts in

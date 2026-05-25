@@ -1065,7 +1065,7 @@ let extract_instances members_raw =
           Some {
             inst_name;
             module_name;
-            param_values = [];
+            param_values = []; param_strs = [];
             port_connections;
           }
     | _ -> None

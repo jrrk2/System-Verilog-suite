@@ -2659,7 +2659,7 @@ let extract_instances ~pkgs ~params tok =
             Some {
               inst_name = prefixed_inst;
               module_name = m;
-              param_values = [];
+              param_values = []; param_strs = [];
               port_connections = List.rev !port_conns;
             }
       | _ -> None

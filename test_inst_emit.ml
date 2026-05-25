@@ -29,6 +29,7 @@ let () =
         [ { inst_name = "blk0"
           ; module_name = "BLK"
           ; param_values = [ ("MODE", 1) ]
+          ; param_strs = []
           ; port_connections = [ ("A", BVar "din"); ("Y", BVar "dout") ]
           } ]
     ; funcs = []

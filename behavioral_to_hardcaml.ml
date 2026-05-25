@@ -879,9 +879,21 @@ let create_circuit ?(emit_instances = false) (bmod : Behavioral_ir.bmodule) =
     if out_wires <> [] then begin
       let inputs = List.map (fun (port, e) -> port, expr_to_signal ctx e) ins in
       let outputs = List.map (fun (port, w) -> port, Signal.width w) out_wires in
-      let parameters =
+      let int_params =
         List.map (fun (n, v) ->
           Parameter.create ~name:n ~value:(Parameter.Value.Int v)) i.param_values in
+      (* string params: an all-0/1 value is a bit-vector (RAMB INIT_xx),
+         anything else a Verilog string (RAM_MODE="TDP", …). *)
+      let str_params =
+        List.map (fun (n, s) ->
+          let is_bits =
+            String.length s > 0 && String.for_all (fun c -> c = '0' || c = '1') s in
+          let value =
+            if is_bits then
+              Parameter.Value.Std_logic_vector (Logic.Std_logic_vector.of_string s)
+            else Parameter.Value.String s in
+          Parameter.create ~name:n ~value) i.param_strs in
+      let parameters = int_params @ str_params in
       let omap =
         Instantiation.create () ~name:i.module_name ~instance:i.inst_name
           ~parameters ~inputs ~outputs in

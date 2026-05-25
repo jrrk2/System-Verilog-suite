@@ -382,7 +382,7 @@ let convert filename =
       Some {
         inst_name = inst.name;
         module_name;
-        param_values = params;
+        param_values = params; param_strs = [];
         port_connections = get_port_connections inst.name;
       }
     else None

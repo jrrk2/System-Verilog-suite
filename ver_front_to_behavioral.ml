@@ -693,7 +693,7 @@ let cell_to_binstance (c : cell_inst) : Behavioral_ir.binstance option =
     Some {
       Behavioral_ir.inst_name = c.inst_name;
       module_name = c.raw_cell_type;
-      param_values = [];
+      param_values = []; param_strs = [];
       port_connections = pcs;
     }
 

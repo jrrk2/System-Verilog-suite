@@ -184,6 +184,7 @@ let build_single_ramb36 ~(name : string) ~(depth : int) ~(width : int)
         [ ("WRITE_WIDTH_A", 36); ("READ_WIDTH_B", 36)
         ; ("READ_WIDTH_A", 0); ("WRITE_WIDTH_B", 0)
         ; ("DOA_REG", 0); ("DOB_REG", 0) ]
+    ; param_strs = []
     ; port_connections =
         [ ("CLKARDCLK", write_clk); ("CLKBWRCLK", read_clk)
         ; ("ENARDEN", kconst 1 1); ("ENBWREN", kconst 1 1)

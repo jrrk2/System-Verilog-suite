@@ -24,7 +24,7 @@ let bir_of_synth_netlists
     let cell_insts = List.map (fun (i : Lib_map.instance) ->
       { Behavioral_ir.inst_name = i.inst_name;
         module_name = i.cell.cell_name;
-        param_values = [];
+        param_values = []; param_strs = [];
         port_connections =
           List.map (fun (pc : Lib_map.pin_conn) ->
             (pc.pin, Behavioral_ir.BVar pc.net)) i.conns }

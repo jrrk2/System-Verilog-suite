@@ -108,6 +108,13 @@ type binstance = {
   inst_name: string;
   module_name: string;
   param_values: (string * int) list;
+  (* String / bit-vector parameters that don't fit an int: Verilog string
+   * params (RAM_MODE="TDP", WRITE_MODE_A="WRITE_FIRST") and wide bit-vector
+   * params (RAMB INIT_xx as 256-bit hex). behavioral_to_hardcaml maps an
+   * all-0/1 value to a Std_logic_vector param and anything else to a
+   * String param. Defaults to [] so non-instantiating frontends are
+   * unaffected. *)
+  param_strs: (string * string) list [@default []];
   port_connections: (string * bexpr) list;
 } [@@deriving yojson]
 
