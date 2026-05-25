@@ -287,6 +287,45 @@ Sklansky, Kogge-Stone alternates). All five arches sit on top of
 the same bit-blasting primitives in `lib_map`; per-(arch, width)
 correctness is proved standalone via `verify-arch`.
 
+## FPGA synth (BIR → LUT/FF netlist → nextpnr → bitstream)
+
+A second, independent back end in `fpga_synth/` (its own dune library
+with `ppx_hardcaml`) targets Xilinx 7-series FPGAs through the **open**
+nextpnr-xilinx + prjxray flow — no yosys, no VPR, no Vivado anywhere in
+the path.  Where the ASIC pipeline above tech-maps to Liberty std cells,
+this maps to LUTs + flip-flops.
+
+| Stage | Module | Purpose |
+|---|---|---|
+| `Bir_to_aig.lower_circuit` | `fpga_synth/bir_to_aig.ml` | Bit-blast a hardcaml `Circuit.t` (from `behavioral_to_hardcaml`) into a 2-input And-Inverter graph: bitwise / add / sub / eq / lt / mul / mux / cat / select lowered to AND2 + edge inversions, hash-consed. Registers are boundaries — a FF's Q becomes an AIG primary input, its D-cone an AIG primary output — with clock + async-reset nets returned for later stitching |
+| `Lut_cover.cover` / `map_to_luts` | `fpga_synth/lut_cover.ml` | FlowMap / ABC-`if`-style LUT covering specialised to k≤6 (a truth table is one `Int64`): k-feasible cut enumeration (dominance prune + 8-cut priority cap), per-cut truth-table eval via elementary masks (= the `LUTk` INIT), area-flow cut selection |
+| `Fpga_map.map_lowered` | `fpga_synth/fpga_map.ml` | Stitch the LUT-mapped combinational logic + one FF per register bit (FDRE, or FDCE when the boundary carried an async reset) into a single `Circuit.t`, closing register feedback through wires. Folds `~`-inversions on outputs / FF-D into the driving LUT's INIT when fanout-safe. `~io` wraps top pads in IBUF / OBUF (clock through IBUF + BUFG) |
+| `Xil_prim` | `fpga_synth/xil_prim.ml` | Black-box Xilinx-primitive instantiation helpers (LUT1-6 with INIT, FDRE / FDCE, IBUF / OBUF / BUFG) via the hardcaml v0.17.1 `Instantiation.create_with_interface` idiom |
+| `Fpga_emit.write_yosys_json` | `fpga_synth/fpga_emit.ml` | Direct `Circuit.t` → yosys-`write_json` netlist for nextpnr, with **no yosys process**: walks the graph, allocates net ids, emits each primitive as a cell (INIT etc. serialised from `Parameter.Value`), residual inverters as `LUT1 #(.INIT(2'b01))`. Native Verilog emit (`emit_verilog`) also available |
+
+End to end, no proprietary or third-party synth tool in the loop:
+
+```
+SystemVerilog/BIR → hardcaml → AIG → lut_cover (+inverter fold)
+  → LUT+FF Circuit → write_yosys_json → nextpnr-xilinx → FASM
+  → prjxray (fasm2frames + xc7frames2bit) → .bit [→ uf2conv → board]
+```
+
+`fpga_synth/nextpnr_validate.sh` drives it (env-parameterised
+`CHIPDB`/`DEVICE`/`JSON`/`XDC`; `MAKE_BIT=1` adds the prjxray FASM→bit
+stage, `UF2=1` packages a Sonata UF2).  The nextpnr chipdb is built once
+from the bundled prjxray-db (`bbaexport.py` → `bbasm`).  nextpnr-xilinx
+is the flow that consumes a fresh prjxray DB *directly*, so it is the one
+aligned with in-house virtex7 fuzzing — the f4pga/VPR eblif path was
+evaluated and dropped.
+
+**Validated** on xc7z020 (`test_artyz7`) and xc7a50t (`test_sonata`):
+nextpnr places & routes at 250 MHz, and the xc7a50t bitstream is
+**hardware-confirmed on a Sonata board** (a 4-bit ~1 Hz LED counter).
+Scope boundary: `bir_to_aig` currently raises on memories / submodule
+instances, so block-RAM / DSP / hierarchy inference is the next step
+before a full SoC (picosoc) rides this path.
+
 ## DFT (scan + ATPG + JTAG / BSDL)
 
 The synth pipeline carries an optional DFT track that turns any
@@ -562,6 +601,7 @@ Required for the test suites listed alongside each tool:
 | **Surelog** | UHDM frontend (parked at port-surface; slang strictly supersedes for SV elaboration) | optional |
 | **Yosys** | RTLIL frontend, parallel-correctness sweep (`test_yosys_oracle_sweep.exe`), four-way miter (`test_yosys_vs_verible.exe`) | optional |
 | **Vivado 2020.1** | CVA6 entity oracle, Vivado column on the sv-tests dashboard | optional |
+| **nextpnr-xilinx** + **prjxray** | FPGA back end (`fpga_synth/`): chipdb build (`bbaexport`/`bbasm`), place & route, and FASM→bitstream (`fasm2frames` + `xc7frames2bit`); `uf2conv` for Sonata-board packaging | required for `fpga_synth/nextpnr_validate.sh`; otherwise optional |
 
 Verible itself is **not** an external dependency — the SystemVerilog
 parser used by the headline drivers is an OCaml port of Verible's
@@ -608,6 +648,12 @@ Pending in the task tracker, in rough priority order:
 1. **Auto-cascade `gen_mul`** for widths beyond Z3's monolithic ceiling
    (~10-bit) — emit hierarchical mul-leaves + adder-leaves automatically
    so any wide multiplier inherits the cascade verification path (#126)
+2. **FPGA back end: memory / instance lowering** — `fpga_synth/bir_to_aig`
+   raises on `Multiport_mem` / `Mem_read_port` / `Inst`; add block-RAM
+   (RAMB), DSP48 and hierarchy inference so a full SoC (picosoc) can take
+   the LUT/FF → nextpnr → prjxray path that counters already ride.
+   Next milestone after that: VC707 / virtex7 (xc7vx485t) once the
+   in-house prjxray DB finishes fuzzing
 2. **Predictor calibration sweep against measured ORFS QoR** —
    close the loop between `predict_swap`'s analytical numbers and
    real post-CTS measurements (#109)
