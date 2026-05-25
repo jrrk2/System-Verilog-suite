@@ -29,6 +29,6 @@ let () =
     (List.length l.Fpga_synth.Bir_to_aig.insts)
     (List.length l.Fpga_synth.Bir_to_aig.regs)
     (List.length l.Fpga_synth.Bir_to_aig.graph.Fpga_synth.Lut_cover.outputs);
-  let mapped = Fpga_synth.Fpga_map.map_lowered ~k:6 ~name:top l in
+  let mapped = Fpga_synth.Fpga_map.map_lowered ~io:true ~k:6 ~name:top l in
   Fpga_synth.Fpga_emit.write_yosys_json ~path:"/tmp/mem_fpga.json" mapped;
   print_endline "wrote /tmp/mem_fpga.json"
