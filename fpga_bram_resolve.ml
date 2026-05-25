@@ -79,7 +79,11 @@ let plan ?prim_hint ~(depth : int) ~(width : int) () : plan =
   if depth <= 0 || width <= 0 then
     failwith (Printf.sprintf "fpga_bram_resolve.plan: depth=%d width=%d invalid" depth width);
   let prim = choose_prim ?prim_hint ~depth ~width () in
-  let maxw = prim_max_width prim in
+  (* cap tile width at 16: widths 1..16 store data straight into DI[w-1:0]
+     (parity lanes unused), so the builder stays interleave-free; a 32-bit
+     word becomes 2x16-bit tiles rather than one x36 lane with the awkward
+     8-data+1-parity interleave. *)
+  let maxw = min (prim_max_width prim) 16 in
   let cap = prim_capacity prim in
   (* Depth expansion is MUX-FREE: a narrower per-tile data width gives the
      same physical BRAM a deeper address space (cap/w words), so pick the
@@ -251,43 +255,94 @@ let lane_init_strings ~(words : int array) ~(lane : int) : (string * string) lis
     in
     Printf.sprintf "INIT_%02X" xx, s)
 
-(* Build a [width]-bit (width%8=0) sync RAM, depth<=2048, as width/8
-   byte-lane RAMB18E1s in 2K×9 mode.  [ports] is 1 or 2 true-dual-port
-   ports (each read+write): port A reads on DOADO, port B on DOBDO.
-   Returns (binstances, internal signals, read-reassembly stmts, one
-   rdata net name per input port). *)
+(* RAMB mode width = physical port width incl. parity for a given data
+   tile width: 8->9, 16->18, 32->36; 1/2/4 have no parity. *)
+let mode_width tw = match tw with 8 -> 9 | 16 -> 18 | 32 -> 36 | w -> w
+
+let rec log2 n = if n <= 1 then 0 else 1 + log2 (n / 2)
+
+(* INIT_xx (256-bit binary strings) for one tile = bits [tile_lo +: slice_w]
+   of each word, stored in a [tile_width]-bit-per-entry RAMB (high
+   tile_width-slice_w bits zero).  Entry A -> INIT_(A/(256/tw)) bit
+   (A mod (256/tw))*tw + bit_in_entry.  Parity (INITP) left 0. *)
+let tile_init_strings ~(words : int array) ~(tile_lo : int) ~(slice_w : int)
+    ~(tile_width : int) ~(n_init : int) : (string * string) list =
+  let eps = 256 / tile_width in
+  List.init n_init (fun xx ->
+    let s =
+      String.init 256 (fun i ->
+        let p = 255 - i in
+        let entry = p / tile_width and bit = p mod tile_width in
+        let a = (xx * eps) + entry in
+        let w = if a < Array.length words then words.(a) else 0 in
+        let dv = (w lsr tile_lo) land ((1 lsl slice_w) - 1) in
+        if bit < slice_w && (dv lsr bit) land 1 = 1 then '1' else '0')
+    in
+    Printf.sprintf "INIT_%02X" xx, s)
+
+(* Build a [width]-bit sync RAM, depth<=cap (32K on RAMB36, mux-free via
+   narrow tiles), as the plan's n_width_tiles of [tile_width]-bit RAMBs
+   (RAMB18E1/RAMB36E1, x1..x16 — interleave-free).  [ports] is 1 or 2
+   true-dual-port ports (each read+write): port A reads on DOADO, B on
+   DOBDO.  Returns (binstances, internal signals, read-reassembly stmts,
+   one rdata net name per input port). *)
 let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
     ?(init : int array option) ~(ports : ram_port list) ()
     : binstance list * bsignal list * bstmt list * string list =
-  if depth > 2048 then
-    failwith "build_byte_lane_ram: depth>2048 needs deep tiling (not yet)";
-  if width mod 8 <> 0 then failwith "build_byte_lane_ram: width must be a multiple of 8";
   (match ports with [ _ ] | [ _; _ ] -> () | _ -> failwith "build_byte_lane_ram: 1 or 2 ports");
+  let pl = plan ~depth ~width () in
+  if pl.n_depth_tiles > 1 then
+    failwith
+      (Printf.sprintf "build_byte_lane_ram: depth %d exceeds one tile (%d) — deep tiling TODO"
+         depth pl.tile.tile_depth);
+  let prim = pl.tile.prim in
+  let tw = pl.tile.tile_width in
+  let n = pl.n_width_tiles in
   let aw = bits_needed depth in
-  let n_lanes = width / 8 in
+  let cap = prim_capacity prim in
+  let n_init = cap / 256 in
+  let mw = mode_width tw in
+  let shift = log2 tw in
+  let addr_total, di_w, dip_w, wea_w, webwe_w, top =
+    match prim with
+    | RAMB18E1 -> 14, 16, 2, 2, 4, []
+    | RAMB36E1 -> 16, 32, 4, 4, 8, [ kconst 1 1 ]
+  in
+  let word_addr_w = addr_total - shift - List.length top in
+  let addr_expr a =
+    BConcat
+      (top @ [ zext a ~from_w:aw ~to_w:word_addr_w ]
+       @ (if shift > 0 then [ kconst 0 shift ] else []))
+  in
   let pa = List.nth ports 0 in
   let pb = if List.length ports >= 2 then Some (List.nth ports 1) else None in
-  let addr14 a = BConcat [ zext a ~from_w:aw ~to_w:11; kconst 0 3 ] in
-  let byte e lane = BSlice { signal = e; msb = (lane * 8) + 7; lsb = lane * 8 } in
-  let lanes =
-    List.init n_lanes (fun lane ->
-      let lname = Printf.sprintf "%s_l%d" name lane in
-      let doa = lname ^ "_doa" and dopa = lname ^ "_dopa" in
-      let dob = lname ^ "_dob" and dopb = lname ^ "_dopb" in
+  let tiles =
+    List.init n (fun t ->
+      let lo = t * tw in
+      let sw = min tw (width - lo) in
+      let tname = Printf.sprintf "%s_t%d" name t in
+      let doa = tname ^ "_doa" and dopa = tname ^ "_dopa" in
+      let dob = tname ^ "_dob" and dopb = tname ^ "_dopb" in
+      let di_of (p : ram_port) =
+        let slice = BSlice { signal = p.p_wdata; msb = lo + sw - 1; lsb = lo } in
+        if di_w = sw then slice else BConcat [ kconst 0 (di_w - sw); slice ]
+      in
       let base_strs =
         [ ("RAM_MODE", "TDP"); ("WRITE_MODE_A", "READ_FIRST")
         ; ("WRITE_MODE_B", "READ_FIRST") ]
       in
       let param_strs =
         base_strs
-        @ (match init with Some words -> lane_init_strings ~words ~lane | None -> [])
+        @ (match init with
+           | Some words -> tile_init_strings ~words ~tile_lo:lo ~slice_w:sw ~tile_width:tw ~n_init
+           | None -> [])
       in
-      let b_w = if Option.is_some pb then 9 else 0 in
+      let b_w = if Option.is_some pb then mw else 0 in
       let inst =
-        { inst_name = lname ^ "_ramb"
-        ; module_name = "RAMB18E1"
+        { inst_name = tname ^ "_ramb"
+        ; module_name = prim_name prim
         ; param_values =
-            [ ("READ_WIDTH_A", 9); ("WRITE_WIDTH_A", 9)
+            [ ("READ_WIDTH_A", mw); ("WRITE_WIDTH_A", mw)
             ; ("READ_WIDTH_B", b_w); ("WRITE_WIDTH_B", b_w)
             ; ("DOA_REG", 0); ("DOB_REG", 0) ]
         ; param_strs
@@ -298,52 +353,50 @@ let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
             ; ("REGCEAREGCE", kconst 0 1); ("REGCEB", kconst 0 1)
             ; ("RSTRAMARSTRAM", kconst 0 1); ("RSTRAMB", kconst 0 1)
             ; ("RSTREGARSTREG", kconst 0 1); ("RSTREGB", kconst 0 1)
-            ; ("WEA", BReplicate { count = 2; value = pa.p_we })
+            ; ("WEA", BReplicate { count = wea_w; value = pa.p_we })
             ; ( "WEBWE"
               , match pb with
-                | Some p -> BReplicate { count = 4; value = p.p_we }
-                | None -> kconst 0 4 )
-            ; ("ADDRARDADDR", addr14 pa.p_addr)
+                | Some p -> BReplicate { count = webwe_w; value = p.p_we }
+                | None -> kconst 0 webwe_w )
+            ; ("ADDRARDADDR", addr_expr pa.p_addr)
             ; ( "ADDRBWRADDR"
-              , addr14 (match pb with Some p -> p.p_addr | None -> pa.p_addr) )
-            ; ("DIADI", BConcat [ kconst 0 8; byte pa.p_wdata lane ]); ("DIPADIP", kconst 0 2)
+              , addr_expr (match pb with Some p -> p.p_addr | None -> pa.p_addr) )
+            ; ("DIADI", di_of pa); ("DIPADIP", kconst 0 dip_w)
             ; ( "DIBDI"
-              , match pb with
-                | Some p -> BConcat [ kconst 0 8; byte p.p_wdata lane ]
-                | None -> kconst 0 16 )
-            ; ("DIPBDIP", kconst 0 2)
+              , match pb with Some p -> di_of p | None -> kconst 0 di_w )
+            ; ("DIPBDIP", kconst 0 dip_w)
             ; ("DOADO", BVar doa); ("DOPADOP", BVar dopa)
             ; ("DOBDO", BVar dob); ("DOPBDOP", BVar dopb) ]
         }
       in
-      lane, inst, doa, dob)
+      t, sw, inst, doa, dob)
   in
-  let insts = List.map (fun (_, i, _, _) -> i) lanes in
+  let insts = List.map (fun (_, _, i, _, _) -> i) tiles in
   let signals =
     List.concat_map
-      (fun (lane, _, doa, dob) ->
-        let lname = Printf.sprintf "%s_l%d" name lane in
-        [ isig doa 16; isig (lname ^ "_dopa") 2; isig dob 16; isig (lname ^ "_dopb") 2 ])
-      lanes
+      (fun (t, _, _, doa, dob) ->
+        let tn = Printf.sprintf "%s_t%d" name t in
+        [ isig doa di_w; isig (tn ^ "_dopa") dip_w; isig dob di_w; isig (tn ^ "_dopb") dip_w ])
+      tiles
   in
-  (* reassemble a port's word from its per-lane read bytes (MSB-first). *)
-  let read_word net_of =
+  (* reassemble a port's word from its per-tile read slices (MSB-first). *)
+  let read_word ~use_a =
     BConcat
       (List.rev
-         (List.init n_lanes (fun lane ->
-            BSlice { signal = BVar (net_of lane); msb = 7; lsb = 0 })))
+         (List.map
+            (fun (_, sw, _, doa, dob) ->
+              BSlice { signal = BVar (if use_a then doa else dob); msb = sw - 1; lsb = 0 })
+            tiles))
   in
-  let doa_of lane = let _, _, doa, _ = List.nth lanes lane in doa in
-  let dob_of lane = let _, _, _, dob = List.nth lanes lane in dob in
   let rdata_a = name ^ "_rdata_a" in
   let out_sigs = ref [ isig rdata_a width ] in
-  let out_stmts = ref [ BAssign { lhs = rdata_a; rhs = read_word doa_of } ] in
+  let out_stmts = ref [ BAssign { lhs = rdata_a; rhs = read_word ~use_a:true } ] in
   let rdata_names = ref [ rdata_a ] in
   (match pb with
    | Some _ ->
      let rdata_b = name ^ "_rdata_b" in
      out_sigs := !out_sigs @ [ isig rdata_b width ];
-     out_stmts := !out_stmts @ [ BAssign { lhs = rdata_b; rhs = read_word dob_of } ];
+     out_stmts := !out_stmts @ [ BAssign { lhs = rdata_b; rhs = read_word ~use_a:false } ];
      rdata_names := !rdata_names @ [ rdata_b ]
    | None -> ());
   insts, signals @ !out_sigs, !out_stmts, !rdata_names

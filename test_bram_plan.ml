@@ -12,8 +12,8 @@ let () =
   in
   check "progmem 4096x32" (plan ~depth:4096 ~width:32 ()) ~exp_tiles:4;
   check "ram 1024x16" (plan ~depth:1024 ~width:16 ()) ~exp_tiles:1;
-  check "regfile 32x32" (plan ~depth:32 ~width:32 ()) ~exp_tiles:1;
-  check "wide 1024x64" (plan ~depth:1024 ~width:64 ()) ~exp_tiles:2;
+  check "regfile 32x32" (plan ~depth:32 ~width:32 ()) ~exp_tiles:2;
+  check "wide 1024x64" (plan ~depth:1024 ~width:64 ()) ~exp_tiles:4;
   check "deep+wide 8192x64" (plan ~depth:8192 ~width:64 ()) ~exp_tiles:16;
   (* depth expansion is mux-free: deep memories fit one depth-tile by
      narrowing the per-tile width (up to 32K on RAMB36). *)
@@ -51,16 +51,21 @@ let () =
   Printf.printf "INIT_00 lane0 low8 = %s (word0 byte0 = 0xAB)\n" (String.sub s00 248 8);
   if String.sub s00 248 8 <> "10101011" then (print_endline "FAIL: INIT byte pack"; exit 1);
   let port a = { p_clk = BVar "clk"; p_addr = BVar a; p_we = BVar "we"; p_wdata = BVar "wd" } in
+  (* 4096x32: planner -> 8-bit tiles on RAMB36 (mux-free), 4 wide. *)
   let bi, bsig, bst, brd =
-    build_byte_lane_ram ~name:"pm" ~depth:4 ~width:32 ~init:words ~ports:[ port "a" ] ()
+    build_byte_lane_ram ~name:"pm" ~depth:4096 ~width:32 ~init:words ~ports:[ port "a" ] ()
   in
-  Printf.printf "byte-lane ROM: insts=%d (%s) param_strs=%d sigs=%d stmts=%d rports=%d\n"
+  Printf.printf "ROM 4096x32: insts=%d (%s) param_strs=%d sigs=%d stmts=%d rports=%d\n"
     (List.length bi) (List.hd bi).module_name (List.length (List.hd bi).param_strs)
     (List.length bsig) (List.length bst) (List.length brd);
-  if List.length bi <> 4 then (print_endline "FAIL: lane count"; exit 1);
-  if (List.hd bi).module_name <> "RAMB18E1" then (print_endline "FAIL: not RAMB18E1"; exit 1);
-  (* 3 base string params (RAM_MODE, WRITE_MODE_A/B) + 64 INIT_xx = 67. *)
-  if List.length (List.hd bi).param_strs <> 67 then (print_endline "FAIL: param_strs"; exit 1);
+  if List.length bi <> 4 then (print_endline "FAIL: tile count"; exit 1);
+  if (List.hd bi).module_name <> "RAMB36E1" then (print_endline "FAIL: not RAMB36E1"; exit 1);
+  (* 3 base string params (RAM_MODE, WRITE_MODE_A/B) + 128 INIT_xx (RAMB36). *)
+  if List.length (List.hd bi).param_strs <> 131 then (print_endline "FAIL: param_strs"; exit 1);
+  (* deep mux-free: 32768x8 -> one 1-bit tile per bit, single depth-tile. *)
+  let dbi, _, _, _ = build_byte_lane_ram ~name:"deep" ~depth:32768 ~width:8 ~ports:[ port "a" ] () in
+  Printf.printf "deep 32768x8: tiles=%d (%s, 1-bit)\n" (List.length dbi) (List.hd dbi).module_name;
+  if List.length dbi <> 8 then (print_endline "FAIL: deep tile count"; exit 1);
   let _, _, _, brd2 =
     build_byte_lane_ram ~name:"dp" ~depth:8 ~width:32
       ~ports:[ port "ca"; { p_clk = BVar "hclk"; p_addr = BVar "ha"; p_we = BVar "hwe"; p_wdata = BVar "hwd" } ]
