@@ -107,8 +107,15 @@ let rec value_of = function
  * STRING tag-labels) returns None. Without this, walk emits "TUPLE3"
  * etc. as literal text and the resulting expression is garbage. *)
 let leaf_text = function
-  | TK_DecNumber n | TK_UnBasedNumber n
-  | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n -> Some n
+  | TK_DecNumber n | TK_UnBasedNumber n -> Some n
+  (* Preserve the radix: verible surfaces a based literal's digits in a
+   * typed token (TK_HexDigits etc.) with the base stripped, so emitting
+   * the bare digits would make the downstream evaluator read e.g. a hex
+   * value as decimal (PROGADDR_RESET 32'h00100000 -> 100000).  Re-attach
+   * the Verilog base marker so [Eval] parses the radix correctly. *)
+  | TK_HexDigits n -> Some ("'h" ^ n)
+  | TK_BinDigits n -> Some ("'b" ^ n)
+  | TK_OctDigits n -> Some ("'o" ^ n)
   | SymbolIdentifier id -> Some id
   | LT_LT -> Some "<<"  | GT_GT -> Some ">>"
   | SLASH -> Some "/"   | STAR  -> Some "*"
@@ -1217,8 +1224,10 @@ and resolve_arg_to_sv pkgs tok : sv_value =
   | Some v -> v
   | None ->
       let s = String.trim (deep_string_of_token tok) in
-      (* Plain integer literal? *)
-      (match int_of_string_opt s with
+      (* Plain integer literal? (int_of_pvalue understands the Verilog
+       * based form `'h..`/`'b..`/`'o..` that leaf_text now emits, as well
+       * as plain decimals.) *)
+      (match int_of_pvalue (PStr s) with
        | Some n -> SVInt n
        | None ->
            (* `pkg :: name` reference to a struct localparam? *)
@@ -1540,17 +1549,37 @@ module Eval = struct
           push (TDollar (String.sub s (!i + 1) (!j - !i - 1)));
           i := !j
       | '\'' ->
-          (* `'0`, `'1`, `'x`, `'z` — bare unsized literals.  Anything
-             else after a leading apostrophe (e.g. `'{` opening an
-             assignment pattern) means this string isn't a plain integer
-             expression and we can't fold it to an int — bail rather
-             than silently emit TNum 0 (task #139).  *)
+          (* `'0`, `'1`, `'x`, `'z` — bare unsized fill literals.  Also
+             unsized based literals `'h..`, `'b..`, `'o..`, `'d..` (these
+             are what [leaf_text] emits for a based number whose width
+             token verible kept separate).  `'{` (assignment pattern) and
+             anything else bail rather than fold to a bogus 0 (task #139). *)
           if !i + 1 < n then begin
-            let nc = s.[!i + 1] in
+            let nc = Char.lowercase_ascii s.[!i + 1] in
             (match nc with
-             | '0' | 'x' | 'X' | 'z' | 'Z' -> push (TNum 0); i := !i + 2
+             | '0' | 'x' | 'z' -> push (TNum 0); i := !i + 2
              | '1' -> push (TNum 1); i := !i + 2
-             | _ -> bail (Printf.sprintf "unhandled apostrophe-prefix '%c" nc))
+             | 'h' | 'b' | 'o' | 'd' ->
+                 let k = ref (!i + 2) in
+                 while !k < n &&
+                       (let cc = s.[!k] in
+                        is_dig cc || (cc >= 'a' && cc <= 'f')
+                                  || (cc >= 'A' && cc <= 'F') || cc = '_')
+                 do incr k done;
+                 let digits =
+                   String.concat "" (String.split_on_char '_'
+                     (String.sub s (!i + 2) (!k - !i - 2))) in
+                 let v =
+                   try
+                     match nc with
+                     | 'h' -> int_of_string ("0x" ^ digits)
+                     | 'b' -> int_of_string ("0b" ^ digits)
+                     | 'o' -> int_of_string ("0o" ^ digits)
+                     | _   -> int_of_string digits
+                   with _ -> bail (Printf.sprintf "based literal %S failed" digits)
+                 in
+                 push (TNum v); i := !k
+             | _ -> bail (Printf.sprintf "unhandled apostrophe-prefix '%c" s.[!i + 1]))
           end else bail "trailing apostrophe"
       | _ when is_dig c ->
           let j = ref !i in
