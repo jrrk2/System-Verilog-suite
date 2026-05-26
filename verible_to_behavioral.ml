@@ -3717,13 +3717,24 @@ let convert_module ~pkgs (mdecl : module_decl)
         | Some { stype = BInt { width; _ }; _ } ->
             (* Scalar bit-vector — `assign foo[k] = X` writes a single
                bit, not an array element.  Each "index" corresponds to
-               one bit of width 1, so the concat reassembles bit-wise. *)
+               one bit; for multi-bit slice writes like `foo[3:2] = …`
+               the slot occupies multiple bits and we recover its
+               width from the data expression. *)
             (width, 1, true)
         | _ -> (List.length writes, 1, false)
       in
-      let truncate_to_elem e =
-        if elem_w >= 32 then e
-        else BSlice { signal = e; msb = elem_w - 1; lsb = 0 }
+      (* Width of a single write's data — used to recover multi-bit
+         slot widths for scalar bit-vector slice writes (`foo[3:2] = X`
+         comes in as @mem_write(foo, 2, X) with X 2-bit). *)
+      let data_width data =
+        match width_of_bexpr_ctx
+                (List.map (fun (s : bsignal) ->
+                   s.name, width_of_type s.stype) signals) data with
+        | Some w when w >= 1 -> w
+        | _ -> elem_w in
+      let truncate_to_elem ~w e =
+        if w >= 32 then e
+        else BSlice { signal = e; msb = w - 1; lsb = 0 }
       in
       (* Sort msb-first so the concat reads top-to-bottom. *)
       let sorted = List.sort (fun (a, _) (b, _) -> compare b a) writes in
@@ -3747,12 +3758,20 @@ let convert_module ~pkgs (mdecl : module_decl)
       let parts = ref [] in
       let cursor = ref (arr_size - 1) in
       List.iter (fun (idx, data) ->
-        if idx < !cursor then
-          for k = !cursor downto idx + 1 do
+        (* For scalar bit-vector slice writes (`foo[hi:lo] = …`)
+           verible's [lhs_indexed_of] stores `hi` (the msb) as the
+           idx, and the data's width tells us how far down the slot
+           extends.  For true unpacked arrays each idx is one
+           element of elem_w bits.  In both cases the slot occupies
+           [slot_top : slot_top - slot_w + 1]. *)
+        let slot_w = if is_scalar then data_width data else elem_w in
+        let slot_top = if is_scalar then idx else idx in
+        if slot_top < !cursor then
+          for k = !cursor downto slot_top + 1 do
             parts := filler_at k :: !parts
           done;
-        parts := truncate_to_elem data :: !parts;
-        cursor := idx - 1
+        parts := truncate_to_elem ~w:slot_w data :: !parts;
+        cursor := slot_top - slot_w
       ) sorted;
       if !cursor >= 0 then
         for k = !cursor downto 0 do
