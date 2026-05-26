@@ -1556,13 +1556,29 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         then bin BOr lhs rhs
       else if prefix_is "xor_expr" tag || prefix_is "bitxor_expr" tag
         then bin BXor lhs rhs
-      (* `&&` and `||` — logical AND/OR. For 1-bit operands these
-       * coincide with bitwise AND/OR; for wider operands the SV
-       * semantics is "any non-zero bit ⇒ true" but the existing
-       * BAnd/BOr Z3 encoding already widens to the operand width
-       * and the result is non-zero iff both/either are non-zero. *)
-      else if prefix_is "logand_expr" tag then bin BAnd lhs rhs
-      else if prefix_is "logor_expr" tag then bin BOr lhs rhs
+      (* `&&` and `||` — logical AND/OR.  SV reduces each operand to
+       * "non-zero" before combining (`cpuregs_write && latched_rd` with
+       * latched_rd=5'b01010 yields true).  Lowering as bitwise BAnd/BOr
+       * at mixed widths zero-extends the 1-bit operand, so the AND's
+       * high bits become zero and a downstream if-condition OR-reduce
+       * collapses to just bit 0 of the wider operand — exactly the
+       * picorv32 cpuregs_write gate bug.  Wrap each operand in BRedOr
+       * (if wider than 1) so both sides are 1-bit booleans before the
+       * bitwise combine.  Caught by tests/operators/op_if_logand5. *)
+      else if prefix_is "logand_expr" tag || prefix_is "logor_expr" tag then begin
+        let op = if prefix_is "logand_expr" tag then BAnd else BOr in
+        let reduce_to_bool e =
+          let ew = match e with
+            | BConst { width; _ } -> width
+            | _ -> 32 in
+          if ew <= 1 then e
+          else BUnOp { op = BRedOr; operand = e;
+                       result_type = BInt { width = 1; signed = Unsigned } } in
+        let lb = reduce_to_bool (recurse lhs) in
+        let rb = reduce_to_bool (recurse rhs) in
+        BBinOp { op; lhs = lb; rhs = rb;
+                 result_type = BInt { width = 1; signed = Unsigned } }
+      end
       else if prefix_is "shift_expr2" tag then bin BShl lhs rhs
       else if prefix_is "shift_expr3" tag then bin BShr lhs rhs
       else if prefix_is "shift_expr4" tag then
