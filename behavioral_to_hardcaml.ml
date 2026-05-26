@@ -14,6 +14,12 @@ type conv_context = {
   scope: Scope.t;
   mutable clock: Signal.t option;
   mutable reset: Signal.t option;
+  (* Reset is async + active-low when set (SV `negedge rstn` + `if (!rstn)`).
+     Override Reg_spec's default Rising-edge reset so the emitted FF uses
+     `negedge` sensitivity and the body's reset condition matches the
+     source.  Otherwise picorv32's progmem o_ready (and any other negedge-
+     async-reset FF) gets polarity-flipped and never leaves reset. *)
+  mutable reset_falling: bool;
   (* Per-element width for BArray-typed signals — populated by the
      pre-pass in [create_circuit] from each bsignal's stype.  Lets
      [BSelect] compute the right slice when the index is dynamic. *)
@@ -59,11 +65,15 @@ let get_or_create_var ctx name width is_reg =
   match List.assoc_opt name ctx.variables with
   | Some v -> v
   | None ->
+      let with_reset_edge spec =
+        if ctx.reset_falling
+        then Reg_spec.override spec ~reset_edge:Falling
+        else spec in
       let v =
         if is_reg then
           match ctx.clock, ctx.reset with
           | Some clk, Some rst ->
-              let spec = Reg_spec.create ~clock:clk ~reset:rst () in
+              let spec = Reg_spec.create ~clock:clk ~reset:rst () |> with_reset_edge in
               Always.Variable.reg spec ~width
           | Some clk, None ->
               let spec = Reg_spec.create ~clock:clk () in
@@ -787,12 +797,20 @@ let process_to_always ctx = function
          Verilog's body-order (last-wins) semantics. *)
       Always.compile (List.rev alw)
 
-  | BSequential { clock; reset; reset_async; body; blocking_vars; _ } ->
+  | BSequential { clock; reset; reset_async; reset_edge; body; blocking_vars; _ } ->
       let clk_sig = get_signal ctx clock in
       ctx.clock <- Some clk_sig;
+      (* For an async negedge reset (`always @(posedge clk or negedge rstn)
+         if (!rstn) ...`) flip Reg_spec's default Rising-edge reset to
+         Falling, so the emitted FF uses `negedge rstn` sensitivity and
+         the body's reset condition matches the source.  Without this,
+         picorv32's progmem o_ready stays in reset forever and the picosoc
+         mem_ready handshake stalls. *)
       (match reset, reset_async with
-       | Some rst_name, true -> ctx.reset <- Some (get_signal ctx rst_name)
-       | _ -> ());
+       | Some rst_name, true ->
+           ctx.reset <- Some (get_signal ctx rst_name);
+           ctx.reset_falling <- (reset_edge = Some `Neg)
+       | _ -> ctx.reset_falling <- false);
       let body = thread_body ~blocking_vars body in
       let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
@@ -837,7 +855,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
     scope;
     clock = None;
     reset = None;
-    array_elem_w = Hashtbl.create 8;
+    array_elem_w = Hashtbl.create 8; reset_falling = false;
   } in
   (* Clock/reset get bound by [process_to_always] when each
      BSequential block tells us its clock and reset signal names
@@ -873,7 +891,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     scope;
     clock = None;
     reset = None;
-    array_elem_w = Hashtbl.create 8;
+    array_elem_w = Hashtbl.create 8; reset_falling = false;
   } in
 
   (* Clock/reset get bound by [process_to_always] when each
@@ -902,7 +920,12 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
      reset paths, one async by hardcaml default and one sync by
      the BIf in the body).  We only pass reset to Reg_spec when
      [reset_async = true]. *)
-  let driver_proc : (string, (string * string option) option) Hashtbl.t =
+  (* Per-signal driver info: (clock_name, async_reset_name_opt,
+     reset_falling).  `reset_falling = true` means the source SV says
+     `negedge rstn` + `if (!rstn)` — we must override Reg_spec's default
+     Rising-edge async reset to Falling, else the FF gets stuck in
+     reset (active polarity is flipped). *)
+  let driver_proc : (string, (string * string option * bool) option) Hashtbl.t =
     Hashtbl.create 16 in
   let rec scan_lhs ck_rst = function
     | [] -> ()
@@ -926,9 +949,10 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     | BBlock s :: tl -> scan_lhs ck_rst s; scan_lhs ck_rst tl
     | _ :: tl -> scan_lhs ck_rst tl in
   List.iter (function
-    | BSequential { clock; reset; reset_async; body; _ } ->
+    | BSequential { clock; reset; reset_async; reset_edge; body; _ } ->
         let async_rst = if reset_async then reset else None in
-        scan_lhs (Some (clock, async_rst)) body
+        let rst_falling = reset_async && reset_edge = Some `Neg in
+        scan_lhs (Some (clock, async_rst, rst_falling)) body
     | BCombinational { body; _ } -> scan_lhs None body)
     bmod.processes;
 
@@ -959,10 +983,12 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
       end else
       let is_reg, var =
         match Hashtbl.find_opt driver_proc s.name with
-        | Some (Some (clock, reset)) ->
+        | Some (Some (clock, reset, rst_falling)) ->
             let clk = get_signal ctx clock in
             let spec = match reset with
-              | Some rst -> Reg_spec.create ~clock:clk ~reset:(get_signal ctx rst) ()
+              | Some rst ->
+                  let s = Reg_spec.create ~clock:clk ~reset:(get_signal ctx rst) () in
+                  if rst_falling then Reg_spec.override s ~reset_edge:Falling else s
               | None     -> Reg_spec.create ~clock:clk () in
             (true, Always.Variable.reg spec ~width:w)
         | _ ->
