@@ -632,8 +632,18 @@ let thread_body ?(blocking_vars = []) body =
     List.iter (fun s ->
       match s with
       | BAssign { lhs; rhs } ->
-          Hashtbl.replace env lhs (subst env rhs);
-          if not (List.mem lhs !local) then local := lhs :: !local
+          let rhs' = subst env rhs in
+          (* Only blocking (`=`) LHSes get threaded into env so subsequent
+             reads see the in-cycle value.  Non-blocking (`<=`) LHSes keep
+             SV semantics — reads see the registered Q, not the value
+             scheduled in this cycle — by staying out of env entirely; we
+             emit them directly via emit_assign (which still un-lifts
+             self-referencing BConds so multi-drive composes correctly). *)
+          if is_blocking lhs then begin
+            Hashtbl.replace env lhs rhs';
+            if not (List.mem lhs !local) then local := lhs :: !local
+          end else
+            emit_assign out lhs rhs'
       | BIf { condition; then_stmts; else_stmts } ->
           let assigned = assigned_scalars [s] in
           materialise out assigned;
