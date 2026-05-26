@@ -252,6 +252,16 @@ let tests : (string * string * ((string,Z3.Expr.expr) Hashtbl.t -> (string,int) 
     let plus1 = Z3.BitVector.mk_add ctx x_prev (bvk 1 8) in
     eq x_next (ite (to_bool resetn) plus1 (bvk 0 8)));
 
+  (* op_bit_select: y0 = pc[0]; y31 = pc[31].  Caught the picorv32
+   * MISALIGNED-INSTRUCTION false trap: the BIR encoded the bit-0
+   * select but the emit produced pc[31:31] under certain contexts. *)
+  "op_bit_select", "tests/operators/op_bit_select.v", (fun env _wt ->
+    let pc = bv "pc" 32 in
+    let y0 = env_lookup env _wt "y0" in
+    let y31 = env_lookup env _wt "y31" in
+    band [ eq y0 (Z3.BitVector.mk_extract ctx 0 0 pc)
+         ; eq y31 (Z3.BitVector.mk_extract ctx 31 31 pc) ]);
+
   (* op_case_fsm: 4-state FSM in a case statement.  Encodes the
    * picorv32 pattern where each `cpu_state_X: cpu_state <= Y` branch
    * must NOT leak its RHS into the register update for a different
