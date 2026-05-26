@@ -52,6 +52,7 @@ let counter_module ~reset_async name : bmodule = {
           ];
         }
       ];
+      blocking_vars = [];
     }
   ];
   instances = [];

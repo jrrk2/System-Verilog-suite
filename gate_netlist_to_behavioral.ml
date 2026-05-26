@@ -170,6 +170,7 @@ let expand_instance lib (inst : binstance)
                  reset_edge = None;
                  reset_async = false;
                  body = stmts;
+                 blocking_vars = [];
                } in
              ([proc], !bit_taps, false)
        | _ ->

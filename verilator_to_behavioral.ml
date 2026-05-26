@@ -688,6 +688,7 @@ let always_to_bprocess = function
           reset_edge = None;
           reset_async = false;
           body;
+          blocking_vars = [];
         }
       else
         BCombinational { name = "always_comb"; sensitivity = [BAny]; body }
@@ -890,6 +891,7 @@ let cell_to_bprocess = function
               reset_edge = (if async then Some `Pos else None);
               reset_async = async;
               body;
+              blocking_vars = [];
             })
         | _ -> None
       in

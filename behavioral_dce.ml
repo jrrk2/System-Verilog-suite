@@ -263,12 +263,12 @@ let eliminate_dead_process_with_module_live module_live = function
       let body' = List.filter_map (eliminate_dead_stmt live_vars) body in
       BCombinational { name; sensitivity; body = body' }
 
-  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body } ->
+  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
       (* Combine local liveness with module-level liveness *)
       let local_live = compute_live_vars body in
       let live_vars = StringSet.union local_live module_live in
       let body' = List.filter_map (eliminate_dead_stmt live_vars) body in
-      BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body' }
+      BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body'; blocking_vars }
 
 (* NEW: Eliminate dead code in module with cross-process tracking *)
 let eliminate_dead_module bmod =

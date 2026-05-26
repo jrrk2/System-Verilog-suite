@@ -533,7 +533,8 @@ let rec stmt_to_always ~is_reg ctx alw = function
  * register's Q).  Array/slice [BCallStmt]s pass through with their
  * argument expressions threaded.  Works for both combinational and
  * sequential bodies. *)
-let thread_body body =
+let thread_body ?(blocking_vars = []) body =
+  let is_blocking name = List.mem name blocking_vars in
   let rec subst env e =
     match e with
     | BVar n -> (match Hashtbl.find_opt env n with Some v -> v | None -> e)
@@ -628,20 +629,73 @@ let thread_body body =
           materialise out assigned;
           let cond' = subst env condition in
           let snap = snapshot () in
-          let te = thread then_stmts in restore snap;
-          let ee = thread else_stmts in restore snap;
+          let te = thread then_stmts in
+          let env_then = snapshot () in
+          restore snap;
+          let ee = thread else_stmts in
+          let env_else = snapshot () in
+          restore snap;
           out := BIf { condition = cond'; then_stmts = te; else_stmts = ee } :: !out;
-          List.iter (Hashtbl.remove env) assigned
+          (* For SV blocking (`=`) vars: their in-cycle value is whatever
+             the branch computed, merged via BCond on the threaded guard.
+             Keep that in env so later reads inline the merged expression
+             (matching SV blocking semantics; the FF stays driven by the
+             emitted BIf and is dead-code-eliminated if no external read).
+             For non-blocking (`<=`) vars: reads after the barrier should
+             see Q (the previous clock's value), so just drop them from
+             env and let BVar fall through to the register output. *)
+          List.iter (fun k ->
+            if is_blocking k then
+              let pv () = match Hashtbl.find_opt env k with
+                | Some v -> v | None -> BVar k in
+              let vt = match List.assoc_opt k env_then with Some v -> v | None -> pv () in
+              let ve = match List.assoc_opt k env_else with Some v -> v | None -> pv () in
+              let merged = if vt = ve then vt
+                           else BCond { condition = cond'; then_val = vt; else_val = ve } in
+              Hashtbl.replace env k merged
+            else
+              Hashtbl.remove env k
+          ) assigned
       | BCase { selector; cases; default } ->
           let assigned = assigned_scalars [s] in
           materialise out assigned;
           let sel' = subst env selector in
           let snap = snapshot () in
-          let cases' = List.map (fun (k, ss) ->
-            let k' = subst env k in let ss' = thread ss in restore snap; (k', ss')) cases in
-          let default' = thread default in restore snap;
+          let case_envs = List.map (fun (k, ss) ->
+            let k' = subst env k in
+            let ss' = thread ss in
+            let env_case = snapshot () in
+            restore snap;
+            (k', ss', env_case)) cases in
+          let default' = thread default in
+          let env_default = snapshot () in
+          restore snap;
+          let cases' = List.map (fun (k', ss', _) -> (k', ss')) case_envs in
           out := BCase { selector = sel'; cases = cases'; default = default' } :: !out;
-          List.iter (Hashtbl.remove env) assigned
+          (* Same blocking/non-blocking split as BIf, merged across all
+             arms: blocking k threads `sel'==k0 ? v0 : sel'==k1 ? v1 : ...
+             : default`; non-blocking k drops from env. *)
+          List.iter (fun k ->
+            if is_blocking k then
+              let pv () = match Hashtbl.find_opt env k with
+                | Some v -> v | None -> BVar k in
+              let v_def = match List.assoc_opt k env_default with
+                | Some v -> v | None -> pv () in
+              let merged =
+                List.fold_right (fun (k_val, _, env_case) acc ->
+                  let v_arm = match List.assoc_opt k env_case with
+                    | Some v -> v | None -> pv () in
+                  if v_arm = acc then acc
+                  else BCond {
+                    condition = BBinOp { op = BEq; lhs = sel'; rhs = k_val;
+                                         result_type = BBool };
+                    then_val = v_arm; else_val = acc }
+                ) case_envs v_def
+              in
+              Hashtbl.replace env k merged
+            else
+              Hashtbl.remove env k
+          ) assigned
       | BCallStmt { func; args } ->
           out := BCallStmt { func; args = List.map (subst env) args } :: !out
       | other -> out := other :: !out
@@ -733,13 +787,13 @@ let process_to_always ctx = function
          Verilog's body-order (last-wins) semantics. *)
       Always.compile (List.rev alw)
 
-  | BSequential { clock; reset; reset_async; body; _ } ->
+  | BSequential { clock; reset; reset_async; body; blocking_vars; _ } ->
       let clk_sig = get_signal ctx clock in
       ctx.clock <- Some clk_sig;
       (match reset, reset_async with
        | Some rst_name, true -> ctx.reset <- Some (get_signal ctx rst_name)
        | _ -> ());
-      let body = thread_body body in
+      let body = thread_body ~blocking_vars body in
       let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
       Always.compile (List.rev alw)
@@ -1002,20 +1056,25 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
   let seq_groups = Hashtbl.create 4 in
   List.iter (fun p ->
     match p with
-    | BSequential { body; _ } ->
+    | BSequential { body; blocking_vars; _ } ->
         (match seq_key p with
          | Some k ->
-             let prev = try Hashtbl.find seq_groups k with Not_found -> [] in
-             Hashtbl.replace seq_groups k (prev @ body)
+             let (prev_body, prev_bv) =
+               try Hashtbl.find seq_groups k with Not_found -> ([], []) in
+             Hashtbl.replace seq_groups k
+               (prev_body @ body,
+                List.sort_uniq compare (prev_bv @ blocking_vars))
          | None -> ())
     | _ -> ()
   ) bmod.processes;
   let merged_seqs =
-    Hashtbl.fold (fun (clock, clock_edge, reset, reset_edge, reset_async) body acc ->
+    Hashtbl.fold (fun (clock, clock_edge, reset, reset_edge, reset_async)
+                     (body, blocking_vars) acc ->
       BSequential {
         name = "merged_seq_" ^ clock;
         clock; clock_edge; reset; reset_edge; reset_async;
         body;
+        blocking_vars;
       } :: acc
     ) seq_groups [] in
   let other_processes = List.filter (function

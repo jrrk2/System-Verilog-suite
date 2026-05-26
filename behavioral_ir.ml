@@ -86,6 +86,16 @@ type bprocess =
       reset_edge: [`Pos | `Neg] option;
       reset_async: bool;  (* true = async reset, false = sync reset *)
       body: bstmt list;
+      (* Names of variables assigned with SystemVerilog *blocking* `=`
+       * inside this clocked block (the rest are non-blocking `<=`).  SV's
+       * `=` in an always_ff makes the LHS an in-cycle combinational temp
+       * — subsequent reads see this-cycle's value (the D side of any FF
+       * that ends up driven from it), not the registered Q.  Populated by
+       * the frontend; [behavioral_to_hardcaml] threads reads of these
+       * names with their merged in-cycle expression instead of the
+       * register output.  Default [] = treat every LHS as non-blocking,
+       * matching the prior (BIR-loses-=/<=) behaviour.  *)
+      blocking_vars: string list [@default []];
     }
   [@@deriving yojson]
 

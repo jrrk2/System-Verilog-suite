@@ -510,6 +510,7 @@ let convert_cell (edif : edif_data) =
            reset_edge = (if Option.is_some reset then Some `Pos else None);
            reset_async;
            body;
+           blocking_vars = [];
          } :: !sequential_processes
      | _ -> ())
   ) edif.instances;

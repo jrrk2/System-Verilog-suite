@@ -86,6 +86,7 @@ let pack_module (m : bmodule) : bmodule =
           name = bus ^ "_pack";
           clock; clock_edge; reset; reset_edge; reset_async;
           body = [BAssign { lhs = bus; rhs = rhs_packed }];
+          blocking_vars = [];
         } in
         packed_procs := packed :: !packed_procs;
         List.iter (fun (_, _, p) -> to_drop := p :: !to_drop) entries;

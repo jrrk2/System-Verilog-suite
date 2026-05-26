@@ -994,6 +994,7 @@ let process_to_bprocess ctx name sens_list ?(proc_decls=VhdNone) body =
         reset_edge;
         reset_async = true;  (* VHDL async reset if in sensitivity list *)
         body = body_stmts;
+        blocking_vars = [];
       }
 
   | None ->

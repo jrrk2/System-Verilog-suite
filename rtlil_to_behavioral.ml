@@ -268,6 +268,7 @@ let cell_to_bprocess (c : rtlil_cell) =
              reset_edge = None;
              reset_async = false;
              body = [assign_or_slice_write lhs slice d];
+             blocking_vars = [];
            })
        | _ -> None)
   (* Sync-reset flip-flop. Vivado calls this RTL_REG_SYNC; yosys emits
@@ -294,6 +295,7 @@ let cell_to_bprocess (c : rtlil_cell) =
                then_stmts = [assign_or_slice_write lhs slice rst_val];
                else_stmts = [assign_or_slice_write lhs slice d];
              }];
+             blocking_vars = [];
            })
        | _ -> None)
   (* Clock-enable flip-flop, no reset. Body: if (EN) q<=D. The else
@@ -314,6 +316,7 @@ let cell_to_bprocess (c : rtlil_cell) =
                then_stmts = [assign_or_slice_write lhs slice d];
                else_stmts = [assign_or_slice_write lhs slice (BVar lhs)];
              }];
+             blocking_vars = [];
            })
        | _ -> None)
   (* Async-reset flip-flop. *)
@@ -351,6 +354,7 @@ let cell_to_bprocess (c : rtlil_cell) =
                then_stmts = [assign_or_slice_write lhs slice rst_val];
                else_stmts = [assign_or_slice_write lhs slice d];
              }];
+             blocking_vars = [];
            })
        | _ -> None)
   (* Async-reset clock-enable flip-flop. Body:
@@ -397,6 +401,7 @@ let cell_to_bprocess (c : rtlil_cell) =
                then_stmts = [assign_or_slice_write lhs slice ad];
                else_stmts = [assign_or_slice_write lhs slice d];
              }];
+             blocking_vars = [];
            })
        | _ -> None)
   | "$adffe" ->
@@ -445,6 +450,7 @@ let cell_to_bprocess (c : rtlil_cell) =
                  else_stmts = [assign_or_slice_write lhs slice (BVar lhs)];
                }];
              }];
+             blocking_vars = [];
            })
        | _ -> None)
   (* D-latch. `$dlatch` is a level-sensitive transparent latch:

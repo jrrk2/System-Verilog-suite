@@ -37,7 +37,8 @@ let counter ~name ~reset_async : bmodule = {
                                     result_type = BInt { width = 4; signed = Unsigned }
                                   } }]
         }
-      ]
+      ];
+      blocking_vars = []
     }
   ];
   instances = []; funcs = []; mems = []; attrs = [];

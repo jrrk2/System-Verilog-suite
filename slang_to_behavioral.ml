@@ -912,6 +912,7 @@ let extract_processes members_raw =
             reset_edge = None;
             reset_async = false;
             body;
+            blocking_vars = [];
           })
         end else
           let body = [stmt_to_bstmt inner] in

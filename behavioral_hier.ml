@@ -117,7 +117,7 @@ let sub_process ~subst ~lhs_subst ~prefix = function
           | BAny       -> BAny
         ) sensitivity;
         body = List.map (sub_bstmt ~subst ~lhs_subst ~prefix) body }
-  | BSequential { name; clock; clock_edge;
+  | BSequential { name; clock; clock_edge; blocking_vars;
                   reset; reset_edge; reset_async; body } ->
       BSequential {
         name        = pname prefix name;
@@ -128,7 +128,12 @@ let sub_process ~subst ~lhs_subst ~prefix = function
                        | Some n -> Some (sub_name ~subst ~lhs_subst ~prefix n));
         reset_edge;
         reset_async;
-        body        = List.map (sub_bstmt ~subst ~lhs_subst ~prefix) body }
+        body        = List.map (sub_bstmt ~subst ~lhs_subst ~prefix) body;
+        (* Rename blocking_vars in lockstep with the body's LHS rewrites so
+         * `is_blocking` checks downstream match the flattened names
+         * (e.g. picorv32's `current_pc` -> `cpu__current_pc`).  *)
+        blocking_vars = List.map
+          (sub_name ~subst ~lhs_subst ~prefix) blocking_vars }
 
 (* Inline `child` (already flattened) into `parent` at instance `inst`.
  * Returns a new bmodule with child's signals/processes added under the

@@ -215,6 +215,7 @@ let always_to_bprocess (always_blk : always_info) =
         reset_edge;
         reset_async = (async_reset <> None);
         body = body_stmts;
+        blocking_vars = [];
       }
 
 (* Extract internal signals from symbol table *)

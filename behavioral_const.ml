@@ -352,10 +352,10 @@ let propagate_process = function
       let body' = List.map (propagate_stmt ctx) body in
       (BCombinational { name; sensitivity; body = body' }, ctx.changes)
 
-  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body } ->
+  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
       let ctx = create_prop_context () in
       let body' = List.map (propagate_stmt ctx) body in
-      (BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body' }, ctx.changes)
+      (BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body'; blocking_vars }, ctx.changes)
 
 (* Propagate constants through module *)
 let propagate_module bmod =
@@ -500,10 +500,11 @@ let propagate_module_with_globals bmod =
           BCombinational { name; sensitivity;
                            body = List.map (propagate_stmt ctx) body }
       | BSequential { name; clock; clock_edge; reset; reset_edge;
-                      reset_async; body } ->
+                      reset_async; body; blocking_vars } ->
           BSequential { name; clock; clock_edge; reset; reset_edge;
                         reset_async;
-                        body = List.map (propagate_stmt ctx) body }
+                        body = List.map (propagate_stmt ctx) body;
+                        blocking_vars }
     in
     total_changes := !total_changes + ctx.changes;
     proc'
@@ -823,10 +824,11 @@ let normalize_bcall_args_module bmod =
         BCombinational { name; sensitivity;
           body = List.map (normalize_stmt sig_widths func_sigs) body }
     | BSequential { name; clock; clock_edge; reset; reset_edge;
-                    reset_async; body } ->
+                    reset_async; body; blocking_vars } ->
         BSequential { name; clock; clock_edge; reset; reset_edge;
           reset_async;
-          body = List.map (normalize_stmt sig_widths func_sigs) body }
+          body = List.map (normalize_stmt sig_widths func_sigs) body;
+          blocking_vars }
   ) bmod.processes in
   { bmod with processes = processes' }
 
@@ -916,10 +918,11 @@ let expand_fills_module bmod =
         BCombinational { name; sensitivity;
           body = List.map (expand_fills_stmt sig_widths) body }
     | BSequential { name; clock; clock_edge; reset; reset_edge;
-                    reset_async; body } ->
+                    reset_async; body; blocking_vars } ->
         BSequential { name; clock; clock_edge; reset; reset_edge;
           reset_async;
-          body = List.map (expand_fills_stmt sig_widths) body }
+          body = List.map (expand_fills_stmt sig_widths) body;
+          blocking_vars }
   ) bmod.processes in
   { bmod with processes = processes' }
 
@@ -997,10 +1000,10 @@ let strip_signed_module bmod =
         BCombinational { name; sensitivity;
           body = List.map strip_signed_program_stmt body }
     | BSequential { name; clock; clock_edge; reset; reset_edge;
-                    reset_async; body } ->
+                    reset_async; body; blocking_vars } ->
         BSequential { name; clock; clock_edge; reset; reset_edge;
           reset_async;
-          body = List.map strip_signed_program_stmt body }
+          body = List.map strip_signed_program_stmt body; blocking_vars }
   ) bmod.processes in
   { bmod with processes = processes' }
 

@@ -102,6 +102,7 @@ let clock_div_behavioral_ir =
                 else_stmts = [];
               };
             ];
+            blocking_vars = [];
           };
 
           (* Continuous assignment: Q := iQ *)

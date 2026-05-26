@@ -463,6 +463,7 @@ let cell_to_bprocess (c : cell_inst) =
           reset_edge = (if async then Some `Pos else None);
           reset_async = async;
           body;
+          blocking_vars = [];
         })
     | _ -> None
   in

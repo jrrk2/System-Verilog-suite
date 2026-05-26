@@ -2471,6 +2471,27 @@ let extract_always ~pkgs ~params ~arrays tok =
               let (n, e) = pick_clock () in
               (n, e, None, None, false)
         in
+        (* Collect names of LHS assigned with blocking `=` in this clocked
+         * block.  In SV, `current_pc = reg_pc + 4` inside an always_ff
+         * makes current_pc an in-cycle wire — subsequent reads must see
+         * this value, not the registered Q (1-cycle stale) that a naive
+         * `<=` lowering would expose.  Walk the parse subtree so we
+         * preserve this distinction that the BIR's BAssign type itself
+         * doesn't carry, and hand the set to [behavioral_to_hardcaml]
+         * via BSequential.blocking_vars. *)
+        let blocking_vars =
+          let names = ref [] in
+          walk (function
+            | TUPLE4 (STRING t, lhs, _, _)
+              when prefix_is "assignment_statement_no_expr" t ->
+                let id = ref None in
+                walk (function
+                  | SymbolIdentifier n when !id = None -> id := Some n
+                  | _ -> ()) lhs;
+                (match !id with Some n -> names := n :: !names | None -> ())
+            | _ -> ()) an;
+          List.sort_uniq compare !names
+        in
         BSequential {
           name = "always_ff";
           clock = clk_name;
@@ -2479,6 +2500,7 @@ let extract_always ~pkgs ~params ~arrays tok =
           reset_edge;
           reset_async;
           body;
+          blocking_vars;
         }
     | false ->
         (* Level-sensitive always block. Treated as combinational here
@@ -3763,26 +3785,28 @@ let convert_module ~pkgs (mdecl : module_decl)
     let groups = Hashtbl.create 4 in
     let order = ref [] in
     let other_procs = List.filter (fun p -> match p with
-      | BSequential { name; clock; clock_edge; reset; reset_edge;
+      | BSequential { name; clock; clock_edge; reset; reset_edge; blocking_vars;
                       reset_async; body } ->
           let key = domain_key clock clock_edge reset reset_edge reset_async in
           (match Hashtbl.find_opt groups key with
            | None ->
                Hashtbl.add groups key
                  (name, clock, clock_edge, reset, reset_edge,
-                  reset_async, ref body);
+                  reset_async, ref body, ref blocking_vars);
                order := key :: !order
-           | Some (_, _, _, _, _, _, body_ref) ->
-               body_ref := !body_ref @ body);
+           | Some (_, _, _, _, _, _, body_ref, bv_ref) ->
+               body_ref := !body_ref @ body;
+               bv_ref := List.sort_uniq compare (!bv_ref @ blocking_vars));
           false
       | _ -> true
     ) processes in
     let merged_seqs =
       List.rev_map (fun key ->
         let (name, clock, clock_edge, reset, reset_edge, reset_async,
-             body_ref) = Hashtbl.find groups key in
+             body_ref, bv_ref) = Hashtbl.find groups key in
         BSequential { name; clock; clock_edge; reset; reset_edge;
-                      reset_async; body = !body_ref }
+                      reset_async; body = !body_ref;
+                      blocking_vars = !bv_ref }
       ) !order
     in
     other_procs @ merged_seqs

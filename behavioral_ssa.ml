@@ -265,10 +265,10 @@ let process_to_ssa = function
       let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
       BCombinational { name; sensitivity; body = body' }
 
-  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body } ->
+  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
       let ctx = create_ssa_context () in
       let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
-      BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body' }
+      BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body'; blocking_vars }
 
 (* Convert module to SSA form *)
 let module_to_ssa bmod =

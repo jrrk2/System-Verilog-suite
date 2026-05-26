@@ -318,10 +318,10 @@ let apply_cse_process = function
       let body' = List.concat (List.map (apply_cse_stmt ctx) body) in
       (BCombinational { name; sensitivity; body = body' }, ctx.eliminations)
 
-  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body } ->
+  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
       let ctx = create_cse_context () in
       let body' = List.concat (List.map (apply_cse_stmt ctx) body) in
-      (BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body' },
+      (BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body'; blocking_vars },
        ctx.eliminations)
 
 (* Apply CSE to module *)

@@ -1340,6 +1340,7 @@ let convert_always ~params node =
              reset_edge;
              reset_async;
              body = body_stmts;
+             blocking_vars = [];
            }
        | [] ->
            BCombinational {
