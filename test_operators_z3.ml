@@ -181,6 +181,31 @@ and exec_one env wt s =
         ) envs (env_lookup env_def wt k) in
         Hashtbl.replace env k final) touched
   | BWhile { body; _ } | BFor { body; _ } -> exec env wt body
+  | BCallStmt { func = "@slice_write"; args = [BVar n; m_e; l_e; rhs_e] } ->
+      let int_of_bexpr = function
+        | BConst { value; _ } -> value
+        | _ -> 0 in
+      let m_i = int_of_bexpr m_e and l_i = int_of_bexpr l_e in
+      let cur = env_lookup env wt n in
+      let w_full = bvw cur in
+      let w_slice = max 1 (m_i - l_i + 1) in
+      let rhs_v = enc env wt rhs_e in
+      let rhs_slice = extend_to rhs_v w_slice in
+      let pieces = List.filter_map (fun x -> x) [
+        (if m_i + 1 <= w_full - 1
+         then Some (Z3.BitVector.mk_extract ctx (w_full - 1) (m_i + 1) cur)
+         else None);
+        Some rhs_slice;
+        (if l_i >= 1
+         then Some (Z3.BitVector.mk_extract ctx (l_i - 1) 0 cur)
+         else None);
+      ] in
+      let new_v = match pieces with
+        | [] -> cur
+        | [p] -> p
+        | p :: rest ->
+            List.fold_left (fun acc x -> Z3.BitVector.mk_concat ctx acc x) p rest in
+      Hashtbl.replace env n new_v
   | BCallStmt _ | BReturn _ -> ()
 
 (* Encode a module: run each process to completion in an env that maps
@@ -251,6 +276,31 @@ let tests : (string * string * ((string,Z3.Expr.expr) Hashtbl.t -> (string,int) 
     let x_next = env_lookup env _wt "x" in
     let plus1 = Z3.BitVector.mk_add ctx x_prev (bvk 1 8) in
     eq x_next (ite (to_bool resetn) plus1 (bvk 0 8)));
+
+  (* op_concat_lhs: 8-bit adder via two 4-bit chunks with explicit
+   * carry, using `{carry, sum_slice[w-1:0]} = lhs[w-1:0] + ...`.
+   * Verible emits a concat-LHS; our lowering must NOT collapse each
+   * part to a whole-signal write.  This is the picorv32 pcpi_mul
+   * carry-save idiom that produces the comb loop. *)
+  "op_concat_lhs", "tests/operators/op_concat_lhs.v", (fun env _wt ->
+    let a = bv "a" 8 and b = bv "b" 8 in
+    let y = env_lookup env _wt "y" in
+    let co = env_lookup env _wt "co" in
+    (* Spec: y == (a + b)[7:0], co == carry-out of the high nibble add. *)
+    let sum_lo = Z3.BitVector.mk_add ctx
+                   (Z3.BitVector.mk_zero_ext ctx 1 (Z3.BitVector.mk_extract ctx 3 0 a))
+                   (Z3.BitVector.mk_zero_ext ctx 1 (Z3.BitVector.mk_extract ctx 3 0 b)) in
+    let lo = Z3.BitVector.mk_extract ctx 3 0 sum_lo in
+    let c_lo = Z3.BitVector.mk_extract ctx 4 4 sum_lo in
+    let sum_hi = Z3.BitVector.mk_add ctx
+                   (Z3.BitVector.mk_add ctx
+                      (Z3.BitVector.mk_zero_ext ctx 1 (Z3.BitVector.mk_extract ctx 7 4 a))
+                      (Z3.BitVector.mk_zero_ext ctx 1 (Z3.BitVector.mk_extract ctx 7 4 b)))
+                   (Z3.BitVector.mk_zero_ext ctx 4 c_lo) in
+    let hi = Z3.BitVector.mk_extract ctx 3 0 sum_hi in
+    let c_hi = Z3.BitVector.mk_extract ctx 4 4 sum_hi in
+    band [ eq y (Z3.BitVector.mk_concat ctx hi lo)
+         ; eq co c_hi ]);
 
   (* op_bit_select: y0 = pc[0]; y31 = pc[31].  Caught the picorv32
    * MISALIGNED-INSTRUCTION false trap: the BIR encoded the bit-0

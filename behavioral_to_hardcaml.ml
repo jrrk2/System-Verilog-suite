@@ -780,10 +780,7 @@ let merge_slice_writes ctx body =
          | Some msb, Some lsb ->
              let prev = try Hashtbl.find groups arr with Not_found -> [] in
              Hashtbl.replace groups arr ((msb, lsb, data) :: prev)
-         | _ ->
-             (* Non-const range — drop for now; would need a barrel-
-                shift translation. *)
-             rest := stmt :: !rest)
+         | _ -> rest := stmt :: !rest)
     | other -> rest := other :: !rest
   ) body;
   let merged_assigns = Hashtbl.fold (fun arr writes acc ->

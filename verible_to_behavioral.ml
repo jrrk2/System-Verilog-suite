@@ -2009,24 +2009,53 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                   | TLIST [] | EMPTY_TOKEN -> false
                   | _ -> true) xs)
             | other -> [other] in
-          (* For each part, get name + optional range. *)
+          (* For each part, capture name + the OUTERMOST
+             select_variable_dimension kind (1=range [m:l],
+             3=indexed-up [base+:w], 4=indexed-down [base-:w], None=plain).
+             Walking the part token directly (rather than the whole
+             concat) keeps each part's range local. *)
           let get_part p =
             let name_opt = match lhs_indexed_of p with
               | Some (n, _) -> Some n | None -> None in
-            let range = match
-              (let m = ref None and l = ref None in
-               walk (function
-                 | TUPLE6 (STRING dt, _, m_n, _, l_n, _)
-                   when prefix_is "select_variable_dimension" dt
-                     && !m = None ->
-                     m := Some m_n; l := Some l_n
-                 | _ -> ()) p;
-               !m, !l)
-            with
-            | Some mn, Some ln -> Some (mn, ln)
-            | _ -> None
+            let kind = ref `None in
+            let stop = ref false in
+            let rec walk_outer t =
+              if !stop then ()
+              else match t with
+                | TUPLE6 (STRING dt, _, mn, _, ln, _)
+                  when prefix_is "select_variable_dimension" dt ->
+                    let suffix = String.sub dt
+                        (String.length "select_variable_dimension")
+                        (String.length dt
+                         - String.length "select_variable_dimension") in
+                    (match suffix with
+                     | "1" -> kind := `Range (mn, ln); stop := true
+                     | "3" -> kind := `IndexedUp (mn, ln); stop := true
+                     | "4" -> kind := `IndexedDown (mn, ln); stop := true
+                     | _   -> stop := true)
+                | TUPLE4 (STRING dt, _, idx_n, _)
+                  when prefix_is "select_variable_dimension" dt ->
+                    (* Single-bit `[idx]` — write one bit at idx.
+                       Encode as `Range (idx, idx)` so the per-part
+                       width computation gives 1 and the emit reaches
+                       the @slice_write branch. *)
+                    kind := `Range (idx_n, idx_n); stop := true
+                | TUPLE2 (a, b) -> walk_outer a; walk_outer b
+                | TUPLE3 (a, b, c) -> List.iter walk_outer [a; b; c]
+                | TUPLE4 (a, b, c, d) -> List.iter walk_outer [a; b; c; d]
+                | TUPLE5 (a, b, c, d, e) ->
+                    List.iter walk_outer [a; b; c; d; e]
+                | TUPLE6 (a, b, c, d, e, f) ->
+                    List.iter walk_outer [a; b; c; d; e; f]
+                | TUPLE7 (a, b, c, d, e, f, g) ->
+                    List.iter walk_outer [a; b; c; d; e; f; g]
+                | TUPLE8 (a, b, c, d, e, f, g, h) ->
+                    List.iter walk_outer [a; b; c; d; e; f; g; h]
+                | TLIST xs -> List.iter walk_outer xs
+                | _ -> ()
             in
-            (name_opt, range, p) in
+            walk_outer p;
+            (name_opt, !kind, p) in
           let infos = List.map get_part parts in
           if List.for_all (fun (n, _, _) -> n <> None) infos then Some infos
           else None
@@ -2034,30 +2063,56 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
     in
     (match concat_parts with
      | Some infos ->
-         (* Compute per-part widths: from explicit range, or from
-            signal width cache, or default 1.  Then slice RHS
-            MSB-first at decreasing positions. *)
+         (* Per-part width depends on the range kind:
+              [m:l]      -> |m-l|+1
+              [base+:w]  -> w  (the second operand is the width)
+              [base-:w]  -> w
+              plain      -> signal-width-cache lookup
+            Each part then receives a slice of the outer RHS at the
+            running cursor; sliced parts go through @slice_write /
+            @part_sel_write_* so downstream RMW-lowers them properly,
+            instead of overwriting the whole base signal with the
+            slice value (which is what produced the picorv32 pcpi_mul
+            comb loop on `{carry, next_rd[j+:4]} = ...`). *)
          let rhs_e = recurse_e rhs in
-         let part_widths = List.map (fun (n, range, _) ->
-           let nm = match n with Some s -> s | None -> "?" in
-           match range with
-           | Some (m_node, l_node) ->
-               (match recurse_e m_node, recurse_e l_node with
+         let part_width (n_opt, kind, _) =
+           let nm = match n_opt with Some s -> s | None -> "?" in
+           match kind with
+           | `Range (m_n, l_n) ->
+               (match recurse_e m_n, recurse_e l_n with
                 | BConst { value = m; _ }, BConst { value = l; _ } ->
                     abs (m - l) + 1
                 | _ -> 1)
-           | None ->
+           | `IndexedUp (_, w_n) | `IndexedDown (_, w_n) ->
+               (match recurse_e w_n with
+                | BConst { value = w; _ } when w >= 1 -> w
+                | _ -> 1)
+           | `None ->
                (match List.assoc_opt nm !cur_signal_widths with
                 | Some w -> w | None -> 1)
-         ) infos in
+         in
+         let part_widths = List.map part_width infos in
          let total_w = List.fold_left (+) 0 part_widths in
          let cursor = ref total_w in
-         let stmts = List.map2 (fun (n_opt, _, _) w ->
+         let stmts = List.map2 (fun (n_opt, kind, _) w ->
            let nm = match n_opt with Some s -> s | None -> "?" in
            let hi = !cursor - 1 and lo = !cursor - w in
            cursor := !cursor - w;
            let part_rhs = BSlice { signal = rhs_e; msb = hi; lsb = lo } in
-           BAssign { lhs = nm; rhs = part_rhs }
+           match kind with
+           | `Range (m_n, l_n) ->
+               BCallStmt { func = "@slice_write";
+                           args = [BVar nm; recurse_e m_n; recurse_e l_n;
+                                   part_rhs] }
+           | `IndexedUp (base_n, w_n) ->
+               BCallStmt { func = "@part_sel_write_up";
+                           args = [BVar nm; recurse_e base_n;
+                                   recurse_e w_n; part_rhs] }
+           | `IndexedDown (base_n, w_n) ->
+               BCallStmt { func = "@part_sel_write_down";
+                           args = [BVar nm; recurse_e base_n;
+                                   recurse_e w_n; part_rhs] }
+           | `None -> BAssign { lhs = nm; rhs = part_rhs }
          ) infos part_widths in
          BBlock stmts
      | None ->
