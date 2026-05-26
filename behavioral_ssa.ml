@@ -17,66 +17,44 @@
 
 open Behavioral_ir
 
-(* SSA context tracks variable versions *)
+(* SSA context.  [versions] maps each variable to its CURRENT top
+   version — flat ints, not a stack.  Scope handling (BIf, BCase) is
+   done by snapshotting and restoring [versions], not by stack
+   push/pop, so each branch evolves from a clean copy of the entering
+   state.  This is simpler than the previous Stack-of-versions
+   approach and avoids the aliasing bug where [Hashtbl.copy] returned
+   shallow copies sharing the same Stack.t values — pushing inside a
+   branch mutated the "saved" snapshot too, and the BIf phi ended up
+   reading the post-then state instead of pre-then. *)
+module StringMap = Map.Make (String)
 type ssa_context = {
   mutable next_version: int;
-  (* Current version of each variable in each scope *)
-  versions: (string, int Stack.t) Hashtbl.t;
-  (* Declared width of each signal — needed by @slice_write /
-     @part_sel_write_* expansion so the new version's RHS can stitch
-     the previous version's untouched bits via BSlice + BConcat.  When
-     absent (legacy callers), the slice-write branch falls through to
-     leaving the BCallStmt as-is and the cycle survives — matching
-     pre-extension behaviour. *)
+  mutable versions: int StringMap.t;
   widths: (string, int) Hashtbl.t;
-  (* Phi nodes to insert at join points *)
   mutable phi_nodes: (string * string list * string) list;
 }
 
 let create_ssa_context ?(widths = Hashtbl.create 0) () = {
   next_version = 0;
-  versions = Hashtbl.create 50;
+  versions = StringMap.empty;
   widths;
   phi_nodes = [];
 }
 
-(* Get current version of a variable, or None if it hasn't been
-   assigned yet in this scope (the read should resolve to the original
-   un-versioned name). *)
-let current_version_opt ctx var =
-  match Hashtbl.find_opt ctx.versions var with
-  | Some stack when not (Stack.is_empty stack) -> Some (Stack.top stack)
-  | _ -> None
+let current_version_opt ctx var = StringMap.find_opt var ctx.versions
 
-(* Legacy API — kept for callers that expect an int.  Returns 0 when
-   no version has been pushed; callers that need the "original name"
-   semantics should switch to [current_version_opt]. *)
 let current_version ctx var =
   match current_version_opt ctx var with
   | Some v -> v
   | None -> 0
 
-(* Push new version of variable *)
 let push_version ctx var =
   let version = ctx.next_version in
   ctx.next_version <- version + 1;
-
-  let stack = try Hashtbl.find ctx.versions var
-            with Not_found ->
-              let s = Stack.create () in
-              Hashtbl.add ctx.versions var s;
-              s
-  in
-  Stack.push version stack;
+  ctx.versions <- StringMap.add var version ctx.versions;
   version
 
-(* Pop version (when exiting scope) *)
-let pop_version ctx var =
-  try
-    let stack = Hashtbl.find ctx.versions var in
-    if not (Stack.is_empty stack) then
-      ignore (Stack.pop stack)
-  with Not_found -> ()
+let pop_version _ctx _var = ()  (* no-op: scoping is via snapshot/restore *)
 
 (* Generate SSA name for variable *)
 let ssa_name var version =
@@ -158,104 +136,65 @@ let rec stmt_to_ssa ctx = function
 
   | BIf { condition; then_stmts; else_stmts } ->
       let condition' = rename_expr ctx condition in
-
-      (* Track variables assigned in each branch *)
-      let assigned_vars = ref [] in
-
-      (* Save current versions *)
-      let saved_versions = Hashtbl.copy ctx.versions in
-
-      (* Process then branch *)
+      let saved = ctx.versions in
       let then_stmts' = List.concat (List.map (stmt_to_ssa ctx) then_stmts) in
-      let then_versions = Hashtbl.copy ctx.versions in
-
-      (* Restore and process else branch *)
-      Hashtbl.iter (fun var stack ->
-        Hashtbl.replace ctx.versions var (Stack.copy stack)
-      ) saved_versions;
-
+      let then_versions = ctx.versions in
+      ctx.versions <- saved;
       let else_stmts' = List.concat (List.map (stmt_to_ssa ctx) else_stmts) in
-      let else_versions = Hashtbl.copy ctx.versions in
-
-      (* Find variables assigned in either branch *)
-      let find_assigned versions =
-        let vars = ref [] in
-        Hashtbl.iter (fun var then_stack ->
-          try
-            let saved_stack = Hashtbl.find saved_versions var in
-            if Stack.length then_stack > Stack.length saved_stack then
-              vars := var :: !vars
-          with Not_found ->
-            vars := var :: !vars
-        ) versions;
-        !vars
-      in
-
-      assigned_vars := List.sort_uniq String.compare
-        (find_assigned then_versions @ find_assigned else_versions);
-
-      (* Create phi nodes for assigned variables *)
+      let else_versions = ctx.versions in
+      ctx.versions <- saved;
+      (* Variables assigned in either branch = those whose version
+         in then/else differs from the entering version. *)
+      let bumped versions =
+        StringMap.fold (fun k v acc ->
+          if StringMap.find_opt k saved <> Some v then k :: acc else acc
+        ) versions [] in
+      let assigned_vars =
+        List.sort_uniq String.compare (bumped then_versions @ bumped else_versions) in
+      (* For each var, the then-/else-side value is its version at
+         the END of that branch, or the entering version if the
+         branch didn't push, or the original un-versioned name. *)
+      let name_at versions var =
+        match StringMap.find_opt var versions with
+        | Some v -> BVar (ssa_name var v)
+        | None ->
+            (match StringMap.find_opt var saved with
+             | Some v -> BVar (ssa_name var v)
+             | None -> BVar var) in
       let phi_assigns = List.map (fun var ->
-        (* Get versions from each branch *)
-        let then_ver = try
-          let stack = Hashtbl.find then_versions var in
-          if Stack.is_empty stack then 0 else Stack.top stack
-        with Not_found -> current_version ctx var in
-
-        let else_ver = try
-          let stack = Hashtbl.find else_versions var in
-          if Stack.is_empty stack then 0 else Stack.top stack
-        with Not_found -> current_version ctx var in
-
-        (* Create new merged version *)
+        let then_expr = name_at then_versions var in
+        let else_expr = name_at else_versions var in
         let new_version = push_version ctx var in
         let merged_name = ssa_name var new_version in
-        let then_name = ssa_name var then_ver in
-        let else_name = ssa_name var else_ver in
-
-        (* Record phi node (conceptual - we'll represent as assignment for now) *)
-        ctx.phi_nodes <- (merged_name, [then_name; else_name], var) :: ctx.phi_nodes;
-
-        (* For now, represent phi as conditional assignment *)
+        let pretty_of = function BVar n -> n | _ -> "?" in
+        ctx.phi_nodes <-
+          (merged_name, [pretty_of then_expr; pretty_of else_expr], var)
+          :: ctx.phi_nodes;
         BAssign {
           lhs = merged_name;
-          rhs = BCond {
-            condition = condition';
-            then_val = BVar then_name;
-            else_val = BVar else_name;
-          }
+          rhs = BCond { condition = condition';
+                        then_val = then_expr;
+                        else_val = else_expr }
         }
-      ) !assigned_vars in
-
-      (* Return if statement followed by phi assignments *)
+      ) assigned_vars in
       [BIf { condition = condition'; then_stmts = then_stmts'; else_stmts = else_stmts' }]
       @ phi_assigns
 
   | BCase { selector; cases; default } ->
       let selector' = rename_expr ctx selector in
-
-      (* Save current versions *)
-      let saved_versions = Hashtbl.copy ctx.versions in
-
-      (* Process each case *)
+      let saved = ctx.versions in
+      (* TODO: BCase phi (case-arm version merge) — earlier attempts
+         emitted ITE chains that closed structural cycles in picosoc.
+         For now, run each case from a fresh copy of the entering
+         map without merging exits, matching the pre-Map behaviour. *)
       let cases' = List.map (fun (value, stmts) ->
-        (* Restore versions for each case *)
-        Hashtbl.iter (fun var stack ->
-          Hashtbl.replace ctx.versions var (Stack.copy stack)
-        ) saved_versions;
-
+        ctx.versions <- saved;
         let value' = rename_expr ctx value in
         let stmts' = List.concat (List.map (stmt_to_ssa ctx) stmts) in
         (value', stmts')
       ) cases in
-
-      (* Process default case *)
-      Hashtbl.iter (fun var stack ->
-        Hashtbl.replace ctx.versions var (Stack.copy stack)
-      ) saved_versions;
+      ctx.versions <- saved;
       let default' = List.concat (List.map (stmt_to_ssa ctx) default) in
-
-      (* TODO: Insert phi nodes for case statements *)
       [BCase { selector = selector'; cases = cases'; default = default' }]
 
   | BWhile { condition; body } ->
@@ -341,11 +280,8 @@ and ssa_part_sel_write ctx ~func ~lhs ~base_e ~w_e ~data ~fallback =
    body composed value.  Without this, the SSA-renamed `name_K`
    signals are dangling and the original `name` has no driver. *)
 let final_writebacks ctx =
-  Hashtbl.fold (fun var stack acc ->
-    if Stack.is_empty stack then acc
-    else
-      let v = Stack.top stack in
-      BAssign { lhs = var; rhs = BVar (ssa_name var v) } :: acc
+  StringMap.fold (fun var v acc ->
+    BAssign { lhs = var; rhs = BVar (ssa_name var v) } :: acc
   ) ctx.versions []
 
 (* Convert process to SSA form.  When [widths] is supplied, slice-
@@ -427,7 +363,7 @@ let program_to_ssa prog =
 let print_ssa_stats ctx =
   Printf.printf "SSA Statistics:\n";
   Printf.printf "  Total versions created: %d\n" ctx.next_version;
-  Printf.printf "  Variables in SSA form: %d\n" (Hashtbl.length ctx.versions);
+  Printf.printf "  Variables in SSA form: %d\n" (StringMap.cardinal ctx.versions);
   Printf.printf "  Phi nodes created: %d\n" (List.length ctx.phi_nodes);
 
   if List.length ctx.phi_nodes > 0 then begin
