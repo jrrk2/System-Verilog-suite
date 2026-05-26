@@ -215,8 +215,17 @@ let rec expr_to_signal ctx = function
           [Signal.log_shift] which accepts a dynamic amount.  cordic_sincos
           and similar shift-add iterative designs need dynamic shifts. *)
        | BShl ->
-           (try Signal.(sll s_lhs (Signal.to_int s_rhs))
-            with _ -> Signal.log_shift Signal.sll s_lhs s_rhs)
+           (* SV evaluates the RHS of an assignment in the LHS context
+              width, so a left shift like `decoded_imm <= slice[31:12] << 12`
+              must shift in the LHS's 32-bit width — shifting in the
+              slice's narrower self-determined width (20) loses every bit
+              picorv32's decoder cares about (decoded_imm 0x03000 << 12
+              becomes 0 instead of 0x03000000).  Widen s_lhs to result_width
+              before the shift. *)
+           let s = if result_width > Signal.width s_lhs
+                   then Signal.uresize s_lhs result_width else s_lhs in
+           (try Signal.(sll s (Signal.to_int s_rhs))
+            with _ -> Signal.log_shift Signal.sll s s_rhs)
        | BShr ->
            (try Signal.(srl s_lhs (Signal.to_int s_rhs))
             with _ -> Signal.log_shift Signal.srl s_lhs s_rhs)
