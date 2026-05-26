@@ -22,23 +22,39 @@ type ssa_context = {
   mutable next_version: int;
   (* Current version of each variable in each scope *)
   versions: (string, int Stack.t) Hashtbl.t;
+  (* Declared width of each signal — needed by @slice_write /
+     @part_sel_write_* expansion so the new version's RHS can stitch
+     the previous version's untouched bits via BSlice + BConcat.  When
+     absent (legacy callers), the slice-write branch falls through to
+     leaving the BCallStmt as-is and the cycle survives — matching
+     pre-extension behaviour. *)
+  widths: (string, int) Hashtbl.t;
   (* Phi nodes to insert at join points *)
   mutable phi_nodes: (string * string list * string) list;
 }
 
-let create_ssa_context () = {
+let create_ssa_context ?(widths = Hashtbl.create 0) () = {
   next_version = 0;
   versions = Hashtbl.create 50;
+  widths;
   phi_nodes = [];
 }
 
-(* Get current version of a variable *)
+(* Get current version of a variable, or None if it hasn't been
+   assigned yet in this scope (the read should resolve to the original
+   un-versioned name). *)
+let current_version_opt ctx var =
+  match Hashtbl.find_opt ctx.versions var with
+  | Some stack when not (Stack.is_empty stack) -> Some (Stack.top stack)
+  | _ -> None
+
+(* Legacy API — kept for callers that expect an int.  Returns 0 when
+   no version has been pushed; callers that need the "original name"
+   semantics should switch to [current_version_opt]. *)
 let current_version ctx var =
-  try
-    let stack = Hashtbl.find ctx.versions var in
-    if Stack.is_empty stack then 0
-    else Stack.top stack
-  with Not_found -> 0
+  match current_version_opt ctx var with
+  | Some v -> v
+  | None -> 0
 
 (* Push new version of variable *)
 let push_version ctx var =
@@ -66,11 +82,15 @@ let pop_version ctx var =
 let ssa_name var version =
   Printf.sprintf "%s_%d" var version
 
-(* Rename variable references in expressions *)
+(* Rename variable references in expressions.  Reads of variables
+   that haven't been assigned in this scope resolve to the original
+   name (no version suffix) so they pick up the FF/wire output from
+   outside the always block. *)
 let rec rename_expr ctx = function
   | BVar var ->
-      let version = current_version ctx var in
-      BVar (ssa_name var version)
+      (match current_version_opt ctx var with
+       | Some version -> BVar (ssa_name var version)
+       | None -> BVar var)
 
   | BConst _ as c -> c
 
@@ -255,25 +275,148 @@ let rec stmt_to_ssa ctx = function
       let stmts' = List.concat (List.map (stmt_to_ssa ctx) stmts) in
       [BBlock stmts']
 
+  | BCallStmt { func = "@slice_write";
+                args = [BVar lhs; m_e; l_e; data] } as orig ->
+      ssa_slice_write ctx ~lhs ~m_e ~l_e ~data ~fallback:[orig]
+  | BCallStmt { func; args = [BVar lhs; base_e; w_e; data] } as orig
+    when func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+      ssa_part_sel_write ctx ~func ~lhs ~base_e ~w_e ~data ~fallback:[orig]
   | BCallStmt _ as s -> [s]
   | BReturn _ as s -> [s]
 
-(* Convert process to SSA form *)
-let process_to_ssa = function
+(* @slice_write(name, msb, lsb, data): name[msb:lsb] = data.  In
+   SSA form, we push a new version of `name` whose RHS is a concat of
+   the previous version's untouched bits and `data` (renamed via
+   current versions).  Falls back to leaving the call as-is when m,
+   l aren't constants or the signal width isn't known. *)
+and ssa_slice_write ctx ~lhs ~m_e ~l_e ~data ~fallback =
+  let m' = rename_expr ctx m_e in
+  let l' = rename_expr ctx l_e in
+  let data' = rename_expr ctx data in
+  let const_of = function BConst { value; _ } -> Some value | _ -> None in
+  match const_of m', const_of l',
+        Hashtbl.find_opt ctx.widths lhs with
+  | Some msb, Some lsb, Some total_w when total_w > 0 && msb >= lsb ->
+      let prev_name = match current_version_opt ctx lhs with
+        | Some v -> ssa_name lhs v
+        | None   -> lhs in
+      let parts = ref [] in
+      if lsb >= 1 then
+        parts := BSlice { signal = BVar prev_name; msb = lsb - 1; lsb = 0 } :: !parts;
+      parts := data' :: !parts;
+      if msb + 1 <= total_w - 1 then
+        parts := BSlice { signal = BVar prev_name;
+                          msb = total_w - 1; lsb = msb + 1 } :: !parts;
+      let rhs = match !parts with
+        | [single] -> single
+        | many -> BConcat many in
+      let version = push_version ctx lhs in
+      [ BAssign { lhs = ssa_name lhs version; rhs } ]
+  | _ -> fallback
+
+(* @part_sel_write_up(name, base, width, data)  ⇒  name[base+:width] = data.
+   @part_sel_write_down(name, base, width, data) ⇒  name[base-:width] = data.
+   Constant base/width get converted to (msb, lsb) and reused via
+   ssa_slice_write's per-version-concat expansion. *)
+and ssa_part_sel_write ctx ~func ~lhs ~base_e ~w_e ~data ~fallback =
+  let base' = rename_expr ctx base_e in
+  let w'    = rename_expr ctx w_e in
+  let const_of = function BConst { value; _ } -> Some value | _ -> None in
+  match const_of base', const_of w' with
+  | Some base, Some w when w > 0 ->
+      let msb, lsb = match func with
+        | "@part_sel_write_up"   -> base + w - 1, base
+        | "@part_sel_write_down" -> base, base - w + 1
+        | _ -> base + w - 1, base in
+      let bw = match w' with BConst { width; _ } -> width | _ -> 32 in
+      let m_e = BConst { value = msb; width = bw } in
+      let l_e = BConst { value = lsb; width = bw } in
+      ssa_slice_write ctx ~lhs ~m_e ~l_e ~data ~fallback
+  | _ -> fallback
+
+(* Add a final-version writeback at the end of an SSA-converted body:
+   for each variable that was ever assigned (final-version > 0), emit
+   `BAssign { lhs = original_name; rhs = BVar (name_<final_v>) }` so
+   external readers (other processes referencing `name`) see the post-
+   body composed value.  Without this, the SSA-renamed `name_K`
+   signals are dangling and the original `name` has no driver. *)
+let final_writebacks ctx =
+  Hashtbl.fold (fun var stack acc ->
+    if Stack.is_empty stack then acc
+    else
+      let v = Stack.top stack in
+      BAssign { lhs = var; rhs = BVar (ssa_name var v) } :: acc
+  ) ctx.versions []
+
+(* Convert process to SSA form.  When [widths] is supplied, slice-
+   write / part-sel-write calls expand to versioned BAssigns whose
+   RHS stitches the previous version's untouched bits via BConcat. *)
+let process_to_ssa ?widths = function
   | BCombinational { name; sensitivity; body } ->
-      let ctx = create_ssa_context () in
+      let ctx = create_ssa_context ?widths () in
       let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
-      BCombinational { name; sensitivity; body = body' }
+      let tail = final_writebacks ctx in
+      BCombinational { name; sensitivity; body = body' @ tail }
 
   | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
-      let ctx = create_ssa_context () in
+      let ctx = create_ssa_context ?widths () in
       let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
-      BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body'; blocking_vars }
+      let tail = final_writebacks ctx in
+      BSequential { name; clock; clock_edge; reset; reset_edge; reset_async;
+                    body = body' @ tail; blocking_vars }
 
-(* Convert module to SSA form *)
+(* Convert module to SSA form.  Builds the [widths] table from the
+   module's declared signals so slice-write expansion has the right
+   total width per target. *)
 let module_to_ssa bmod =
-  let processes' = List.map process_to_ssa bmod.processes in
-  { bmod with processes = processes' }
+  let widths = Hashtbl.create (List.length bmod.signals) in
+  let rec w_of = function
+    | BInt { width; _ } -> width
+    | BBool -> 1
+    | BArray { element; size } -> size * w_of element
+    | BStruct _ -> 32 in
+  List.iter (fun (s : bsignal) -> Hashtbl.replace widths s.name (w_of s.stype))
+    bmod.signals;
+  let processes' = List.map (process_to_ssa ~widths) bmod.processes in
+  (* New signals introduced by SSA renaming get added to the module's
+     signal list so downstream emit (behavioral_to_hardcaml) has a
+     declaration for each versioned name.  We collect the names that
+     appear as a BAssign LHS in any process but aren't already in the
+     module's signal list. *)
+  let known = Hashtbl.create 64 in
+  List.iter (fun (s : bsignal) -> Hashtbl.replace known s.name s) bmod.signals;
+  let add_if_new name =
+    if Hashtbl.mem known name then ()
+    else begin
+      (* Width of the new name: peel back the _<digits> suffix and look
+         up the original signal's stype. *)
+      let base = match String.rindex_opt name '_' with
+        | Some i -> String.sub name 0 i
+        | None -> name in
+      match Hashtbl.find_opt known base with
+      | Some src ->
+          let sig_ : bsignal = { src with name; direction = `Internal;
+                                          initial_value = None } in
+          Hashtbl.replace known name sig_
+      | None -> ()
+    end in
+  let rec walk_stmt = function
+    | BAssign { lhs; _ } -> add_if_new lhs
+    | BIf { then_stmts; else_stmts; _ } ->
+        List.iter walk_stmt then_stmts;
+        List.iter walk_stmt else_stmts
+    | BCase { cases; default; _ } ->
+        List.iter (fun (_, ss) -> List.iter walk_stmt ss) cases;
+        List.iter walk_stmt default
+    | BBlock ss -> List.iter walk_stmt ss
+    | BWhile { body; _ } | BFor { body; _ } -> List.iter walk_stmt body
+    | _ -> () in
+  List.iter (function
+    | BCombinational { body; _ } | BSequential { body; _ } ->
+        List.iter walk_stmt body
+  ) processes';
+  let signals' = Hashtbl.fold (fun _ s acc -> s :: acc) known [] in
+  { bmod with processes = processes'; signals = signals' }
 
 (* Convert program to SSA form *)
 let program_to_ssa prog =

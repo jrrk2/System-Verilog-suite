@@ -19,6 +19,13 @@ let () =
     |> Behavioral_meminfer.infer_program
   in
   let lowered, _ = Behavioral_memlower.lower_program prog in
+  (* SSA after memlower: convert each combinational/sequential body to
+     versioned BAssigns so multi-write targets (picorv32 pcpi_mul's
+     carry-save next_rd/next_rdt slice-write chain) get separate
+     intermediate signals, breaking the structural cycle through
+     Always.Variable.value var. *)
+  let lowered = { lowered with
+    modules = List.map Behavioral_ssa.module_to_ssa lowered.modules } in
   let m = List.find (fun (m : Behavioral_ir.bmodule) -> m.name = top) lowered.modules in
   let circ =
     Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~detect_loops:false m
