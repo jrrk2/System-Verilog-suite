@@ -251,6 +251,23 @@ let tests : (string * string * ((string,Z3.Expr.expr) Hashtbl.t -> (string,int) 
     let x_next = env_lookup env _wt "x" in
     let plus1 = Z3.BitVector.mk_add ctx x_prev (bvk 1 8) in
     eq x_next (ite (to_bool resetn) plus1 (bvk 0 8)));
+
+  (* op_case_fsm: 4-state FSM in a case statement.  Encodes the
+   * picorv32 pattern where each `cpu_state_X: cpu_state <= Y` branch
+   * must NOT leak its RHS into the register update for a different
+   * branch.  If lowering loses the per-branch guard, we'll see the
+   * default/reset/trap target chosen unconditionally. *)
+  "op_case_fsm", "tests/operators/op_case_fsm.v", (fun env _wt ->
+    let resetn = bv "resetn" 1 in
+    let go = bv "go" 1 in
+    let state_prev = bv "state" 2 in
+    let state_next = env_lookup env _wt "state" in
+    let s0 = bvk 0 2 and s1 = bvk 1 2 and s2 = bvk 2 2 and s3 = bvk 3 2 in
+    let case_next =
+      ite (eq state_prev s0) (ite (to_bool go) s1 s0)
+        (ite (eq state_prev s1) s2
+          (ite (eq state_prev s2) s0 s3)) in
+    eq state_next (ite (to_bool resetn) case_next s0));
 ]
 
 let run_one (name, file, prop_builder) =
