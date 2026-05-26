@@ -206,17 +206,66 @@ and exec_one env wt s =
         | p :: rest ->
             List.fold_left (fun acc x -> Z3.BitVector.mk_concat ctx acc x) p rest in
       Hashtbl.replace env n new_v
+  | BCallStmt { func; args = [BVar n; base_e; width_e; rhs_e] }
+    when func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+      let int_of_bexpr = function
+        | BConst { value; _ } -> value
+        | _ -> 0 in
+      let base = int_of_bexpr base_e and w = int_of_bexpr width_e in
+      let m_i, l_i = match func with
+        | "@part_sel_write_up"   -> base + w - 1, base
+        | "@part_sel_write_down" -> base, base - w + 1
+        | _ -> base + w - 1, base in
+      let cur = env_lookup env wt n in
+      let w_full = bvw cur in
+      let w_slice = max 1 (m_i - l_i + 1) in
+      let rhs_v = enc env wt rhs_e in
+      let rhs_slice = extend_to rhs_v w_slice in
+      let pieces = List.filter_map (fun x -> x) [
+        (if m_i + 1 <= w_full - 1
+         then Some (Z3.BitVector.mk_extract ctx (w_full - 1) (m_i + 1) cur)
+         else None);
+        Some rhs_slice;
+        (if l_i >= 1
+         then Some (Z3.BitVector.mk_extract ctx (l_i - 1) 0 cur)
+         else None);
+      ] in
+      let new_v = match pieces with
+        | [] -> cur
+        | [p] -> p
+        | p :: rest ->
+            List.fold_left (fun acc x -> Z3.BitVector.mk_concat ctx acc x) p rest in
+      Hashtbl.replace env n new_v
   | BCallStmt _ | BReturn _ -> ()
 
-(* Encode a module: run each process to completion in an env that maps
- * each signal to its symbolic post-process value.  Returns (env, wt). *)
+(* Encode a module: run BSequential processes exactly once (each models
+ * one clock edge), then iterate BCombinational processes to fix point
+ * so cross-process references resolve.  Verible emits one
+ * BCombinational per continuous `assign` so `assign hi = hi_r` and
+ * `always @* hi_r = data[7:4]` are separate processes; on the first
+ * combinational pass env[hi] is still the free `BVar hi_r`.  N+1
+ * passes suffice for N combinational processes when the dataflow is
+ * acyclic — each additional pass propagates one level of inter-
+ * process dependency.  Re-running sequential processes would double-
+ * apply state updates (`x := x + 1` would run N times). *)
 let encode bmod =
   let wt = build_width_tbl bmod in
   let env = Hashtbl.create 64 in
+  let combs = List.filter (function BCombinational _ -> true | _ -> false)
+                bmod.processes in
+  let seqs = List.filter (function BSequential _ -> true | _ -> false)
+               bmod.processes in
   List.iter (function
-    | BCombinational { body; _ } | BSequential { body; _ } ->
-        exec env wt body
-  ) bmod.processes;
+    | BSequential { body; _ } -> exec env wt body
+    | _ -> ()
+  ) seqs;
+  let n_combs = List.length combs in
+  for _ = 0 to n_combs do
+    List.iter (function
+      | BCombinational { body; _ } -> exec env wt body
+      | _ -> ()
+    ) combs
+  done;
   (env, wt)
 
 (* ---------- test driver ---------- *)
@@ -328,6 +377,65 @@ let tests : (string * string * ((string,Z3.Expr.expr) Hashtbl.t -> (string,int) 
         (ite (eq state_prev s1) s2
           (ite (eq state_prev s2) s0 s3)) in
     eq state_next (ite (to_bool resetn) case_next s0));
+
+  (* op_pc_misalign: picorv32 MISALIGNED-INSTRUCTION pattern,
+   * `cpr ? pc[0] : |pc[1:0]`.  Verible parses `pc[0]` here as a
+   * 32-bit-indexed BSelect (not a BSlice) — the hardcaml lowering
+   * must reduce that to a 1-bit slice, not return the whole 32-bit
+   * signal.  If the lowering returns the whole signal, the outer
+   * `(|...)` BRedOr fires for any non-zero pc, producing a false
+   * misalign trap on the first fetch (pc=0x00100000, |pc=1).        *)
+  "op_pc_misalign", "tests/operators/op_pc_misalign.v", (fun env _wt ->
+    let cpr = bv "cpr" 1 in
+    let pc = bv "pc" 32 in
+    let y = env_lookup env _wt "y" in
+    let pc0 = Z3.BitVector.mk_extract ctx 0 0 pc in
+    let pc10 = Z3.BitVector.mk_extract ctx 1 0 pc in
+    let or_pc10 = to_bit pc10 in
+    let expected = ite (to_bool cpr) pc0 or_pc10 in
+    eq y (extend_to expected (bvw y)));
+
+  (* op_concat_lhs_balanced: `{hi, lo} = data` where total LHS width
+   * (4+4) matches RHS width (8) — sidesteps the operator-context-
+   * width gap (op_concat_lhs trips that one).  Tests that each part
+   * of the concat-LHS receives the correct slice of the RHS, not the
+   * whole-signal value. *)
+  "op_concat_lhs_balanced", "tests/operators/op_concat_lhs_balanced.v",
+  (fun env _wt ->
+    let data = bv "data" 8 in
+    let hi = env_lookup env _wt "hi" in
+    let lo = env_lookup env _wt "lo" in
+    band [ eq hi (Z3.BitVector.mk_extract ctx 7 4 data)
+         ; eq lo (Z3.BitVector.mk_extract ctx 3 0 data) ]);
+
+  (* op_slice_self: r = in; if (sel) r[3:0] = r[3:0] ^ 4'hF.
+   * Catches (1) verible side encoding `r[3:0] = ...` as a slice-write
+   * rather than a whole-signal BAssign and (2) the SSA pass versioning
+   * `r` so the slice-write's RHS reads the previous version. *)
+  "op_slice_self", "tests/operators/op_slice_self.v", (fun env _wt ->
+    let in_ = bv "in" 8 in
+    let sel = bv "sel" 1 in
+    let out = env_lookup env _wt "out" in
+    let hi = Z3.BitVector.mk_extract ctx 7 4 in_ in
+    let lo = Z3.BitVector.mk_extract ctx 3 0 in_ in
+    let lo_xor = Z3.BitVector.mk_xor ctx lo (bvk 0xF 4) in
+    let toggled = Z3.BitVector.mk_concat ctx hi lo_xor in
+    eq out (ite (to_bool sel) toggled in_));
+
+  (* op_unrolled_slice_chain: distilled picorv32 pcpi_mul carry-save
+   * pattern — 4 iterations of `r[i+:2] = r[i+:2] ^ 2'b11` after
+   * `r = init`.  After unroll the BIR has 4 `@part_sel_write_up`
+   * calls on `r` that each read their own slice.  Without SSA
+   * versioning, the merged BAssign would close a self-reference loop
+   * through `Always.Variable.value r` — yosys-scc reported 16 SCCs
+   * on picosoc before the fix; this seed exercises the same pattern
+   * at small scale. *)
+  "op_unrolled_slice_chain", "tests/operators/op_unrolled_slice_chain.v",
+  (fun env _wt ->
+    let init = bv "init" 8 in
+    let out = env_lookup env _wt "out" in
+    let flip = bvk 0xFF 8 in
+    eq out (Z3.BitVector.mk_xor ctx init flip));
 ]
 
 let run_one (name, file, prop_builder) =
@@ -338,6 +446,17 @@ let run_one (name, file, prop_builder) =
   end else
     try
       let prog = Verible_to_behavioral.convert_files ~top:name [file] in
+      (* Run the same lowering passes test_picosoc_gates uses (minus
+         memlower/SSA — neither runs on these small operator seeds in
+         a useful way) so for-loops are unrolled and if-trees lifted
+         before the Z3 encoder sees them.  op_unrolled_slice_chain
+         needs unroll to expose its 4 iterations; op_case_fsm and
+         friends were tolerant of either path. *)
+      let prog = prog
+        |> Behavioral_unroll.unroll_program
+        |> Behavioral_inline.inline_program
+        |> Behavioral_iflift.lift_program
+        |> Behavioral_blocking_subst.blocking_subst_program in
       let bmod =
         try List.find (fun (m : bmodule) -> m.name = name) prog.modules
         with Not_found ->
