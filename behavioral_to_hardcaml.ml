@@ -308,7 +308,24 @@ let rec expr_to_signal ctx = function
         | BVar n -> Hashtbl.find_opt ctx.array_elem_w n
         | _ -> None in
       (match elem_w with
-       | None -> s_array
+       | None ->
+           (* Scalar (packed-reg) bit-select: BIR sometimes carries
+              `reg[k]` as BSelect with a 32-bit constant index instead
+              of the (msb=k,lsb=k) BSlice form.  Returning the whole
+              signal is wrong: an outer `|reg[k]` then OR-reduces every
+              bit and fires for any non-zero value (this is exactly the
+              picorv32 MISALIGNED-INSTRUCTION trap firing on
+              pc=0x00100000 — pc[0]=0 but |pc=1, so the gated trap
+              branch wins on the first fetch).  Lower a constant index
+              to a 1-bit slice, and a dynamic index to a 1-bit shift+
+              mask so the result width matches SV `pc[idx]` semantics. *)
+           let w_arr = Signal.width s_array in
+           (match index with
+            | BConst { value; _ } when value >= 0 && value < w_arr ->
+                Signal.select s_array value value
+            | _ ->
+                let shifted = Signal.log_shift Signal.srl s_array s_index in
+                Signal.select shifted 0 0)
        | Some elem_w ->
            let total_w = Signal.width s_array in
            let size = total_w / elem_w in
