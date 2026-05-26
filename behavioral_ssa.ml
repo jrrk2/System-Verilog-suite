@@ -122,25 +122,54 @@ let rec rename_expr ctx = function
         args = List.map (rename_expr ctx) args;
       }
 
-(* Convert statements to SSA form *)
-let rec stmt_to_ssa ctx = function
+(* Find every signal that is *ever* the target of @slice_write or
+   @part_sel_write in a statement list (recursively).  Used to decide
+   which BAssigns need SSA versioning.  Plain BAssigns to a name that
+   is never slice-written can stay un-versioned: SV's last-wins
+   semantics on hardcaml Always.Variable converges to one FF for
+   case-arm-style writes and we save the N-stage shift register that
+   versioning would produce.  Names that *are* slice-written need
+   their BAssigns versioned too, otherwise the first slice-write
+   would read `BVar arr` (the final composite) and form a cycle. *)
+let sliced_targets stmts =
+  let h = Hashtbl.create 8 in
+  let rec go = function
+    | BAssign _ -> ()
+    | BIf { then_stmts; else_stmts; _ } ->
+        List.iter go then_stmts; List.iter go else_stmts
+    | BCase { cases; default; _ } ->
+        List.iter (fun (_, ss) -> List.iter go ss) cases;
+        List.iter go default
+    | BBlock ss -> List.iter go ss
+    | BWhile { body; _ } | BFor { body; _ } -> List.iter go body
+    | BCallStmt { func; args = (BVar n) :: _ }
+      when func = "@slice_write"
+        || func = "@part_sel_write_up"
+        || func = "@part_sel_write_down" ->
+        Hashtbl.replace h n ()
+    | BCallStmt _ | BReturn _ -> ()
+  in
+  List.iter go stmts;
+  h
+
+(* Convert statements to SSA form. *)
+let rec stmt_to_ssa ?(sliced = Hashtbl.create 0) ctx stmt =
+  match stmt with
   | BAssign { lhs; rhs } ->
-      (* Rename RHS first (uses old version) *)
       let rhs' = rename_expr ctx rhs in
-
-      (* Create new version for LHS *)
-      let version = push_version ctx lhs in
-      let lhs' = ssa_name lhs version in
-
-      [BAssign { lhs = lhs'; rhs = rhs' }]
+      if Hashtbl.mem sliced lhs then begin
+        let version = push_version ctx lhs in
+        [BAssign { lhs = ssa_name lhs version; rhs = rhs' }]
+      end else
+        [BAssign { lhs; rhs = rhs' }]
 
   | BIf { condition; then_stmts; else_stmts } ->
       let condition' = rename_expr ctx condition in
       let saved = ctx.versions in
-      let then_stmts' = List.concat (List.map (stmt_to_ssa ctx) then_stmts) in
+      let then_stmts' = List.concat (List.map (stmt_to_ssa ~sliced ctx) then_stmts) in
       let then_versions = ctx.versions in
       ctx.versions <- saved;
-      let else_stmts' = List.concat (List.map (stmt_to_ssa ctx) else_stmts) in
+      let else_stmts' = List.concat (List.map (stmt_to_ssa ~sliced ctx) else_stmts) in
       let else_versions = ctx.versions in
       ctx.versions <- saved;
       (* Variables assigned in either branch = those whose version
@@ -181,37 +210,73 @@ let rec stmt_to_ssa ctx = function
       @ phi_assigns
 
   | BCase { selector; cases; default } ->
+      (* Keep BCase intact for the emit but build phi merges per
+         assigned variable.  Each case-arm is processed from a fresh
+         copy of the entering map; we capture the exit map and use
+         per-arm versions in a single ITE chain emitted *after* the
+         BCase node.  Crucially the ITE chain reads only branch-end
+         versions and the pre-case version — no inter-variable
+         dependencies — so the merges don't form mutual cycles. *)
       let selector' = rename_expr ctx selector in
       let saved = ctx.versions in
-      (* TODO: BCase phi (case-arm version merge) — earlier attempts
-         emitted ITE chains that closed structural cycles in picosoc.
-         For now, run each case from a fresh copy of the entering
-         map without merging exits, matching the pre-Map behaviour. *)
       let cases' = List.map (fun (value, stmts) ->
         ctx.versions <- saved;
         let value' = rename_expr ctx value in
-        let stmts' = List.concat (List.map (stmt_to_ssa ctx) stmts) in
-        (value', stmts')
+        let stmts' = List.concat (List.map (stmt_to_ssa ~sliced ctx) stmts) in
+        (value', stmts', ctx.versions)
       ) cases in
       ctx.versions <- saved;
-      let default' = List.concat (List.map (stmt_to_ssa ctx) default) in
-      [BCase { selector = selector'; cases = cases'; default = default' }]
+      let default' = List.concat (List.map (stmt_to_ssa ~sliced ctx) default) in
+      let default_versions = ctx.versions in
+      ctx.versions <- saved;
+      let bumped vs =
+        StringMap.fold (fun k v acc ->
+          if StringMap.find_opt k saved <> Some v then k :: acc else acc
+        ) vs [] in
+      let all_bumped =
+        List.sort_uniq String.compare
+          (List.concat_map (fun (_, _, v) -> bumped v) cases'
+           @ bumped default_versions) in
+      let name_at versions var =
+        match StringMap.find_opt var versions with
+        | Some v -> BVar (ssa_name var v)
+        | None ->
+            (match StringMap.find_opt var saved with
+             | Some v -> BVar (ssa_name var v)
+             | None -> BVar var) in
+      let phi_assigns = List.map (fun var ->
+        let default_expr = name_at default_versions var in
+        let rhs = List.fold_right (fun (value', _, vs) acc ->
+          let case_expr = name_at vs var in
+          BCond { condition =
+                    BBinOp { op = BEq; lhs = selector'; rhs = value';
+                             result_type = BInt { width = 1;
+                                                  signed = Unsigned } };
+                  then_val = case_expr;
+                  else_val = acc }
+        ) cases' default_expr in
+        let new_version = push_version ctx var in
+        BAssign { lhs = ssa_name var new_version; rhs }
+      ) all_bumped in
+      let stripped = List.map (fun (v, s, _) -> (v, s)) cases' in
+      [ BCase { selector = selector'; cases = stripped; default = default' } ]
+      @ phi_assigns
 
   | BWhile { condition; body } ->
       (* While loops need special handling with loop phi nodes *)
       let condition' = rename_expr ctx condition in
-      let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
+      let body' = List.concat (List.map (stmt_to_ssa ~sliced ctx) body) in
       [BWhile { condition = condition'; body = body' }]
 
   | BFor { init; condition; update; body } ->
-      let init' = List.hd (stmt_to_ssa ctx init) in
+      let init' = List.hd (stmt_to_ssa ~sliced ctx init) in
       let condition' = rename_expr ctx condition in
-      let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
-      let update' = List.hd (stmt_to_ssa ctx update) in
+      let body' = List.concat (List.map (stmt_to_ssa ~sliced ctx) body) in
+      let update' = List.hd (stmt_to_ssa ~sliced ctx update) in
       [BFor { init = init'; condition = condition'; update = update'; body = body' }]
 
   | BBlock stmts ->
-      let stmts' = List.concat (List.map (stmt_to_ssa ctx) stmts) in
+      let stmts' = List.concat (List.map (stmt_to_ssa ~sliced ctx) stmts) in
       [BBlock stmts']
 
   | BCallStmt { func = "@slice_write";
@@ -290,13 +355,15 @@ let final_writebacks ctx =
 let process_to_ssa ?widths = function
   | BCombinational { name; sensitivity; body } ->
       let ctx = create_ssa_context ?widths () in
-      let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
+      let sliced = sliced_targets body in
+      let body' = List.concat (List.map (stmt_to_ssa ~sliced ctx) body) in
       let tail = final_writebacks ctx in
       BCombinational { name; sensitivity; body = body' @ tail }
 
   | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
       let ctx = create_ssa_context ?widths () in
-      let body' = List.concat (List.map (stmt_to_ssa ctx) body) in
+      let sliced = sliced_targets body in
+      let body' = List.concat (List.map (stmt_to_ssa ~sliced ctx) body) in
       let tail = final_writebacks ctx in
       BSequential { name; clock; clock_edge; reset; reset_edge; reset_async;
                     body = body' @ tail; blocking_vars }
