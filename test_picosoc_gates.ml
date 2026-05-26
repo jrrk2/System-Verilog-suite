@@ -4,7 +4,13 @@
 open Hardcaml
 
 let () =
-  Unix.putenv "MEMLOWER_FPGA" "1";
+  (* Default to FPGA-mode memlower (the picosoc bring-up wants block-
+     RAM inference for the progmem ROM), but allow callers to skip
+     it — random_sv_gen's tiny case-as-ROM emits would otherwise
+     pick up RAMB18/36E1 primitives that downstream yosys equiv
+     can't link without unisims_sim.    *)
+  if Sys.getenv_opt "GATE_NO_BRAM" <> Some "1" then
+    Unix.putenv "MEMLOWER_FPGA" "1";
   let top = Sys.argv.(1) in
   let files = Array.to_list (Array.sub Sys.argv 2 (Array.length Sys.argv - 2)) in
   let prog = Verible_to_behavioral.convert_files ~top files in

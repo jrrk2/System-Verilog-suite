@@ -574,6 +574,137 @@ let emit_cfg_recursive ~name seed =
      endmodule\n"
     seed name name name name (w-1) (w-1) name w
 
+(* ─── ssa_stress: structures the SSA pass cares about ────────────── *)
+
+(* Three sub-patterns, picked at random per seed:
+ *   1. always_ff with a shared LHS written by all arms of a case
+ *      statement (mutually exclusive constant labels).
+ *   2. always_comb with a chain of slice writes to the same register
+ *      (the picorv32 pcpi_mul carry-save idiom at small scale).
+ *   3. nested if/else tree with the same LHS assigned in different
+ *      paths.
+ * All three patterns produce a single-output module with simple
+ * input ports; the miter compares our emit against the original SV. *)
+
+let emit_ssa_case_lhs ~name seed =
+  Random.init seed;
+  let w = (match rand_int 4 with 0 -> 4 | 1 -> 8 | 2 -> 16 | _ -> 32) in
+  let sel_w = (1 + rand_int 3) in (* 1..3 *)
+  let n_arms = 1 + rand_int ((1 lsl sel_w) - 1) in
+  (* Guarantee every input gets used by at least one arm, so hardcaml
+     doesn't DCE the unused port from the gate side and the yosys
+     equiv miter can match ports by name.  We rotate through
+     {a-derived, b-derived, const} based on i so each kind appears
+     unless the case has fewer arms than kinds (in which case the
+     residue is covered by the default arm via an extra OR of all
+     inputs into the seeded constant). *)
+  let arm_rhs i =
+    match i mod 3 with
+    | 0 -> Printf.sprintf "a + %d'd%d" w (i land 7)
+    | 1 -> Printf.sprintf "b ^ %d'd%d" w (i + 1)
+    | _ -> Printf.sprintf "%d'd%d" w ((i * 37 + 5) land ((1 lsl w) - 1)) in
+  let buf = Buffer.create 512 in
+  Buffer.add_string buf (Printf.sprintf
+    "// random_sv_gen seed=%d mode=ssa_stress/case_lhs\n\
+     module %s (\n\
+     \  input  wire        clk,\n\
+     \  input  wire        rst_n,\n\
+     \  input  wire [%d:0] sel,\n\
+     \  input  wire [%d:0] a,\n\
+     \  input  wire [%d:0] b,\n\
+     \  output reg  [%d:0] y\n);\n\
+     \  always @(posedge clk) begin\n\
+     \    if (!rst_n) y <= %d'd0;\n\
+     \    else case (sel)\n"
+    seed name (sel_w - 1) (w - 1) (w - 1) (w - 1) w);
+  for i = 0 to n_arms - 1 do
+    Buffer.add_string buf (Printf.sprintf
+      "      %d'd%d: y <= %s;\n" sel_w i (arm_rhs i))
+  done;
+  Buffer.add_string buf (Printf.sprintf
+    "      default: y <= (a ^ b);\n    endcase\n  end\nendmodule\n");
+  Buffer.contents buf
+
+let emit_ssa_slice_chain ~name seed =
+  Random.init seed;
+  let w = (match rand_int 3 with 0 -> 8 | 1 -> 16 | _ -> 32) in
+  let chunk = (match rand_int 3 with 0 -> 2 | 1 -> 4 | _ -> 8) in
+  let chunks = w / chunk in
+  let buf = Buffer.create 512 in
+  Buffer.add_string buf (Printf.sprintf
+    "// random_sv_gen seed=%d mode=ssa_stress/slice_chain W=%d chunk=%d\n\
+     module %s (\n\
+     \  input  wire [%d:0] init,\n\
+     \  input  wire [%d:0] mask,\n\
+     \  output wire [%d:0] out\n);\n\
+     \  reg  [%d:0] r;\n\
+     \  always @* begin\n\
+     \    r = init;\n"
+    seed w chunk name (w - 1) (w - 1) (w - 1) (w - 1));
+  for c = 0 to chunks - 1 do
+    let hi = (c + 1) * chunk - 1 and lo = c * chunk in
+    let op = if coin () then "^" else "&" in
+    Buffer.add_string buf (Printf.sprintf
+      "    r[%d:%d] = r[%d:%d] %s mask[%d:%d];\n"
+      hi lo hi lo op hi lo)
+  done;
+  Buffer.add_string buf "  end\n  assign out = r;\nendmodule\n";
+  Buffer.contents buf
+
+let emit_ssa_if_tree ~name seed =
+  Random.init seed;
+  let w = (match rand_int 3 with 0 -> 4 | 1 -> 8 | _ -> 16) in
+  let depth = 2 + rand_int 3 in (* 2..4 nested levels *)
+  let buf = Buffer.create 512 in
+  Buffer.add_string buf (Printf.sprintf
+    "// random_sv_gen seed=%d mode=ssa_stress/if_tree depth=%d\n\
+     module %s (\n\
+     \  input  wire        clk,\n\
+     \  input  wire        rst_n,\n\
+     \  input  wire [%d:0] flags,\n\
+     \  input  wire [%d:0] a,\n\
+     \  input  wire [%d:0] b,\n\
+     \  input  wire [%d:0] c,\n\
+     \  output reg  [%d:0] y\n);\n"
+    seed depth name (depth - 1) (w - 1) (w - 1) (w - 1) (w - 1));
+  Buffer.add_string buf (Printf.sprintf
+    "  always @(posedge clk) begin\n\
+    \    if (!rst_n) y <= %d'd0;\n\
+    \    else begin\n" w);
+  let indent n =
+    let buf = Buffer.create n in
+    for _ = 1 to n do Buffer.add_char buf ' ' done;
+    Buffer.contents buf in
+  (* Rotate through expressions that touch every input so the gate
+     doesn't DCE unused ports and yosys can match by name. *)
+  let exprs = [| "a ^ b ^ c"; "a + b"; "b & c"; "a | c";
+                 "a + c"; "a & b ^ c" |] in
+  let leaf_counter = ref 0 in
+  let rec emit_level lv =
+    let ind = indent (6 + 2 * lv) in
+    if lv >= depth then begin
+      let e = exprs.(!leaf_counter mod Array.length exprs) in
+      incr leaf_counter;
+      Buffer.add_string buf (Printf.sprintf "%sy <= %s;\n" ind e)
+    end
+    else begin
+      Buffer.add_string buf (Printf.sprintf "%sif (flags[%d]) begin\n" ind lv);
+      emit_level (lv + 1);
+      Buffer.add_string buf (Printf.sprintf "%send else begin\n" ind);
+      emit_level (lv + 1);
+      Buffer.add_string buf (Printf.sprintf "%send\n" ind)
+    end in
+  emit_level 0;
+  Buffer.add_string buf "    end\n  end\nendmodule\n";
+  Buffer.contents buf
+
+let emit_ssa_stress ~name seed =
+  let _ = Random.init seed in
+  match rand_int 3 with
+  | 0 -> emit_ssa_case_lhs   ~name seed
+  | 1 -> emit_ssa_slice_chain ~name seed
+  | _ -> emit_ssa_if_tree    ~name seed
+
 (* ─── Mode dispatcher ────────────────────────────────────────────── *)
 
 let emit_for_mode ~name ~seed mode =
@@ -586,6 +717,7 @@ let emit_for_mode ~name ~seed mode =
   | "cfg_chain"     -> emit_cfg_chain ~name seed
   | "cfg_ternary"   -> emit_cfg_ternary ~name seed
   | "cfg_recursive" -> emit_cfg_recursive ~name seed
+  | "ssa_stress"    -> emit_ssa_stress ~name seed
   | "simple" | _ ->
       let include_clock = (let _ = Random.init seed in coin ()) in
       emit_module ~name ~include_clock seed
@@ -610,7 +742,7 @@ let pick_mode s =
   | ["mixed"] ->
       let modes = ["simple"; "struct"; "func"; "gen"; "mem2d";
                    "cfg_struct"; "cfg_chain"; "cfg_ternary";
-                   "cfg_recursive"] in
+                   "cfg_recursive"; "ssa_stress"] in
       List.nth modes (s mod List.length modes)
   | _ ->
       List.nth active_modes (s mod List.length active_modes)
