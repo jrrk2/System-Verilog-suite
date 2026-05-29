@@ -423,6 +423,17 @@ let lwrite_edif mapped_h path =
   Fpga_synth.Fpga_emit.write_edif ~path circ;
   path
 
+(* Lift a Mapped Circuit.t directly into BIR as a structural bprogram
+ * with a single bmodule, preserving bus widths on top-level ports.
+ * Bypasses the lossy write_cellmapped_v + ver_front re-parse loop that
+ * tasks #38/#39 traced as the source of CARRY4.DI/S width collapse and
+ * vector-port flattening. *)
+let lmapped_to_prog mapped_h =
+  let _, circ = find_mapped mapped_h in
+  let m = Hardcaml_to_behavioral.of_circuit circ in
+  let p = { Behavioral_ir.modules = [m]; library_cells = [] } in
+  hadd (Prog (m.name, p))
+
 (* Parse cell-mapped Verilog back into BIR via Ver_front_to_behavioral,
  * returning a prog handle.  Used to splice a gate-mapped sub-module
  * back under a wrapper that has user-instantiated primitive cells. *)
@@ -880,6 +891,8 @@ module MakeLib
                                (wrap2 lwrite_nextpnr_json);
         "write_edif",         V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_edif);
+        "mapped_to_prog",     V.efunc (V.string **->> V.string)
+                               (wrap1 lmapped_to_prog);
       ] g;
       C.register_module "gui" [
         "add_menu",    V.efunc (V.string **->> V.string) (wrap1 lgui_add_menu);

@@ -39,15 +39,19 @@ child_prog = svd.meminfer(child_prog)
 child_prog = svd.memlower(child_prog)
 print("  child pipeline done")
 
--- 3. Gate-map the child (BIR -> AIG -> LUT cover -> Hardcaml Circuit),
---    dump as cell-mapped Verilog, re-parse via ver_front. This is the
---    behavioural -> structural transition.
-child_pick = svd.pick(child_prog, CHILD)
-mapped     = svd.gate_map(child_pick, 6, 0)  -- k_lut=6, io=false
-cells_v    = svd.write_cellmapped_v(mapped, OUTDIR .. "/" .. CHILD .. "_cells.v")
-print("  wrote " .. cells_v)
-struct_prog = svd.parse_v_cells(cells_v)
-print("  re-parsed cell-mapped: " .. svd.module_names(struct_prog))
+-- 3. Gate-map the child (BIR -> AIG -> LUT cover -> Hardcaml Circuit)
+--    then lift the Mapped Circuit.t directly back into BIR via
+--    hardcaml_to_behavioral.  The old route went through
+--    write_cellmapped_v + ver_front re-parse, but Hardcaml's Verilog
+--    emitter flattens bus ports into `<port>__<i>` scalars and ver_front
+--    re-parsed them as 1-bit signals — collapsing CARRY4.DI/S to 1 bit
+--    and crashing nextpnr-xilinx's carry packer (tasks #38/#39).  The
+--    direct Circuit.t -> bmodule path keeps bus widths vector all the
+--    way through.
+child_pick  = svd.pick(child_prog, CHILD)
+mapped      = svd.gate_map(child_pick, 6, 0)  -- k_lut=6, io=false
+struct_prog = svd.mapped_to_prog(mapped)
+print("  Mapped -> BIR: " .. svd.module_names(struct_prog))
 
 -- 4. Splice the structural child back under the wrapper, flatten
 --    structurally (primitive instances in the wrapper survive),
