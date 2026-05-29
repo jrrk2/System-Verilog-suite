@@ -272,7 +272,8 @@ let cell_to_bprocess (c : rtlil_cell) =
            })
        | _ -> None)
   (* Sync-reset flip-flop. Vivado calls this RTL_REG_SYNC; yosys emits
-   * `$sdff`. Body: if (SRST==SRST_POL) q<=val; else q<=D. *)
+   * `$sdff`. Body: if (SRST==SRST_POL) q<=val; else q<=D.
+   * SRST_POLARITY=0 means active-low — invert the condition. *)
   | "$sdff" ->
       (match pin_lhs_slice c "Q", pin_expr c "D", pin c "CLK", pin c "SRST" with
        | Some (lhs, slice), Some d, Some clk, Some srst ->
@@ -283,6 +284,16 @@ let cell_to_bprocess (c : rtlil_cell) =
              sigspec_to_bexpr (SigConst v)
            with Not_found -> BConst { value = 0; width = yw }
            in
+           let rst_pol =
+             try int_of_string (List.assoc "SRST_POLARITY" c.cell_params)
+             with _ -> 1
+           in
+           let rst_cond =
+             let v = BVar rst_name in
+             if rst_pol = 0
+             then BUnOp { op = BNot; operand = v; result_type = bool_t }
+             else v
+           in
            Some (BSequential {
              name = Printf.sprintf "sdff_%s" c.cell_inst;
              clock = clk_name;
@@ -291,7 +302,7 @@ let cell_to_bprocess (c : rtlil_cell) =
              reset_edge = None;       (* sync: not in sensitivity list *)
              reset_async = false;
              body = [BIf {
-               condition = BVar rst_name;
+               condition = rst_cond;
                then_stmts = [assign_or_slice_write lhs slice rst_val];
                else_stmts = [assign_or_slice_write lhs slice d];
              }];

@@ -24,6 +24,15 @@ type conv_context = {
      pre-pass in [create_circuit] from each bsignal's stype.  Lets
      [BSelect] compute the right slice when the index is dynamic. *)
   array_elem_w: (string, int) Hashtbl.t;
+  (* BIR-level initial_value for each registered signal, keyed by
+     signal name and stored as (width, int_value).  Set when the BIR
+     bsignal has [initial_value = Some (BConst _)].  Threaded into
+     each register's Reg_spec via [~reset_to] (with [reset] tied to
+     gnd so runtime semantics are unchanged) so the constant survives
+     onto the Reg signal's [reg_reset_value] field and downstream
+     mappers (FPGA → FDRE INIT; ASIC → "would-need-explicit-reset"
+     check) can read it back. *)
+  initial_values: (string, int * int) Hashtbl.t;  (* name -> (width, value) *)
 }
 
 (* Get width from behavioral IR type *)
@@ -69,14 +78,37 @@ let get_or_create_var ctx name width is_reg =
         if ctx.reset_falling
         then Reg_spec.override spec ~reset_edge:Falling
         else spec in
+      (* If this signal has a BIR-level initial_value, thread it into
+         Reg_spec via [~reset_to] while tying [~reset] to gnd so the
+         constant survives onto the Reg signal's [reg_reset_value] field
+         (downstream mappers read it) without changing runtime
+         semantics.  The actual runtime reset path (if any) is wired
+         separately by [Reg_spec.create ~reset:rst]; for signals with
+         an init but no explicit BIR reset, reset stays at gnd. *)
+      let with_init spec =
+        match Hashtbl.find_opt ctx.initial_values name with
+        | None -> spec
+        | Some (init_w, init_v) ->
+          let const = Signal.of_int ~width:(max width init_w) init_v in
+          let const = if Signal.width const = width then const
+                      else Signal.uresize const width in
+          (* If no source-level reset is wired, point [~reset] at gnd
+             (constant 0 — Hardcaml emits no reset logic).  Either way,
+             [~reset_to] carries the init metadata.                   *)
+          (match ctx.reset with
+           | Some _ -> Reg_spec.override spec ~reset_to:const
+           | None ->
+             Reg_spec.override spec ~reset:Signal.gnd ~reset_to:const)
+      in
       let v =
         if is_reg then
           match ctx.clock, ctx.reset with
           | Some clk, Some rst ->
-              let spec = Reg_spec.create ~clock:clk ~reset:rst () |> with_reset_edge in
+              let spec = Reg_spec.create ~clock:clk ~reset:rst ()
+                         |> with_reset_edge |> with_init in
               Always.Variable.reg spec ~width
           | Some clk, None ->
-              let spec = Reg_spec.create ~clock:clk () in
+              let spec = Reg_spec.create ~clock:clk () |> with_init in
               Always.Variable.reg spec ~width
           | _ ->
               Always.Variable.wire ~default:(Signal.zero width)
@@ -378,6 +410,14 @@ let rec expr_to_signal ctx = function
       let replicated = List.init count (fun _ -> s_value) in
       Signal.concat_msb replicated
 
+  (* `@signed(x)` is the converter's signedness annotation — it does not
+     compute a different value, it just marks the operand as signed for
+     downstream arithmetic.  Pass the operand through unchanged so the
+     value survives; without this, every $signed(...) lowers to zero,
+     which silently broke I-type immediate decoding (picorv32 line 1106
+     decoded_imm := $signed(mem_rdata_q[31:20])) and propagated as a
+     reg_op2 = 0 divergence at cyc 129 of the xsim co-sim. *)
+  | BCall { func = "@signed"; args = [x] } -> expr_to_signal ctx x
   | BCall _ ->
       (* Unsupported for now *)
       Signal.zero 32
@@ -388,6 +428,19 @@ let rec expr_to_signal ctx = function
    Passed down through nested if/case/block bodies. *)
 let rec stmt_to_always ~is_reg ctx alw = function
   | BAssign { lhs; rhs } ->
+      (* SystemVerilog `$signed(narrow_expr)` is a sign-extending cast:
+         when assigned to a wider LHS, the upper bits are filled from
+         the operand's MSB.  The Verible converter tags such RHSs as
+         `BCall { func = "@signed"; args = [x] }`.  Detect that and
+         use Signal.sresize instead of uresize when widening.
+         picorv32's I-type/B-type/S-type immediate decoders all use
+         $signed(...) on a narrower bit-select; without this they
+         silently zero-extend and a negative branch offset like -8
+         (B-type imm 13'h1ff8) lowers to +8184 in the gate, breaking
+         the BLTU back-edge at cyc 159 of the xsim co-sim. *)
+      let is_signed_cast = match rhs with
+        | BCall { func = "@signed"; _ } -> true
+        | _ -> false in
       let rhs_signal = expr_to_signal ctx rhs in
       let rhs_w = Signal.width rhs_signal in
       let var = get_or_create_var ctx lhs rhs_w is_reg in
@@ -396,13 +449,13 @@ let rec stmt_to_always ~is_reg ctx alw = function
          declared width — when the RHS is wider (e.g. a 32-bit default
          localparam being stored into a 2-bit reg) or narrower we need
          to coerce, otherwise [Always.compile] later builds a mux of
-         mismatched arms.  Truncate when wider, zero-extend when
-         narrower; both sides agree this is the SystemVerilog rule for
-         non-blocking assigns of unsigned integers. *)
+         mismatched arms.  Truncate when wider; for narrower, sign-
+         extend if the RHS was `@signed(...)`, else zero-extend. *)
       let var_w = Signal.width (Always.Variable.value var) in
       let rhs_signal' =
         if rhs_w = var_w then rhs_signal
         else if rhs_w > var_w then Signal.select rhs_signal (var_w - 1) 0
+        else if is_signed_cast then Signal.sresize rhs_signal var_w
         else Signal.uresize rhs_signal var_w in
       Always.(var <-- rhs_signal') :: alw
 
@@ -889,7 +942,13 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
     clock = None;
     reset = None;
     array_elem_w = Hashtbl.create 8; reset_falling = false;
+    initial_values = Hashtbl.create 16;
   } in
+  List.iter (fun (s : Behavioral_ir.bsignal) ->
+    match s.initial_value with
+    | Some (BConst { value; width }) ->
+        Hashtbl.replace ctx.initial_values s.name (width, value)
+    | _ -> ()) bmod.signals;
   (* Clock/reset get bound by [process_to_always] when each
      BSequential block tells us its clock and reset signal names
      directly.  We deliberately do NOT recognise them by name
@@ -925,11 +984,20 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     clock = None;
     reset = None;
     array_elem_w = Hashtbl.create 8; reset_falling = false;
+    initial_values = Hashtbl.create 16;
   } in
 
   (* Clock/reset get bound by [process_to_always] when each
      BSequential block names them via its [clock] / [reset] fields.
      Pattern, not name, is the source of truth. *)
+
+  (* Collect BIR-level initial_value per signal.  Used in
+     [get_or_create_var] to thread an init through Reg_spec.            *)
+  List.iter (fun (s : Behavioral_ir.bsignal) ->
+    match s.initial_value with
+    | Some (BConst { value; width }) ->
+        Hashtbl.replace ctx.initial_values s.name (width, value)
+    | _ -> ()) bmod.signals;
 
   (* Pre-pass: classify each non-input signal and pre-declare an
      Always.Variable of the right shape (register vs wire) at the
@@ -1014,15 +1082,60 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
         ctx.signals <- (s.name, Signal.zero w) :: ctx.signals;
         ()
       end else
+      (* SSA-version detection: a name like `<base>_<N>` whose `<base>`
+         is also a signal in the module is an intermediate produced by
+         Behavioral_ssa.module_to_ssa.  These must be COMBINATIONAL
+         wires (driven by the same always block as the final reg),
+         not separate FFs — otherwise picorv32 reg_pc grows a 5-deep
+         FF pipeline (reg_pc_7 → _10 → _29 → _32 → _38 → reg_pc) that
+         takes ~5 cycles for the reset value to propagate, and X-bits
+         from intermediate stages leak through during the reset
+         period.  Detection is by suffix; we keep the original
+         `<base>` name as a reg. *)
+      let is_ssa_version name =
+        match String.rindex_opt name '_' with
+        | None -> false
+        | Some i ->
+            let suffix = String.sub name (i + 1) (String.length name - i - 1) in
+            if String.length suffix = 0
+            || not (String.for_all (fun c -> c >= '0' && c <= '9') suffix)
+            then false
+            else
+              let base = String.sub name 0 i in
+              List.exists (fun (s' : Behavioral_ir.bsignal) -> s'.name = base)
+                bmod.signals
+      in
+      (* Apply BIR initial_value into the Reg_spec at variable
+         creation time — this is the pre-pass that runs BEFORE the
+         body processing (where [get_or_create_var]'s [with_init]
+         normally fires).  Mirror that logic here so the resulting
+         Reg signal carries [reg_reset_value], which bir_to_aig and
+         downstream FPGA mappers read for FDRE INIT. *)
+      (* Apply BIR initial_value via reset_to.  Don't touch the
+         [~reset] field — overriding it with gnd makes Hardcaml emit
+         a non-empty reg_reset signal, which bir_to_aig then treats
+         as a real async reset and mis-maps the FF to FDCE.  Setting
+         reset_to alone leaves reg_reset empty (so FDRE is selected)
+         while still recording the initial value on the Signal. *)
+      let apply_init_pre spec =
+        match Hashtbl.find_opt ctx.initial_values s.name with
+        | None -> spec
+        | Some (init_w, init_v) ->
+          let const = Signal.of_int ~width:(max w init_w) init_v in
+          let const = if Signal.width const = w then const
+                      else Signal.uresize const w in
+          Reg_spec.override spec ~reset_to:const
+      in
       let is_reg, var =
         match Hashtbl.find_opt driver_proc s.name with
-        | Some (Some (clock, reset, rst_falling)) ->
+        | Some (Some (clock, reset, rst_falling)) when not (is_ssa_version s.name) ->
             let clk = get_signal ctx clock in
             let spec = match reset with
               | Some rst ->
                   let s = Reg_spec.create ~clock:clk ~reset:(get_signal ctx rst) () in
                   if rst_falling then Reg_spec.override s ~reset_edge:Falling else s
               | None     -> Reg_spec.create ~clock:clk () in
+            let spec = apply_init_pre spec in
             (true, Always.Variable.reg spec ~width:w)
         | _ ->
             (false, Always.Variable.wire ~default:(Signal.zero w)) in

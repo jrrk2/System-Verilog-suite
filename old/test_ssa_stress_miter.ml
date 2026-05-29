@@ -93,13 +93,18 @@ let () =
   (* yosys's write_verilog still emits `assign out[i:j] = ...` for
      slice-LHS continuous assigns, which Verible converts to
      @slice_write — apply the same lowering as the SUT side so Z3
-     sees per-bit assignments instead of no-ops on both. *)
+     sees per-bit assignments instead of no-ops on both.  Also
+     inline functions: yosys lowers parallel-case to a Verilog
+     function (e.g. `n_07_(...)`), and without inlining the BCall
+     becomes a Z3 uninterpreted function. *)
   let yos_prog = Behavioral_mem_merge.merge_slice_writes_program yos_prog in
+  let yos_prog = Behavioral_inline.inline_program yos_prog in
   Printf.printf "  %d modules\n" (List.length yos_prog.modules);
 
-  Printf.printf "[2/3] ver_front → BIR (SUT, with slice-write lowering) ...\n%!";
+  Printf.printf "[2/3] ver_front → BIR (SUT, with slice-write lowering + inline) ...\n%!";
   let ver_prog = Verible_to_behavioral.convert_files ~top files in
   let ver_prog = Behavioral_mem_merge.merge_slice_writes_program ver_prog in
+  let ver_prog = Behavioral_inline.inline_program ver_prog in
   Printf.printf "  %d modules\n" (List.length ver_prog.modules);
 
   let pick label src =

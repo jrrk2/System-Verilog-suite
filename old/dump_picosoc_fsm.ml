@@ -20,7 +20,11 @@ let () =
   (* Find any BAssign whose LHS contains cpu__cpu_state or cpu__mem_do_rinst,
    * print the assignment's RHS pretty. *)
   let open Behavioral_ir in
-  let interest = ["cpu__cpu_state"; "cpu__mem_do_rinst"; "cpu__trap"] in
+  let interest =
+    match Sys.getenv_opt "FSM_INTEREST" with
+    | Some s -> String.split_on_char ',' s
+    | None -> ["cpu__cpu_state"; "cpu__mem_do_rinst"; "cpu__trap"]
+  in
   let rec walk_stmt path s = match s with
     | BAssign { lhs; rhs } when List.mem lhs interest ->
         Printf.printf "─── %s = ───\n%s\n" lhs (string_of_bexpr rhs);
@@ -30,8 +34,15 @@ let () =
         let cs = string_of_bexpr condition in
         List.iter (walk_stmt (path^" / if("^cs^")")) then_stmts;
         List.iter (walk_stmt (path^" / else of if("^cs^")")) else_stmts
+    | BCase { selector; cases; default } ->
+        let sel = string_of_bexpr selector in
+        List.iter (fun (k, ss) ->
+          let ks = string_of_bexpr k in
+          List.iter (walk_stmt (path^" / case("^sel^") k="^ks)) ss
+        ) cases;
+        List.iter (walk_stmt (path^" / case("^sel^") default")) default
     | BBlock ss -> List.iter (walk_stmt path) ss
-    | BCase _ | BWhile _ | BFor _ | BCallStmt _ | BReturn _ -> ()
+    | BWhile _ | BFor _ | BCallStmt _ | BReturn _ -> ()
   in
   List.iter (function
     | BSequential { name; body; _ } -> List.iter (walk_stmt ("seq "^name)) body

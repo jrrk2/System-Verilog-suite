@@ -101,7 +101,10 @@ let vbit (v : lit array) i = if i < Array.length v then v.(i) else const_false
 
 let fit (v : lit array) n = Array.init n ~f:(fun i -> vbit v i)
 
-(* ripple-carry add of [a]+[b]+carry_in, low [n] bits (carry-out dropped). *)
+(* ripple-carry add of [a]+[b]+carry_in, low [n] bits (carry-out dropped).
+   Pure-AIG fallback — slow on FPGA because the carry threads through
+   general LUT routing.  [v_add_carry4] below emits dedicated CARRY4
+   cells for [Signal_add]/[Signal_sub] in [lower_circuit] instead. *)
 let v_add b a bb ~carry_in ~n =
   let cy = ref carry_in in
   Array.init n ~f:(fun i ->
@@ -185,6 +188,13 @@ type reg_boundary =
   ; rb_clock : string
   ; rb_reset : string option (* async reset net, if any *)
   ; rb_width : int
+  ; rb_init  : int option
+      (* BIR-level initial_value, threaded through Hardcaml's
+         Reg_spec.override ~reset_to.  FPGA mappers emit this as an
+         FDRE INIT parameter (per-bit slice).  ASIC mappers should
+         REJECT a register with rb_init <> None and rb_reset = None
+         since ASIC FFs have no config-time init — the source code
+         must be rewritten with an explicit reset block. *)
   }
 
 (* A black-box instance, lowered as a generalized boundary: its OUTPUT
@@ -234,6 +244,113 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
   let regs = ref [] in
   let insts = ref [] in
   let inst_outs = ref [] in
+  let carry4_counter = ref 0 in
+  (* Decompose a + b + carry_in (low w bits) into ceil(w/4) chained
+     CARRY4 instances.  S = a XOR b is still a 1-LUT per bit (LUT2),
+     but the carry propagates through Xilinx's dedicated carry chain
+     instead of general LUT routing — picosoc carry-add chains run
+     much faster (target: Fmax > 25 MHz, vs 18.6 MHz with all-AIG).
+
+     CARRY4 truth (UG953):
+       O[i]  = S[i] XOR cin_chain[i]      (sum)
+       CO[i] = S[i] ? cin_chain[i] : DI[i]  (carry)
+       cin_chain[0] = (CYINIT or CI; exactly one driven, other 0)
+       cin_chain[i>0] = CO[i-1]
+     For a+b: S[i] = a[i] XOR b[i], DI[i] = a[i].
+     Returns ([sum bits LSB-first], top carry-out lit).  The CO is
+     the full carry chain output at bit (w-1), used by comparator
+     lowerings (a<b = !(a + ~b + 1).CO_top, etc.). *)
+  let emit_carry4_chain ~carry_in s_lits di_lits ~w =
+    let n_blocks = (w + 3) / 4 in
+    let out_lits = Array.create ~len:w const_false in
+    let prev_co3_name = ref None in
+    let top_co_lit = ref const_false in
+    for k = 0 to n_blocks - 1 do
+      let block_id = !carry4_counter in
+      Int.incr carry4_counter;
+      let base = Printf.sprintf "c4_%d" block_id in
+      let mk_bit_names port =
+        List.init 4 ~f:(fun j -> Printf.sprintf "%s_%s_%d" base port j)
+      in
+      let s_names = mk_bit_names "S" in
+      let di_names = mk_bit_names "DI" in
+      List.iteri s_names ~f:(fun j nm ->
+        let bit_idx = (4 * k) + j in
+        let lit = if bit_idx < w then s_lits.(bit_idx) else const_false in
+        inst_outs := (nm, lit) :: !inst_outs);
+      List.iteri di_names ~f:(fun j nm ->
+        let bit_idx = (4 * k) + j in
+        let lit = if bit_idx < w then di_lits.(bit_idx) else const_false in
+        inst_outs := (nm, lit) :: !inst_outs);
+      let cyinit_name = Printf.sprintf "%s_CYINIT" base in
+      let ci_name = Printf.sprintf "%s_CI" base in
+      (* Only emit ci_name as an AIG output when this is the chain
+         head (no previous CARRY4 to source CI from).  Otherwise
+         ib_in_ports points CI at the prev block's CO_3 (q_wire
+         fallback in bus_of_bits) and ci_name doesn't appear in
+         ib_in_ports — so adding it to inst_outs would leak it as a
+         top-level real output port. *)
+      let cyinit_lit, chain_head =
+        match !prev_co3_name with
+        | None -> carry_in, true
+        | Some _ -> const_false, false
+      in
+      inst_outs := (cyinit_name, cyinit_lit) :: !inst_outs;
+      if chain_head then inst_outs := (ci_name, const_false) :: !inst_outs;
+      let o_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_O_%d" base j) in
+      let co_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_CO_%d" base j) in
+      let o_lits = List.map o_names ~f:(aig_input b) in
+      let co_lits = List.map co_names ~f:(aig_input b) in
+      List.iteri o_lits ~f:(fun j l ->
+        let bit_idx = (4 * k) + j in
+        if bit_idx < w then out_lits.(bit_idx) <- l);
+      (* The carry-out at bit w-1 lives in block k = (w-1)/4 at position
+         (w-1) mod 4.  Record it as we walk the chain. *)
+      let last_block = n_blocks - 1 in
+      if k = last_block
+      then begin
+        let last_bit = (w - 1) - (4 * k) in
+        top_co_lit := List.nth_exn co_lits last_bit
+      end;
+      let ci_port_names =
+        match !prev_co3_name with
+        | Some prev -> [ prev ]
+        | None -> [ ci_name ]
+      in
+      let in_ports =
+        [ "CYINIT", [ cyinit_name ]
+        ; "CI", ci_port_names
+        ; "DI", di_names
+        ; "S", s_names
+        ]
+      in
+      let out_ports = [ "O", o_names; "CO", co_names ] in
+      insts
+      := { ib_name = "CARRY4"
+         ; ib_instance = base
+         ; ib_generics = []
+         ; ib_in_ports = in_ports
+         ; ib_out_ports = out_ports
+         }
+         :: !insts;
+      prev_co3_name := List.nth co_names 3
+    done;
+    out_lits, !top_co_lit
+  in
+  let v_add_carry4 ~carry_in a bb ~w =
+    let s_lits = Array.init w ~f:(fun i -> aig_xor b (vbit a i) (vbit bb i)) in
+    let di_lits = Array.init w ~f:(fun i -> vbit a i) in
+    let sum, _co = emit_carry4_chain ~carry_in s_lits di_lits ~w in
+    sum
+  in
+  (* a < b (unsigned), via CARRY4 of a + ~b + 1.  Top CO = 0 iff a < b
+     (the subtract borrowed).  Returns a 1-bit lit. *)
+  let v_lt_carry4 a bb ~w =
+    let s_lits = Array.init w ~f:(fun i -> aig_xnor b (vbit a i) (vbit bb i)) in
+    let di_lits = Array.init w ~f:(fun i -> vbit a i) in
+    let _sum, co = emit_carry4_chain ~carry_in:const_true s_lits di_lits ~w in
+    [| lit_not co |]
+  in
   let rec walk sig_ : lit array =
     if T.is_empty sig_ then [||]
     else begin
@@ -258,10 +375,14 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
              | Signal_or -> Array.init w ~f:(fun i -> aig_or b (vbit a i) (vbit bb i))
              | Signal_xor -> Array.init w ~f:(fun i -> aig_xor b (vbit a i) (vbit bb i))
              | Signal_eq -> v_eq b a bb ~n
-             | Signal_lt -> v_lt b a bb ~n
-             | Signal_add -> v_add b a bb ~carry_in:const_false ~n:w
+             | Signal_lt -> v_lt_carry4 a bb ~w:n
+             | Signal_add -> v_add_carry4 ~carry_in:const_false a bb ~w
              | Signal_sub ->
-               v_add b a (Array.map bb ~f:lit_not) ~carry_in:const_true ~n:w
+               v_add_carry4
+                 ~carry_in:const_true
+                 a
+                 (Array.map bb ~f:lit_not)
+                 ~w
              | Signal_mulu -> fit (v_mul b a bb) w
              | Signal_muls ->
                Stdlib.prerr_endline
@@ -293,12 +414,30 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
               if is_empty register.reg_reset then None
               else Some (signal_name register.reg_reset)
             in
+            (* Extract init value from Hardcaml's [reg_reset_value] when
+               it's a constant.  behavioral_to_hardcaml threads the BIR
+               [initial_value] there via Reg_spec.override ~reset_to. *)
+            let init =
+              match register.reg_reset_value with
+              | Const { constant; _ } ->
+                let bits = Hardcaml.Bits.to_string constant in
+                (* bits is MSB-first; parse to int.  Width matches w. *)
+                let n = String.length bits in
+                let v = ref 0 in
+                for i = 0 to n - 1 do
+                  if Char.equal bits.[i] '1' then
+                    v := !v lor (1 lsl (n - 1 - i))
+                done;
+                if !v = 0 then None else Some !v
+              | _ -> None
+            in
             regs :=
               { rb_q_names = q_names
               ; rb_d_names = d_names
               ; rb_clock = clk
               ; rb_reset = rst
               ; rb_width = w
+              ; rb_init = init
               }
               :: !regs;
             Queue.enqueue reg_queue (d, d_names);

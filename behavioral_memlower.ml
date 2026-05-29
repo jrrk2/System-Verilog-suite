@@ -354,6 +354,285 @@ let rec rewrite_reads_s m_name dout = function
              body = List.map (rewrite_reads_s m_name dout) body }
   | BReturn e -> BReturn (Option.map (rewrite_reads_e m_name dout) e)
 
+(* ──────────── RAM32M (1W + 2R async) ──────────── *)
+
+(* Replace `BSelect (BVar m_name) idx` with `BVar pin_for_idx`, where
+ * `pin_for_idx` is chosen by syntactic equality of the index expression
+ * against the keys in `addr_to_pin` (a small list of (addr_bexpr, pin)
+ * pairs, typically 2 entries for cpuregs).  Other reads of m_name keep
+ * the existing single-pin behaviour via `fallback`.  *)
+let rec rewrite_reads_e_per_addr m_name (addr_to_pin : (bexpr * string) list) ~fallback = function
+  | BSelect { array = BVar n; index } when n = m_name ->
+      (match List.find_opt (fun (a, _) -> a = index) addr_to_pin with
+       | Some (_, pin) -> BVar pin
+       | None -> BVar fallback)
+  | BBinOp { op; lhs; rhs; result_type } ->
+      BBinOp { op
+             ; lhs = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback lhs
+             ; rhs = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback rhs
+             ; result_type }
+  | BUnOp { op; operand; result_type } ->
+      BUnOp { op; result_type
+            ; operand = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback operand }
+  | BSlice { signal; msb; lsb } ->
+      BSlice { signal = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback signal; msb; lsb }
+  | BSelect { array; index } ->
+      BSelect { array = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback array
+              ; index = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback index }
+  | BConcat es ->
+      BConcat (List.map (rewrite_reads_e_per_addr m_name addr_to_pin ~fallback) es)
+  | BReplicate { count; value } ->
+      BReplicate { count; value = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback value }
+  | BCond { condition; then_val; else_val } ->
+      BCond { condition = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback condition
+            ; then_val  = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback then_val
+            ; else_val  = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback else_val }
+  | BCall { func; args } ->
+      BCall { func
+            ; args = List.map (rewrite_reads_e_per_addr m_name addr_to_pin ~fallback) args }
+  | other -> other
+
+let rec rewrite_reads_s_per_addr m_name addr_to_pin ~fallback = function
+  | BAssign { lhs; rhs } ->
+      BAssign { lhs; rhs = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback rhs }
+  | BIf { condition; then_stmts; else_stmts } ->
+      BIf { condition = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback condition
+          ; then_stmts = List.map (rewrite_reads_s_per_addr m_name addr_to_pin ~fallback) then_stmts
+          ; else_stmts = List.map (rewrite_reads_s_per_addr m_name addr_to_pin ~fallback) else_stmts }
+  | BCase { selector; cases; default } ->
+      BCase { selector = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback selector
+            ; cases = List.map (fun (k, ss) ->
+                rewrite_reads_e_per_addr m_name addr_to_pin ~fallback k,
+                List.map (rewrite_reads_s_per_addr m_name addr_to_pin ~fallback) ss) cases
+            ; default = List.map (rewrite_reads_s_per_addr m_name addr_to_pin ~fallback) default }
+  | BBlock ss -> BBlock (List.map (rewrite_reads_s_per_addr m_name addr_to_pin ~fallback) ss)
+  | BCallStmt { func; args } ->
+      BCallStmt { func; args = List.map (rewrite_reads_e_per_addr m_name addr_to_pin ~fallback) args }
+  | BWhile { condition; body } ->
+      BWhile { condition = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback condition
+             ; body = List.map (rewrite_reads_s_per_addr m_name addr_to_pin ~fallback) body }
+  | BFor { init; condition; update; body } ->
+      BFor { init = rewrite_reads_s_per_addr m_name addr_to_pin ~fallback init
+           ; condition = rewrite_reads_e_per_addr m_name addr_to_pin ~fallback condition
+           ; update = rewrite_reads_s_per_addr m_name addr_to_pin ~fallback update
+           ; body = List.map (rewrite_reads_s_per_addr m_name addr_to_pin ~fallback) body }
+  | BReturn e -> BReturn (Option.map (rewrite_reads_e_per_addr m_name addr_to_pin ~fallback) e)
+
+(* RAM32M lowering for 1W + 2R async-read memories with depth ≤ 32.
+ * Emits ceil(width/2) RAM32M instances in quad-port mode:
+ *   - port A : rs1 read (ADDRA = rs1_addr when WE=0; write_addr when WE=1)
+ *   - port B : rs2 read (likewise with rs2_addr)
+ *   - port C : unused (ADDRC tied to write_addr-or-zero so writes still go through)
+ *   - port D : write only (ADDRD = write_addr)
+ * When WE=1, all 4 ADDR* point at write_addr and all 4 DI* are tied to
+ * the write data, so the four internal LUTs stay in sync.  When WE=0,
+ * ports A/B/C each read their independent address.                    *)
+let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
+  let writer = find_writing_process mname m.processes in
+  let reader = find_reading_process mname m.processes in
+  match writer, reader with
+  | None, _ -> skip "RAM32M: no writing process"
+  | _, None -> skip "RAM32M: no reading process"
+  | Some w_idx, Some r_idx ->
+    let w_proc = List.nth m.processes w_idx in
+    let r_proc = List.nth m.processes r_idx in
+    let w_body = match w_proc with
+      | BSequential s -> s.body | _ -> [] in
+    let r_body = match r_proc with
+      | BSequential s -> s.body
+      | BCombinational c -> c.body in
+    let w_sites = collect_write_sites mname w_body in
+    let r_sites = collect_read_sites  mname r_body in
+    (* Distinct read addresses, in order of first appearance. *)
+    let distinct_addrs =
+      List.fold_left (fun acc (_, addr) ->
+        if List.exists (fun a -> a = addr) acc then acc
+        else acc @ [addr]) [] r_sites
+    in
+    (match fold_write_sites w_sites, distinct_addrs with
+     | None, _ -> skip "RAM32M: no write sites"
+     | _, ([] | [_]) ->
+       skip (Printf.sprintf "RAM32M: expected 2 distinct read addresses, got %d"
+               (List.length distinct_addrs))
+     | Some (we_expr, w_addr, w_data), addr_a :: addr_b :: _ ->
+       let dw = mm.data_width in
+       let orig_clk = match w_proc with BSequential s -> s.clock | _ -> "clk" in
+       let rs1_pin = mname ^ "_rs1" in
+       let rs2_pin = mname ^ "_rs2" in
+       let read_sig nm =
+         { name = nm
+         ; stype = BInt { width = dw; signed = Unsigned }
+         ; direction = `Internal
+         ; initial_value = None
+         ; attrs = [] }
+       in
+       let addr_to_pin = [ (addr_a, rs1_pin); (addr_b, rs2_pin) ] in
+       let rewrite_e = rewrite_reads_e_per_addr mname addr_to_pin ~fallback:rs1_pin in
+       let we_expr = rewrite_e we_expr in
+       let w_addr  = rewrite_e w_addr in
+       let w_data  = rewrite_e w_data in
+       let addr_a  = rewrite_e addr_a in
+       let addr_b  = rewrite_e addr_b in
+       let pad5 e =
+         let aw = bits_needed mm.depth in
+         if aw >= 5 then e
+         else BConcat [ BConst { value = 0; width = 5 - aw }; e ]
+       in
+       let w_addr5 = pad5 w_addr in
+       let rs1_a5  = pad5 addr_a in
+       let rs2_a5  = pad5 addr_b in
+       (* SDP-style RAM32M: port D writes (ADDRD = write_addr, DID = data),
+          ports A/B/C read (ADDRA/B/C = read_addr).  Each RAM32M provides
+          6 bits of read per copy (DOA + DOB + DOC = 6 bits) and 8 bits of
+          write (DIA + DIB + DIC + DID = 8 bits — port D's 2 bits are
+          written but not read from this copy).  For 1W + 2R we duplicate
+          the storage: one copy per read port.
+          n_per_copy = ceil(width / 6) RAM32Ms per read view.            *)
+       let n_per_copy = (dw + 5) / 6 in   (* ceil(dw / 6) *)
+       (* INIT for one LUT covering address-range entries, MSB-first 64-bit
+          string. lo_bit picks 2 bits from each init_values[addr].         *)
+       let init_for_lut lo_bit =
+         let bits = Bytes.make 64 '0' in
+         List.iteri (fun addr v ->
+           if addr < 32 then begin
+             let b0 = if lo_bit < dw then (v lsr lo_bit) land 1 else 0 in
+             let b1 = if lo_bit + 1 < dw then (v lsr (lo_bit + 1)) land 1 else 0 in
+             Bytes.set bits (63 - 2 * addr) (Char.chr (Char.code '0' + b0));
+             if 2 * addr + 1 < 64 then
+               Bytes.set bits (63 - 2 * addr - 1) (Char.chr (Char.code '0' + b1))
+           end) mm.init_values;
+         Bytes.to_string bits
+       in
+       (* Slice a 2-bit chunk from write data, zero-padding past width.    *)
+       let di_slice lo =
+         if lo + 1 < dw then BSlice { signal = w_data; msb = lo + 1; lsb = lo }
+         else if lo < dw then
+           BConcat [ BConst { value = 0; width = 1 }
+                   ; BSlice { signal = w_data; msb = lo; lsb = lo } ]
+         else BConst { value = 0; width = 2 }
+       in
+       (* Build one copy's RAM32M instances + per-instance read output names.
+          read_addr = the 5-bit address feeding ADDRA/B/C of this copy.    *)
+       let build_copy ~tag ~read_addr5 =
+         let outs = List.init n_per_copy (fun k ->
+           ( Printf.sprintf "%s_%s_a%d" mname tag k
+           , Printf.sprintf "%s_%s_b%d" mname tag k
+           , Printf.sprintf "%s_%s_c%d" mname tag k )) in
+         let new_sigs =
+           List.concat_map (fun (a, b, c) ->
+             [ { name = a; stype = BInt { width = 2; signed = Unsigned }
+               ; direction = `Internal; initial_value = None; attrs = [] }
+             ; { name = b; stype = BInt { width = 2; signed = Unsigned }
+               ; direction = `Internal; initial_value = None; attrs = [] }
+             ; { name = c; stype = BInt { width = 2; signed = Unsigned }
+               ; direction = `Internal; initial_value = None; attrs = [] } ]) outs
+         in
+         let dod_stubs = List.init n_per_copy (fun k ->
+           Printf.sprintf "%s_%s_d%d" mname tag k) in
+         let dod_sigs = List.map (fun nm ->
+           { name = nm; stype = BInt { width = 2; signed = Unsigned }
+           ; direction = `Internal; initial_value = None; attrs = [] }) dod_stubs
+         in
+         let insts = List.mapi (fun k (a_out, b_out, c_out) ->
+           (* This RAM32M covers bits [6k+5 : 6k] of the width via ports
+              A/B/C (2 bits each); port D's DID gets the remaining 2 bits
+              (lo + 6) — but DOD from this copy isn't used, so those 2 bits
+              are just consistent-storage padding.  When width < 6k+8 we
+              zero-pad the missing slots.                                 *)
+           let lo = 6 * k in
+           let dod_name = List.nth dod_stubs k in
+           { inst_name = Printf.sprintf "%s_%s_ram32m_%d" mname tag k
+           ; module_name = "RAM32M"
+           ; param_values = []
+           ; param_strs =
+               [ ("INIT_A", init_for_lut lo)
+               ; ("INIT_B", init_for_lut (lo + 2))
+               ; ("INIT_C", init_for_lut (lo + 4))
+               ; ("INIT_D", init_for_lut (lo + 6)) ]
+           ; port_connections =
+               [ ("ADDRA", read_addr5); ("ADDRB", read_addr5)
+               ; ("ADDRC", read_addr5); ("ADDRD", w_addr5)
+               ; ("DIA", di_slice lo);       ("DIB", di_slice (lo + 2))
+               ; ("DIC", di_slice (lo + 4)); ("DID", di_slice (lo + 6))
+               ; ("WCLK", BVar orig_clk);    ("WE", we_expr)
+               ; ("DOA", BVar a_out); ("DOB", BVar b_out)
+               ; ("DOC", BVar c_out); ("DOD", BVar dod_name) ]
+           }) outs in
+         (insts, new_sigs @ dod_sigs, outs)
+       in
+       let rs1_insts, rs1_sigs, rs1_outs = build_copy ~tag:"r1" ~read_addr5:rs1_a5 in
+       let rs2_insts, rs2_sigs, rs2_outs = build_copy ~tag:"r2" ~read_addr5:rs2_a5 in
+       (* Read assembly:
+          rs1_pin <= {dw-bit slice of (DOC|DOB|DOA across all copy-1 RAMs)} *)
+       let assemble outs =
+         (* per-RAM: 6 bits = {DOC, DOB, DOA} (MSB first).  Concat all the
+            per-RAM 6-bit chunks MSB-first across k.                       *)
+         let chunks = List.map (fun (a, b, c) ->
+           BConcat [ BVar c; BVar b; BVar a ]) outs in
+         let cat = BConcat (List.rev chunks) in
+         if dw mod 6 = 0 then cat
+         else BSlice { signal = cat; msb = dw - 1; lsb = 0 }
+       in
+       let driver =
+         BCombinational
+           { name = mname ^ "_drv"; sensitivity = [ BAny ]
+           ; body =
+               [ BAssign { lhs = rs1_pin; rhs = assemble rs1_outs }
+               ; BAssign { lhs = rs2_pin; rhs = assemble rs2_outs } ] }
+       in
+       let new_sigs = [ read_sig rs1_pin; read_sig rs2_pin ] @ rs1_sigs @ rs2_sigs in
+       let rewrite_body body =
+         List.map (rewrite_reads_s_per_addr mname addr_to_pin ~fallback:rs1_pin)
+           (strip_mem_writes mname body)
+       in
+       let processes' =
+         List.mapi (fun i p ->
+           let do_strip = i = w_idx || i = r_idx in
+           match p with
+           | BSequential s ->
+             BSequential
+               { s with body =
+                   (if do_strip then rewrite_body s.body
+                    else List.map (rewrite_reads_s_per_addr mname addr_to_pin
+                                     ~fallback:rs1_pin) s.body) }
+           | BCombinational c ->
+             BCombinational
+               { c with body =
+                   (if do_strip then rewrite_body c.body
+                    else List.map (rewrite_reads_s_per_addr mname addr_to_pin
+                                     ~fallback:rs1_pin) c.body) })
+           m.processes
+       in
+       let instances' =
+         List.map (fun (i : binstance) ->
+           { i with port_connections =
+               List.map (fun (p, e) ->
+                 (p, rewrite_reads_e_per_addr mname addr_to_pin ~fallback:rs1_pin e))
+                 i.port_connections })
+           m.instances
+       in
+       let funcs' =
+         List.map (fun (f : bfunc) ->
+           { f with body = List.map (rewrite_reads_s_per_addr mname addr_to_pin
+                                       ~fallback:rs1_pin) f.body })
+           m.funcs
+       in
+       let signals' =
+         List.filter (fun (s : bsignal) -> s.name <> mname) m.signals @ new_sigs
+       in
+       let m' =
+         { m with
+           signals = signals'
+         ; processes = processes' @ [ driver ]
+         ; instances = rs1_insts @ rs2_insts @ instances'
+         ; funcs = funcs'
+         ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
+       in
+       Printf.eprintf
+         "[memlower] %s.%s: FPGA 1W+2R async-read → %d × RAM32M (SDP, %d per copy × 2 copies, depth=%d, width=%d)\n"
+         m.name mname (2 * n_per_copy) n_per_copy mm.depth dw;
+       `Lowered (m', None))
+
 (* ──────────── per-memory lowering ──────────── *)
 
 (* Try to lower a single bmem. Returns either:
@@ -464,12 +743,190 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
            `Lowered (m', None))
   end
   else if mm.kind <> BRam then `Skipped  (* non-FPGA ROM: deferred to phase 4 *)
+  (* async-read fork.  OpenRAM's behavioural model is sync-only (1-cycle
+     read latency), so an async-read source can't drop into OpenRAM
+     without changing semantics.  Three branches:
+       - FPGA  → distributed RAM (LUTRAM, native async on Xilinx).
+                 Current implementation: bit-blast fallback (functional,
+                 just larger than DRAM); RAM32M/RAM32X1D primitive
+                 emission is TODO once we settle on the address-port
+                 count (picorv32 cpuregs needs 2-read+1-write).
+       - ASIC + MEMLOWER_ASYNC_OK=1 → fall through to OpenRAM mapping,
+                 accepting the 1-cycle read latency change.
+       - default (ASIC, async_ok=0) → keep bit-blast (FFs+muxes). *)
+  else if not mm.read_is_sync && fpga then begin
+    (* FPGA async-read → distributed RAM (LUTRAM).
+       Implemented variants:
+         - RAM*X1S    : depth ≤ 256, 1W + 1R single-port (read addr = write addr)
+         - RAM32M     : depth ≤  32, 1W + 2R quad-port (picorv32 cpuregs)
+       For *X1S: one instance per data bit, INIT[b] sliced from init_values.
+       For RAM32M: ceil(width/2) instances in quad-port mode — port A holds
+       the rs1 view, B holds rs2, D drives writes; ADDR* mux toggles the
+       3 ports between write-broadcast (WE=1) and per-port read (WE=0). *)
+    if mm.n_write_ports = 1 && mm.n_read_ports = 2 && mm.depth <= 32 then
+      ram32m_lower_dual_port ~m ~mm ~mname ~skip
+    else if mm.n_write_ports <> 1 || mm.n_read_ports <> 1 then
+      skip (Printf.sprintf
+              "FPGA async-read needs 1W+1R or 1W+2R; got %dW+%dR (depth %d)"
+              mm.n_write_ports mm.n_read_ports mm.depth)
+    else if mm.depth > 256 then
+      skip (Printf.sprintf "FPGA async-read depth %d > 256 (deeper LUTRAM tiling TODO)" mm.depth)
+    else begin
+      let writer = find_writing_process mname m.processes in
+      let reader = find_reading_process mname m.processes in
+      match writer, reader with
+      | None, _ -> skip "no writing process"
+      | _, None -> skip "no reading process"
+      | Some w_idx, Some r_idx ->
+        let w_proc = List.nth m.processes w_idx in
+        let r_proc = List.nth m.processes r_idx in
+        let w_body = match w_proc with
+          | BSequential s -> s.body | _ -> [] in
+        let r_body = match r_proc with
+          | BSequential s -> s.body
+          | BCombinational c -> c.body in
+        let w_sites = collect_write_sites mname w_body in
+        let r_sites = collect_read_sites  mname r_body in
+        (match fold_write_sites w_sites, fold_read_sites r_sites with
+         | None, _ -> skip "no write sites collected"
+         | _, None -> skip "no read sites collected"
+         | Some (we_expr, w_addr, w_data), Some r_addr ->
+           let prim, prim_depth, addr_w =
+             if      mm.depth <=  32 then "RAM32X1S",  32, 5
+             else if mm.depth <=  64 then "RAM64X1S",  64, 6
+             else if mm.depth <= 128 then "RAM128X1S", 128, 7
+             else                         "RAM256X1S", 256, 8
+           in
+           let dw = mm.data_width in
+           let orig_clk = match w_proc with BSequential s -> s.clock | _ -> "clk" in
+           let read_pin = mname ^ "_dout" in
+           let read_sig =
+             { name = read_pin
+             ; stype = BInt { width = dw; signed = Unsigned }
+             ; direction = `Internal
+             ; initial_value = None
+             ; attrs = [] }
+           in
+           let rw_e = rewrite_reads_e mname read_pin in
+           let we_expr = rw_e we_expr in
+           let w_addr  = rw_e w_addr in
+           let w_data  = rw_e w_data in
+           let r_addr  = rw_e r_addr in
+           (* Single-port: same address pin services read and write.
+              When the bit-blast source had distinct read/write addresses
+              they should already collapse here (cpuregs has separate addrs
+              and would fail the 1R check above). *)
+           ignore r_addr;
+           let pad_to_addr_w e =
+             (* Pad/truncate the BIR address expression to addr_w bits.
+                bexpr widths are implicit in the suite, so we just feed it
+                in via a BConcat with zero-extension where needed. *)
+             let zext_const = BConst { value = 0; width = max 1 (addr_w - bits_needed mm.depth) } in
+             if bits_needed mm.depth >= addr_w then e
+             else BConcat [ zext_const; e ]
+           in
+           let a_expr = pad_to_addr_w w_addr in
+           (* Per-bit INIT: bit i of init[addr] -> position addr of INIT[i].
+              yosys-JSON expects MSB-first binary string, so address 0 is
+              at the rightmost (LSB) position. *)
+           let init_for_bit b =
+             let buf = Bytes.make prim_depth '0' in
+             List.iteri (fun addr v ->
+               if addr < prim_depth then
+                 let bit = if (v lsr b) land 1 = 1 then '1' else '0' in
+                 Bytes.set buf (prim_depth - 1 - addr) bit)
+               mm.init_values;
+             Bytes.to_string buf
+           in
+           let per_bit_outs =
+             List.init dw (fun b -> Printf.sprintf "%s_o_%d" mname b)
+           in
+           let new_sigs = read_sig ::
+             List.map (fun nm ->
+               { name = nm; stype = BInt { width = 1; signed = Unsigned }
+               ; direction = `Internal; initial_value = None; attrs = [] })
+               per_bit_outs
+           in
+           let instances = List.mapi (fun b out_name ->
+             { inst_name    = Printf.sprintf "%s_b%d" mname b
+             ; module_name  = prim
+             ; param_values = []
+             ; param_strs   =
+                 (* plain binary digits, no `%d'b` prefix — see RAM32M note *)
+                 [ ("INIT", init_for_bit b) ]
+             ; port_connections =
+                 [ ("D",    BSlice { signal = w_data; msb = b; lsb = b })
+                 ; ("A",    a_expr)
+                 ; ("WE",   we_expr)
+                 ; ("WCLK", BVar orig_clk)
+                 ; ("O",    BVar out_name) ]
+             }) per_bit_outs
+           in
+           (* Driver concat: read_pin <= {o_(dw-1), ..., o_1, o_0}.       *)
+           let driver_stmts =
+             [ BAssign
+                 { lhs = read_pin
+                 ; rhs = BConcat (List.rev_map (fun n -> BVar n) per_bit_outs) } ]
+           in
+           let driver =
+             BCombinational
+               { name = mname ^ "_drv"; sensitivity = [ BAny ]
+               ; body = driver_stmts }
+           in
+           let rewrite_body body =
+             List.map (rewrite_reads_s mname read_pin) (strip_mem_writes mname body)
+           in
+           let processes' =
+             List.mapi (fun i p ->
+               let do_strip = i = w_idx || i = r_idx in
+               match p with
+               | BSequential s ->
+                 BSequential
+                   { s with body =
+                       (if do_strip then rewrite_body s.body
+                        else List.map (rewrite_reads_s mname read_pin) s.body) }
+               | BCombinational c ->
+                 BCombinational
+                   { c with body =
+                       (if do_strip then rewrite_body c.body
+                        else List.map (rewrite_reads_s mname read_pin) c.body) })
+               m.processes
+           in
+           let instances' =
+             List.map (fun (i : binstance) ->
+               { i with port_connections =
+                   List.map (fun (p, e) -> (p, rewrite_reads_e mname read_pin e))
+                     i.port_connections })
+               m.instances
+           in
+           let funcs' =
+             List.map (fun (f : bfunc) ->
+               { f with body = List.map (rewrite_reads_s mname read_pin) f.body })
+               m.funcs
+           in
+           let signals' =
+             List.filter (fun (s : bsignal) -> s.name <> mname) m.signals @ new_sigs
+           in
+           let m' =
+             { m with
+               signals = signals'
+             ; processes = processes' @ [ driver ]
+             ; instances = instances @ instances'
+             ; funcs = funcs'
+             ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
+           in
+           Printf.eprintf
+             "[memlower] %s.%s: FPGA async-read → %d × %s (depth=%d, width=%d)\n"
+             m.name mname dw prim mm.depth dw;
+           `Lowered (m', None))
+    end
+  end
   else if not mm.read_is_sync && not async_ok then begin
     Printf.eprintf
-      "[memlower] %s.%s: async read — keeping bit-blast.  This memory is read \
-       combinationally (e.g. `assign x = mem[idx]`); OpenRAM's behavioural \
-       model is sync-only and would add 1 cycle of read latency vs source.  \
-       Set MEMLOWER_ASYNC_OK=1 to map anyway and accept the timing change.\n"
+      "[memlower] %s.%s: ASIC async-read — keeping bit-blast.  OpenRAM's \
+       behavioural model is sync-only and would add 1 cycle of read \
+       latency vs source.  Set MEMLOWER_ASYNC_OK=1 to map anyway and \
+       accept the timing change.\n"
       m.name mname;
     `Skipped
   end

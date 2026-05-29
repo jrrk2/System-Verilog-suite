@@ -41,6 +41,19 @@ type edif_data = {
 }
 
 (* Read entire EDIF file *)
+
+(* Safe slice that clamps to string bounds rather than raising
+   Invalid_argument. Returns "" if start exceeds length. Used by the
+   find_close-based section extractors below; a malformed (or simply
+   foreign-dialect) EDIF whose paren depth doesn't balance would
+   otherwise crash via String.sub. *)
+let safe_sub content start length =
+  let cap = String.length content in
+  if start >= cap then ""
+  else
+    let length = min length (cap - start) in
+    if length <= 0 then "" else String.sub content start length
+
 let read_file filename =
   let ic = open_in filename in
   let buf = Buffer.create (1024 * 1024) in
@@ -96,7 +109,7 @@ let parse_ports content =
   let ports = ref [] in
   let rec find_port pos =
     try
-      let port_start = Str.search_forward (Str.regexp "(port ") content pos in
+      let port_start = Str.search_forward (Str.regexp_case_fold "(port ") content pos in
       (* Find matching closing paren *)
       let rec find_close p depth =
         if p >= String.length content then p
@@ -106,7 +119,7 @@ let parse_ports content =
           | _ -> find_close (p + 1) depth
       in
       let port_end = find_close (port_start + 1) 1 in
-      let port_text = String.sub content port_start (port_end - port_start + 1) in
+      let port_text = safe_sub content port_start (port_end - port_start + 1) in
 
       (* Parse port - three cases:
          1. Array with rename: (port (array (rename NAME "NAME[H:L]") SIZE) (direction DIR))
@@ -114,18 +127,18 @@ let parse_ports content =
          3. Simple port: (port NAME (direction DIR))
       *)
       let is_array = String.contains port_text '(' &&
-                     Str.string_match (Str.regexp ".*array.*rename") port_text 0 in
+                     Str.string_match (Str.regexp_case_fold ".*array.*rename") port_text 0 in
       let is_renamed = String.contains port_text '(' &&
-                       Str.string_match (Str.regexp ".*port +(rename") port_text 0 in
+                       Str.string_match (Str.regexp_case_fold ".*port[ \t\n\r]+(rename") port_text 0 in
 
       if is_array then begin
         (* Array port: (port (array (rename NAME "NAME[H:L]") SIZE) (direction DIR)) *)
         try
-          let _ = Str.search_forward (Str.regexp "rename +\\([^ ]+\\) +\"\\([^\"]+\\)\"") port_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "rename[ \t\n\r]+\\([^ ]+\\)[ \t\n\r]+\"\\([^\"]+\\)\"") port_text 0 in
           let name = Str.matched_group 1 port_text in
           let array_str = Str.matched_group 2 port_text in
           let (base, width) = parse_array_name array_str in
-          let _ = Str.search_forward (Str.regexp "direction +\\(INPUT\\|OUTPUT\\|INOUT\\)") port_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "direction[ \t\n\r]+\\(INPUT\\|OUTPUT\\|INOUT\\)") port_text 0 in
           let dir_str = Str.matched_group 1 port_text in
           let direction = match dir_str with
             | "INPUT" -> Input
@@ -137,12 +150,12 @@ let parse_ports content =
       end else if is_renamed then begin
         (* Simple renamed port: (port (rename NAME "NAME[N]") (direction DIR)) *)
         try
-          let _ = Str.search_forward (Str.regexp "rename +\\([^ ]+\\) +\"\\([^\"]+\\)\"") port_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "rename[ \t\n\r]+\\([^ ]+\\)[ \t\n\r]+\"\\([^\"]+\\)\"") port_text 0 in
           let orig_name = Str.matched_group 1 port_text in
           let renamed_str = Str.matched_group 2 port_text in
           (* Extract base name from renamed string (e.g., "I0[0]" -> "I0") *)
           let (base, _) = parse_array_name renamed_str in
-          let _ = Str.search_forward (Str.regexp "direction +\\(INPUT\\|OUTPUT\\|INOUT\\)") port_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "direction[ \t\n\r]+\\(INPUT\\|OUTPUT\\|INOUT\\)") port_text 0 in
           let dir_str = Str.matched_group 1 port_text in
           let direction = match dir_str with
             | "INPUT" -> Input
@@ -155,9 +168,9 @@ let parse_ports content =
       end else begin
         (* Simple port: (port NAME (direction DIR)) *)
         try
-          let _ = Str.search_forward (Str.regexp "port +\\([^ (]+\\)") port_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "port[ \t\n\r]+\\([^ (]+\\)") port_text 0 in
           let name = Str.matched_group 1 port_text in
-          let _ = Str.search_forward (Str.regexp "direction +\\(INPUT\\|OUTPUT\\|INOUT\\)") port_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "direction[ \t\n\r]+\\(INPUT\\|OUTPUT\\|INOUT\\)") port_text 0 in
           let dir_str = Str.matched_group 1 port_text in
           let direction = match dir_str with
             | "INPUT" -> Input
@@ -179,7 +192,7 @@ let parse_instances content =
   let instances = ref [] in
   let rec find_instance pos =
     try
-      let inst_start = Str.search_forward (Str.regexp "(instance ") content pos in
+      let inst_start = Str.search_forward (Str.regexp_case_fold "(instance ") content pos in
 
       (* Find cellref and libraryref *)
       let rec find_close p depth =
@@ -190,18 +203,18 @@ let parse_instances content =
           | _ -> find_close (p + 1) depth
       in
       let inst_end = find_close (inst_start + 1) 1 in
-      let inst_text = String.sub content inst_start (inst_end - inst_start + 1) in
+      let inst_text = safe_sub content inst_start (inst_end - inst_start + 1) in
 
       (* Extract instance name - handle both simple and rename formats *)
       let inst_name =
         try
           (* Try renamed format: (instance (rename old "new") ...) *)
-          let _ = Str.search_forward (Str.regexp "rename +\\([^ ]+\\) +\"\\([^\"]+\\)\"") inst_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "rename[ \t\n\r]+\\([^ ]+\\)[ \t\n\r]+\"\\([^\"]+\\)\"") inst_text 0 in
           Str.matched_group 1 inst_text  (* Use original name *)
         with Not_found ->
           try
             (* Try simple format: (instance name ...) *)
-            let _ = Str.search_forward (Str.regexp "instance +\\([^ (]+\\)") inst_text 0 in
+            let _ = Str.search_forward (Str.regexp_case_fold "instance[ \t\n\r]+\\([^ (]+\\)") inst_text 0 in
             Str.matched_group 1 inst_text
           with _ -> ""
       in
@@ -209,9 +222,9 @@ let parse_instances content =
       (* Extract cellref and libraryref *)
       if inst_name <> "" then
         (try
-          let _ = Str.search_forward (Str.regexp "cellref +\\([^ )]+\\)") inst_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "cellref[ \t\n\r]+\\([^ )]+\\)") inst_text 0 in
           let cell_type = Str.matched_group 1 inst_text in
-          let _ = Str.search_forward (Str.regexp "libraryref +\\([^ )]+\\)") inst_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "libraryref[ \t\n\r]+\\([^ )]+\\)") inst_text 0 in
           let library = Str.matched_group 1 inst_text in
           (* Optional (property INIT (string "...")) — truth table for LUTs,
              reset state for FFs.  Vivado puts at most one INIT per inst. *)
@@ -238,7 +251,7 @@ let parse_nets content =
   let nets = ref [] in
   let rec find_net pos =
     try
-      let net_start = Str.search_forward (Str.regexp "(net ") content pos in
+      let net_start = Str.search_forward (Str.regexp_case_fold "(net ") content pos in
       let rec find_close p depth =
         if p >= String.length content then p
         else match content.[p] with
@@ -247,18 +260,18 @@ let parse_nets content =
           | _ -> find_close (p + 1) depth
       in
       let net_end = find_close (net_start + 1) 1 in
-      let net_text = String.sub content net_start (net_end - net_start + 1) in
+      let net_text = safe_sub content net_start (net_end - net_start + 1) in
 
       (* Extract net name (may have rename) *)
       let (name, original) =
         try
-          let _ = Str.search_forward (Str.regexp "rename +\\([^ ]+\\) +\"\\([^\"]+\\)\"") net_text 0 in
+          let _ = Str.search_forward (Str.regexp_case_fold "rename[ \t\n\r]+\\([^ ]+\\)[ \t\n\r]+\"\\([^\"]+\\)\"") net_text 0 in
           let orig = Str.matched_group 1 net_text in
           let renamed = Str.matched_group 2 net_text in
           (renamed, orig)
         with _ ->
           try
-            let _ = Str.search_forward (Str.regexp "net +\\([^ )]+\\)") net_text 0 in
+            let _ = Str.search_forward (Str.regexp_case_fold "net[ \t\n\r]+\\([^ )]+\\)") net_text 0 in
             let n = Str.matched_group 1 net_text in
             (n, n)
           with _ -> ("", "")
@@ -269,20 +282,30 @@ let parse_nets content =
         let connections = ref [] in
         let rec find_portref p =
           try
-            let pr_start = Str.search_forward (Str.regexp "(portref ") net_text p in
-            let pr_end = String.index_from net_text pr_start ')' in
-            let pr_text = String.sub net_text pr_start (pr_end - pr_start + 1) in
+            let pr_start = Str.search_forward (Str.regexp_case_fold "(portref ") net_text p in
+            (* `(portref (member S 0) (instanceref X))` has a nested paren
+               group, so we can't just take the first `)`.  Walk with a
+               depth counter to find the matching close. *)
+            let rec find_close pos depth =
+              if pos >= String.length net_text then pos
+              else match net_text.[pos] with
+                | '(' -> find_close (pos + 1) (depth + 1)
+                | ')' -> if depth = 1 then pos else find_close (pos + 1) (depth - 1)
+                | _   -> find_close (pos + 1) depth
+            in
+            let pr_end = find_close (pr_start + 1) 1 in
+            let pr_text = safe_sub net_text pr_start (pr_end - pr_start + 1) in
 
             (* Check for member (array index) *)
             let (pin, idx) =
               try
-                let _ = Str.search_forward (Str.regexp "member +\\([^ )]+\\) +\\([0-9]+\\)") pr_text 0 in
+                let _ = Str.search_forward (Str.regexp_case_fold "member[ \t\n\r]+\\([^ )]+\\)[ \t\n\r]+\\([0-9]+\\)") pr_text 0 in
                 let p = Str.matched_group 1 pr_text in
                 let i = int_of_string (Str.matched_group 2 pr_text) in
                 (p, Some i)
               with _ ->
                 try
-                  let _ = Str.search_forward (Str.regexp "portref +\\([^ )]+\\)") pr_text 0 in
+                  let _ = Str.search_forward (Str.regexp_case_fold "portref[ \t\n\r]+\\([^ )]+\\)") pr_text 0 in
                   (Str.matched_group 1 pr_text, None)
                 with _ -> ("", None)
             in
@@ -290,7 +313,7 @@ let parse_nets content =
             (* Check for instanceref *)
             let inst =
               try
-                let _ = Str.search_forward (Str.regexp "instanceref +\\([^ )]+\\)") pr_text 0 in
+                let _ = Str.search_forward (Str.regexp_case_fold "instanceref[ \t\n\r]+\\([^ )]+\\)") pr_text 0 in
                 Some (Str.matched_group 1 pr_text)
               with _ -> None
             in
@@ -316,7 +339,7 @@ let parse_library_cells content =
   let cells = Hashtbl.create 256 in
   let rec find_cell pos =
     try
-      let cell_start = Str.search_forward (Str.regexp "(cell +\\([^ ]+\\) +(celltype +GENERIC)") content pos in
+      let cell_start = Str.search_forward (Str.regexp_case_fold "(cell[ \t\n\r]+\\([^ ]+\\)[ \t\n\r]+(celltype[ \t\n\r]+GENERIC)") content pos in
       let cell_name = Str.matched_group 1 content in
 
       (* Find matching closing paren *)
@@ -328,11 +351,11 @@ let parse_library_cells content =
           | _ -> find_close (p + 1) depth
       in
       let cell_end = find_close (cell_start + 1) 1 in
-      let cell_text = String.sub content cell_start (cell_end - cell_start + 1) in
+      let cell_text = safe_sub content cell_start (cell_end - cell_start + 1) in
 
       (* Check if this is a primitive cell (no contents) or netlist cell (has contents) *)
       let has_contents = try
-        let _ = Str.search_forward (Str.regexp "(contents") cell_text 0 in
+        let _ = Str.search_forward (Str.regexp_case_fold "(contents") cell_text 0 in
         true
       with Not_found -> false in
 
@@ -367,7 +390,7 @@ let parse_all_netlist_cells content =
   let cells = ref [] in
   let rec find_cell pos =
     try
-      let cell_start = Str.search_forward (Str.regexp "(cell +\\([^ ]+\\) +(celltype +GENERIC)") content pos in
+      let cell_start = Str.search_forward (Str.regexp_case_fold "(cell[ \t\n\r]+\\([^ ]+\\)[ \t\n\r]+(celltype[ \t\n\r]+GENERIC)") content pos in
       let cell_name = Str.matched_group 1 content in
 
       (* Find matching closing paren *)
@@ -379,20 +402,29 @@ let parse_all_netlist_cells content =
           | _ -> find_close (p + 1) depth
       in
       let cell_end = find_close (cell_start + 1) 1 in
-      let cell_text = String.sub content cell_start (cell_end - cell_start + 1) in
+      (* Clamp to string bounds in case find_close walked off the end
+         (malformed input or a regex match that wasn't really a cell). *)
+      let cell_end = min cell_end (String.length content - 1) in
+      if cell_end <= cell_start then
+        failwith (Printf.sprintf
+          "edif_parser: find_close walked off end of '(cell %s …)' \
+           starting at %d (no matching close paren)" cell_name cell_start)
+      else begin
+        let cell_text = safe_sub content cell_start (cell_end - cell_start + 1) in
 
-      (* Check if this cell has a contents section (netlist cell) *)
-      let has_contents = try
-        let _ = Str.search_forward (Str.regexp "(contents") cell_text 0 in
-        true
-      with Not_found -> false in
+        (* Check if this cell has a contents section (netlist cell) *)
+        let has_contents = try
+          let _ = Str.search_forward (Str.regexp_case_fold "(contents") cell_text 0 in
+          true
+        with Not_found -> false in
 
-      if has_contents then begin
-        let cell_data = parse_cell cell_name cell_text in
-        cells := cell_data :: !cells
-      end;
+        if has_contents then begin
+          let cell_data = parse_cell cell_name cell_text in
+          cells := cell_data :: !cells
+        end;
 
-      find_cell (cell_end + 1)
+        find_cell (cell_end + 1)
+      end
     with Not_found -> ()
   in
   find_cell 0;
@@ -404,7 +436,7 @@ let parse_schematic filename =
   (* Find main module name from top-level edif declaration *)
   let module_name =
     try
-      let _ = Str.search_forward (Str.regexp "(edif +\\([^ \n]+\\)") content 0 in
+      let _ = Str.search_forward (Str.regexp_case_fold "(edif[ \t\n\r]+\\([^ \n]+\\)") content 0 in
       Str.matched_group 1 content
     with _ -> "top"
   in
@@ -415,7 +447,7 @@ let parse_schematic filename =
   (* Find the main cell definition (cell with module_name in work library) *)
   let cell_start =
     try
-      Str.search_forward (Str.regexp (Printf.sprintf "(cell +%s +(celltype +GENERIC)" module_name)) content 0
+      Str.search_forward (Str.regexp_case_fold (Printf.sprintf "(cell +%s +(celltype +GENERIC)" module_name)) content 0
     with Not_found -> 0
   in
 
@@ -428,7 +460,7 @@ let parse_schematic filename =
       | _ -> find_cell_end (pos + 1) depth
   in
   let cell_end = find_cell_end cell_start 0 in
-  let cell_content = String.sub content cell_start (cell_end - cell_start + 1) in
+  let cell_content = safe_sub content cell_start (cell_end - cell_start + 1) in
 
   (* Extract interface section from main cell only *)
   let ports = parse_ports cell_content in

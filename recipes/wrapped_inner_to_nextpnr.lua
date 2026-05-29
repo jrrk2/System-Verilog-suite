@@ -21,8 +21,11 @@ print("recipe: wrapped_inner_to_nextpnr")
 print("  TOP="    .. TOP    .. "  CHILD=" .. CHILD)
 print("  OUTDIR=" .. OUTDIR)
 
--- 1. Parse the whole design with Verible.
-prog = svd.parse("verible", TOP, FILES)
+-- 1. Parse the whole design with Verible-ext so user-instantiated
+--    primitive cells (IBUFDS_GTE2, BUFG, IBUF, OBUF, …) in the wrapper
+--    are retained as binstances rather than being silently dropped
+--    as "unresolved module references" (the historic miter default).
+prog = svd.parse("verible-ext", TOP, FILES)
 print("  parsed: " .. svd.module_names(prog))
 
 -- 2. Run the generic behavioural pipeline on a child-only program.

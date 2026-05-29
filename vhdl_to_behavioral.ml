@@ -1481,6 +1481,76 @@ let convert_vhdl_files_to_behavioral filenames =
     Vhd_front.VhdlSettings.settings := old_settings;
     None
 
+(* ====================================================================== *)
+(* Xilinx unisim primitive-port lookup                                    *)
+(*                                                                        *)
+(* Task #36: when SV parsing leaves cell-types unresolved (IBUFDS,        *)
+(* BUFG, CARRY4, …), reuse the existing VHDL frontend on Vivado's        *)
+(* per-primitive `.vhd` files to produce port-direction / width meta     *)
+(* in the bprogram.library_cells field.  No new parser — just            *)
+(* orchestration over convert_vhdl_files_to_behavioral above.            *)
+(* ====================================================================== *)
+
+let xil_unisims_dir =
+  try Sys.getenv "XIL_UNISIMS_VHD_DIR"
+  with Not_found ->
+    "/opt/Xilinx/Vivado/2020.1/data/vhdl/src/unisims/primitive"
+
+let xil_primitive_cache :
+    (string, Behavioral_ir.library_port list) Hashtbl.t =
+  Hashtbl.create 256
+let xil_primitive_missing : (string, unit) Hashtbl.t = Hashtbl.create 64
+
+let bmodule_to_library_ports (m : Behavioral_ir.bmodule) :
+    Behavioral_ir.library_port list =
+  List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+    match s.direction with
+    | `Internal -> None
+    | (`Input | `Output) as d ->
+        let width = match s.stype with
+          | Behavioral_ir.BInt { width; _ } -> width
+          | _ -> 1 in
+        Some { Behavioral_ir.port_name = s.name;
+               port_direction = d;
+               port_width = width })
+    m.signals
+
+(* Look up port metadata for a list of cell-type names by parsing
+ * Vivado's per-primitive `<NAME>.vhd` files through this same VHDL
+ * frontend.  Returns one (name, port-list) pair per name that
+ * resolved; silently skips names with no matching VHD file (the
+ * caller decides whether an unresolved name is fatal — for the
+ * Verible hook it isn't, since the user may have a non-Xilinx
+ * primitive name).  Memoised across calls. *)
+let lookup_xil_primitive_ports names :
+    (string * Behavioral_ir.library_port list) list =
+  let dedup = List.sort_uniq compare names in
+  let need = List.filter (fun n ->
+    not (Hashtbl.mem xil_primitive_cache n
+         || Hashtbl.mem xil_primitive_missing n)) dedup in
+  let to_parse = List.filter_map (fun n ->
+    let p = Filename.concat xil_unisims_dir (n ^ ".vhd") in
+    if Sys.file_exists p then Some (n, p)
+    else (Hashtbl.add xil_primitive_missing n (); None)) need in
+  if to_parse <> [] then begin
+    let paths = List.map snd to_parse in
+    (match convert_vhdl_files_to_behavioral paths with
+     | Some p ->
+         List.iter (fun (m : Behavioral_ir.bmodule) ->
+           Hashtbl.replace xil_primitive_cache m.name
+             (bmodule_to_library_ports m)) p.modules;
+         List.iter (fun (n, _) ->
+           if not (Hashtbl.mem xil_primitive_cache n)
+           then Hashtbl.add xil_primitive_missing n ()) to_parse
+     | None ->
+         List.iter (fun (n, _) ->
+           Hashtbl.add xil_primitive_missing n ()) to_parse)
+  end;
+  List.filter_map (fun n ->
+    match Hashtbl.find_opt xil_primitive_cache n with
+    | Some ports -> Some (n, ports)
+    | None -> None) dedup
+
 (* Helper: Convert a single VHDL file to behavioral IR *)
 let convert_vhdl_file_to_behavioral filename =
   convert_vhdl_files_to_behavioral [filename]

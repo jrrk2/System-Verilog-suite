@@ -33,13 +33,30 @@ type ctx = {
   next_id     : int ref;
   ids         : (net_key, int) Hashtbl.t;
   net_names   : (string, int list) Hashtbl.t;     (* base -> bit ids, in bit-order *)
+  widths      : (string, int) Hashtbl.t;          (* signal-name -> declared width *)
 }
 
 let mk_ctx () = {
   next_id   = ref 2;
   ids       = Hashtbl.create 4096;
   net_names = Hashtbl.create 1024;
+  widths    = Hashtbl.create 1024;
 }
+
+(* Populate the widths table from the bmodule's signal declarations.
+ * Lets bits_of_conn expand a bare `BVar name` reference into its full
+ * vector of bits when name is a multi-bit signal — without this,
+ * CARRY4.S = BVar "_671" expanded to a single bit instead of four,
+ * which left nextpnr-xilinx's carry packer accessing past-the-end of
+ * the bit list and segfaulting. *)
+let populate_widths ctx (m : bmodule) =
+  List.iter (fun (s : bsignal) ->
+    let w = match s.stype with
+      | BInt { width; _ } -> width
+      | BBool             -> 1
+      | _                 -> 1 in
+    Hashtbl.replace ctx.widths s.name w
+  ) m.signals
 
 let alloc ctx (key : net_key) : int =
   match Hashtbl.find_opt ctx.ids key with
@@ -67,6 +84,13 @@ let rec resolve_bit_ref (e : bexpr) : (string * int option) option =
    pins -> 1-element list; CARRY4 S[3:0] -> 4-element list (LSB first). *)
 let rec bits_of_conn ctx (e : bexpr) : bit list =
   match e with
+  | BConst { value; width } ->
+      (* Verilog literal on an instance pin (e.g. `.CEB(1'b0)` on
+         IBUFDS_GTE2).  Emit one `C "0"` / `C "1"` per bit, LSB first. *)
+      let rec range i = if i >= width then [] else
+        let b = (value lsr i) land 1 in
+        C (if b = 1 then "1" else "0") :: range (i + 1) in
+      range 0
   | BConcat es ->
       (* BIR's BConcat is MSB-first by convention; reverse to get the
          LSB-first order yosys-JSON `bits` lists use. *)
@@ -86,14 +110,20 @@ let rec bits_of_conn ctx (e : bexpr) : bit list =
         | None -> I (alloc ctx { base; bit = i })
       ) (range lsb msb)
   | _ ->
-      [(match resolve_bit_ref e with
+      (match resolve_bit_ref e with
         | Some (nm, _) when const_of_name nm <> None ->
-            C (match const_of_name nm with Some s -> s | None -> assert false)
-        | Some (nm, Some bit) -> I (alloc ctx { base = nm; bit })
-        | Some (nm, None    ) -> I (alloc ctx { base = nm; bit = 0 })
+            [C (match const_of_name nm with Some s -> s | None -> assert false)]
+        | Some (nm, Some bit) -> [I (alloc ctx { base = nm; bit })]
+        | Some (nm, None    ) ->
+            (* Bare `BVar nm` reference — expand to nm's declared
+             * width if known, else fall back to one bit.  Multi-bit
+             * expansion is essential for CARRY4 inputs like .S(_671)
+             * where _671 is a 4-bit wire. *)
+            let w = try Hashtbl.find ctx.widths nm with Not_found -> 1 in
+            List.init w (fun i -> I (alloc ctx { base = nm; bit = i }))
         | None ->
             failwith ("bir_to_nextpnr_json: unsupported pin expression: "
-                      ^ Behavioral_ir.string_of_bexpr e))]
+                      ^ Behavioral_ir.string_of_bexpr e))
 
 (* Convert a Verilog literal like "64'h12AB" / "1'b0" / "2'h1" to the
    raw binary string yosys-JSON expects (MSB-first, length = stated width).
@@ -155,10 +185,64 @@ let verilog_lit_to_binary (s : string) : string =
           (* pad on the LEFT with zeros to reach the width                *)
           String.make (width - n) '0' ^ bits
 
-(* port_direction lookup table built from bprogram.library_cells. *)
+(* Hard-coded port directions for Xilinx 7-series primitives the recipes
+ * commonly encounter — used as a fallback when library_cells doesn't
+ * supply them (Verible doesn't always know about vendor primitives).
+ * Without this, nextpnr-xilinx asserts during pack with
+ *   old.type == rep.type
+ * because every port defaulted to PORT_IN — the output ports of CARRY4,
+ * BUFG, IBUFDS, etc. then mismatch nextpnr's silicon-truth.
+ *
+ * Keep this list ordered to match the prjxray/openXC7 primitive set.
+ * For composite cells (CARRY4) the output ports come first below for
+ * grep-ability. *)
+let xil_primitive_ports : (string * (string * [`Input|`Output]) list) list = [
+  "LUT1",    [ "O", `Output; "I0", `Input ];
+  "LUT2",    [ "O", `Output; "I0", `Input; "I1", `Input ];
+  "LUT3",    [ "O", `Output; "I0", `Input; "I1", `Input; "I2", `Input ];
+  "LUT4",    [ "O", `Output; "I0", `Input; "I1", `Input; "I2", `Input; "I3", `Input ];
+  "LUT5",    [ "O", `Output; "I0", `Input; "I1", `Input; "I2", `Input; "I3", `Input; "I4", `Input ];
+  "LUT6",    [ "O", `Output; "I0", `Input; "I1", `Input; "I2", `Input; "I3", `Input; "I4", `Input; "I5", `Input ];
+  "FDRE",    [ "Q", `Output; "C", `Input; "CE", `Input; "D", `Input; "R", `Input ];
+  "FDCE",    [ "Q", `Output; "C", `Input; "CE", `Input; "D", `Input; "CLR", `Input ];
+  "FDPE",    [ "Q", `Output; "C", `Input; "CE", `Input; "D", `Input; "PRE", `Input ];
+  "FDSE",    [ "Q", `Output; "C", `Input; "CE", `Input; "D", `Input; "S", `Input ];
+  "CARRY4",  [ "CO", `Output; "O", `Output;
+               "CYINIT", `Input; "CI", `Input; "DI", `Input; "S", `Input ];
+  "MUXF7",   [ "O", `Output; "I0", `Input; "I1", `Input; "S", `Input ];
+  "MUXF8",   [ "O", `Output; "I0", `Input; "I1", `Input; "S", `Input ];
+  "BUFG",    [ "O", `Output; "I", `Input ];
+  "BUFGCTRL",[ "O", `Output; "I0", `Input; "I1", `Input; "S0", `Input;
+               "S1", `Input; "CE0", `Input; "CE1", `Input;
+               "IGNORE0", `Input; "IGNORE1", `Input ];
+  "BUFH",    [ "O", `Output; "I", `Input ];
+  "BUFHCE",  [ "O", `Output; "I", `Input; "CE", `Input ];
+  "BUFR",    [ "O", `Output; "I", `Input; "CE", `Input; "CLR", `Input ];
+  "BUFIO",   [ "O", `Output; "I", `Input ];
+  "IBUF",    [ "O", `Output; "I", `Input ];
+  "OBUF",    [ "O", `Output; "I", `Input ];
+  "IBUFDS",  [ "O", `Output; "I", `Input; "IB", `Input ];
+  "OBUFDS",  [ "O", `Output; "OB", `Output; "I", `Input ];
+  "IBUFDS_GTE2", [ "O", `Output; "ODIV2", `Output;
+                   "I", `Input; "IB", `Input; "CEB", `Input ];
+  "INV",     [ "O", `Output; "I", `Input ];
+  "GND",     [ "G", `Output ];
+  "VCC",     [ "P", `Output ];
+]
+
+(* port_direction lookup table built from bprogram.library_cells, plus
+ * the Xilinx primitive baseline so output ports stay output even when
+ * Verible parses the wrapper without primitive-cell port-direction
+ * information. *)
 let port_dir_table (cells : (string * library_port list) list)
     : (string * string, [`Input|`Output]) Hashtbl.t =
   let t = Hashtbl.create 256 in
+  (* Seed with Xilinx primitives first so library_cells (when present)
+   * still wins via Hashtbl.replace. *)
+  List.iter (fun (cname, ports) ->
+    List.iter (fun (port_name, dir) ->
+      Hashtbl.replace t (cname, port_name) dir) ports
+  ) xil_primitive_ports;
   List.iter (fun (cname, ports) ->
     List.iter (fun (p : library_port) ->
       Hashtbl.replace t (cname, p.port_name) p.port_direction)
@@ -176,6 +260,7 @@ let yosys_json
     ~(library_cells : (string * library_port list) list)
     (m : bmodule) : Yojson.Safe.t =
   let ctx = mk_ctx () in
+  populate_widths ctx m;
   let port_dirs = port_dir_table library_cells in
 
   (* Pre-allocate net ids for top-level ports so they are stable.

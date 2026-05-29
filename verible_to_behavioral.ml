@@ -4395,7 +4395,24 @@ let convert_files_inner ~keep_external ~top files : bprogram =
   (* Positional → named port connections, before prep_for_z3's
    * destructive flatten/ffrip/share. *)
   let bmods = name_positional_ports bmods in
-  let prog = { modules = bmods; library_cells = [] } in
+  (* Task #36: resolve any cell-type that has no user-supplied
+   * bmodule against Vivado's per-primitive VHDL stubs via the
+   * existing VHDL frontend (lookup_xil_primitive_ports).
+   * Resolved ports land in bprogram.library_cells; unresolved
+   * names are left silent here because keep_external already
+   * warned on them upstream. *)
+  let user_names =
+    List.fold_left (fun acc (m : bmodule) -> m.name :: acc) [] bmods in
+  let unresolved =
+    List.fold_left (fun acc (m : bmodule) ->
+      List.fold_left (fun acc (i : Behavioral_ir.binstance) ->
+        if List.mem i.module_name user_names
+           || List.mem i.module_name acc
+        then acc
+        else i.module_name :: acc) acc m.instances) [] bmods in
+  let lib_cells =
+    Vhdl_to_behavioral.lookup_xil_primitive_ports unresolved in
+  let prog = { modules = bmods; library_cells = lib_cells } in
   (* Stamp `(* sv_decomp_* *)` attributes from each source file's
    * pre-scan. Sv_attr_extract is a regex-based side pass that runs
    * on the raw SV text — Verible's parse-tree carries attributes in
@@ -4431,7 +4448,19 @@ let convert_files_all files : bprogram =
     let m = convert_module ~pkgs mdecl [] in
     { m with name = mdecl.m_name }
   ) mods in
-  let prog = { modules = bmods; library_cells = [] } in
+  (* Task #36 — same primitive-lookup as convert_files_inner. *)
+  let user_names =
+    List.fold_left (fun acc (m : bmodule) -> m.name :: acc) [] bmods in
+  let unresolved =
+    List.fold_left (fun acc (m : bmodule) ->
+      List.fold_left (fun acc (i : Behavioral_ir.binstance) ->
+        if List.mem i.module_name user_names
+           || List.mem i.module_name acc
+        then acc
+        else i.module_name :: acc) acc m.instances) [] bmods in
+  let lib_cells =
+    Vhdl_to_behavioral.lookup_xil_primitive_ports unresolved in
+  let prog = { modules = bmods; library_cells = lib_cells } in
   let attr_tables = List.map Sv_attr_extract.extract_file files in
   List.fold_left (fun p tbl -> Sv_attr_extract.stamp_program tbl p)
     prog attr_tables

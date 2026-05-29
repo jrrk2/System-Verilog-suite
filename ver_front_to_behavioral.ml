@@ -205,12 +205,31 @@ type cell_inst = {
 }
 and sv_node = Vparser.token
 
+(* Constructor-name probe for diagnostic output.  We only need to
+ * identify the top-level shape of an AST node to distinguish e.g.
+ * QUADRUPLE from QUINTUPLE.  Returns a short tag like "QUADRUPLE/4". *)
+let token_shape = function
+  | EMPTY -> "EMPTY"
+  | DOUBLE _ -> "DOUBLE"
+  | TRIPLE _ -> "TRIPLE"
+  | QUADRUPLE _ -> "QUADRUPLE"
+  | QUINTUPLE _ -> "QUINTUPLE"
+  | SEXTUPLE _ -> "SEXTUPLE"
+  | SEPTUPLE _ -> "SEPTUPLE"
+  | OCTUPLE _ -> "OCTUPLE"
+  | NONUPLE _ -> "NONUPLE"
+  | TLIST _ -> "TLIST"
+  | THASH _ -> "THASH"
+  | ID _ -> "ID"
+  | _ -> "?"
+
 let extract_cells body =
   let cells = ref [] in
-  let process_inst = function
+  let unrecognised = ref [] in
+  let process_inst tok = match tok with
     | QUADRUPLE (modinst_kw, ID cell_id, _params, TLIST insts) ->
         ignore modinst_kw;
-        List.iter (function
+        List.iter (fun inst -> match inst with
           | TRIPLE (ID inst_name, _scalar, TLIST pin_list) ->
               let pins = List.filter_map (function
                 | TRIPLE (cellpin_kw, ID pin_name, expr) ->
@@ -224,13 +243,31 @@ let extract_cells body =
                 inst_name = inst_name.Idhash.id;
                 pins;
               } :: !cells
-          | _ -> ()
+          | _ ->
+              unrecognised := ("inner:" ^ token_shape inst) :: !unrecognised
         ) insts
-    | _ -> ()
+    | _ ->
+        (* Track shape of any tuple-form top-level token we didn't
+         * recognise as an instance declaration. *)
+        (match tok with
+         | QUINTUPLE _ | SEXTUPLE _ | SEPTUPLE _ | OCTUPLE _ | NONUPLE _ ->
+             unrecognised := ("outer:" ^ token_shape tok) :: !unrecognised
+         | _ -> ())
   in
   (match body with
    | THASH (_, body_h) -> Hashtbl.iter (fun k _ -> process_inst k) body_h
    | _ -> ());
+  Printf.eprintf "[ver_front extract_cells] cells=%d, unrecognised=%d\n"
+    (List.length !cells) (List.length !unrecognised);
+  if !unrecognised <> [] then begin
+    let module SM = Map.Make (String) in
+    let tally = List.fold_left (fun acc s ->
+      let n = try SM.find s acc with Not_found -> 0 in
+      SM.add s (n + 1) acc) SM.empty !unrecognised in
+    SM.iter (fun shape n ->
+      Printf.eprintf "[ver_front extract_cells] dropped %d tokens of shape %s\n"
+        n shape) tally
+  end;
   List.rev !cells
 
 (* ─── Per-bit register grouping ───────────────────────────────────────── *)
@@ -685,8 +722,21 @@ let cell_type_is_primitive ct =
   || ct = "BUFG" || ct = "IBUF" || ct = "OBUF"
   || ct = "GND" || ct = "VCC"
 
+(* Preserve all cells as binstances by default — primitives (LUT/FDRE/
+ * MUXF/BUFG/IBUF/OBUF) are exactly what the round-trip recipe in
+ * recipes/wrapped_inner_to_nextpnr.lua needs to feed back into nextpnr.
+ *
+ * The historic miter use-case wanted them dropped because Z3-equivalence
+ * couldn't reason about opaque primitive bodies; that path now opts in
+ * via VFRONT_DROP_PRIMS=1, instead of being the silent default.
+ * No silent lossage: when the env var is set, we still print a one-line
+ * count to stderr so the drop is auditable. *)
 let cell_to_binstance (c : cell_inst) : Behavioral_ir.binstance option =
-  if cell_type_is_primitive c.cell_type then None
+  let drop_primitives =
+    Sys.getenv_opt "VFRONT_DROP_PRIMS" <> None
+    && cell_type_is_primitive c.cell_type
+  in
+  if drop_primitives then None
   else
     let pcs = List.map (fun (pin, expr) ->
       (pin, expr_to_bexpr expr)

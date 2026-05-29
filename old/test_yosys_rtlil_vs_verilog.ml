@@ -87,12 +87,19 @@ let () =
   Printf.printf "[2/4] RTLIL → BIR (Rtlil_to_behavioral) ...\n%!";
   let rtlil_prog = Rtlil_to_behavioral.convert_file rtlil_out in
   (try Sys.remove rtlil_out with _ -> ());
+  let rtlil_prog = Behavioral_inline.inline_program rtlil_prog in
   Printf.printf "  %d modules\n" (List.length rtlil_prog.modules);
 
-  Printf.printf "[3/4] yosys-Verilog → BIR (Verible_to_behavioral + slice merge) ...\n%!";
+  Printf.printf "[3/4] yosys-Verilog → BIR (Verible_to_behavioral + slice merge + inline) ...\n%!";
   let v_prog = Verible_to_behavioral.convert_files ~top [v_out] in
   (try Sys.remove v_out with _ -> ());
   let v_prog = Behavioral_mem_merge.merge_slice_writes_program v_prog in
+  (* yosys's write_verilog lowers parallel-case to a Verilog function
+     (e.g. `n_07_(default, {arm1,arm0}, {s1,s0})`).  Without inlining,
+     the BCall stays as a Z3 uninterpreted function and the miter
+     can't reason through it.  Behavioral_inline expands the bfunc
+     bodies into BCond ITE chains so Z3 sees the case-mux. *)
+  let v_prog = Behavioral_inline.inline_program v_prog in
   Printf.printf "  %d modules\n" (List.length v_prog.modules);
 
   let pick label src =
@@ -107,6 +114,13 @@ let () =
         exit 1 in
   let rtlil_top = pick "rtlil"   rtlil_prog.modules in
   let v_top     = pick "verible" v_prog.modules in
+
+  if Sys.getenv_opt "DUMP_BIR" <> None then begin
+    Printf.printf "── RTLIL-reader BIR ─────────────\n%s\n"
+      (Behavioral_ir.string_of_bmodule rtlil_top);
+    Printf.printf "── Verible-reader BIR ───────────\n%s\n"
+      (Behavioral_ir.string_of_bmodule v_top)
+  end;
 
   Printf.printf "[4/4] Z3 miter ...\n";
   let ok = Z3_miter.check_miter_equivalence rtlil_top v_top in

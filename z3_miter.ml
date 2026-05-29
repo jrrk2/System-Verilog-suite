@@ -340,11 +340,26 @@ let rec expr_to_z3 suffix ctx_sigs = function
         Z3.BitVector.mk_extract ctx msb lsb z3_signal
 
   | BConcat exprs ->
+      (* Each chunk must occupy exactly its BIR-declared width slot,
+       * otherwise overflow bits leak into the next chunk's slot and
+       * later BSlice extractions land on the wrong bits.  The classic
+       * trigger: a `(a + b)` chunk encodes as a 5-bit Z3 BV (BAdd's
+       * +1 carry widening) instead of the BIR-declared 4-bit chunk,
+       * shifting every higher chunk by one bit.  Truncate each child
+       * to its declared width before concatenating. *)
+      let encode_child e =
+        let z3_e = expr_to_z3 suffix ctx_sigs e in
+        let actual_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_e) in
+        match width_of_expr e with
+        | Some declared_w when declared_w > 0 && declared_w < actual_w ->
+            Z3.BitVector.mk_extract ctx (declared_w - 1) 0 z3_e
+        | _ -> z3_e
+      in
       List.fold_right (fun e acc ->
         match acc with
-        | None -> Some (expr_to_z3 suffix ctx_sigs e)
+        | None -> Some (encode_child e)
         | Some z3_acc ->
-            let z3_e = expr_to_z3 suffix ctx_sigs e in
+            let z3_e = encode_child e in
             Some (Z3.BitVector.mk_concat ctx z3_e z3_acc)
       ) exprs None
       |> Option.get

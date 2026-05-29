@@ -34,9 +34,10 @@ let () =
   Stdio.printf "cover (k=%d): %d LUT(s)\n" k (List.length chosen);
   List.iter chosen ~f:(fun c ->
     let truth = truth_table_of_cut g c in
+    let k_c = List.length c.leaves in
     Stdio.printf "  LUT%d  root=%d  leaves=[%s]  INIT(msb..lsb)=%s\n"
-      (List.length c.leaves) c.root
+      k_c c.root
       (String.concat ~sep:";" (List.map c.leaves ~f:Int.to_string))
-      (bits_to_string truth));
+      (bits_to_string (Tt.to_bool_list ~k:k_c truth)));
   Stdio.print_endline "---- netlist ----";
   Fpga_emit.emit_verilog (map_to_luts ~k ~name:"and_or" g)

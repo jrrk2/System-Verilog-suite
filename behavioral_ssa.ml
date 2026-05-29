@@ -173,10 +173,19 @@ let rec stmt_to_ssa ?(sliced = Hashtbl.create 0) ctx stmt =
       let else_versions = ctx.versions in
       ctx.versions <- saved;
       (* Variables assigned in either branch = those whose version
-         in then/else differs from the entering version. *)
+         in then/else differs from the entering version.  Restrict to
+         sliced_targets — phi-merging an UNVERSIONED variable would
+         spuriously create new SSA names that hardcaml's Always
+         compile emits as additional FFs, producing N-stage pipelines
+         and losing reset values (picorv32 reg_pc grew reg_pc_7→_29→
+         _32→_38→reg_pc; the reset BIf landed in _7 but never reached
+         the visible reg_pc).  Non-sliced multi-write targets are
+         handled correctly by hardcaml's last-write-wins. *)
       let bumped versions =
         StringMap.fold (fun k v acc ->
-          if StringMap.find_opt k saved <> Some v then k :: acc else acc
+          if Hashtbl.mem sliced k &&
+             StringMap.find_opt k saved <> Some v
+          then k :: acc else acc
         ) versions [] in
       let assigned_vars =
         List.sort_uniq String.compare (bumped then_versions @ bumped else_versions) in
@@ -231,7 +240,9 @@ let rec stmt_to_ssa ?(sliced = Hashtbl.create 0) ctx stmt =
       ctx.versions <- saved;
       let bumped vs =
         StringMap.fold (fun k v acc ->
-          if StringMap.find_opt k saved <> Some v then k :: acc else acc
+          if Hashtbl.mem sliced k &&
+             StringMap.find_opt k saved <> Some v
+          then k :: acc else acc
         ) vs [] in
       let all_bumped =
         List.sort_uniq String.compare

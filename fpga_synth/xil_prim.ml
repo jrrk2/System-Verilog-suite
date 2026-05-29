@@ -44,6 +44,22 @@ let lutk ~(truth : bool list) (inputs : Signal.t list) : Signal.t =
   in
   Map.find_exn outs "O"
 
+(* MUXF7 / MUXF8: SLICE wide-function muxes that combine two LUT6
+ * outputs (MUXF7) or two MUXF7 outputs (MUXF8) on a 1-bit select.
+ * Used by lut_cover to implement k=7 / k=8 cuts as 2/4 LUT6 cells
+ * stitched through these wide muxes — saves a LUT-cascade level
+ * vs synthesising the same function from LUT6 + LUT6→LUT6 fanout. *)
+let muxf ~name (i0 : Signal.t) (i1 : Signal.t) (s : Signal.t) : Signal.t =
+  let outs =
+    Instantiation.create () ~name
+      ~inputs:[ ("I0", i0); ("I1", i1); ("S", s) ]
+      ~outputs:[ ("O", 1) ]
+  in
+  Map.find_exn outs "O"
+
+let muxf7 i0 i1 s = muxf ~name:"MUXF7" i0 i1 s
+let muxf8 i0 i1 s = muxf ~name:"MUXF8" i0 i1 s
+
 (* ---- Registers ---------------------------------------------------- *)
 
 (* FDRE: D flip-flop, clock-enable + synchronous reset (the common
@@ -61,8 +77,20 @@ module Fdre = struct
   module O = struct
     type 'a t = { q : 'a [@rtlname "Q"] } [@@deriving hardcaml]
   end
-  let create (i : Signal.t I.t) : Signal.t O.t =
-    Instantiation.create_with_interface (module I) (module O) ~name:"FDRE" i
+  (* INIT param: per-FDRE config-time value (0 or 1).  Source's
+     [reg ... = <init>] threads through BIR initial_value, Hardcaml
+     reg_reset_value, bir_to_aig rb_init, and lands here as one bit. *)
+  let create ?(init : bool = false) (i : Signal.t I.t) : Signal.t O.t =
+    let parameters =
+      [ Parameter.create ~name:"INIT"
+          ~value:(Parameter.Value.Bit init) ]
+    in
+    let inputs = [ "C", i.c; "CE", i.ce; "R", i.r; "D", i.d ] in
+    let outs =
+      Instantiation.create ~parameters () ~name:"FDRE" ~inputs
+        ~outputs:[ "Q", 1 ]
+    in
+    { O.q = Map.find_exn outs "Q" }
 end
 
 (* FDCE: D flip-flop with clock-enable + asynchronous clear. *)
@@ -94,3 +122,30 @@ let unary ~name (i : Signal.t) : Signal.t =
 let bufg i = unary ~name:"BUFG" i
 let ibuf i = unary ~name:"IBUF" i
 let obuf i = unary ~name:"OBUF" i
+
+(* IBUFDS: differential input buffer (LVDS, LVDS_25, etc.).  Combines
+ * a P/N pad pair into a single-ended O.  Common case is a differential
+ * clock pad (VC707's 200 MHz SYSCLK_P/SYSCLK_N) — pair with [bufg] on
+ * the output for global clock distribution.
+ *
+ * Parameters left at Xilinx defaults (DIFF_TERM=FALSE, IBUF_LOW_PWR=
+ * TRUE, IOSTANDARD="DEFAULT").  Override at the integration point if
+ * a board needs DIFF_TERM=TRUE or a specific LVDS_25 standard; both
+ * nextpnr-xilinx and Vivado read the parameters from the EDIF/JSON
+ * we emit. *)
+let ibufds ?(diff_term : bool = false) ?(iostandard : string = "DEFAULT")
+    ~(i : Signal.t) ~(ib : Signal.t) () : Signal.t =
+  let parameters =
+    [ Parameter.create ~name:"DIFF_TERM"
+        ~value:(Parameter.Value.String (if diff_term then "TRUE" else "FALSE"))
+    ; Parameter.create ~name:"IBUF_LOW_PWR"
+        ~value:(Parameter.Value.String "TRUE")
+    ; Parameter.create ~name:"IOSTANDARD"
+        ~value:(Parameter.Value.String iostandard)
+    ]
+  in
+  let outs =
+    Instantiation.create () ~parameters ~name:"IBUFDS"
+      ~inputs:[ ("I", i); ("IB", ib) ] ~outputs:[ ("O", 1) ]
+  in
+  Map.find_exn outs "O"
