@@ -84,17 +84,13 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
     nm
   in
 
-  let add_const_tie ~value : string =
-    let net = add_internal_net () in
-    let typ, pin = match value with '1' -> "VCC", "P" | _ -> "GND", "G" in
-    instances := {
-      Behavioral_ir.inst_name = Printf.sprintf "tie_%s_%s" typ net;
-      module_name = typ;
-      param_values = []; param_strs = [];
-      port_connections = [pin, BVar net];
-    } :: !instances;
-    net
-  in
+  (* Encode an HDL constant bit as the sentinel net name bir_to_nextpnr
+   * _json's `const_of_name` already understands: "VCC" → "1", "GND" →
+   * "0".  The emitter skips actual GND/VCC tie cells (nextpnr-xilinx
+   * auto-inserts ties), so any FDRE.CE / FDRE.R / CARRY4.CYINIT input
+   * that USED to dangle as `tie_N_<id>` now references "VCC"/"GND"
+   * directly and resolves to a "1"/"0" string bit token.              *)
+  let const_net_name = function '1' -> "VCC" | _ -> "GND" in
 
   let rec bits_of (s : Signal.t) : string array =
     if T.is_empty s then [||]
@@ -110,7 +106,7 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
           | T.Const { constant; _ } ->
             let s_str = Hardcaml.Bits.to_string constant in
             Array.init w ~f:(fun i ->
-              add_const_tie ~value:s_str.[w - 1 - i])
+              const_net_name s_str.[w - 1 - i])
           | T.Wire { driver; _ } ->
             if T.is_empty !driver
             then Array.init w ~f:(fun _ -> add_internal_net ())

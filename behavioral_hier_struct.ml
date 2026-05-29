@@ -37,8 +37,18 @@ let parse_bit (name : string) : string * int option =
    - if the BVar refers to a child PORT (possibly bit-selected), substitute
      the parent's actual for that pin; bit indices are propagated through.
    - otherwise prefix the name with the instance prefix. *)
+(* Constant-sentinel net names that downstream emitters
+ * (bir_to_nextpnr_json's const_of_name) map straight to "0"/"1"
+ * string-bit tokens.  Must NOT be hierarchy-prefixed during flatten,
+ * otherwise the emitter loses the constant and reports a driverless
+ * net (caught by Vivado place_design's NDRV-1 DRC).               *)
+let is_const_sentinel = function
+  | "VCC" | "GND" | "<const0>" | "<const1>" -> true
+  | _ -> false
+
 let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr) : bexpr =
   match e with
+  | BVar nm when is_const_sentinel nm -> e
   | BVar nm ->
       let base, idx_opt = parse_bit nm in
       (match port_actual base, idx_opt with
