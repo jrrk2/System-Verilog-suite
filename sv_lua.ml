@@ -416,6 +416,13 @@ let lwrite_mapped_json mapped_h path =
   Fpga_synth.Fpga_emit.write_yosys_json ~path circ;
   path
 
+(* Dump a Mapped circuit as EDIF 2.0.0 (Fpga_emit.write_edif), suitable
+ * for Vivado read_edif / link_design as a DRC oracle on the open flow. *)
+let lwrite_edif mapped_h path =
+  let _, circ = find_mapped mapped_h in
+  Fpga_synth.Fpga_emit.write_edif ~path circ;
+  path
+
 (* Parse cell-mapped Verilog back into BIR via Ver_front_to_behavioral,
  * returning a prog handle.  Used to splice a gate-mapped sub-module
  * back under a wrapper that has user-instantiated primitive cells. *)
@@ -871,6 +878,8 @@ module MakeLib
                                (wrap2 lwrite_mapped_json);
         "write_nextpnr_json", V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_nextpnr_json);
+        "write_edif",         V.efunc (V.string **-> V.string **->> V.string)
+                               (wrap2 lwrite_edif);
       ] g;
       C.register_module "gui" [
         "add_menu",    V.efunc (V.string **->> V.string) (wrap1 lgui_add_menu);
