@@ -4,7 +4,7 @@ frontend.
 
 Pipeline (in tools/wrappers/decompiler_verilator_parse.sh):
   verilator --json-only ...  →  V<top>.tree.json
-  test_verilator_behavioral.exe <json>  →  rc=0 if ≥ 1 module emerged.
+  sv_suite.exe <json>  →  rc=0 if ≥ 1 module emerged.
 
 Passes when both stages succeed; fails if verilator rejects the SV or
 our converter throws / produces no modules.
@@ -15,7 +15,7 @@ from BaseRunner import BaseRunner
 
 _THIS = os.path.dirname(os.path.realpath(__file__))
 _REPO = os.path.realpath(os.path.join(_THIS, '..', '..', '..'))
-_EXE = os.path.join(_REPO, '_build', 'default', 'test_verilator_behavioral.exe')
+_EXE = os.path.join(_REPO, '_build', 'default', 'sv_suite.exe')
 _WRAPPER = os.path.join(
     _REPO, 'test', 'sv_tests', 'wrappers', 'decompiler_verilator_parse.sh')
 

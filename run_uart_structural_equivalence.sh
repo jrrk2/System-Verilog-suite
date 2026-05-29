@@ -57,7 +57,7 @@ for module in "${MODULES[@]}"; do
 
     # Run structural equivalence test
     log_file="/tmp/struct_equiv_${module}.log"
-    if _build/default/test_behavioral_equivalence.exe "$vhdl_file" "$sv_file" > "$log_file" 2>&1; then
+    if _build/default/sv_suite.exe script recipes/vhdl_sv_equiv.lua "$vhdl_file" "$sv_file" > "$log_file" 2>&1; then
         # Extract key metrics
         vhdl_regs=$(grep "VHDL:" "$log_file" | grep "registers" | awk '{print $2}')
         sv_regs=$(grep "SV:" "$log_file" | grep "registers" | awk '{print $2}')

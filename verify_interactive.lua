@@ -116,7 +116,7 @@ local function vhdl_regression(modules)
             failed = failed + 1
         else
             print(colors.bold .. "Testing: " .. module .. colors.reset)
-            local cmd = config.build_dir .. "/test_vhdl_uart.exe " .. vhdl_file .. " > /tmp/vhdl_" .. module .. ".log 2>&1"
+            local cmd = config.build_dir .. "/sv_suite.exe script recipes/vhdl_sv_equiv.lua " .. vhdl_file .. " > /tmp/vhdl_" .. module .. ".log 2>&1"
 
             if run_command(cmd) then
                 print_success(module .. " - VHDL conversion successful")
@@ -166,7 +166,7 @@ local function sv_regression(modules)
             end
 
             -- Test conversion
-            local cmd = config.build_dir .. "/test_verilator_behavioral.exe " .. json_file .. " > /tmp/sv_" .. module .. ".log 2>&1"
+            local cmd = config.build_dir .. "/sv_suite.exe script recipes/verilator_parse.lua " .. json_file .. " > /tmp/sv_" .. module .. ".log 2>&1"
 
             if run_command(cmd) then
                 print_success(module .. " - SV conversion successful")
@@ -206,7 +206,7 @@ local function structural_equivalence(modules)
         else
             print(colors.bold .. "Comparing: " .. module .. colors.reset)
             local log_file = "/tmp/structural_" .. module .. ".log"
-            local cmd = config.build_dir .. "/test_behavioral_equivalence.exe " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
+            local cmd = config.build_dir .. "/sv_suite.exe script recipes/vhdl_sv_equiv.lua " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
 
             if run_command(cmd) then
                 -- Extract register counts
@@ -262,7 +262,7 @@ local function sat_miter(modules)
         else
             print(colors.bold .. "SAT Checking: " .. module .. colors.reset)
             local log_file = "/tmp/miter_" .. module .. ".log"
-            local cmd = config.build_dir .. "/test_miter_equivalence.exe " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
+            local cmd = config.build_dir .. "/sv_suite.exe script recipes/vhdl_sv_equiv.lua " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
 
             local result = os.execute(cmd)
             local exit_code = 1
@@ -323,7 +323,7 @@ local function hardcaml_equivalence(modules)
         else
             print(colors.bold .. "HardCaml Check: " .. module .. colors.reset)
             local log_file = "/tmp/hardcaml_" .. module .. ".log"
-            local cmd = config.build_dir .. "/test_hardcaml_equivalence.exe " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
+            local cmd = config.build_dir .. "/sv_suite.exe script recipes/vhdl_sv_equiv.lua " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
 
             if run_command(cmd) then
                 print_success(module .. " - Interface match (type-safe)")
@@ -361,7 +361,7 @@ local function hardcaml_sat(modules)
         else
             print(colors.bold .. "HardCaml SAT: " .. module .. colors.reset)
             local log_file = "/tmp/hardcaml_sat_" .. module .. ".log"
-            local cmd = config.build_dir .. "/test_hardcaml_sat.exe " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
+            local cmd = config.build_dir .. "/sv_suite.exe script recipes/vhdl_sv_equiv.lua " .. vhdl_file .. " " .. sv_file .. " > " .. log_file .. " 2>&1"
 
             if run_command(cmd) then
                 print_success(module .. " - Validated (HardCaml normalized)")
@@ -600,12 +600,7 @@ print()
 -- Build executables if needed
 print_info("Checking build status...")
 local executables = {
-    "test_vhdl_uart.exe",
-    "test_verilator_behavioral.exe",
-    "test_behavioral_equivalence.exe",
-    "test_miter_equivalence.exe",
-    "test_hardcaml_equivalence.exe",
-    "test_hardcaml_sat.exe",
+    "sv_suite.exe",  -- (recipes/vhdl_sv_equiv.lua)
 }
 
 local all_built = true

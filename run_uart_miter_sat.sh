@@ -57,7 +57,7 @@ for module in "${MODULES[@]}"; do
 
     # Run miter equivalence check
     log_file="/tmp/miter_${module}.log"
-    _build/default/test_miter_equivalence.exe "$vhdl_file" "$sv_file" > "$log_file" 2>&1
+    _build/default/sv_suite.exe script recipes/vhdl_sv_equiv.lua "$vhdl_file" "$sv_file" > "$log_file" 2>&1
     exit_code=$?
 
     if [ $exit_code -eq 0 ]; then

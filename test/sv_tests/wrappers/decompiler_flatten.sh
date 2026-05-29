@@ -51,4 +51,4 @@ then
 fi
 
 # Run the target exe on the flattened source.
-exec "$exe" "$top" "$flat"
+exec "$exe" script recipes/verilator_vs_verible.lua "$top" "$flat"

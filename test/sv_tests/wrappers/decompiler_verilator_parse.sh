@@ -55,4 +55,4 @@ fi
 
 # test_verilator_behavioral.exe accepts a JSON path positionally and
 # prints "✗" markers / non-zero exit when conversion fails.
-exec "$exe" "$json"
+exec "$exe" script recipes/verilator_parse.lua "$json"

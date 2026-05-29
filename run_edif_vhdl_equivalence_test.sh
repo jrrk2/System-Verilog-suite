@@ -96,10 +96,14 @@ echo "════════════════════════�
 echo ""
 
 echo "Building equivalence checker..."
-dune build test_edif_vhdl_equivalence.exe
+dune build _build/default/sv_suite.exe
 
-echo "Running equivalence checker..."
-_build/default/test_edif_vhdl_equivalence.exe
+echo "Running equivalence checker (recipes/edif_vs_vhdl.lua)..."
+# The original test hard-coded uart_synthesized.edf + apb_uart; the
+# recipe takes them as positional args so future runs can target
+# other designs without rebuilding.
+_build/default/sv_suite.exe script recipes/edif_vs_vhdl.lua \
+    uart_synthesized.edf sysver_tests/apb_uart.vhd apb_uart
 
 # Capture exit code
 TEST_RESULT=$?

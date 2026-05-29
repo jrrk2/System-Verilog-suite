@@ -61,7 +61,7 @@ for module in "${MODULES[@]}"; do
     fi
 
     # Run Z3 equivalence verification
-    if _build/default/test_behavioral_z3.exe "$vhdl_file" "$sv_file" > "/tmp/z3_${module}.log" 2>&1; then
+    if _build/default/sv_suite.exe script recipes/vhdl_sv_equiv.lua "$vhdl_file" "$sv_file" > "/tmp/z3_${module}.log" 2>&1; then
         echo "  ✓ EQUIVALENT - Z3 proof successful"
         PASS_LIST+=("$module")
         ((PASSED++))

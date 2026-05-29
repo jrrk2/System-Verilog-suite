@@ -28,6 +28,7 @@ type luaitm =
   | Prog of string * bprogram                 (* label, program *)
   | Mod  of string * bmodule * bprogram       (* mod name, bmodule, owning program (for hier flatten) *)
   | Lib  of string * Sv_liberty.library_info
+  | Mapped of string * Hardcaml.Circuit.t       (* gate-mapped Circuit.t (label, circ) *)
 
 let lhash : (string, luaitm) Hashtbl.t = Hashtbl.create 64
 
@@ -44,6 +45,7 @@ let hadd x =
     | None, Prog (n, p), Prog (n', p') when n = n' && p == p' -> found := Some k
     | None, Mod  (n, m, _), Mod  (n', m', _) when n = n' && m == m' -> found := Some k
     | None, Lib  (n, l), Lib  (n', l') when n = n' && l == l' -> found := Some k
+    | None, Mapped (n, c), Mapped (n', c') when n = n' && c == c' -> found := Some k
     | _ -> ()
   ) lhash;
   match !found with
@@ -62,6 +64,11 @@ let find_mod h =
   match Hashtbl.find_opt lhash h with
   | Some (Mod (n, m, p)) -> (n, m, p)
   | _ -> failwith ("handle " ^ h ^ " is not a module")
+
+let find_mapped h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Mapped (n, c)) -> (n, c)
+  | _ -> failwith ("handle " ^ h ^ " is not a mapped circuit")
 
 let find_lib h =
   match Hashtbl.find_opt lhash h with
@@ -307,6 +314,205 @@ let lexpand prog_h lib_h =
   let p' = Gate_netlist_to_behavioral.expand_program lib p in
   hadd (Prog (label, p'))
 
+(* ──────────────────────────────────────────────────────────────────
+ * Pipeline building-blocks: each transformation as a stand-alone
+ * Lua-callable function so a recipe script can compose them per design.
+ * These replace the per-design test_*.exe pattern.
+ *
+ * GENERIC behavioural passes (used by both ASIC and FPGA flows):
+ *   unroll / inline / iflift / blocking_subst / meminfer / memlower /
+ *   ssa / flatten_z3 / flatten_struct.
+ * Behavioral_meminfer / Behavioral_memlower honour the MEMLOWER_FPGA
+ * env var; recipes can set it before calling, or leave it unset for
+ * the ASIC path.  Neither lmeminfer nor lmemlower touches the env
+ * here.
+ *
+ * FPGA-SPECIFIC (use Fpga_synth and consume LUT/FDRE/CARRY4 cells):
+ *   gate_map (BIR → AIG → LUT-cover → Hardcaml Circuit.t),
+ *   write_cellmapped_v, write_mapped_json, write_nextpnr_json.
+ * ASIC flows substitute their own cell-mapper at the gate_map stage.
+ *
+ * Conventions:
+ *   - Every prog→prog pass returns a fresh prog handle (label preserved).
+ *   - Flatteners take prog + top name, return a module handle.
+ *   - The gate-mapper takes a module handle (behavioural body) and
+ *     returns a Mapped (Hardcaml Circuit.t) handle. *)
+
+let lunroll prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_unroll.unroll_program p))
+
+let linline prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_inline.inline_program p))
+
+let liflift prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_iflift.lift_program p))
+
+let lblocking_subst prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_blocking_subst.blocking_subst_program p))
+
+let lmeminfer prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_meminfer.infer_program p))
+
+let lmemlower prog_h =
+  let label, p = find_prog prog_h in
+  let p', _ = Behavioral_memlower.lower_program p in
+  hadd (Prog (label, p'))
+
+let lssa prog_h =
+  let label, p = find_prog prog_h in
+  let p' = { p with modules = List.map Behavioral_ssa.module_to_ssa p.modules } in
+  hadd (Prog (label, p'))
+
+(* The two flatteners are intentionally separate so a recipe makes
+ * its choice explicit: flatten_z3 drops primitive binstances and
+ * keeps behavioural processes (Z3-equivalence shape); flatten_struct
+ * keeps every binstance and expects an already-structural program
+ * (nextpnr JSON shape). *)
+let lflatten_z3 prog_h top =
+  let _, p = find_prog prog_h in
+  let m = Behavioral_hier.flatten_for_z3 p ~top in
+  let p' = { Behavioral_ir.modules = [m];
+             library_cells = p.library_cells } in
+  hadd (Mod (top, m, p'))
+
+let lflatten_struct prog_h top =
+  let _, p = find_prog prog_h in
+  let m = Behavioral_hier_struct.flatten_structural p ~top in
+  let p' = { Behavioral_ir.modules = [m];
+             library_cells = p.library_cells } in
+  hadd (Mod (top, m, p'))
+
+(* Gate-map one module: behavioural BIR → AIG → LUT-cover → Hardcaml
+ * Circuit.t of LUT/FDRE/CARRY4/IBUF/OBUF/BUFG cells. *)
+let lgate_map mod_h k_lut io_flag =
+  let _, m, _ = find_mod mod_h in
+  let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true m in
+  let l = Fpga_synth.Bir_to_aig.lower_circuit circ in
+  let mapped = Fpga_synth.Fpga_map.map_lowered
+    ~io:(io_flag <> 0) ~k:k_lut ~name:m.name l in
+  hadd (Mapped (m.name, mapped))
+
+(* Dump a Mapped circuit as cell-mapped Verilog via Hardcaml.Rtl,
+ * suitable for ver_front to re-parse into structural BIR. *)
+let lwrite_cellmapped_v mapped_h path =
+  let _, circ = find_mapped mapped_h in
+  let oc = Stdlib.open_out path in
+  Stdlib.Fun.protect ~finally:(fun () -> Stdlib.close_out oc)
+    (fun () ->
+       Hardcaml.Rtl.output
+         ~output_mode:(Hardcaml.Rtl.Output_mode.To_channel oc)
+         Hardcaml.Rtl.Language.Verilog circ);
+  path
+
+(* Dump a Mapped circuit directly as yosys JSON (Fpga_emit path).
+ * Use this when no further BIR-level manipulation is wanted. *)
+let lwrite_mapped_json mapped_h path =
+  let _, circ = find_mapped mapped_h in
+  Fpga_synth.Fpga_emit.write_yosys_json ~path circ;
+  path
+
+(* Parse cell-mapped Verilog back into BIR via Ver_front_to_behavioral,
+ * returning a prog handle.  Used to splice a gate-mapped sub-module
+ * back under a wrapper that has user-instantiated primitive cells. *)
+let lparse_v_cells path =
+  match Ver_front_to_behavioral.convert_v_file path with
+  | None -> failwith ("ver_front failed to parse " ^ path)
+  | Some p -> hadd (Prog (Filename.basename path, p))
+
+(* Replace bmodule named [child] in [prog_h] with the same-named
+ * module taken from [src_h] (the splice). *)
+let lsplice prog_h child src_h =
+  let label, p = find_prog prog_h in
+  let _, src  = find_prog src_h  in
+  let src_m =
+    match List.find_opt (fun (m : bmodule) -> m.name = child) src.modules with
+    | Some m -> m
+    | None -> failwith ("splice: no module " ^ child ^ " in source program")
+  in
+  let modules' = List.map (fun (m : bmodule) ->
+    if m.name = child then src_m else m) p.modules in
+  let modules' =
+    if List.exists (fun (m : bmodule) -> m.name = child) p.modules
+    then modules'
+    else modules' @ [src_m]
+  in
+  let p' = { p with modules = modules' } in
+  hadd (Prog (label ^ ":+" ^ child, p'))
+
+(* Emit a single module (typically the output of flatten_struct) as
+ * nextpnr-xilinx-compatible yosys JSON via the EDIF-path emitter. *)
+let lwrite_nextpnr_json mod_h path =
+  let _, m, p = find_mod mod_h in
+  Bir_to_nextpnr_json.write_yosys_json
+    ~library_cells:p.library_cells
+    ~path m;
+  path
+
+(* Comma-separated list of module names in a prog. *)
+let lmodule_names prog_h =
+  let _, p = find_prog prog_h in
+  String.concat "," (List.map (fun (m : bmodule) -> m.name) p.modules)
+
+(* ──────────────────────────────────────────────────────────────────
+ * Second-tier generic operations: extracted from the standalones in
+ * old/, used both by ASIC miters and FPGA recipes.  Where a pass has
+ * a `?force_ff` or similar option we expose only the most common
+ * defaulted form — the underlying library function is one open away
+ * if a recipe needs the variant. *)
+
+let lflatten prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_flatten.flatten_program p))
+
+let loptimize prog_h =
+  let label, p = find_prog prog_h in
+  let p', _ = Behavioral_optimize.optimize_full p in
+  hadd (Prog (label, p'))
+
+let lffrip mod_h =
+  let label, m, p = find_mod mod_h in
+  let m' = Behavioral_ffrip.rip_module m in
+  let p' = { p with modules = List.map (fun (mm : bmodule) ->
+              if mm.name = m.name then m' else mm) p.modules } in
+  hadd (Mod (label, m', p'))
+
+let lregister_analyse mod_h =
+  let _, m, _ = find_mod mod_h in
+  let ctx = Behavioral_registers.analyze_module m in
+  Printf.sprintf "module %s: %d registers" m.name
+    (List.length ctx.Behavioral_registers.registers)
+
+let lcdc_analyse mod_h =
+  let _, m, _ = find_mod mod_h in
+  let report = Cdc_analysis.analyse m in
+  Cdc_analysis.format_report report
+
+let lprep_for_z3 mod_h =
+  let _, m, p = find_mod mod_h in
+  let m' = prep_for_z3 m p in
+  hadd (Mod (m.name, m', p))
+
+(* Recover the owning bprogram of a module handle as a Prog handle.
+ * Lets a recipe go Prog -> flatten_z3 -> Mod -> owner -> Prog and
+ * continue the prog→prog pipeline (unroll, inline, …). *)
+let lowner mod_h =
+  let label, _m, p = find_mod mod_h in
+  hadd (Prog (label, p))
+
+(* Read an EDIF netlist file and return a Prog handle of structural
+ * BIR (binstances of Xilinx/library primitives). Companion of
+ * svd.parse for the EDIF frontend; used by recipes/edif_vs_vhdl.lua. *)
+let lread_edif path =
+  if not (Sys.file_exists path) then
+    failwith ("read_edif: file not found: " ^ path);
+  let p = Edif_to_behavioral.convert path in
+  hadd (Prog (Filename.basename path, p))
+
 let lgate_miter top beh gate lib_opt =
   let lib_path = match lib_opt with "" -> default_lib () | s -> s in
   if not (Sys.file_exists lib_path) then
@@ -334,6 +540,9 @@ let lbir h =
   | Some (Mod  (_, m, _)) -> string_of_bmodule m
   | Some (Lib  (n, l)) ->
       Printf.sprintf "library %s: %d cells" n (Hashtbl.length l.cells)
+  | Some (Mapped (n, _)) ->
+      Printf.sprintf "mapped %s: (gate-mapped Hardcaml Circuit.t — \
+                      use svd.write_cellmapped_v / svd.write_mapped_json)" n
   | None -> failwith ("unknown handle " ^ h)
 
 (* Critical-path timing report for a module. Returns the printable
@@ -370,7 +579,8 @@ let linsts h =
 
 let lname h =
   match Hashtbl.find_opt lhash h with
-  | Some (Prog (n, _)) | Some (Mod (n, _, _)) | Some (Lib (n, _)) -> n
+  | Some (Prog (n, _)) | Some (Mod (n, _, _)) | Some (Lib (n, _))
+  | Some (Mapped (n, _)) -> n
   | None -> failwith ("unknown handle " ^ h)
 
 (* ──────────────────────────────────────────────────────────────────
@@ -500,6 +710,7 @@ let litems () =
       | Lib (n, l) ->
           Printf.sprintf "library %s (%d cells)" n
             (Hashtbl.length l.cells)
+      | Mapped (n, _) -> Printf.sprintf "mapped %s (gate-mapped Circuit)" n
     in
     (k ^ "\t" ^ kind) :: acc
   ) lhash [] in
@@ -617,6 +828,49 @@ module MakeLib
                           (wrap2 lwrite_vhdl);
         "convert_hdl",   V.efunc (V.string **-> V.string **->> V.string)
                           (wrap2 lconvert_hdl);
+
+        (* ──── Generic behavioural passes (ASIC and FPGA flows) ──── *)
+        "unroll",         V.efunc (V.string **->> V.string) (wrap1 lunroll);
+        "inline",         V.efunc (V.string **->> V.string) (wrap1 linline);
+        "iflift",         V.efunc (V.string **->> V.string) (wrap1 liflift);
+        "blocking_subst", V.efunc (V.string **->> V.string)
+                           (wrap1 lblocking_subst);
+        "meminfer",       V.efunc (V.string **->> V.string) (wrap1 lmeminfer);
+        "memlower",       V.efunc (V.string **->> V.string) (wrap1 lmemlower);
+        "ssa",            V.efunc (V.string **->> V.string) (wrap1 lssa);
+        "flatten_z3",     V.efunc (V.string **-> V.string **->> V.string)
+                           (wrap2 lflatten_z3);
+        "flatten_struct", V.efunc (V.string **-> V.string **->> V.string)
+                           (wrap2 lflatten_struct);
+        "module_names",   V.efunc (V.string **->> V.string)
+                           (wrap1 lmodule_names);
+        "splice",         V.efunc (V.string **-> V.string **-> V.string
+                                   **->> V.string)
+                           (wrap3 lsplice);
+        "parse_v_cells",  V.efunc (V.string **->> V.string)
+                           (wrap1 lparse_v_cells);
+        "flatten",        V.efunc (V.string **->> V.string) (wrap1 lflatten);
+        "optimize",       V.efunc (V.string **->> V.string) (wrap1 loptimize);
+        "ffrip",          V.efunc (V.string **->> V.string) (wrap1 lffrip);
+        "register_analyse", V.efunc (V.string **->> V.string)
+                             (wrap1 lregister_analyse);
+        "cdc_analyse",    V.efunc (V.string **->> V.string)
+                           (wrap1 lcdc_analyse);
+        "prep_for_z3",    V.efunc (V.string **->> V.string)
+                           (wrap1 lprep_for_z3);
+        "owner",          V.efunc (V.string **->> V.string) (wrap1 lowner);
+        "read_edif",      V.efunc (V.string **->> V.string) (wrap1 lread_edif);
+
+        (* ──────── FPGA-specific (Fpga_synth + nextpnr-xilinx) ──── *)
+        "gate_map",       V.efunc (V.string **-> V.int **-> V.int
+                                   **->> V.string)
+                           (wrap3 lgate_map);
+        "write_cellmapped_v", V.efunc (V.string **-> V.string **->> V.string)
+                               (wrap2 lwrite_cellmapped_v);
+        "write_mapped_json",  V.efunc (V.string **-> V.string **->> V.string)
+                               (wrap2 lwrite_mapped_json);
+        "write_nextpnr_json", V.efunc (V.string **-> V.string **->> V.string)
+                               (wrap2 lwrite_nextpnr_json);
       ] g;
       C.register_module "gui" [
         "add_menu",    V.efunc (V.string **->> V.string) (wrap1 lgui_add_menu);
@@ -654,7 +908,7 @@ module I =
 
 (* Public entry: run a Lua script file and return its exit code (0 on
  * success, 1 on Lua exception). *)
-let run_script path =
+let run_script ?(args : string list = []) path =
   if not (Sys.file_exists path) then begin
     Printf.eprintf "lua script not found: %s\n" path;
     1
@@ -666,7 +920,28 @@ let run_script path =
      done with End_of_file -> ());
     close_in ic;
     let state = I.mk () in
+    (* Pre-populate ARGV global from [args] so recipes can read the
+     * shell-script-style positional arguments via ARGV[1], ARGV[2], ….
+     * Lua 2.5-style table literal — we build it as a string of source
+     * code and dostring before running the recipe.
+     *
+     * ARGN is a convenience holding the count, since lua-ml's getn
+     * helpers aren't in the table namespace. *)
+    let argv_src =
+      let parts = List.mapi (fun i a ->
+        let esc = String.concat ""
+          (List.map (fun c ->
+             if c = '"' then "\\\""
+             else if c = '\\' then "\\\\"
+             else String.make 1 c)
+            (List.init (String.length a) (String.get a))) in
+        Printf.sprintf "ARGV[%d] = \"%s\"" (i + 1) esc) args in
+      "ARGV = {}\n" ^
+      String.concat "\n" parts ^
+      Printf.sprintf "\nARGN = %d\n" (List.length args)
+    in
     try
+      ignore (I.dostring state argv_src);
       ignore (I.dostring state (Buffer.contents buf));
       0
     with e ->

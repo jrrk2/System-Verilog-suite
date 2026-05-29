@@ -454,9 +454,9 @@ let cmd_random args =
 
 let cmd_script args =
   match args with
-  | [path] -> exit (Sv_lua.run_script path)
+  | path :: extra -> exit (Sv_lua.run_script ~args:extra path)
   | _ ->
-      prerr_endline "usage: sv_suite script <file.lua>"; exit 2
+      prerr_endline "usage: sv_suite script <file.lua> [args…]"; exit 2
 
 let parse_arch_args args =
   let width = ref 8 in

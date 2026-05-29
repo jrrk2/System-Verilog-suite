@@ -50,7 +50,7 @@ for vhdl_file in "${VHDL_FILES[@]}"; do
     fi
 
     # Run the test
-    if _build/default/test_vhdl_uart.exe "$vhdl_file" > /tmp/vhdl_test_$module_name.log 2>&1; then
+    if _build/default/sv_suite.exe script recipes/vhdl_sv_equiv.lua "$vhdl_file" > /tmp/vhdl_test_$module_name.log 2>&1; then
         echo "  ✓ PASS"
         PASS_LIST+=("$module_name")
         ((PASSED++))

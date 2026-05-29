@@ -4,7 +4,7 @@ Verilator↔Verible Z3 miter.
 
 Passes only when:
   1. verilator -E flattens the test (so includes/defines work);
-  2. test_verilator_vs_verible.exe builds BOTH frontends' BIR;
+  2. sv_suite.exe builds BOTH frontends' BIR;
   3. the Z3 miter proves them equivalent for all inputs.
 
 This is the strictest of the three Decompiler runners — it surfaces
@@ -17,7 +17,7 @@ from BaseRunner import BaseRunner
 
 _THIS = os.path.dirname(os.path.realpath(__file__))
 _REPO = os.path.realpath(os.path.join(_THIS, '..', '..', '..'))
-_EXE = os.path.join(_REPO, '_build', 'default', 'test_verilator_vs_verible.exe')
+_EXE = os.path.join(_REPO, '_build', 'default', 'sv_suite.exe')
 _WRAPPER = os.path.join(
     _REPO, 'test', 'sv_tests', 'wrappers', 'decompiler_flatten.sh')
 
