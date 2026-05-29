@@ -57,6 +57,11 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
   | BConst _ -> e
   | BConcat es ->
       BConcat (List.map (rewrite_bexpr ~prefix ~port_actual) es)
+  | BSlice { signal; msb; lsb } ->
+      (* hardcaml_to_behavioral emits BSlice on output-port bits after
+       * regrouping per-bit Circuit.t outputs into vector ports.        *)
+      let signal' = rewrite_bexpr ~prefix ~port_actual signal in
+      BSlice { signal = signal'; msb; lsb }
   | _ -> e   (* other forms shouldn't appear in a structural net *)
 
 (* Pull `bit` out of `expr`.  Used when a child's port-bit reference must

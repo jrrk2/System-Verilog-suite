@@ -60,3 +60,10 @@ merged = svd.splice(prog, CHILD, struct_prog)
 flat   = svd.flatten_struct(merged, TOP)
 out    = svd.write_nextpnr_json(flat, OUTDIR .. "/" .. TOP .. ".json")
 print("  wrote " .. out)
+
+-- 5. Mirror the JSON as EDIF for Vivado read_edif / link_design as a
+--    cross-check oracle.  When nextpnr fails post-pack (timing loop,
+--    unresolved constraints), Vivado's checker usually names the
+--    offending path.
+edif = svd.write_mod_edif(flat, OUTDIR .. "/" .. TOP .. ".edif")
+print("  wrote " .. edif)

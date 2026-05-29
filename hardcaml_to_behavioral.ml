@@ -183,54 +183,104 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
   let input_sigs = Circuit.inputs circ in
   let output_sigs = Circuit.outputs circ in
 
-  (* Pre-seed memo with per-bit names for input ports.  Each input
-   * port is one multi-bit bsignal; the per-bit names are synthetic
-   * (`<port>__<i>`) — they appear only inside instance port_connections
-   * and never as their own bsignals, so we leave them out of `signals`
-   * and let bir_to_nextpnr_json's `bits_of_conn BVar` fallback expand
-   * the multi-bit reference into per-bit ids. *)
-  let port_signals : Behavioral_ir.bsignal list ref = ref [] in
-  List.iter input_sigs ~f:(fun s ->
-    let nm = signal_name s in
-    let w = Signal.width s in
-    let bits = Array.init w ~f:(fun i ->
-      Printf.sprintf "%s__%d" nm i) in
-    Hashtbl.set memo ~key:(T.uid s) ~data:bits;
-    port_signals := { Behavioral_ir.name = nm;
-                      stype = BInt { width = w; signed = Unsigned };
-                      direction = `Input;
-                      initial_value = None;
-                      attrs = [] } :: !port_signals);
+  (* Hardcaml's Circuit.inputs / Circuit.outputs return ONE signal per
+   * per-bit scalar (`led__0`, `led__1`, …) when the gate mapper drives
+   * outputs per-bit.  Regroup these into vector ports — same logic
+   * fpga_emit.regroup_bus_ports uses for its EDIF/yosys-JSON emit —
+   * so downstream BIR has a single `led[7:0]` Output bsignal and the
+   * wrapper's `.led(led)` connection lines up after flatten_struct. *)
+  let split_base_idx (nm : string) : (string * int) option =
+    let n = String.length nm in
+    let rec find_uu i =
+      if i + 1 >= n then None
+      else if Char.equal nm.[i] '_' && Char.equal nm.[i+1] '_'
+      then
+        let suf = String.sub nm ~pos:(i+2) ~len:(n - i - 2) in
+        if not (String.is_empty suf)
+           && String.for_all suf ~f:Char.is_digit
+        then Some (String.sub nm ~pos:0 ~len:i, Int.of_string suf)
+        else find_uu (i + 1)
+      else find_uu (i + 1)
+    in
+    find_uu 0
+  in
+  let regroup ~(dir : [`Input | `Output]) (sigs : Signal.t list)
+      : (string * int * (int * Signal.t) list) list =
+    let groups : (string, (int * Signal.t) list ref) Hashtbl.t =
+      Hashtbl.create (module String) in
+    let single : (string * Signal.t) list ref = ref [] in
+    let order : [`Bus of string | `Single of string] list ref = ref [] in
+    List.iter sigs ~f:(fun s ->
+      let nm = signal_name s in
+      match split_base_idx nm with
+      | Some (base, idx) when Signal.width s = 1 ->
+        let lst = Hashtbl.find_or_add groups base ~default:(fun () ->
+          order := `Bus base :: !order; ref []) in
+        lst := (idx, s) :: !lst
+      | _ ->
+        single := (nm, s) :: !single;
+        order := `Single nm :: !order);
+    let _ = dir in
+    List.rev_map !order ~f:(function
+      | `Single nm ->
+        let s = List.Assoc.find_exn !single nm ~equal:String.equal in
+        nm, Signal.width s, [(0, s)]
+      | `Bus base ->
+        let lst = Hashtbl.find_exn groups base in
+        let by_idx = List.sort !lst ~compare:(fun (a,_) (b,_) ->
+          Int.compare a b) in
+        let w = List.length by_idx in
+        base, w, by_idx)
+  in
 
-  (* For each output port, drive each bit with an identity LUT1
-   * #(.INIT(2'b10)) (O = I0).  This keeps everything structural —
-   * one instance per bit, no BCombinational continuous-assigns — and
-   * the bit gets named via BSlice { signal = BVar port; msb=i; lsb=i }
-   * which bir_to_nextpnr_json already handles.  nextpnr-xilinx
-   * absorbs identity LUT1s during pack.  Multi-bit ports stay
-   * multi-bit Output bsignals all the way through. *)
-  List.iter output_sigs ~f:(fun s ->
-    let nm = signal_name s in
-    let w = Signal.width s in
-    let inner_bits = bits_of s in
-    port_signals := { Behavioral_ir.name = nm;
-                      stype = BInt { width = w; signed = Unsigned };
-                      direction = `Output;
-                      initial_value = None;
-                      attrs = [] } :: !port_signals;
-    Array.iteri inner_bits ~f:(fun i src ->
-      let port_bit =
-        if w = 1
-        then Behavioral_ir.BVar nm
-        else BSlice { signal = BVar nm; msb = i; lsb = i }
-      in
-      instances := {
-        Behavioral_ir.inst_name = Printf.sprintf "obuf_%s_%d" nm i;
-        module_name = "LUT1";
-        param_values = [];
-        param_strs = ["INIT", "2'b10"];
-        port_connections = ["I0", BVar src; "O", port_bit];
-      } :: !instances));
+  let port_signals : Behavioral_ir.bsignal list ref = ref [] in
+
+  (* Inputs: emit ONE Input bsignal per regrouped port.  For width 1
+   * the bsignal name IS the bit name — seed memo with [|base|] so
+   * inner FDRE.C / LUT.I0 references resolve straight to `BVar base`
+   * and after flatten line up with the wrapper's actual input net.
+   * For multi-bit inputs the per-bit memo uses the synthetic
+   * `<base>__<i>` form; bir_to_nextpnr_json's bare-BVar fallback
+   * expands `BVar base` against widths, so consumers that reference
+   * the whole bus directly still work. *)
+  List.iter (regroup ~dir:`Input input_sigs)
+    ~f:(fun (base, w, by_idx) ->
+      port_signals := { Behavioral_ir.name = base;
+                        stype = BInt { width = w; signed = Unsigned };
+                        direction = `Input;
+                        initial_value = None;
+                        attrs = [] } :: !port_signals;
+      List.iter by_idx ~f:(fun (i, s) ->
+        let bit_name =
+          if w = 1 then base
+          else Printf.sprintf "%s__%d" base i in
+        Hashtbl.set memo ~key:(T.uid s) ~data:[| bit_name |]));
+
+  (* Outputs: emit ONE multi-bit Output bsignal per regrouped bus.
+   * Drive each bit with an identity LUT1 #(.INIT(2'b10)) so the bit
+   * gets a structural driver via BSlice { signal = BVar port; msb=i;
+   * lsb=i } — flatten_struct's BSlice rewrite then propagates the
+   * wrapper's actual when the wrapper instantiates with .port(port). *)
+  List.iter (regroup ~dir:`Output output_sigs)
+    ~f:(fun (base, w, by_idx) ->
+      port_signals := { Behavioral_ir.name = base;
+                        stype = BInt { width = w; signed = Unsigned };
+                        direction = `Output;
+                        initial_value = None;
+                        attrs = [] } :: !port_signals;
+      List.iter by_idx ~f:(fun (i, s) ->
+        let inner = (bits_of s).(0) in
+        let port_bit =
+          if w = 1 then Behavioral_ir.BVar base
+          else BSlice { signal = BVar base; msb = i; lsb = i }
+        in
+        instances := {
+          Behavioral_ir.inst_name = Printf.sprintf "obuf_%s_%d" base i;
+          module_name = "LUT1";
+          param_values = [];
+          param_strs = ["INIT", "2'b10"];
+          port_connections = ["I0", BVar inner; "O", port_bit];
+        } :: !instances));
 
   {
     Behavioral_ir.name = Circuit.name circ;

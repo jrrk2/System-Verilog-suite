@@ -423,6 +423,18 @@ let lwrite_edif mapped_h path =
   Fpga_synth.Fpga_emit.write_edif ~path circ;
   path
 
+(* Same EDIF emit but from a Mod handle (post-flatten_struct bmodule).
+ * Lifts the structural BIR to a hardcaml Circuit.t via the existing
+ * behavioral_to_hardcaml entry, then routes through write_edif.  Used
+ * to feed the FULLY-WRAPPED netlist (post-splice) into Vivado as a
+ * DRC / timing-loop oracle, where svd.write_edif on Mapped only sees
+ * the gate-mapped inner. *)
+let lwrite_mod_edif mod_h path =
+  let _, m, _ = find_mod mod_h in
+  let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true m in
+  Fpga_synth.Fpga_emit.write_edif ~path circ;
+  path
+
 (* Lift a Mapped Circuit.t directly into BIR as a structural bprogram
  * with a single bmodule, preserving bus widths on top-level ports.
  * Bypasses the lossy write_cellmapped_v + ver_front re-parse loop that
@@ -891,6 +903,8 @@ module MakeLib
                                (wrap2 lwrite_nextpnr_json);
         "write_edif",         V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_edif);
+        "write_mod_edif",     V.efunc (V.string **-> V.string **->> V.string)
+                               (wrap2 lwrite_mod_edif);
         "mapped_to_prog",     V.efunc (V.string **->> V.string)
                                (wrap1 lmapped_to_prog);
       ] g;
