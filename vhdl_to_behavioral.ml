@@ -1551,6 +1551,47 @@ let lookup_xil_primitive_ports names :
     | Some ports -> Some (n, ports)
     | None -> None) dedup
 
+(* ====================================================================== *)
+(* Xilinx unisim primitive IMPLEMENTATION bodies                          *)
+(*                                                                        *)
+(* Variant of lookup_xil_primitive_ports that keeps the full bmodule —    *)
+(* processes + signals + everything the VHDL parser produced — so the     *)
+(* mapped-Netlist → Z3 verification loop (task #44) can substitute        *)
+(* each binstance with its primitive body and miter against the source   *)
+(* RTL.  Cached separately from the ports-only path.                     *)
+(* ====================================================================== *)
+
+let xil_primitive_impl_cache : (string, Behavioral_ir.bmodule) Hashtbl.t =
+  Hashtbl.create 64
+
+let lookup_xil_primitive_impl names :
+    (string * Behavioral_ir.bmodule) list =
+  let dedup = List.sort_uniq compare names in
+  let need = List.filter (fun n ->
+    not (Hashtbl.mem xil_primitive_impl_cache n
+         || Hashtbl.mem xil_primitive_missing n)) dedup in
+  let to_parse = List.filter_map (fun n ->
+    let p = Filename.concat xil_unisims_dir (n ^ ".vhd") in
+    if Sys.file_exists p then Some (n, p)
+    else (Hashtbl.add xil_primitive_missing n (); None)) need in
+  if to_parse <> [] then begin
+    let paths = List.map snd to_parse in
+    (match convert_vhdl_files_to_behavioral paths with
+     | Some p ->
+         List.iter (fun (m : Behavioral_ir.bmodule) ->
+           Hashtbl.replace xil_primitive_impl_cache m.name m) p.modules;
+         List.iter (fun (n, _) ->
+           if not (Hashtbl.mem xil_primitive_impl_cache n)
+           then Hashtbl.add xil_primitive_missing n ()) to_parse
+     | None ->
+         List.iter (fun (n, _) ->
+           Hashtbl.add xil_primitive_missing n ()) to_parse)
+  end;
+  List.filter_map (fun n ->
+    match Hashtbl.find_opt xil_primitive_impl_cache n with
+    | Some m -> Some (n, m)
+    | None -> None) dedup
+
 (* Helper: Convert a single VHDL file to behavioral IR *)
 let convert_vhdl_file_to_behavioral filename =
   convert_vhdl_files_to_behavioral [filename]

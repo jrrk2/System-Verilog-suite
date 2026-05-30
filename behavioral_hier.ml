@@ -205,7 +205,34 @@ let base_of_name n =
     String.sub n 0 i
   with Not_found -> n
 
+(* Tracker for unresolved binstances encountered during the most
+ * recent flatten_for_z3 run.  Cleared at the top of each call.
+ * The miter (z3_miter) reads this after flatten to decide whether
+ * it can declare EQUIVALENT or must report "INCONCLUSIVE — N
+ * primitive bodies missing".  Per feedback-no-silent-lossage, a
+ * missing instance must be auditable. *)
+let unresolved : (string * string * string) list ref = ref []
+let unresolved_seen : (string * string, unit) Hashtbl.t = Hashtbl.create 16
+
+let unresolved_register ~parent_name (i : binstance) =
+  let key = (parent_name, i.module_name) in
+  if not (Hashtbl.mem unresolved_seen key) then begin
+    Hashtbl.add unresolved_seen key ();
+    unresolved := (parent_name, i.inst_name, i.module_name) :: !unresolved;
+    Printf.eprintf
+      "[flatten_for_z3] unresolved instance %s : %s in module %s\n"
+      i.inst_name i.module_name parent_name
+  end
+
+let take_unresolved () : (string * string * string) list =
+  let r = List.rev !unresolved in
+  unresolved := [];
+  Hashtbl.clear unresolved_seen;
+  r
+
 let flatten_for_z3 ?(debug = false) (p : bprogram) ~top : bmodule =
+  unresolved := [];
+  Hashtbl.clear unresolved_seen;
   let by_name = Hashtbl.create 16 in
   List.iter (fun m -> Hashtbl.replace by_name m.name m) p.modules;
   let by_base = List.fold_left (fun acc (m : bmodule) ->
@@ -250,9 +277,15 @@ let flatten_for_z3 ?(debug = false) (p : bprogram) ~top : bmodule =
   let rec flatten ~parent (i : binstance) : bmodule =
     match lookup_resolving ~parent i with
     | None ->
-        (* External / leaf cell — Liberty cells, vendor primitives.
-         * Empty placeholder; caller is responsible for handling
-         * unresolved references (typically via expand_program). *)
+        (* External / leaf cell — Liberty cells, vendor primitives whose
+         * body wasn't merged in (e.g. expand_primitives_for_z3 didn't
+         * cover this type, or it isn't in the program at all).  Per
+         * feedback-no-silent-lossage: a missing-instance is its own
+         * Z3-encoding failure category and must be auditable.  Emit
+         * one stderr line per unresolved (parent, type) pair (the
+         * tracker dedups), and the miter checks take_unresolved()
+         * before declaring EQUIVALENT. *)
+        unresolved_register ~parent_name:parent.name i;
         { name = i.module_name; params = []; signals = []; processes = [];
           instances = []; funcs = []; mems = []; attrs = [] }
     | Some m ->

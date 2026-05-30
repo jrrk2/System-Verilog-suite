@@ -307,9 +307,25 @@ let prep_for_z3 (m : bmodule) (p : bprogram) : bmodule =
 let lmiter a_h b_h =
   let (_, ma, pa) = find_mod a_h in
   let (_, mb, pb) = find_mod b_h in
+  (* prep_for_z3 internally calls Behavioral_hier.flatten_for_z3 which
+   * registers any unresolved binstance into Behavioral_hier.unresolved.
+   * Drain it on both sides before deciding the verdict — per
+   * feedback-no-silent-lossage, an unresolved instance is its own
+   * verification-failure category, distinct from EQUIVALENT/DIFFER. *)
+  let _ = Behavioral_hier.take_unresolved () in   (* clear any stale *)
   let ma' = prep_for_z3 ma pa in
+  let unres_a = Behavioral_hier.take_unresolved () in
   let mb' = prep_for_z3 mb pb in
-  if Z3_miter.check_miter_equivalence ma' mb' then "EQUIVALENT" else "DIFFER"
+  let unres_b = Behavioral_hier.take_unresolved () in
+  let unres = unres_a @ unres_b in
+  if unres <> [] then begin
+    let summary = String.concat ", "
+      (List.map (fun (_, inst, ty) -> Printf.sprintf "%s:%s" inst ty)
+         unres) in
+    Printf.sprintf "INCONCLUSIVE — %d unresolved primitive bodies: %s"
+      (List.length unres) summary
+  end else if Z3_miter.check_miter_equivalence ma' mb' then "EQUIVALENT"
+  else "DIFFER"
 
 let default_lib () =
   let home = try Sys.getenv "HOME" with Not_found -> "" in
@@ -456,6 +472,23 @@ let lwrite_netlist_edif net_h path =
   let _, m, lc = find_netlist net_h in
   Bir_to_edif.write_edif ~library_cells:lc ~path m;
   path
+
+(* Expand each Netlist binstance against its VHDL primitive implementation
+ * body (LUT4.vhd, FDRE.vhd, CARRY4.vhd, …), producing a bprogram whose
+ * top is the netlist's flat bmodule and whose remaining modules are the
+ * primitive impl bodies.  Feeds the existing prep_for_z3 + miter flow so
+ * the open-flow gate-mapped netlist can be Z3-equivalence-checked
+ * against the source RTL (task #44). *)
+let lexpand_primitives_for_z3 net_h =
+  let label, m, lc = find_netlist net_h in
+  let types =
+    List.fold_left (fun acc (i : binstance) ->
+      if List.mem i.module_name acc then acc else i.module_name :: acc)
+      [] m.instances in
+  let impls = Vhdl_to_behavioral.lookup_xil_primitive_impl types in
+  let impl_mods = List.map snd impls in
+  let p = { Behavioral_ir.modules = m :: impl_mods; library_cells = lc } in
+  hadd (Prog (label ^ "+prims", p))
 
 (* Lift a Mapped Circuit.t directly into BIR as a structural bprogram
  * with a single bmodule, preserving bus widths on top-level ports.
@@ -938,6 +971,8 @@ module MakeLib
                                (wrap2 lwrite_mod_edif);
         "write_netlist_edif", V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_netlist_edif);
+        "expand_primitives_for_z3", V.efunc (V.string **->> V.string)
+                               (wrap1 lexpand_primitives_for_z3);
         "mapped_to_prog",     V.efunc (V.string **->> V.string)
                                (wrap1 lmapped_to_prog);
       ] g;
