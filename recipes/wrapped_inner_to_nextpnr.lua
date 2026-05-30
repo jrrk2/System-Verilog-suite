@@ -12,6 +12,18 @@
 --   FILES    table   -- list of source .v files (Verible front end)
 --   OUTDIR   string  -- output dir (must already exist)
 --
+-- Optional globals: when CHIPDB and XDC are set the recipe also runs
+-- nextpnr-xilinx end-to-end producing top.fasm.  --router router1 is
+-- the default because the virtex7 chipdb routes cleanly via router1
+-- (proven on counter / telegraph / passthrough); router2 silently
+-- defaults but currently spins in the main router loop on this
+-- chipdb without progress signal.  Override via the ROUTER global if
+-- you want to experiment.
+--   CHIPDB   string  -- path to xc7vx485t.bin (optional)
+--   XDC      string  -- path to top-level .xdc (optional)
+--   ROUTER   string  -- nextpnr router (default "router1")
+--   NEXTPNR  string  -- nextpnr-xilinx binary (default ~/nextpnr-xilinx/build/nextpnr-xilinx)
+--
 -- See recipes/example_uart_vc707.lua for a concrete invocation.
 --
 -- The same recipe with gate_map/write_*_json swapped for an ASIC
@@ -67,3 +79,25 @@ print("  wrote " .. out)
 --    preserves INIT values as Vivado-format Verilog literals.
 edif = svd.write_netlist_edif(flat, OUTDIR .. "/" .. TOP .. ".edif")
 print("  wrote " .. edif)
+
+-- 6. Optionally invoke nextpnr-xilinx if CHIPDB and XDC are provided.
+--    Forces --router router1 (the virtex7-known-good path); without
+--    this nextpnr defaults to router2 which spins indefinitely on
+--    this chipdb with no progress output.
+if CHIPDB ~= nil and XDC ~= nil then
+    local nextpnr = NEXTPNR or
+        "/home/jonathan/nextpnr-xilinx/build/nextpnr-xilinx"
+    local router  = ROUTER  or "router1"
+    local json    = OUTDIR .. "/" .. TOP .. ".json"
+    local fasm    = OUTDIR .. "/" .. TOP .. ".fasm"
+    local cmd = nextpnr ..
+        " --router " .. router ..
+        " --chipdb " .. CHIPDB ..
+        " --xdc "    .. XDC    ..
+        " --json "   .. json   ..
+        " --fasm "   .. fasm
+    print("  running nextpnr-xilinx (--router " .. router .. ")")
+    print("  " .. cmd)
+    execute(cmd)
+    print("  emitted " .. fasm)
+end
