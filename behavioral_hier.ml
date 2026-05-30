@@ -277,14 +277,6 @@ let flatten_for_z3 ?(debug = false) (p : bprogram) ~top : bmodule =
   let rec flatten ~parent (i : binstance) : bmodule =
     match lookup_resolving ~parent i with
     | None ->
-        (* External / leaf cell — Liberty cells, vendor primitives whose
-         * body wasn't merged in (e.g. expand_primitives_for_z3 didn't
-         * cover this type, or it isn't in the program at all).  Per
-         * feedback-no-silent-lossage: a missing-instance is its own
-         * Z3-encoding failure category and must be auditable.  Emit
-         * one stderr line per unresolved (parent, type) pair (the
-         * tracker dedups), and the miter checks take_unresolved()
-         * before declaring EQUIVALENT. *)
         unresolved_register ~parent_name:parent.name i;
         { name = i.module_name; params = []; signals = []; processes = [];
           instances = []; funcs = []; mems = []; attrs = [] }

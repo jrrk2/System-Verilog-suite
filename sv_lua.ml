@@ -490,6 +490,31 @@ let lexpand_primitives_for_z3 net_h =
   let p = { Behavioral_ir.modules = m :: impl_mods; library_cells = lc } in
   hadd (Prog (label ^ "+prims", p))
 
+(* Same as expand_primitives_for_z3 but for a Prog handle.  The source-
+ * side miter input (top.v parsed by Verible) is a Prog with no primitive
+ * bodies: BUFG/IBUFDS/LUT/FDRE/CARRY4 instances reference primitives
+ * whose bodies live in Vivado's VHDL stubs, not in the user RTL.  When
+ * prep_for_z3 runs flatten_for_z3 on such a Prog, every primitive
+ * binstance hits lookup_resolving's None branch and the miter declares
+ * INCONCLUSIVE (task #45).  This augments the Prog by walking ALL
+ * binstances in ALL bmodules, gathering the distinct cell-type names,
+ * and appending the VHDL impl bodies so both miter sides see the same
+ * primitive definitions. *)
+let laugment_prog_with_primitives prog_h =
+  let label, p = find_prog prog_h in
+  let known = List.fold_left (fun acc (m : bmodule) -> m.name :: acc)
+                [] p.modules in
+  let types =
+    List.fold_left (fun acc (m : bmodule) ->
+      List.fold_left (fun acc (i : binstance) ->
+        if List.mem i.module_name known || List.mem i.module_name acc
+        then acc
+        else i.module_name :: acc) acc m.instances) [] p.modules in
+  let impls = Vhdl_to_behavioral.lookup_xil_primitive_impl types in
+  let impl_mods = List.map snd impls in
+  let p' = { p with modules = p.modules @ impl_mods } in
+  hadd (Prog (label ^ "+prims", p'))
+
 (* Lift a Mapped Circuit.t directly into BIR as a structural bprogram
  * with a single bmodule, preserving bus widths on top-level ports.
  * Bypasses the lossy write_cellmapped_v + ver_front re-parse loop that
@@ -973,6 +998,8 @@ module MakeLib
                                (wrap2 lwrite_netlist_edif);
         "expand_primitives_for_z3", V.efunc (V.string **->> V.string)
                                (wrap1 lexpand_primitives_for_z3);
+        "augment_prog_with_primitives", V.efunc (V.string **->> V.string)
+                               (wrap1 laugment_prog_with_primitives);
         "mapped_to_prog",     V.efunc (V.string **->> V.string)
                                (wrap1 lmapped_to_prog);
       ] g;
