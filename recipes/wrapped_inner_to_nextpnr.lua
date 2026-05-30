@@ -61,9 +61,9 @@ flat   = svd.flatten_struct(merged, TOP)
 out    = svd.write_nextpnr_json(flat, OUTDIR .. "/" .. TOP .. ".json")
 print("  wrote " .. out)
 
--- 5. Mirror the JSON as EDIF for Vivado read_edif / link_design as a
---    cross-check oracle.  When nextpnr fails post-pack (timing loop,
---    unresolved constraints), Vivado's checker usually names the
---    offending path.
-edif = svd.write_mod_edif(flat, OUTDIR .. "/" .. TOP .. ".edif")
+-- 5. Mirror the JSON as EDIF via the Netlist -> EDIF direct emitter
+--    (no yosys bridge — yosys 0.64's write_edif mangled LUT INITs).
+--    `flat` is a Netlist handle from svd.flatten_struct; the writer
+--    preserves INIT values as Vivado-format Verilog literals.
+edif = svd.write_netlist_edif(flat, OUTDIR .. "/" .. TOP .. ".edif")
 print("  wrote " .. edif)

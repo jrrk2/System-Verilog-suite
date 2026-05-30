@@ -29,6 +29,11 @@ type luaitm =
   | Mod  of string * bmodule * bprogram       (* mod name, bmodule, owning program (for hier flatten) *)
   | Lib  of string * Sv_liberty.library_info
   | Mapped of string * Hardcaml.Circuit.t       (* gate-mapped Circuit.t (label, circ) *)
+  (* Flat structural netlist: post flatten_struct, NO processes, just
+   * binstances + nets.  Operations on this handle are restricted to
+   * EDIF / yosys-JSON writers — BIR passes (Z3, flatten, prep_for_z3,
+   * splice, …) don't make sense and are not bound to accept it. *)
+  | Netlist of string * bmodule * (string * library_port list) list
 
 let lhash : (string, luaitm) Hashtbl.t = Hashtbl.create 64
 
@@ -46,6 +51,7 @@ let hadd x =
     | None, Mod  (n, m, _), Mod  (n', m', _) when n = n' && m == m' -> found := Some k
     | None, Lib  (n, l), Lib  (n', l') when n = n' && l == l' -> found := Some k
     | None, Mapped (n, c), Mapped (n', c') when n = n' && c == c' -> found := Some k
+    | None, Netlist (n, m, _), Netlist (n', m', _) when n = n' && m == m' -> found := Some k
     | _ -> ()
   ) lhash;
   match !found with
@@ -74,6 +80,11 @@ let find_lib h =
   match Hashtbl.find_opt lhash h with
   | Some (Lib (n, l)) -> (n, l)
   | _ -> failwith ("handle " ^ h ^ " is not a library")
+
+let find_netlist h =
+  match Hashtbl.find_opt lhash h with
+  | Some (Netlist (n, m, lc)) -> (n, m, lc)
+  | _ -> failwith ("handle " ^ h ^ " is not a netlist")
 
 (* ──────────────────────────────────────────────────────────────────
  * Frontend / pipeline shims — duplicated from sv_suite.ml's
@@ -383,9 +394,7 @@ let lflatten_z3 prog_h top =
 let lflatten_struct prog_h top =
   let _, p = find_prog prog_h in
   let m = Behavioral_hier_struct.flatten_structural p ~top in
-  let p' = { Behavioral_ir.modules = [m];
-             library_cells = p.library_cells } in
-  hadd (Mod (top, m, p'))
+  hadd (Netlist (top, m, p.library_cells))
 
 (* Gate-map one module: behavioural BIR → AIG → LUT-cover → Hardcaml
  * Circuit.t of LUT/FDRE/CARRY4/IBUF/OBUF/BUFG cells. *)
@@ -425,14 +434,27 @@ let lwrite_edif mapped_h path =
 
 (* Same EDIF emit but from a Mod handle (post-flatten_struct bmodule).
  * Lifts the structural BIR to a hardcaml Circuit.t via the existing
- * behavioral_to_hardcaml entry, then routes through write_edif.  Used
- * to feed the FULLY-WRAPPED netlist (post-splice) into Vivado as a
- * DRC / timing-loop oracle, where svd.write_edif on Mapped only sees
- * the gate-mapped inner. *)
+ * behavioral_to_hardcaml entry, then routes through write_edif.
+ *
+ * WARNING: behavioral_to_hardcaml.create_circuit's emit_instances
+ * path re-elaborates pure-structural BIR as RTL and silently drops
+ * binstances that don't have BCombinational/BSequential drivers — so
+ * a fully-flattened structural wrapper comes out with only GND/VCC
+ * cells.  Prefer svd.write_bir_edif (bir_to_edif) for any flattened
+ * wrapper netlist; this entry is kept for the gate-mapped-via-
+ * hardcaml use case only. *)
 let lwrite_mod_edif mod_h path =
   let _, m, _ = find_mod mod_h in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true m in
   Fpga_synth.Fpga_emit.write_edif ~path circ;
+  path
+
+(* Direct Netlist → EDIF, bypassing both hardcaml and yosys.  Used to
+ * feed a flattened structural wrapper into Vivado as a DRC / bitstream
+ * oracle with LUT INIT parameters preserved correctly. *)
+let lwrite_netlist_edif net_h path =
+  let _, m, lc = find_netlist net_h in
+  Bir_to_edif.write_edif ~library_cells:lc ~path m;
   path
 
 (* Lift a Mapped Circuit.t directly into BIR as a structural bprogram
@@ -474,12 +496,14 @@ let lsplice prog_h child src_h =
   let p' = { p with modules = modules' } in
   hadd (Prog (label ^ ":+" ^ child, p'))
 
-(* Emit a single module (typically the output of flatten_struct) as
- * nextpnr-xilinx-compatible yosys JSON via the EDIF-path emitter. *)
-let lwrite_nextpnr_json mod_h path =
-  let _, m, p = find_mod mod_h in
+(* Emit a flat structural netlist as nextpnr-xilinx-compatible yosys
+ * JSON.  Takes a Netlist handle (the result of flatten_struct) — the
+ * Mod path is gone because consumers of write_nextpnr_json always
+ * want a structural shape, not RTL BIR. *)
+let lwrite_nextpnr_json net_h path =
+  let _, m, lc = find_netlist net_h in
   Bir_to_nextpnr_json.write_yosys_json
-    ~library_cells:p.library_cells
+    ~library_cells:lc
     ~path m;
   path
 
@@ -573,6 +597,10 @@ let lbir h =
   | Some (Mapped (n, _)) ->
       Printf.sprintf "mapped %s: (gate-mapped Hardcaml Circuit.t — \
                       use svd.write_cellmapped_v / svd.write_mapped_json)" n
+  | Some (Netlist (n, m, _)) ->
+      Printf.sprintf "netlist %s: %d cells (flat structural — use \
+                      svd.write_nextpnr_json / svd.write_netlist_edif)"
+        n (List.length m.instances)
   | None -> failwith ("unknown handle " ^ h)
 
 (* Critical-path timing report for a module. Returns the printable
@@ -610,7 +638,7 @@ let linsts h =
 let lname h =
   match Hashtbl.find_opt lhash h with
   | Some (Prog (n, _)) | Some (Mod (n, _, _)) | Some (Lib (n, _))
-  | Some (Mapped (n, _)) -> n
+  | Some (Mapped (n, _)) | Some (Netlist (n, _, _)) -> n
   | None -> failwith ("unknown handle " ^ h)
 
 (* ──────────────────────────────────────────────────────────────────
@@ -741,6 +769,9 @@ let litems () =
           Printf.sprintf "library %s (%d cells)" n
             (Hashtbl.length l.cells)
       | Mapped (n, _) -> Printf.sprintf "mapped %s (gate-mapped Circuit)" n
+      | Netlist (n, m, _) ->
+          Printf.sprintf "netlist %s (%d cells, flat structural)" n
+            (List.length m.instances)
     in
     (k ^ "\t" ^ kind) :: acc
   ) lhash [] in
@@ -905,6 +936,8 @@ module MakeLib
                                (wrap2 lwrite_edif);
         "write_mod_edif",     V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_mod_edif);
+        "write_netlist_edif", V.efunc (V.string **-> V.string **->> V.string)
+                               (wrap2 lwrite_netlist_edif);
         "mapped_to_prog",     V.efunc (V.string **->> V.string)
                                (wrap1 lmapped_to_prog);
       ] g;
