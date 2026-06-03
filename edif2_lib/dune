@@ -1,0 +1,22 @@
+; edif2 — menhir-based EDIF parser, vendored from /home/jonathan/edif2/.
+; Original Makefile-built artefacts replaced by a dune library so the main
+; SVS build links it directly (no string-search regex parser any more).
+;
+; The original tree built `edif2` as an interactive toplevel via
+; `ocamlmktop`.  We only need the library form here — emain.ml's CLI is
+; kept for reference / debug runs via `dune exec edif2_main`.
+
+(library
+ (name edif2_lib)
+ (wrapped false)
+ (modules edif2 elexer eparse eord dummy eargs emain)
+ (libraries str)
+ ; Vendored code from /home/jonathan/edif2/ that originally targeted
+ ; OCaml 5.1.1.  5.3+ treats unused-open / unused-var as fatal — relax
+ ; those warnings here without polluting the rest of the SVS build.
+ (flags (:standard -w "-26-27-32-33-34-35-37-39-58-69")))
+
+(ocamllex elexer)
+
+(menhir
+ (modules edif2))
