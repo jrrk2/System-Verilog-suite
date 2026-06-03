@@ -18,6 +18,14 @@ type instance_info = {
                            FF reset state, etc.  Raw verilog literal form
                            ("64'hABCDEF...", "1'b0", etc.); decoded by the
                            consumer.  None when no INIT property present. *)
+  properties: (string * string) list;
+                        (* All other (property NAME (kind VAL)) entries on
+                           the instance — DIFF_TERM, IBUF_LOW_PWR,
+                           CLKCM_CFG, etc.  Each (name, val_text); the
+                           wrapping (string "...") / (boolean (true|false))
+                           is stripped so consumers see just the literal
+                           value text ("TRUE", "FALSE", "11", …).  Empty
+                           list when no other properties present. *)
 }
 
 type net_pin = {
@@ -237,7 +245,58 @@ let parse_instances content =
               Some (Str.matched_group 1 inst_text)
             with Not_found -> None
           in
-          instances := { name = inst_name; cell_type; library; init } :: !instances
+          (* Sweep every (property NAME (kind RAW)) on the instance.
+             Vivado emits one per cell attribute — DIFF_TERM, IOSTANDARD,
+             IBUF_LOW_PWR, CLKCM_CFG, …  Match the name and the kind+raw
+             value blob, then post-process to strip wrapping. *)
+          let properties =
+            let re =
+              Str.regexp
+                "property +\\([A-Za-z_][A-Za-z0-9_]*\\) +(\\([a-z]+\\) +\\(.*\\))" in
+            let strip_value kind raw =
+              (* raw still has trailing close-parens from the property's
+                 own closing wrap; cut at the first ')' for boolean/integer
+                 forms which use (boolean (false)) syntax.                *)
+              match kind with
+              | "string" ->
+                (* raw looks like:  "LVDS")     after the final )
+                   strip the leading quote, find the closing quote.        *)
+                (try
+                   let q1 = String.index raw '"' in
+                   let q2 = String.index_from raw (q1 + 1) '"' in
+                   String.sub raw (q1 + 1) (q2 - q1 - 1)
+                 with Not_found -> raw)
+              | "boolean" ->
+                (* raw looks like:  (false))    or (true)).                *)
+                (try
+                   let lp = String.index raw '(' in
+                   let rp = String.index_from raw lp ')' in
+                   String.sub raw (lp + 1) (rp - lp - 1)
+                 with Not_found -> raw)
+              | "integer" ->
+                (try
+                   let rp = String.index raw ')' in
+                   String.trim (String.sub raw 0 rp)
+                 with Not_found -> raw)
+              | _ -> raw
+            in
+            let rec scan acc pos =
+              try
+                let _ = Str.search_forward re inst_text pos in
+                let nm   = Str.matched_group 1 inst_text in
+                let kind = Str.matched_group 2 inst_text in
+                let raw  = Str.matched_group 3 inst_text in
+                let v    = strip_value kind raw in
+                let acc =
+                  if nm = "INIT" then acc
+                  else (nm, String.uppercase_ascii v) :: acc in
+                scan acc (Str.match_end ())
+              with Not_found -> List.rev acc
+            in
+            scan [] 0
+          in
+          instances := { name = inst_name; cell_type; library; init;
+                         properties } :: !instances
         with _ -> ());
 
       find_instance (inst_end + 1)
