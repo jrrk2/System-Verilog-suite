@@ -625,6 +625,16 @@ let lread_edif path =
   let p = Edif_to_behavioral.convert path in
   hadd (Prog (Filename.basename path, p))
 
+(* Structural variant: keep every EDIF instance as a binstance with its
+ * primitive cell_type intact (LUT6/FDRE/CARRY4/BUFG/…), parameters in
+ * param_strs.  For the Vivado-synth → SVS → nextpnr-xilinx flow where
+ * write_nextpnr_json needs gate-level cells, not decoded behaviour. *)
+let lread_edif_structural path =
+  if not (Sys.file_exists path) then
+    failwith ("read_edif_structural: file not found: " ^ path);
+  let p = Edif2_to_structural.convert path in
+  hadd (Prog (Filename.basename path, p))
+
 let lgate_miter top beh gate lib_opt =
   let lib_path = match lib_opt with "" -> default_lib () | s -> s in
   if not (Sys.file_exists lib_path) then
@@ -979,6 +989,9 @@ module MakeLib
                            (wrap1 lprep_for_z3);
         "owner",          V.efunc (V.string **->> V.string) (wrap1 lowner);
         "read_edif",      V.efunc (V.string **->> V.string) (wrap1 lread_edif);
+        "read_edif_structural",
+                          V.efunc (V.string **->> V.string)
+                            (wrap1 lread_edif_structural);
 
         (* ──────── FPGA-specific (Fpga_synth + nextpnr-xilinx) ──── *)
         "gate_map",       V.efunc (V.string **-> V.int **-> V.int

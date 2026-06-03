@@ -34,14 +34,14 @@
           behavioral_to_z3 behavioral_to_hardcaml z3_miter z3_hardcaml_miter
           file_registry
           nlview_parser nlview_to_behavioral behavioral_to_verilog nlview_to_verilog
-          edif_parser edif_to_behavioral edif_to_structural edif_to_verilog behavioral_hier_struct bir_to_nextpnr_json bir_to_edif hardcaml_to_behavioral
+          edif_parser edif_to_behavioral edif_to_structural edif2_to_structural edif_to_verilog behavioral_hier_struct bir_to_nextpnr_json bir_to_edif hardcaml_to_behavioral
           ver_front_to_behavioral vhdl_to_ver_front ff_stats cva6_ram_scan random_sv_gen list_mods sv_suite synth_orfs_shim orfs_prep mac_synth_shim 
           example_round_trip 
           
           
           vhdl_semantic_checker
           vhdl_parse vhdl_elaborate vhdl_expr_to_ir vhdl_process_extract vhdl_to_ir vhdl_to_ir_direct vhdl_to_ir_iterate vhdl_ir_to_opt_ir interactive_client interactive_client_v2 nlview_to_verilog)
- (libraries str yojson unix base fpga_synth hardcaml hardcaml_circuits z3 vhd_front ver_front lua-ml linenoise lef_def lablgtk3)
+ (libraries str yojson unix base fpga_synth hardcaml hardcaml_circuits z3 vhd_front ver_front lua-ml linenoise lef_def lablgtk3 edif2_lib)
  (preprocess (pps ppx_deriving_yojson)))
 
 (env
