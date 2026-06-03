@@ -250,6 +250,35 @@ let port_dir_table (cells : (string * library_port list) list)
   ) cells;
   t
 
+(* Declared port widths for Xilinx primitives.  Anything not in this
+ * table is assumed 1-bit; that's correct for every LUT/FF/buffer pin.
+ * The widths matter because nextpnr-xilinx's pack_carry_xc7 rewrites
+ *   port_xform[id("O[i]")] = id("Oi")  for i in 0..3
+ * and the router then resolves `<bel>.O0..O3` from the chipdb.  If our
+ * JSON emits a bare `O` connection with a single bit (because only one
+ * tap was used in the user RTL), pack_carry's xform doesn't fire and
+ * routing dies with "No wire found for port O on source cell" on the
+ * chain-MSB CARRY4 — that was task #35.  We pad short connections with
+ * fresh unique net IDs so the bus shape always matches the BEL.        *)
+let xil_primitive_widths : (string * (string * int) list) list = [
+  "CARRY4", [ "CO", 4; "O", 4; "DI", 4; "S", 4 ];
+]
+
+let port_width_table (cells : (string * library_port list) list)
+    : (string * string, int) Hashtbl.t =
+  let t = Hashtbl.create 64 in
+  List.iter (fun (cname, ports) ->
+    List.iter (fun (port_name, w) ->
+      Hashtbl.replace t (cname, port_name) w) ports
+  ) xil_primitive_widths;
+  List.iter (fun (cname, ports) ->
+    List.iter (fun (p : library_port) ->
+      if p.port_width > 1 then
+        Hashtbl.replace t (cname, p.port_name) p.port_width)
+      ports
+  ) cells;
+  t
+
 let dir_str : [< `Input | `Output | `Inout | `Internal ] -> string = function
   | `Input    -> "input"
   | `Output   -> "output"
@@ -262,6 +291,7 @@ let yosys_json
   let ctx = mk_ctx () in
   populate_widths ctx m;
   let port_dirs = port_dir_table library_cells in
+  let port_widths = port_width_table library_cells in
 
   (* Pre-allocate net ids for top-level ports so they are stable.
      For vector ports, we allocate one id per bit. *)
@@ -289,8 +319,27 @@ let yosys_json
       | Some d -> d
       | None   -> `Input    (* default to input if library_cells omitted *)
     in
+    (* Pad short bit lists up to the declared port width with fresh net
+     * IDs.  See the comment on xil_primitive_widths above — necessary so
+     * pack_carry_xc7's `O[i] -> Oi` xform fires on every CARRY4 in the
+     * chain, even ones whose top O bits have no consumers in the RTL. *)
+    let pad_bits_to_width pin bits =
+      let actual = List.length bits in
+      let declared =
+        try Hashtbl.find port_widths (i.module_name, pin)
+        with Not_found -> actual
+      in
+      if actual >= declared then bits
+      else
+        let pad_count = declared - actual in
+        let pads = List.init pad_count (fun _ ->
+          I (alloc ctx { base = "__pad_" ^ i.inst_name ^ "_" ^ pin;
+                         bit = !(ctx.next_id) })) in
+        bits @ pads
+    in
     let conns =
-      List.map (fun (pin, expr) -> pin, bits_json (bits_of_conn ctx expr))
+      List.map (fun (pin, expr) ->
+        pin, bits_json (pad_bits_to_width pin (bits_of_conn ctx expr)))
         i.port_connections in
     let dirs =
       List.map (fun (pin, _) -> pin, `String (dir_str (dir_of_pin pin)))
