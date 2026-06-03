@@ -473,6 +473,16 @@ let lwrite_netlist_edif net_h path =
   Bir_to_edif.write_edif ~library_cells:lc ~path m;
   path
 
+(* Direct Netlist → gate-level structural Verilog.  Same internal graph
+ * as write_netlist_edif / write_nextpnr_json — a third independent view
+ * so xsim can functionally simulate the flattened netlist (against
+ * unisims_ver) as a sanity check that the SVS internal representation
+ * is correct.                                                          *)
+let lwrite_netlist_verilog net_h path =
+  let _, m, lc = find_netlist net_h in
+  Bir_to_verilog_netlist.write_verilog ~library_cells:lc ~path m;
+  path
+
 (* Expand each Netlist binstance against its VHDL primitive implementation
  * body (LUT4.vhd, FDRE.vhd, CARRY4.vhd, …), producing a bprogram whose
  * top is the netlist's flat bmodule and whose remaining modules are the
@@ -1009,6 +1019,8 @@ module MakeLib
                                (wrap2 lwrite_mod_edif);
         "write_netlist_edif", V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_netlist_edif);
+        "write_netlist_verilog", V.efunc (V.string **-> V.string **->> V.string)
+                                  (wrap2 lwrite_netlist_verilog);
         "expand_primitives_for_z3", V.efunc (V.string **->> V.string)
                                (wrap1 lexpand_primitives_for_z3);
         "augment_prog_with_primitives", V.efunc (V.string **->> V.string)
