@@ -1083,6 +1083,13 @@ module MakeLib
         "set_status",  V.efunc (V.string **->> V.string)
                        (wrap1 lgui_set_status);
         "quit",        V.efunc (V.unit **->> V.string)   (wrap1 lgui_quit);
+      ] g;
+      (* OS module — this embedded lua-ml has no standard `os` table,
+         so expose the handful of bits recipes need.  getenv returns
+         Lua nil for unset variables (via V.option). *)
+      C.register_module "os" [
+        "getenv", V.efunc (V.string **->> V.option V.string)
+                   (fun k -> Sys.getenv_opt k);
       ] g
   end
 end
