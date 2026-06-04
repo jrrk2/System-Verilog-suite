@@ -253,10 +253,33 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
         Hashtbl.set memo ~key:(T.uid s) ~data:[| bit_name |]));
 
   (* Outputs: emit ONE multi-bit Output bsignal per regrouped bus.
-   * Drive each bit with an identity LUT1 #(.INIT(2'b10)) so the bit
-   * gets a structural driver via BSlice { signal = BVar port; msb=i;
-   * lsb=i } — flatten_struct's BSlice rewrite then propagates the
-   * wrapper's actual when the wrapper instantiates with .port(port). *)
+   * Drive each bit with an identity LUT acting as a structural
+   * buffer so the bit has a concrete driver via BSlice {
+   * signal = BVar port; msb=i; lsb=i } — flatten_struct's BSlice
+   * rewrite then propagates the wrapper's actual when the wrapper
+   * instantiates with .port(port).
+   *
+   * Use **LUT6** (not LUT1) for this buffer.  LUT6 outputs flow via
+   * the SLICE's O6 -> x wire path, which nextpnr-xilinx places at
+   * a regular *6LUT BEL slot.  A LUT1 acting as a buffer would land
+   * at a *5LUT slot whose O5 output exits via xOUTMUX -> xMUX wire;
+   * on V7 silicon that path is unreliable when no FF is co-located
+   * in the same slot, manifesting as stuck-high LEDs on counter25
+   * (see [[project-106-lut5-outmux-diagnosis]]).  yosys's
+   * synth_xilinx avoids the same gap by co-locating an FF; using a
+   * LUT6 sidesteps the OUTMUX entirely.
+   *
+   * All six LUT inputs are tied to the SAME data signal so
+   * nextpnr-xilinx's packer cannot fold a stray LUT5 into the
+   * remaining input pins (which it eagerly does when inputs are
+   * tied to constants, corrupting the buffer's truth table).
+   * With all inputs identical, the address bits reaching the LUT
+   * are either 0b000000 or 0b111111, so the only meaningful INIT
+   * bits are INIT[0]=0 and INIT[63]=1.  INIT pattern
+   * 64'hFFFFFFFF00000000 satisfies that (and is also legible as
+   * "high half of the truth table = 1, low half = 0", i.e. the
+   * identity function under the all-inputs-tied address scheme).
+   *)
   List.iter (regroup ~dir:`Output output_sigs)
     ~f:(fun (base, w, by_idx) ->
       port_signals := { Behavioral_ir.name = base;
@@ -272,10 +295,17 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
         in
         instances := {
           Behavioral_ir.inst_name = Printf.sprintf "obuf_%s_%d" base i;
-          module_name = "LUT1";
+          module_name = "LUT6";
           param_values = [];
-          param_strs = ["INIT", "2'b10"];
-          port_connections = ["I0", BVar inner; "O", port_bit];
+          param_strs = ["INIT", "64'hFFFFFFFF00000000"];
+          port_connections =
+            [ "I0", BVar inner
+            ; "I1", BVar inner
+            ; "I2", BVar inner
+            ; "I3", BVar inner
+            ; "I4", BVar inner
+            ; "I5", BVar inner
+            ; "O",  port_bit ];
         } :: !instances));
 
   {

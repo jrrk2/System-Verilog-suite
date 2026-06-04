@@ -3423,12 +3423,39 @@ let convert_module ~pkgs (mdecl : module_decl)
               let elem_w = width_of ~typedefs ~pkgs ~params inst_type in
               BInt { width = elem_w; signed = Unsigned }
         in
+        (* Capture `reg [W:0] X = expr;` declaration-time initialisers.
+         * The SVS Verible parser tags these as
+         * `trailing_decl_assignment2`, nested inside the register
+         * variable node alongside the name and dimensions.  Pull the
+         * value subtree (TUPLE4 slot 2 = third child) through the
+         * existing expression evaluator; only constant initialisers
+         * survive into BIR's `initial_value`.  Without this, FDRE
+         * INIT is always 0, which breaks LFSRs / one-hot FSMs / any
+         * design whose power-on state matters [[memory: 65]]. *)
+        let init_v = ref None in
+        let try_value v =
+          if !init_v = None then
+            try
+              match expr_to_bexpr ~pkgs ~params ~arrays:[] v with
+              | BConst { value; width } ->
+                  init_v := Some (BConst { value; width })
+              | _ -> ()
+            with _ -> ()
+        in
+        walk (function
+          | TUPLE3 (STRING t, _, v)
+            when prefix_is "trailing_decl_assignment" t -> try_value v
+          | TUPLE4 (STRING t, _, v, _)
+            when prefix_is "trailing_decl_assignment" t -> try_value v
+          | TUPLE5 (STRING t, _, v, _, _)
+            when prefix_is "trailing_decl_assignment" t -> try_value v
+          | _ -> ()) n;
         match !nm with
         | Some id -> Some {
             name = id;
             stype;
             direction = `Internal;
-            initial_value = None; attrs = [];
+            initial_value = !init_v; attrs = [];
           }
         | None -> None
       ) var_nodes
