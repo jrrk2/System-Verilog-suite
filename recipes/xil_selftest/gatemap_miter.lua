@@ -1,0 +1,11 @@
+print("== xil_models: gate-mapped LUT netlist vs behavioral source ==")
+p  = svd.parse("verible", "top", {"recipes/xil_selftest/comb_spec.v"})
+mp = svd.pick(p, "top")
+mapped = svd.gate_map(mp, 6, 0)          -- k=6 LUTs, io=0 (no IO buffers)
+impl   = svd.mapped_to_prog(mapped)      -- BIR with LUT instances carrying INIT
+print("modules:  " .. svd.module_names(impl))
+print("coverage: " .. svd.xil_models_coverage(impl))
+impl = svd.augment_xil_models(impl)
+mi = svd.pick(impl, "top")
+ms = svd.pick(p, "top")
+print("VERDICT: " .. svd.miter(ms, mi))

@@ -1,0 +1,6 @@
+print("== NEGATIVE CONTROL: P&R netlist vs WRONG-TAP source ==")
+impl = svd.read_nextpnr_json("/Users/jonathan/nextpnr-xilinx/xilinx/examples/counter25/routed.json")
+impl = svd.augment_xil_models(impl)
+spec = svd.parse("verible-ext", "top", {"recipes/xil_selftest/top_wrongtap.v"})
+spec = svd.augment_xil_models(spec)
+print("VERDICT: " .. svd.miter(svd.pick(spec,"top"), svd.pick(impl,"top")))

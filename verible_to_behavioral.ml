@@ -2664,6 +2664,53 @@ let extract_instances ~pkgs ~params tok =
     let inst_nodes = collect_by (has_tag (fun t ->
       prefix_is "non_anonymous_gate_instance" t ||
       prefix_is "module_instance" t)) base in
+    (* Parameter overrides `#(.INIT(64'h..), .IS_C_INVERTED(1'b0), ...)` sit on
+       the shared `unqualified_id` type node, sibling to the gate instances in
+       this declaration, so capture them once per base and attach to every
+       binstance it produces.  Kept as source-style strings ("64'h..", "4'h6",
+       "0") in param_strs because a 64-bit LUT INIT overflows a native int —
+       Xil_prim_models.normalize_init re-parses base+digits.                 *)
+    let param_value_str valexpr =
+      (* parameter_expr wraps the value in an `expression` subtree, so search
+         recursively for the first sized literal / number rather than matching
+         at top level. *)
+      let found = ref None in
+      let take s = if !found = None then found := Some s in
+      walk (function
+        | TUPLE3 (STRING tag, base_token, digits)
+          when prefix_is "bin_based_number" tag || prefix_is "hex_based_number" tag
+            || prefix_is "dec_based_number" tag || prefix_is "oct_based_number" tag ->
+            let basestr = match base_token with
+              | TK_BinBase s | TK_HexBase s | TK_DecBase s | TK_OctBase s -> s
+              | _ -> "" in
+            let ds = ref "" in
+            walk (function
+              | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n | TK_DecNumber n ->
+                  ds := !ds ^ n
+              | _ -> ()) digits;
+            take (basestr ^ !ds)
+        | TK_UnBasedNumber n -> take n
+        | _ -> ()) valexpr;
+      match !found with
+      | Some s -> Some s
+      | None ->
+          (match eval_int ~pkgs ~params valexpr with
+           | Some i -> Some (string_of_int i)
+           | None -> None)
+    in
+    let base_param_strs =
+      collect_by (has_tag (prefix_is "parameter_value_byname")) base
+      |> List.filter_map (function
+           | TUPLE6 (_, _, mname, _, valexpr, _) ->
+               let pname = ref None in
+               walk (function
+                 | SymbolIdentifier id when !pname = None -> pname := Some id
+                 | _ -> ()) mname;
+               (match !pname, param_value_str valexpr with
+                | Some n, Some v -> Some (n, v)
+                | _ -> None)
+           | _ -> None)
+    in
     List.filter_map (fun in_ ->
       let inst_name = ref None in
       let port_conns = ref [] in
@@ -2752,7 +2799,7 @@ let extract_instances ~pkgs ~params tok =
             Some {
               inst_name = prefixed_inst;
               module_name = m;
-              param_values = []; param_strs = [];
+              param_values = []; param_strs = base_param_strs;
               port_connections = List.rev !port_conns;
             }
       | _ -> None

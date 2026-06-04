@@ -525,6 +525,33 @@ let laugment_prog_with_primitives prog_h =
   let p' = { p with modules = p.modules @ impl_mods } in
   hadd (Prog (label ^ "+prims", p'))
 
+(* No-Vivado replacement for augment_prog_with_primitives: instead of parsing
+ * Vivado's unisim VHDL, synthesise each Xilinx primitive body directly as BIR
+ * from the binstance's INIT/params (Xil_prim_models).  Each instance is
+ * specialised to a uniquely-named body baking in its INIT, so flatten_for_z3
+ * — which inlines without parameter substitution and caches by module_name —
+ * gets the right function per instance.  Use this on BOTH miter sides. *)
+let laugment_xil_models prog_h =
+  let label, p = find_prog prog_h in
+  let p' = Xil_prim_models.augment_program p in
+  hadd (Prog (label ^ "+xilmodels", p'))
+
+(* Read an actual nextpnr post-P&R netlist (yosys JSON from `nextpnr --write`)
+ * into structural BIR, reconstructing logical primitives from the X_ORIG_TYPE
+ * / X_ORIG_PORT attributes (Nextpnr_json_to_behavioral).  Pair with
+ * augment_xil_models + miter to check the pack/place mapping against source. *)
+let lread_nextpnr_json path =
+  let p = Nextpnr_json_to_behavioral.read_program path in
+  let label = match p.modules with m :: _ -> m.name | [] -> "nextpnr" in
+  hadd (Prog (label, p))
+
+let lxil_models_coverage prog_h =
+  let _, p = find_prog prog_h in
+  let cov = Xil_prim_models.coverage p in
+  if cov = [] then "(no modelled primitives)"
+  else String.concat " "
+         (List.map (fun (k, n) -> Printf.sprintf "%s=%d" k n) cov)
+
 (* Lift a Mapped Circuit.t directly into BIR as a structural bprogram
  * with a single bmodule, preserving bus widths on top-level ports.
  * Bypasses the lossy write_cellmapped_v + ver_front re-parse loop that
@@ -1025,6 +1052,12 @@ module MakeLib
                                (wrap1 lexpand_primitives_for_z3);
         "augment_prog_with_primitives", V.efunc (V.string **->> V.string)
                                (wrap1 laugment_prog_with_primitives);
+        "augment_xil_models", V.efunc (V.string **->> V.string)
+                               (wrap1 laugment_xil_models);
+        "read_nextpnr_json", V.efunc (V.string **->> V.string)
+                               (wrap1 lread_nextpnr_json);
+        "xil_models_coverage", V.efunc (V.string **->> V.string)
+                               (wrap1 lxil_models_coverage);
         "mapped_to_prog",     V.efunc (V.string **->> V.string)
                                (wrap1 lmapped_to_prog);
       ] g;
