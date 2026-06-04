@@ -545,6 +545,10 @@ let lread_nextpnr_json path =
   let label = match p.modules with m :: _ -> m.name | [] -> "nextpnr" in
   hadd (Prog (label, p))
 
+(* Physical routing-completeness report: which FF D-pins are not actually
+ * reached by their net's ROUTING (the bypass-FFMUX defect signature). *)
+let lroute_check path = Nextpnr_json_to_behavioral.route_report path
+
 let lxil_models_coverage prog_h =
   let _, p = find_prog prog_h in
   let cov = Xil_prim_models.coverage p in
@@ -1056,6 +1060,8 @@ module MakeLib
                                (wrap1 laugment_xil_models);
         "read_nextpnr_json", V.efunc (V.string **->> V.string)
                                (wrap1 lread_nextpnr_json);
+        "route_check", V.efunc (V.string **->> V.string)
+                               (wrap1 lroute_check);
         "xil_models_coverage", V.efunc (V.string **->> V.string)
                                (wrap1 lxil_models_coverage);
         "mapped_to_prog",     V.efunc (V.string **->> V.string)
