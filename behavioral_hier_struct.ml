@@ -33,6 +33,29 @@ let parse_bit (name : string) : string * int option =
     else (name, None)
   with _ -> (name, None)
 
+(* Hardcaml names a vector port's bits "<base>__<bit>" (double underscore +
+   decimal index), while the port itself stays a vector signal "<base>".
+   gate_map -> mapped_to_prog emits internal cell pins in this form, so a
+   reference like "rx_data__3" must resolve to bit 3 of the port "rx_data".
+   Split on the LAST "__" whose suffix is all digits.  Returns None for
+   ordinary nets (e.g. Hardcaml temporaries "_n_69" have no "__"). *)
+let split_dunder_bit (name : string) : (string * int) option =
+  let len = String.length name in
+  let rec find i =
+    if i < 1 then None
+    else if name.[i] = '_' && name.[i - 1] = '_' then Some (i - 1)
+    else find (i - 1)
+  in
+  match find (len - 1) with
+  | None -> None
+  | Some us ->
+      let base = String.sub name 0 us in
+      let suff = String.sub name (us + 2) (len - us - 2) in
+      if base <> "" && suff <> ""
+         && String.for_all (fun c -> c >= '0' && c <= '9') suff
+      then Some (base, int_of_string suff)
+      else None
+
 (* Rewrite a child's bexpr into parent scope.
    - if the BVar refers to a child PORT (possibly bit-selected), substitute
      the parent's actual for that pin; bit indices are propagated through.
@@ -54,7 +77,14 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
       (match port_actual base, idx_opt with
        | Some actual, None        -> actual
        | Some actual, Some bit    -> bit_select actual bit
-       | None,        _           -> BVar (pname prefix nm))
+       | None,        _           ->
+           (* Try Hardcaml per-bit vector-port naming "<port>__<bit>". *)
+           (match split_dunder_bit nm with
+            | Some (b, bit) ->
+                (match port_actual b with
+                 | Some actual -> bit_select actual bit
+                 | None        -> BVar (pname prefix nm))
+            | None -> BVar (pname prefix nm)))
   | BSelect { array; index } ->
       let array' = rewrite_bexpr ~prefix ~port_actual array in
       (match array', index with
@@ -78,13 +108,22 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
    route through to the parent's actual net for that bit. *)
 and bit_select (expr : bexpr) (bit : int) : bexpr =
   match expr with
-  | BVar nm ->
-      (* Parent's actual is a flat scalar net name; append bracket. *)
-      BVar (Printf.sprintf "%s[%d]" nm bit)
+  | BVar _ ->
+      (* Select one bit of a flat vector net.  Emit BSlice (msb=lsb=bit) — the
+       * SAME representation hardcaml_to_behavioral uses for vector port bits
+       * (e.g. `.O(dout[3:3])`), so the emitter resolves driver and reader to
+       * the same net bit.  A bracket STRING "net[bit]" would instead become a
+       * separate opaque scalar net and leave the bit undriven. *)
+      BSlice { signal = expr; msb = bit; lsb = bit }
   | BConcat es ->
       let w = List.length es in
       if bit >= 0 && bit < w then List.nth es (w - 1 - bit)
       else expr
+  | BConst { value; _ } ->
+      (* Select one bit of a multi-bit constant (e.g. parent ties a 2-bit
+       * port to 2'b11); without this, a single-bit reference would keep the
+       * whole constant and land a 2-bit value on a 1-bit cell pin. *)
+      BConst { value = (value lsr bit) land 1; width = 1 }
   | BSelect _ -> expr  (* parent already bit-selected; assume scalar *)
   | _         -> expr
 

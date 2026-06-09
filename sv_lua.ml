@@ -418,8 +418,34 @@ let lgate_map mod_h k_lut io_flag =
   let _, m, _ = find_mod mod_h in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true m in
   let l = Fpga_synth.Bir_to_aig.lower_circuit circ in
+  (* Cost mode for the LUT cover, selectable via env so the timing-driven
+     mapping can be exercised without recompiling.  Default `Area keeps the
+     historical (compact, deep) behaviour.
+       GATE_MAP_MODE = area | delay | mixed[:N]   (N = slack tolerance, default 1)
+       GATE_MAP_LUTPACK=1   enable LUT packing (area recovery)
+       GATE_MAP_MFS2=1      enable mfs2 don't-care optimisation *)
+  let mode : Fpga_synth.Lut_cover.cost_mode =
+    match Sys.getenv_opt "GATE_MAP_MODE" with
+    | Some "delay" -> `Delay
+    | Some s when String.length s >= 5 && String.sub s 0 5 = "mixed" ->
+        let tol =
+          if String.length s > 6 && s.[5] = ':'
+          then (try int_of_string (String.sub s 6 (String.length s - 6)) with _ -> 1)
+          else 1 in
+        `Mixed tol
+    | _ -> `Area in
+  let envflag v = Sys.getenv_opt v = Some "1" in
+  let lutpack = envflag "GATE_MAP_LUTPACK" in
+  let mfs2 = envflag "GATE_MAP_MFS2" in
+  let mfs2_var = envflag "GATE_MAP_MFS2_VAR" || mfs2 in
+  let mfs2_odc = envflag "GATE_MAP_MFS2_ODC" || mfs2 in
+  let aig_balance =
+    match Sys.getenv_opt "GATE_MAP_AIG_BALANCE" with
+    | Some s -> (try int_of_string s with _ -> 0)
+    | None -> 0 in
   let mapped = Fpga_synth.Fpga_map.map_lowered
-    ~io:(io_flag <> 0) ~k:k_lut ~name:m.name l in
+    ~io:(io_flag <> 0) ~k:k_lut ~name:m.name
+    ~mode ~lutpack ~mfs2_var_elim:mfs2_var ~mfs2_odc ~aig_balance l in
   hadd (Mapped (m.name, mapped))
 
 (* Dump a Mapped circuit as cell-mapped Verilog via Hardcaml.Rtl,
@@ -625,6 +651,18 @@ let lflatten prog_h =
 let loptimize prog_h =
   let label, p = find_prog prog_h in
   let p', _ = Behavioral_optimize.optimize_full p in
+  hadd (Prog (label, p'))
+
+(* Gate-map-safe logical optimisation: constant-prop + DCE + CSE, but NO SSA
+   (SSA mints multi-driver writebacks that crash Behavioral_to_hardcaml) and no
+   register inference.  Shrinks the BIR before gate_map without breaking it. *)
+let loptimize_logic prog_h =
+  let label, p = find_prog prog_h in
+  let cfg = { Behavioral_optimize.default_config with
+              enable_ssa = false;
+              enable_register_inference = false;
+              verbose = false } in
+  let p', _ = Behavioral_optimize.optimize_custom cfg p in
   hadd (Prog (label, p'))
 
 let lffrip mod_h =
@@ -1021,6 +1059,7 @@ module MakeLib
                            (wrap1 lparse_v_cells);
         "flatten",        V.efunc (V.string **->> V.string) (wrap1 lflatten);
         "optimize",       V.efunc (V.string **->> V.string) (wrap1 loptimize);
+        "optimize_logic", V.efunc (V.string **->> V.string) (wrap1 loptimize_logic);
         "ffrip",          V.efunc (V.string **->> V.string) (wrap1 lffrip);
         "register_analyse", V.efunc (V.string **->> V.string)
                              (wrap1 lregister_analyse);

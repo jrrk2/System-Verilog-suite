@@ -24,10 +24,15 @@ open Hardcaml
  * register side so the rest of the netlist is unchanged. *)
 let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
     ?(lutpack = false) ?(mfs2_var_elim = false) ?(mfs2_odc = false)
+    ?(aig_balance = 0)
     ?(diff_clocks : (string * (string * string)) list = [])
     ~(k : int) ~(name : string) (l : Bir_to_aig.lowered)
   : Circuit.t =
-  let g = l.Bir_to_aig.graph in
+  (* AIG balancing (depth reduction) before LUT covering — the main Fmax
+     lever; semantics-preserving (AND/OR associativity). *)
+  let g = if aig_balance > 0
+          then Bir_to_aig.balance ~passes:aig_balance l.Bir_to_aig.graph
+          else l.Bir_to_aig.graph in
   (* feedback wire per boundary output bit: register Q + instance output
      ports.  signal_of_node routes an AIG input to its wire when present. *)
   let q_wire = Hashtbl.create (module String) in
