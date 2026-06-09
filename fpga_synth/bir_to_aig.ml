@@ -272,31 +272,32 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
       let mk_bit_names port =
         List.init 4 ~f:(fun j -> Printf.sprintf "%s_%s_%d" base port j)
       in
+      (* Pad the unused upper lanes of the top CARRY4 (bit_idx >= w) with the
+         last real S/DI lit rather than a constant 0.  Those lanes' sum and
+         carry-out feed nothing (the chain's used carry-out is taken at lane
+         (w-1) mod 4), so the value is a don't-care — but tying them to GND
+         makes them $PACKER_GND_NET sinks on the CARRY4.S/DI pins, which are
+         driven by the slice's own LUTs and so are NOT reachable by general
+         constant routing (they'd be left unrouted).  Reusing a real local
+         signal keeps every lane routable. *)
       let s_names = mk_bit_names "S" in
       let di_names = mk_bit_names "DI" in
+      let pad_s  = s_lits.(w - 1) in
+      let pad_di = di_lits.(w - 1) in
       List.iteri s_names ~f:(fun j nm ->
         let bit_idx = (4 * k) + j in
-        let lit = if bit_idx < w then s_lits.(bit_idx) else const_false in
+        let lit = if bit_idx < w then s_lits.(bit_idx) else pad_s in
         inst_outs := (nm, lit) :: !inst_outs);
       List.iteri di_names ~f:(fun j nm ->
         let bit_idx = (4 * k) + j in
-        let lit = if bit_idx < w then di_lits.(bit_idx) else const_false in
+        let lit = if bit_idx < w then di_lits.(bit_idx) else pad_di in
         inst_outs := (nm, lit) :: !inst_outs);
-      let cyinit_name = Printf.sprintf "%s_CYINIT" base in
-      let ci_name = Printf.sprintf "%s_CI" base in
-      (* Only emit ci_name as an AIG output when this is the chain
-         head (no previous CARRY4 to source CI from).  Otherwise
-         ib_in_ports points CI at the prev block's CO_3 (q_wire
-         fallback in bus_of_bits) and ci_name doesn't appear in
-         ib_in_ports — so adding it to inst_outs would leak it as a
-         top-level real output port. *)
-      let cyinit_lit, chain_head =
-        match !prev_co3_name with
-        | None -> carry_in, true
-        | Some _ -> const_false, false
-      in
-      inst_outs := (cyinit_name, cyinit_lit) :: !inst_outs;
-      if chain_head then inst_outs := (ci_name, const_false) :: !inst_outs;
+      (* Carry-in source: the chain head uses CYINIT (driven by carry_in);
+         upper blocks cascade via CI from the block below.  Each block must
+         drive EXACTLY ONE of the two (see in_ports): CI is a dedicated
+         cascade pin that can't take a routed constant, and driving CYINIT
+         and CI on the same block makes the fasm backend emit conflicting
+         PRECYINIT.AX and PRECYINIT.CIN bits for that slice. *)
       let o_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_O_%d" base j) in
       let co_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_CO_%d" base j) in
       let o_lits = List.map o_names ~f:(aig_input b) in
@@ -312,17 +313,14 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
         let last_bit = (w - 1) - (4 * k) in
         top_co_lit := List.nth_exn co_lits last_bit
       end;
-      let ci_port_names =
-        match !prev_co3_name with
-        | Some prev -> [ prev ]
-        | None -> [ ci_name ]
-      in
       let in_ports =
-        [ "CYINIT", [ cyinit_name ]
-        ; "CI", ci_port_names
-        ; "DI", di_names
-        ; "S", s_names
-        ]
+        let common = [ "DI", di_names; "S", s_names ] in
+        match !prev_co3_name with
+        | Some prev -> ("CI", [ prev ]) :: common      (* upper block: CI cascade, no CYINIT *)
+        | None ->                                       (* head block: CYINIT only, no CI *)
+            let cyinit_name = Printf.sprintf "%s_CYINIT" base in
+            inst_outs := (cyinit_name, carry_in) :: !inst_outs;
+            ("CYINIT", [ cyinit_name ]) :: common
       in
       let out_ports = [ "O", o_names; "CO", co_names ] in
       insts
