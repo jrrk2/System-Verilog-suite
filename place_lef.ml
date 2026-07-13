@@ -542,11 +542,42 @@ let () =
      only punishes UNRELATED modules sharing a bin -- resolving that tension. *)
   let coh_w = getenv_float "TOPO_COH_W" 0.0 in
   let coh_on = coh_w > 0.0 in
-  let mod_key name =
+  (* TOPO_COH_DEPTH>0: group by the first K hierarchy components (split on '.'
+     or '/'), so a deep vendor IP block (e.g. eth.sgmii_soc1.i_pcs_pma) becomes
+     ONE cohesion module and is pulled compact, instead of shattering into
+     hundreds of per-register-bank groups.  0 = legacy (strip last component). *)
+  let coh_depth = getenv_int "TOPO_COH_DEPTH" 0 in
+  let strip_last name =
     let ld = try String.rindex name '.' with Not_found -> -1 in
     let ls = try String.rindex name '/' with Not_found -> -1 in
     let cut = max ld ls in
     if cut > 0 then String.sub name 0 cut else name in
+  let mod_key name =
+    if coh_depth <= 0 then strip_last name
+    else begin
+      (* Count hierarchy separators.  Only names DEEPER than coh_depth are
+         coarsened (cut at the coh_depth-th separator) so a deep vendor IP is
+         one compact module; shallow names keep legacy per-bank grouping so the
+         surrounding glue logic is unaffected. *)
+      let n = String.length name in
+      let nsep = ref 0 in
+      for i = 0 to n - 1 do
+        if name.[i] = '.' || name.[i] = '/' then incr nsep
+      done;
+      if !nsep <= coh_depth then strip_last name
+      else begin
+        let seen = ref 0 and cut = ref n in
+        (try
+           for i = 0 to n - 1 do
+             if name.[i] = '.' || name.[i] = '/' then begin
+               incr seen;
+               if !seen >= coh_depth then (cut := i; raise Exit)
+             end
+           done
+         with Exit -> ());
+        String.sub name 0 !cut
+      end
+    end in
   let mod_ids = Hashtbl.create 256 and nmods = ref 0 in
   let mod_of = Array.make ncells (-1) in
   Array.iteri (fun i c ->
@@ -1100,7 +1131,18 @@ let () =
              let reg = reg_of sinks in
              let c = try Hashtbl.find rused reg with Not_found -> 0 in
              if c < bufr_per_region then begin
-               Hashtbl.replace rused reg (c + 1); ignore (add_buf bit buf_type sinks)
+               Hashtbl.replace rused reg (c + 1);
+               let bname = add_buf bit buf_type sinks in
+               (* Stamp the BUFR site OURSELVES (same reason as BUFHCE below:
+                  nextpnr doesn't know a BUFR must sit in its loads' clock
+                  region -- left free it landed $cebuf$3 at BUFR_X0Y11/region 2
+                  for region-0 loads, 164 dead arcs).  4 BUFR sites per region
+                  side: BUFR_X<side>Y<region_row*4 + idx>. *)
+               if buf_type = "BUFR" then begin
+                 let (side, row) = reg in
+                 ftstamps := Printf.sprintf "%s\tBUFR_X%dY%d/BUFR"
+                     bname side (row * 4 + c) :: !ftstamps
+               end
              end else if bufh_max > 0 && !nbufh < bufh_max && region_ok reg 1 then begin
                take_bufh reg; stamp_bufh reg (add_buf bit "BUFHCE" sinks)
              end else if !ngbuf < gbuf_max then begin

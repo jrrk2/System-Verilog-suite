@@ -168,6 +168,13 @@ let pack (m : bmodule) : result =
       if starts_with (String.uppercase_ascii i.module_name) "CARRY4" then begin
         let conns = ref [] in
         let put k v = conns := (k, v) :: !conns in
+        (* BEL stamp: constrain ONLY the CARRY4 primitive to the site SVS chose,
+           anchoring the carry column (else nextpnr HeAP-scatters it and strands
+           the short feedback arcs into the chain -> 119 unroutable arcs).  We do
+           NOT stamp the absorbed sum-FFs / S-LUTs: nextpnr's carry-aware packer
+           fills the slice legally, including the DI route-thru $LUTs it inserts
+           -- stamping all 4 LUT slots leaves no room for those and unbinds. *)
+        let bels = ref [ (i.inst_name, "CARRY4") ] in
         (match port_bit i.inst_name "CI" 0 with Some v -> put "CI" v | None -> ());
         (match port_bit i.inst_name "CYINIT" 0 with Some v -> put "CYINIT" v | None -> ());
         (match port_bit i.inst_name "CO" 3 with Some v -> put "CO" v | None -> ());
@@ -215,7 +222,7 @@ let pack (m : bmodule) : result =
             let idx = Str.search_forward (Str.regexp "_i_1$") s 0 in
             String.sub s 0 idx
           with Not_found -> i.inst_name in
-        add (base ^ "$carry") "SLICE_CARRY" (List.rev !conns)
+        add ~bels:(List.rev !bels) (base ^ "$carry") "SLICE_CARRY" (List.rev !conns)
       end)
     m.instances;
 
