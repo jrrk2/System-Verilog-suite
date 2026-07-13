@@ -535,6 +535,27 @@ let () =
   let ll_on = ll_w > 0.0 in
   let hcap = getenv_float "TOPO_LL_HCAP" (float cong_bin) in
   let vcap = getenv_float "TOPO_LL_VCAP" (float cong_bin) in
+  (* MODULE COHESION: pull same-parent-module cells toward their module centroid.
+     The site-density penalty spreads global density but also scatters coupled
+     logic (e.g. i_arp's 48-bit sender_mac readback smeared over 37 columns ->
+     its mux nets can't route).  Cohesion keeps each module compact while density
+     only punishes UNRELATED modules sharing a bin -- resolving that tension. *)
+  let coh_w = getenv_float "TOPO_COH_W" 0.0 in
+  let coh_on = coh_w > 0.0 in
+  let mod_key name =
+    let ld = try String.rindex name '.' with Not_found -> -1 in
+    let ls = try String.rindex name '/' with Not_found -> -1 in
+    let cut = max ld ls in
+    if cut > 0 then String.sub name 0 cut else name in
+  let mod_ids = Hashtbl.create 256 and nmods = ref 0 in
+  let mod_of = Array.make ncells (-1) in
+  Array.iteri (fun i c ->
+      let k = mod_key c.Pack_to_lef.pc_name in
+      let id = match Hashtbl.find_opt mod_ids k with Some d -> d
+               | None -> let d = !nmods in incr nmods; Hashtbl.replace mod_ids k d; d in
+      mod_of.(i) <- id) cells;
+  let msx = Array.make (max 1 !nmods) 0 and msy = Array.make (max 1 !nmods) 0
+  and mcnt = Array.make (max 1 !nmods) 0 in
   let hcut = Array.make (nbx * nby) 0.0 in
   let vcut = Array.make (nbx * nby) 0.0 in
   let hov d = if d > hcap then d -. hcap else 0.0 in
@@ -607,6 +628,14 @@ let () =
         Printf.eprintf "long-line: hcap=%.1f vcap=%.1f, initial track overflow=%.0f\n"
           hcap vcap (track_overflow ())
       end;
+      if coh_on then begin
+        Array.fill msx 0 !nmods 0; Array.fill msy 0 !nmods 0; Array.fill mcnt 0 !nmods 0;
+        Array.iteri (fun i _ -> if is_placed i then begin
+            let mo = mod_of.(i) in
+            msx.(mo) <- msx.(mo) + pos_x.(i); msy.(mo) <- msy.(mo) + pos_y.(i);
+            mcnt.(mo) <- mcnt.(mo) + 1 end) cells;
+        Printf.eprintf "cohesion: %d modules, w=%.1f\n" !nmods coh_w
+      end;
       (* delta over the union of affected cells' nets; apply new positions,
          return (delta, restore-thunk data). *)
       let eval_delta moved newpos =
@@ -644,7 +673,22 @@ let () =
         end;
         let sdelta = if not site_on then 0.0 else
           Hashtbl.fold (fun b d a -> a +. (sov b (occbin.(b) + d) -. sov b occbin.(b))) omap 0.0 in
-        (float (after - before) +. cong_w *. dcong +. site_w *. sdelta +. ll_w *. dtrack,
+        (* module-cohesion delta: change in each moved cell's Manhattan distance to
+           its module centroid (centroid held fixed within the move -- standard). *)
+        let dcoh =
+          if not coh_on then 0.0 else
+          let rec go acc ms os = match ms, os with
+            | i :: mt, (ox, oy) :: ot ->
+              let mo = mod_of.(i) in let c = mcnt.(mo) in
+              let d = if c <= 1 then 0 else
+                let cx = msx.(mo) / c and cy = msy.(mo) / c in
+                (abs (pos_x.(i) - cx) + abs (pos_y.(i) - cy))
+                - (abs (ox - cx) + abs (oy - cy)) in
+              go (acc +. float d) mt ot
+            | _ -> acc in
+          go 0.0 moved olds in
+        (float (after - before) +. cong_w *. dcong +. site_w *. sdelta +. ll_w *. dtrack
+           +. coh_w *. dcoh,
          olds, cmap, omap, hmap, vmap) in
       let accepted = ref 0 in
       for _ = 1 to moves do
@@ -664,6 +708,10 @@ let () =
               incr accepted;
               if cong_on then Hashtbl.iter (fun b d -> rudy.(b) <- rudy.(b) +. d) cmap;
               if site_on then Hashtbl.iter (fun b d -> occbin.(b) <- occbin.(b) + d) omap;
+              if coh_on then List.iter2 (fun i (ox, oy) ->
+                  let mo = mod_of.(i) in
+                  msx.(mo) <- msx.(mo) - ox + pos_x.(i);
+                  msy.(mo) <- msy.(mo) - oy + pos_y.(i)) moved olds;
               if ll_on then begin
                 Hashtbl.iter (fun b d -> hcut.(b) <- hcut.(b) +. d) hmap;
                 Hashtbl.iter (fun b d -> vcut.(b) <- vcut.(b) +. d) vmap
