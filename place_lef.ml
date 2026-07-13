@@ -979,24 +979,51 @@ let () =
         sink-region (TOPO_BUFR_PER_REGION) and PROMOTE the overflow to BUFG. *)
      let bufr_per_region = getenv_int "TOPO_BUFR_PER_REGION" 4 in
      let rused = Hashtbl.create 8 in
-     let reg_of sinks =
-       match List.find_map (fun (cn,_,_) ->
+     let regions_of sinks =
+       List.sort_uniq compare (List.filter_map (fun (cn,_,_) ->
            match Hashtbl.find_opt inst2pos cn with
            | Some (x, y) -> Some ((if x > xmid then 1 else 0), y / region_rows)
-           | None -> None) sinks with
-       | Some r -> r | None -> (0, 0) in
+           | None -> None) sinks) in
+     let reg_of sinks = match regions_of sinks with r :: _ -> r | [] -> (0, 0) in
+     (* BUFHCE middle tier (12/region-side, 168 total): drives its region's
+        12-track HCLK row -- BUFG reach within the region, no global spine.
+        FOURTH ceiling: those 12 tracks are SHARED with the globals loading the
+        region, so per-region BUFH budget = 12 - clocks-in-region - margin.
+        Gated by TOPO_BUFH_MAX (0 = off). *)
+     let bufh_max = getenv_int "TOPO_BUFH_MAX" 0 in
+     let hclk_margin = getenv_int "TOPO_HCLK_MARGIN" 1 in
+     let gload = Hashtbl.create 16 in                    (* region -> #clock tracks used *)
+     let load_regions sinks =
+       List.iter (fun r ->
+           Hashtbl.replace gload r (1 + (try Hashtbl.find gload r with Not_found -> 0)))
+         (regions_of sinks) in
+     (* design clocks: each BUFG/BUFGCTRL-driven net takes a track in every
+        region its loads occupy *)
+     Hashtbl.iter (fun bit (_, dty) ->
+         if dty = "BUFG" || dty = "BUFGCTRL" then
+           match Hashtbl.find_opt snk bit with
+           | Some sinks -> load_regions sinks | None -> ()) drv;
+     let hused = Hashtbl.create 8 and nbufh = ref 0 in
      List.iter (fun (_, bit) ->
          if !nbufg < bufg_max then begin
            let sinks = Hashtbl.find snk bit in
            let wide = n_regions sinks > 1 in
            let btype =
-             if wide then (if !ngbuf < gbuf_max then (incr ngbuf; "BUFG") else "")
+             if wide then
+               (if !ngbuf < gbuf_max then (incr ngbuf; load_regions sinks; "BUFG") else "")
              else begin
                let reg = reg_of sinks in
                let c = try Hashtbl.find rused reg with Not_found -> 0 in
                if c < bufr_per_region then (Hashtbl.replace rused reg (c + 1); buf_type)
-               else if !ngbuf < gbuf_max then (incr ngbuf; "BUFG")   (* region full: promote *)
-               else ""                                                (* leave in fabric *)
+               else begin
+                 let g = try Hashtbl.find gload reg with Not_found -> 0 in
+                 let h = try Hashtbl.find hused reg with Not_found -> 0 in
+                 if !nbufh < bufh_max && g + h + hclk_margin < 12 then begin
+                   Hashtbl.replace hused reg (h + 1); incr nbufh; "BUFHCE"
+                 end
+                 else if !ngbuf < gbuf_max then (incr ngbuf; load_regions sinks; "BUFG")
+                 else ""                                  (* leave to fabric replication *)
+               end
              end in
            if btype <> "" then begin
              let nb = newbit () in
@@ -1192,5 +1219,5 @@ let () =
      Y.to_file outj j';
      let ob = open_out_gen [Open_append; Open_creat] 0o644 bels_path in
      List.iter (fun s -> Printf.fprintf ob "%s\n" s) !ftstamps; close_out ob;
-     Printf.eprintf "feedthroughs: %d LUT1 relays + %d buffers (%d %s + %d BUFG wide) -> %s (+%d stamps)\n"
-       !ftn !nbufg (!nbufg - !ngbuf) buf_type !ngbuf outj (List.length !ftstamps))
+     Printf.eprintf "feedthroughs: %d LUT1 relays + %d buffers (%d %s + %d BUFHCE + %d BUFG wide) -> %s (+%d stamps)\n"
+       !ftn !nbufg (!nbufg - !ngbuf - !nbufh) buf_type !nbufh !ngbuf outj (List.length !ftstamps))
