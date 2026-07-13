@@ -1179,13 +1179,14 @@ let () =
      (* regional/global buffer cell, per-net type (BUFR narrow / BUFG wide).
         BUFR/BUFHCE need CE tied high; BUFR also CLR low + BYPASS (no divide). *)
      let buf_cell bit nb btype =
+       (* BUFR needs CE=1/CLR=0 tied explicitly (its pack path doesn't tie).
+          BUFHCE must have CE UNCONNECTED: pack_clocking_xc7 tie_port()s it and
+          asserts port.net==nullptr -- a pre-tied CE crashes the packer. *)
        let params = if btype = "BUFR" then ["parameters", `Assoc ["BUFR_DIVIDE", `String "BYPASS"]] else [] in
        let pdirs = ["I", `String "input"; "O", `String "output"]
-         @ (if btype = "BUFG" then [] else ["CE", `String "input"])
-         @ (if btype = "BUFR" then ["CLR", `String "input"] else []) in
+         @ (if btype = "BUFR" then ["CE", `String "input"; "CLR", `String "input"] else []) in
        let conns = ["I", `List [`Int bit]; "O", `List [`Int nb]]
-         @ (if btype = "BUFG" then [] else ["CE", `List [`String "1"]])
-         @ (if btype = "BUFR" then ["CLR", `List [`String "0"]] else []) in
+         @ (if btype = "BUFR" then ["CE", `List [`String "1"]; "CLR", `List [`String "0"]] else []) in
        `Assoc (("type", `String btype) :: params
                @ ["port_directions", `Assoc pdirs; "connections", `Assoc conns]) in
      let replica_or_relay bit nb dcn_opt =
