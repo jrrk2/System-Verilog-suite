@@ -66,6 +66,32 @@ for nm, nn in mod.get("netnames", {}).items():
 def is_int(b):
     return isinstance(b, int)
 
+# real SLICE site names for neighbour-bel searches (floorplan + observed BELs)
+import re as _re0
+_known_sites = set()
+try:
+    _fp = json.load(open("/tmp/virtex7_floorplan.json"))
+    for _s in _fp.get("sites", []):
+        if _s.get("name", "").startswith("SLICE_"):
+            _known_sites.add(_s["name"])
+except Exception:
+    pass
+
+def free_neighbour_lut_global(site):
+    m = _re0.match(r"SLICE_X(\d+)Y(\d+)$", site)
+    if not m:
+        return None
+    x, y = int(m.group(1)), int(m.group(2))
+    for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1),(2,0),(-2,0)):
+        ns = f"SLICE_X{x+dx}Y{y+dy}"
+        if _known_sites and ns not in _known_sites:
+            continue
+        for sl in SLOT:
+            bel = f"{ns}/{sl}6LUT"
+            if bel not in occupied:
+                return bel
+    return None
+
 new_cells = {}
 n_buf = 0
 n_slut = 0
@@ -155,6 +181,7 @@ for cn, c in list(cells.items()):
     #     Fracture legality: the 5LUT shares A-pins with the slot's 6LUT, so
     #     feed it the SAME net as the 6LUT occupant (slot_in[k]).
     newDI = list(DI)
+    pending_gnd_di = []
     for k, db in enumerate(DI):
         if not is_int(db):
             continue
@@ -184,7 +211,23 @@ for cn, c in list(cells.items()):
         if is_gnd:
             # const-0 generator: INIT=0 fed by the slot's 6LUT input net.
             # SAME net as the occupant's first pin -> shared A1, no conflict.
-            if slot_in[k] is None:
+            # ILLEGAL when the occupant uses >=6 inputs (Vivado 18-608: "A6
+            # cannot be used because of A5LUT usage") -- the fractured LUT's
+            # O6 reads the upper INIT half with A6 tied high and the 5LUT
+            # OVERWRITES the lower half, corrupting the LUT6's function in
+            # hardware (this silently broke the SGMII AN comparators:
+            # CONFIG_REG_MATCH/CONSISTENCY_MATCH -> link never came up).
+            occ6 = occupied.get(f"{site}/{SLOT[k]}6LUT")
+            occ_n = 0
+            if occ6 is not None:
+                oc = cells.get(occ6) or new_cells.get(occ6)
+                ins6 = set()
+                for pp2, v2 in (oc.get("connections", {}) if oc else {}).items():
+                    if pp2 != "O" and v2 and is_int(v2[0]):
+                        ins6.add(v2[0])
+                occ_n = len(ins6)
+            if occ_n >= 6 or slot_in[k] is None:
+                pending_gnd_di.append(k)
                 continue
             tag = "DIgnd"
             buf = {"type": "LUT1",
@@ -208,6 +251,13 @@ for cn, c in list(cells.items()):
                     v2 = (oc.get("connections", {}) if oc else {}).get(pp, [])
                     if v2 and is_int(v2[0]):
                         occ_ins.append(v2[0])
+            # HARD fracture rule (Vivado 18-608): an occupant using >=6
+            # DISTINCT inputs forbids ANY 5LUT in the slot -- even when the
+            # DI net is among its inputs (truncation does not reduce the
+            # occupant's own pin usage).  nextpnr's di_via_ax handles the
+            # pinned-6-input-LUT case natively; leave DI direct.
+            if len(set(occ_ins)) >= 6:
+                continue
             if db in occ_ins:
                 occ_ins = occ_ins[:occ_ins.index(db)]  # DI net already a pin
             if len(occ_ins) + 1 > 5:
@@ -227,6 +277,22 @@ for cn, c in list(cells.items()):
         new_cells[bufname] = buf
         newDI[k] = onet
         n_di += 1
+    if pending_gnd_di:
+        # per-carry const-0 in a NEIGHBOUR slice; DI enters via the AX bypass
+        src = slice_local_net()
+        rbel = free_neighbour_lut_global(site) if src is not None else None
+        if rbel is not None:
+            maxbit += 1
+            onet = maxbit
+            gname = f"{cn}$DIgndx"
+            new_cells[gname] = {"type": "LUT1",
+                "port_directions": {"I0": "input", "O": "output"},
+                "connections": {"I0": [src], "O": [onet]},
+                "parameters": {"INIT": "00"}, "attributes": {"BEL": rbel}}
+            occupied[rbel] = gname
+            for k in pending_gnd_di:
+                newDI[k] = onet
+                n_di += 1
     if DI:
         c["connections"]["DI"] = newDI
     # --- O outputs: sum FF (FD* consuming O[k] on D) ---

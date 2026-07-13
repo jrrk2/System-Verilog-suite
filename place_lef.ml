@@ -1428,6 +1428,29 @@ let () =
              (match int_of a.(0) with Some i -> Hashtbl.replace ff_by_d i cn | None -> ())
            | _ -> ()) cells_j'';
      let is_lut15 t = t = "LUT1" || t = "LUT2" || t = "LUT3" || t = "LUT4" || t = "LUT5" in
+     (* real SLICE site names, for neighbour-bel searches *)
+     let cs_slice_sites = Hashtbl.create 65536 in
+     List.iter (fun s -> Hashtbl.replace cs_slice_sites s.sname ()) all_slices;
+     let cs_free_neighbour site =
+       match String.index_opt site 'X', String.index_opt site 'Y' with
+       | Some xi, Some yi when yi > xi ->
+         (try
+            let x = int_of_string (String.sub site (xi+1) (yi - xi - 1)) in
+            let y = int_of_string (String.sub site (yi+1) (String.length site - yi - 1)) in
+            let r = ref None in
+            List.iter (fun (dx, dy) ->
+                if !r = None then begin
+                  let ns = Printf.sprintf "SLICE_X%dY%d" (x+dx) (y+dy) in
+                  if Hashtbl.mem cs_slice_sites ns then
+                    Array.iter (fun sl ->
+                        let bel = Printf.sprintf "%s/%s6LUT" ns sl in
+                        if !r = None && not (Hashtbl.mem cs_occ bel) then r := Some bel)
+                      slot_l
+                end)
+              [(1,0);(-1,0);(0,1);(0,-1);(1,1);(-1,1);(1,-1);(-1,-1);(2,0);(-2,0)];
+            !r
+          with _ -> None)
+       | _ -> None in
      List.iter (fun (cn, _) ->
          if (try Hashtbl.find ctype cn with Not_found -> "") = "CARRY4" then
          match Hashtbl.find_opt belmap cn with
@@ -1496,6 +1519,7 @@ let () =
                         Hashtbl.replace cs_rewire (cn, "S", k) nb;
                         slot_in.(k) <- Some src; incr n_sbuf
                     end)) sarr;
+           let pending_gnd = ref [] in
            Array.iteri (fun k b ->
                if k < 4 then match int_of b with
                | None -> ()
@@ -1508,13 +1532,32 @@ let () =
                  let slot5 = Printf.sprintf "%s/%s5LUT" site slot_l.(k) in
                  if not adoptable && not (Hashtbl.mem cs_occ slot5) then begin
                    if is_gnd then begin
-                     (* const-0: input = the occupant's first net -> shared A1 *)
+                     (* const-0: input = the occupant's first net -> shared A1.
+                        ILLEGAL when the occupant uses >=6 inputs (Vivado
+                        18-608): the fractured LUT's O6 reads the upper INIT
+                        half with A6 tied high, and the 5LUT OVERWRITES the
+                        lower half -- silently corrupted the SGMII AN
+                        comparators (CONFIG_REG_MATCH etc), link never up.
+                        Such DI pins are deferred to a per-carry neighbour
+                        const-0 (pending_gnd, resolved after the DI loop). *)
+                     let occ_n =
+                       match Hashtbl.find_opt cs_occ (Printf.sprintf "%s/%s6LUT" site slot_l.(k)) with
+                       | None -> 0
+                       | Some occ6 ->
+                         (match Hashtbl.find_opt cconns occ6 with
+                          | None -> 0
+                          | Some t ->
+                            let ins = Hashtbl.create 8 in
+                            Hashtbl.iter (fun p a ->
+                                if p <> "O" then Array.iter (fun x -> match int_of x with
+                                    | Some i -> Hashtbl.replace ins i () | None -> ()) a) t;
+                            Hashtbl.length ins) in
                      match slot_in.(k) with
-                     | Some src ->
+                     | Some src when occ_n < 6 ->
                        let nb = newbit () in
                        mk_lut1 (Printf.sprintf "%s$DIgnd$%d" cn k) "00" src nb slot5;
                        Hashtbl.replace cs_rewire (cn, "DI", k) nb; incr n_dil
-                     | None -> ()
+                     | _ -> pending_gnd := k :: !pending_gnd
                    end else begin
                      (* FF/LUT6-driven DI passthrough.  PIN-ALIGN with the 6LUT
                         occupant: nextpnr pin-maps each fractured LUT I0->A1,
@@ -1536,6 +1579,13 @@ let () =
                                   | Some i -> occ_ins := i :: !occ_ins | None -> ())
                                | _ -> ()) ["I0"; "I1"; "I2"; "I3"; "I4"; "I5"]));
                      let occ_ins = List.rev !occ_ins in
+                     (* HARD fracture rule (Vivado 18-608): >=6 distinct
+                        occupant inputs forbid ANY 5LUT in the slot, even if
+                        the DI net is among them (truncation doesn't reduce
+                        the occupant's pin usage).  nextpnr's di_via_ax
+                        handles the pinned-LUT6 case natively. *)
+                     let distinct = List.sort_uniq compare occ_ins in
+                     if List.length distinct >= 6 then () else begin
                      (* truncate at the DI net if it is already an occupant pin *)
                      let occ_ins =
                        let rec take acc = function
@@ -1565,8 +1615,20 @@ let () =
                        Hashtbl.replace cs_occ slot5 name;
                        Hashtbl.replace cs_rewire (cn, "DI", k) nb; incr n_dil
                      end
+                     end
                    end
                  end) diarr;
+           (* deferred DI=GND pins (illegal 5LUT fractures): ONE const-0 LUT1
+              per carry in a free neighbour slice, DI enters via the AX bypass *)
+           if !pending_gnd <> [] then begin
+             match local_net (), cs_free_neighbour site with
+             | Some src, Some rbel ->
+               let nb = newbit () in
+               mk_lut1 (Printf.sprintf "%s$DIgndx" cn) "00" src nb rbel;
+               List.iter (fun k ->
+                   Hashtbl.replace cs_rewire (cn, "DI", k) nb; incr n_dil) !pending_gnd
+             | _ -> ()
+           end;
            Array.iteri (fun k b ->
                if k < 4 then match int_of b with
                | None -> ()
