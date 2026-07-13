@@ -48,15 +48,40 @@ let kind_of_lef = function
 
 type site = { sname : string; mutable used : bool; sx : int; sy : int; sm : bool }
 
+(* TOPO_SITE_PHYSMAP (name<TAB>slice_x<TAB>slice_y): override site coords with
+   SLICE-grid-equivalent PHYSICAL positions.  Hard-block site indices are their
+   OWN scale: RAMB36_X11Y68 is physically at slice grid ~X176Y353 (top-right
+   corner), NOT near SLICE_X11Y68.  Comparing raw indices put the eth-arp
+   TX/RX BRAM columns corner-to-corner from their MAC consumers: 7ns routes on
+   falling-edge HALF-PERIOD (4ns @125MHz) BRAM paths, Vivado WNS -5.1,
+   invisible to nextpnr's STA.  Map generated from the prjxray tilegrid:
+   slice_x = SLICE_X of the nearest CLB column, slice_y = yconst - grid_y. *)
+let site_physmap : (string, int * int) Hashtbl.t = Hashtbl.create 2048
+let () = match Sys.getenv_opt "TOPO_SITE_PHYSMAP" with
+  | None -> ()
+  | Some f when Sys.file_exists f ->
+    let ic = open_in f in
+    (try while true do
+         match String.split_on_char '\t' (input_line ic) with
+         | [n; x; y] ->
+           (try Hashtbl.replace site_physmap n (int_of_string x, int_of_string y)
+            with _ -> ())
+         | _ -> ()
+       done with End_of_file -> close_in ic);
+    Printf.eprintf "site physmap: %d overrides\n" (Hashtbl.length site_physmap)
+  | Some f -> Printf.eprintf "site physmap: %s not found (ignored)\n" f
+
 let load_floorplan path =
   let j = Y.from_file path in
   let by_kind : (string, site list ref) Hashtbl.t = Hashtbl.create 16 in
   List.iter (fun sj ->
       let k = U.member "kind" sj |> U.to_string in
       let sub = try U.member "sub" sj |> U.to_string with _ -> "" in
-      let s = { sname = U.member "name" sj |> U.to_string; used = false;
-                sm = (sub = "SLICEM");
-                sx = U.member "x" sj |> U.to_int; sy = U.member "y" sj |> U.to_int } in
+      let nm = U.member "name" sj |> U.to_string in
+      let rx = U.member "x" sj |> U.to_int and ry = U.member "y" sj |> U.to_int in
+      let px, py = match Hashtbl.find_opt site_physmap nm with
+        | Some (x, y) -> x, y | None -> rx, ry in
+      let s = { sname = nm; used = false; sm = (sub = "SLICEM"); sx = px; sy = py } in
       let l = try Hashtbl.find by_kind k with Not_found -> let l = ref [] in Hashtbl.add by_kind k l; l in
       l := s :: !l)
     (j |> U.member "sites" |> U.to_list);
