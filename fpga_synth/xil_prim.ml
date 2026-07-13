@@ -80,14 +80,16 @@ module Fdre = struct
   (* INIT param: per-FDRE config-time value (0 or 1).  Source's
      [reg ... = <init>] threads through BIR initial_value, Hardcaml
      reg_reset_value, bir_to_aig rb_init, and lands here as one bit. *)
-  let create ?(init : bool = false) (i : Signal.t I.t) : Signal.t O.t =
+  let create ?(init : bool = false) ?(instance : string = "") (i : Signal.t I.t)
+    : Signal.t O.t =
     let parameters =
       [ Parameter.create ~name:"INIT"
           ~value:(Parameter.Value.Bit init) ]
     in
     let inputs = [ "C", i.c; "CE", i.ce; "R", i.r; "D", i.d ] in
+    let instance = if String.length instance = 0 then None else Some instance in
     let outs =
-      Instantiation.create ~parameters () ~name:"FDRE" ~inputs
+      Instantiation.create ~parameters ?instance () ~name:"FDRE" ~inputs
         ~outputs:[ "Q", 1 ]
     in
     { O.q = Map.find_exn outs "Q" }
@@ -107,8 +109,31 @@ module Fdce = struct
   module O = struct
     type 'a t = { q : 'a [@rtlname "Q"] } [@@deriving hardcaml]
   end
+  let create ?(instance : string = "") (i : Signal.t I.t) : Signal.t O.t =
+    let instance = if String.length instance = 0 then None else Some instance in
+    Instantiation.create_with_interface (module I) (module O) ?instance ~name:"FDCE" i
+end
+
+(* FDPE: D flip-flop with clock-enable + asynchronous PRESET (to 1).
+   The counterpart of FDCE for registers whose async reset value is 1
+   (e.g. a reset synchroniser `if(!lock) x <= '1`).  Mapping such a
+   register to FDCE (clear-to-0) loses the reset value and, in practice,
+   also drops the async-reset connection. *)
+module Fdpe = struct
+  module I = struct
+    type 'a t =
+      { c   : 'a [@rtlname "C"]
+      ; ce  : 'a [@rtlname "CE"]
+      ; pre : 'a [@rtlname "PRE"]
+      ; d   : 'a [@rtlname "D"]
+      }
+    [@@deriving hardcaml]
+  end
+  module O = struct
+    type 'a t = { q : 'a [@rtlname "Q"] } [@@deriving hardcaml]
+  end
   let create (i : Signal.t I.t) : Signal.t O.t =
-    Instantiation.create_with_interface (module I) (module O) ~name:"FDCE" i
+    Instantiation.create_with_interface (module I) (module O) ~name:"FDPE" i
 end
 
 (* ---- IO / clock buffers ------------------------------------------- *)

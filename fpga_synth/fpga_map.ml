@@ -33,7 +33,10 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
   let q_wire = Hashtbl.create (module String) in
   List.iter l.regs ~f:(fun r ->
     List.iter r.Bir_to_aig.rb_q_names ~f:(fun nm ->
-      Hashtbl.set q_wire ~key:nm ~data:(Signal.wire 1)));
+      (* Name the feedback wire with the register's (source) net name so
+         of_circuit emits it as the Q net name — keeps the gate-mapped
+         netlist name-correspondent with the source for Z3 LEC. *)
+      Hashtbl.set q_wire ~key:nm ~data:(Signal.(wire 1 -- nm))));
   List.iter l.insts ~f:(fun ib ->
     List.iter ib.Bir_to_aig.ib_out_ports ~f:(fun (_, bits) ->
       List.iter bits ~f:(fun nm -> Hashtbl.set q_wire ~key:nm ~data:(Signal.wire 1))));
@@ -164,9 +167,20 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
     (* if the driving LUT was complemented, it already yields ~node. *)
     let s = if inv && not (Hash_set.mem complement id) then Signal.( ~: ) base else base in
     if Hash_set.mem d_names nm then Hashtbl.set d_sig ~key:nm ~data:s
-    else (
-      let pad = if io then Xil_prim.obuf s else s in
-      real_outs := Signal.output nm pad :: !real_outs));
+    else
+      (* A `__keep_<clk>` retention output whose <clk> is a register clock is
+         an INTERNALLY generated clock (a user BUFG/MMCM O net feeding
+         same-module FFs).  Rather than emit it as a driverless top-level IO
+         pad, register its on-chip driver under <clk> so the FF-clock
+         [port_input] below binds to the buffer output.  Without this the FF
+         clock becomes a fresh input pad and the clock net is orphaned
+         (Vivado NSTD-1/UCIO-1 on an unconstrained port). *)
+      (match String.chop_prefix nm ~prefix:"__keep_" with
+       | Some clk when Hash_set.mem clock_names clk ->
+         Hashtbl.set ports ~key:clk ~data:s
+       | _ ->
+         let pad = if io then Xil_prim.obuf s else s in
+         real_outs := Signal.output nm pad :: !real_outs));
   (* ---- instantiate one FF per register bit, close feedback ---- *)
   List.iter l.regs ~f:(fun r ->
     let clk = port_input r.Bir_to_aig.rb_clock in
@@ -182,13 +196,18 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
     List.iteri (List.zip_exn r.Bir_to_aig.rb_d_names r.Bir_to_aig.rb_q_names)
       ~f:(fun bit (dn, qn) ->
         let d = Option.value (Hashtbl.find d_sig dn) ~default:Signal.gnd in
+        (* Carry the source register net name as the FF INSTANCE name so
+           of_circuit can name the emitted Q net after it (Stage-2 of the
+           register-name-preservation fix for FPGA Z3 LEC — ffrip matches
+           state by name). *)
         let q =
           match rst with
-          | Some clr -> (Xil_prim.Fdce.create { c = clk; ce = Signal.vdd; clr; d }).q
+          | Some clr -> (Xil_prim.Fdce.create ~instance:qn { c = clk; ce = Signal.vdd; clr; d }).q
           | None ->
-            (Xil_prim.Fdre.create ~init:(init_bit bit)
+            (Xil_prim.Fdre.create ~init:(init_bit bit) ~instance:qn
                { c = clk; ce = Signal.vdd; r = Signal.gnd; d }).q
         in
+        let q = Signal.(q -- qn) in
         let w = Hashtbl.find_exn q_wire qn in
         Signal.(w <== q)));
   (* ---- re-instantiate each black box, wire its boundary buses ---- *)

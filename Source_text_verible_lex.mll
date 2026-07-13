@@ -514,7 +514,7 @@ let sizednumber = sized_bin | sized_oct | sized_dec | sized_hex
  * digits aren't, so the lexer surfaces a clean failure instead of
  * mis-tokenising the tail as a separate expression. *)
 let sizednumber_bad = ['0'-'9' '_']+'\''['s' 'S']?['b' 'B' 'd' 'D' 'h' 'H' 'o' 'O']
-let number = ['0'-'9' '_']+
+let number = ['0'-'9'] ['0'-'9' '_']*
 let unbased = '''['0'-'9'  'a'-'f' 'x' 'z' 'A'-'F' 'X' 'Z' '_' '?']+
 let space = [' ' '\t' '\r']+
 let newline = ['\n']

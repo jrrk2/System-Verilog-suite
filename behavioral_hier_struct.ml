@@ -21,17 +21,35 @@ open Behavioral_ir
 let pname prefix name =
   if prefix = "" then name else prefix ^ "__" ^ name
 
-(* Pull base + bit from "name" or "name[N]".  *)
+(* Pull base + bit from "name", "name[N]", or "name__N" (of_circuit's
+   multi-bit-input memo naming).  The `__N` form must be recognised here too,
+   else a flattened per-bit input reference `framing_rdata__40` fails to match
+   the port `framing_rdata` and becomes a driverless orphan net.  port_actual
+   disambiguates: if `base` is not a port the whole original name is kept. *)
 let parse_bit (name : string) : string * int option =
-  try
-    let lb = String.rindex name '[' in
-    let rb = String.rindex name ']' in
-    if rb = String.length name - 1 then
-      let base = String.sub name 0 lb in
-      let idx = int_of_string (String.sub name (lb + 1) (rb - lb - 1)) in
-      (base, Some idx)
-    else (name, None)
-  with _ -> (name, None)
+  match
+    (try
+       let lb = String.rindex name '[' in
+       let rb = String.rindex name ']' in
+       if rb = String.length name - 1 then
+         let base = String.sub name 0 lb in
+         Some (base, int_of_string (String.sub name (lb + 1) (rb - lb - 1)))
+       else None
+     with _ -> None)
+  with
+  | Some (base, idx) -> (base, Some idx)
+  | None ->
+      let n = String.length name in
+      let rec find i =
+        if i < 1 then None
+        else if name.[i] = '_' && name.[i - 1] = '_' then Some i else find (i - 1) in
+      (match find (n - 1) with
+       | Some j when j + 1 < n ->
+           let suf = String.sub name (j + 1) (n - j - 1) in
+           if suf <> "" && String.for_all (fun c -> c >= '0' && c <= '9') suf
+           then (String.sub name 0 (j - 1), Some (int_of_string suf))
+           else (name, None)
+       | _ -> (name, None))
 
 (* Rewrite a child's bexpr into parent scope.
    - if the BVar refers to a child PORT (possibly bit-selected), substitute
@@ -115,8 +133,13 @@ let rec flatten_module ~by_name ~prefix (m : bmodule)
             | `Input | `Output -> Some s.name
             | _ -> None) child.signals in
         let new_port_actual pn =
-          if List.mem pn port_set then List.assoc_opt pn inst_port_rewritten
-          else None
+          let r = if List.mem pn port_set then List.assoc_opt pn inst_port_rewritten
+                  else None in
+          (if Sys.getenv_opt "SVS_FLATTEN_DEBUG" <> None
+              && r = None && List.mem pn port_set then
+             Printf.eprintf "[orphan-port] inst=%s mod=%s pin=%s in_portset=true has_conn=%b\n"
+               i.inst_name i.module_name pn (List.mem_assoc pn inst_port_rewritten));
+          r
         in
         flatten_module ~by_name
           ~prefix:new_inst_name

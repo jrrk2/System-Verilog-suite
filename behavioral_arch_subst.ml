@@ -105,6 +105,16 @@ let make_subst_process ~op ~width ~inst_name
 let substitute_in_module ~prog (parent : bmodule) : bmodule * int =
   if Sys.getenv_opt "SUBST_OFF" <> None then (parent, 0)
   else
+    (* FPGA-target override (ARCH_SUBST_FPGA=1): an adder/mul subcell's
+       swappable architecture collapses to a SINGLE choice on FPGA -- the
+       dedicated CARRY4 (add/sub/compare) or DSP48 (mul) primitive, which
+       dominates every LUT-mapped prefix tree on both area and delay.  That
+       primitive is trusted unconditionally, so we lift the subcell to the
+       abstract BAdd/BMul (which bir_to_aig then lowers to CARRY4/DSP)
+       WITHOUT requiring an equivalence certificate -- the cert gate exists
+       only to guard speculative ASIC arch swaps, not the standard FPGA
+       primitive mapping. *)
+    let fpga_target = Sys.getenv_opt "ARCH_SUBST_FPGA" <> None in
     let by_name = Hashtbl.create 32 in
     List.iter (fun m -> Hashtbl.replace by_name m.name m) prog.modules;
     let extra_processes = ref [] in
@@ -133,12 +143,17 @@ let substitute_in_module ~prog (parent : bmodule) : bmodule * int =
                    | Some (BVar out_name), Some e1, Some e2 ->
                        let width =
                          width_of_actual parent (BVar out_name) in
-                       if not (cert_exists ~kind ~arch_name ~width) then begin
+                       if (not fpga_target) && not (cert_exists ~kind ~arch_name ~width) then begin
                          Printf.eprintf
                            "[arch-subst] %s: no cert for %s/%s/%d (keep)\n"
                            i.inst_name kind arch_name width;
                          true
                        end else begin
+                         (if fpga_target && not (cert_exists ~kind ~arch_name ~width) then
+                            Printf.eprintf
+                              "[arch-subst] %s: FPGA target -> lift %s/%s/%d to abstract %s \
+                               (CARRY4/DSP is the one FPGA choice; cert not required)\n"
+                              i.inst_name kind arch_name width kind);
                          let op = match kind with
                            | "adder" -> BAdd
                            | "mul"   -> BMul

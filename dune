@@ -9,7 +9,7 @@
  (names sv_gui sv_main_unified example_round_trip convert_hdl 
         
         
-        vhdl_semantic_checker vhdl_to_ir_iterate interactive_client interactive_client_v2 nlview_to_verilog edif_to_verilog ff_stats cva6_ram_scan random_sv_gen list_mods sv_suite synth_orfs_shim orfs_prep mac_synth_shim)
+        vhdl_semantic_checker vhdl_to_ir_iterate interactive_client interactive_client_v2 nlview_to_verilog edif_to_verilog ff_stats cva6_ram_scan random_sv_gen list_mods sv_suite synth_orfs_shim orfs_prep mac_synth_shim pack_to_lef_main place_lef)
  (modules sv_gui sv_ast vhdl_dump_json sv_dump_json sv_gen sv_gen_struct sv_gen_xilinx_rtl sv_gen_yosys sv_gen_hardcaml behavioral_to_vhdl convert_hdl 
           
           sv_main_unified sv_parse sv_transform sv_tran_struct
@@ -34,7 +34,7 @@
           behavioral_to_z3 behavioral_to_hardcaml z3_miter z3_hardcaml_miter
           file_registry
           nlview_parser nlview_to_behavioral behavioral_to_verilog nlview_to_verilog
-          edif_parser edif_to_behavioral edif_to_structural edif2_to_structural edif_to_verilog behavioral_hier_struct bir_to_nextpnr_json bir_to_edif bir_to_verilog_netlist hardcaml_to_behavioral
+          edif_parser edif_to_behavioral edif_to_structural edif2_to_structural edif_to_verilog behavioral_hier_struct bir_to_nextpnr_json nextpnr_json_to_bir pack_to_lef pack_to_lef_main place_lef bir_to_edif fpga_prim_expand bir_to_verilog_netlist hardcaml_to_behavioral
           ver_front_to_behavioral vhdl_to_ver_front ff_stats cva6_ram_scan random_sv_gen list_mods sv_suite synth_orfs_shim orfs_prep mac_synth_shim 
           example_round_trip 
           

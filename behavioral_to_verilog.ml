@@ -229,15 +229,26 @@ let verilog_of_process proc =
 
 (* Generate instance *)
 let verilog_of_instance prog inst =
-  let { inst_name; module_name; param_values; port_connections } = inst in
+  let { inst_name; module_name; param_values; param_strs; port_connections } = inst in
 
-  (* Parameter instantiation *)
+  (* Parameter instantiation.  Emit BOTH integer params (param_values) and
+   * string params (param_strs) -- the latter carry primitive INIT truth
+   * tables (e.g. INIT = "64'hXXXX"), without which a gate netlist is
+   * functionless.  A value already a sized Verilog literal (has a quote,
+   * or all digits) is emitted raw; anything else (e.g. IOSTANDARD = LVDS)
+   * is wrapped in string quotes. *)
+  let int_params = List.map (fun (name, value) ->
+    Printf.sprintf ".%s(%d)" name value) param_values in
+  let is_vlit s =
+    s <> "" && (String.contains s '\'' ||
+                String.for_all (fun c -> c >= '0' && c <= '9') s) in
+  let str_params = List.map (fun (name, value) ->
+    if is_vlit value then Printf.sprintf ".%s(%s)" name value
+    else Printf.sprintf ".%s(\"%s\")" name value) param_strs in
+  let all_params = int_params @ str_params in
   let params_str =
-    if List.length param_values > 0 then
-      let param_list = String.concat ", " (List.map (fun (name, value) ->
-        Printf.sprintf ".%s(%d)" name value
-      ) param_values) in
-      Printf.sprintf " #(%s)" param_list
+    if all_params <> [] then
+      Printf.sprintf " #(%s)" (String.concat ", " all_params)
     else ""
   in
 

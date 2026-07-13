@@ -405,9 +405,26 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
             let a = walk arg in
             Array.init (high - low + 1) ~f:(fun i -> vbit a (low + i))
           | Reg { register; d; _ } ->
-            let base = Printf.sprintf "r%d" key in
-            let q_names = List.init w ~f:(fun i -> Printf.sprintf "%s_q%d" base i) in
-            let d_names = List.init w ~f:(fun i -> Printf.sprintf "%s_d%d" base i) in
+            (* Preserve the source register net name (like the ASIC path's
+               lib_map.net_for_signal / bit_net) so the gate-mapped netlist's
+               register Q nets stay name-correspondent with the behavioural
+               source.  Z3_miter's ffrip matches state BY NAME across the two
+               designs; the old `r<uid>` naming made every FPGA-mapped
+               register anonymous and broke that correspondence (ASIC LEC
+               worked, FPGA LEC didn't).  Fall back to `r<uid>` only for a
+               truly-unnamed reg. *)
+            let raw = signal_name sig_ in
+            let base =
+              if String.length raw >= 2 && Char.equal raw.[0] '_'
+                 && Char.equal raw.[1] 'n'
+              then Printf.sprintf "r%d" key else raw in
+            let q_names =
+              if w = 1 then [ base ]
+              (* `<bus>__b<idx>` — the convention Behavioral_ffpack re-packs
+                 into a single bus FF so ffrip lines up with a behavioural
+                 bus reg (`<bus>__Q`). *)
+              else List.init w ~f:(fun i -> Printf.sprintf "%s__b%d" base i) in
+            let d_names = List.init w ~f:(fun i -> Printf.sprintf "%s__d%d" base i) in
             let q_lits = Array.of_list (List.map q_names ~f:(aig_input b)) in
             let clk = signal_name register.reg_clock in
             let rst =

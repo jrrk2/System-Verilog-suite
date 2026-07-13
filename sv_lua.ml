@@ -341,6 +341,26 @@ let lexpand prog_h lib_h =
   let p' = Gate_netlist_to_behavioral.expand_program lib p in
   hadd (Prog (label, p'))
 
+(* Expand FPGA primitives (LUT/FF/CARRY4/buffers -> behavioural BIR;
+ * GT/MMCM/RAMB -> uninterpreted BCall) so a gate-mapped prog can be Z3-mitered
+ * against its behavioural source.  Pair with a netlist generated under
+ * FPGA_LEC_NAMES=1 so register nets stay name-correspondent. *)
+let lexpand_fpga prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label ^ "+fpga_exp", Fpga_prim_expand.expand_program p))
+
+(* Hierarchical variant: user-submodule instances named in [ref_prog] become
+ * uninterpreted functions (identical both miter sides) instead of being
+ * flattened, so each module is Z3-verified with its children abstracted —
+ * bounded capacity, and a DIFFER localises the bug to that module's own logic
+ * + child wiring.  Apply to BOTH miter sides (behavioural and gate-mapped)
+ * with the same ref_prog. *)
+let lexpand_fpga_h prog_h ref_h =
+  let label, p = find_prog prog_h in
+  let _, refp = find_prog ref_h in
+  Fpga_prim_expand.set_user_ports refp.Behavioral_ir.modules;
+  hadd (Prog (label ^ "+fpga_exp_h", Fpga_prim_expand.expand_program p))
+
 (* ──────────────────────────────────────────────────────────────────
  * Pipeline building-blocks: each transformation as a stand-alone
  * Lua-callable function so a recipe script can compose them per design.
@@ -412,11 +432,74 @@ let lflatten_struct prog_h top =
   let m = Behavioral_hier_struct.flatten_structural p ~top in
   hadd (Netlist (top, m, p.library_cells))
 
+(* Read a nextpnr-xilinx routed JSON (post-pack/place/route) and reconstruct
+   a UNISIM-primitive Netlist handle (un-packing SLICE_LUTX/SLICE_FFX/... via
+   the X_ORIG_TYPE / X_ORIG_PORT_* attributes).  Pairs with write_netlist_verilog
+   to emit Verilog for functional xsim of the post-layout open-flow netlist. *)
+let lread_nextpnr_json path =
+  if not (Sys.file_exists path) then
+    failwith ("read_nextpnr_json: file not found: " ^ path);
+  let top, m, lc = Nextpnr_json_to_bir.read_netlist path in
+  hadd (Netlist (top, m, lc))
+
 (* Gate-map one module: behavioural BIR → AIG → LUT-cover → Hardcaml
  * Circuit.t of LUT/FDRE/CARRY4/IBUF/OBUF/BUFG cells. *)
 let lgate_map mod_h k_lut io_flag =
-  let _, m, _ = find_mod mod_h in
-  let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true m in
+  let _, m, prog = find_mod mod_h in
+  (* Record the module's declared INPUT-port widths so of_circuit can pad
+     regrouped input ports back to full width (a wide input whose high bits'
+     fanout was pruned would otherwise narrow, dropping data). *)
+  Base.Hashtbl.set Hardcaml_to_behavioral.declared_input_widths
+    ~key:m.Behavioral_ir.name
+    ~data:(List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+        match s.direction with
+        | `Input -> Some (s.name, Behavioral_boundary.width_of_btype s.stype)
+        | _ -> None) m.Behavioral_ir.signals);
+  (* Port-direction lookup so create_circuit classifies instance ports by the
+     primitive's DECLARED direction (library_cells, else Vivado unisim VHDL),
+     not the net heuristic — which misclassifies an instance input reading a
+     net driven by another instance (e.g. MMCM.CLKIN1 <- BUFG) as an output. *)
+  let pd_tbl : (string * string, [ `Input | `Output ]) Hashtbl.t =
+    Hashtbl.create 128 in
+  let add_ports (cn, ports) =
+    List.iter (fun (p : Behavioral_ir.library_port) ->
+      Hashtbl.replace pd_tbl (cn, p.port_name) p.port_direction) ports in
+  List.iter add_ports prog.Behavioral_ir.library_cells;
+  (* USER modules too: a structural parent (eth_macro) instantiates user
+     modules (sgmii_soc, rx_axis_packer); without their declared port
+     directions the net heuristic misclassifies an instance INPUT reading an
+     inter-instance net as an output -> the net orphans (driverless). *)
+  List.iter (fun (mm : Behavioral_ir.bmodule) ->
+    List.iter (fun (s : Behavioral_ir.bsignal) ->
+      match s.direction with
+      | `Input  -> Hashtbl.replace pd_tbl (mm.Behavioral_ir.name, s.name) `Input
+      | `Output -> Hashtbl.replace pd_tbl (mm.Behavioral_ir.name, s.name) `Output
+      | _ -> ()) mm.Behavioral_ir.signals) prog.Behavioral_ir.modules;
+  let covered = Hashtbl.create 64 in
+  List.iter (fun (cn, _) -> Hashtbl.replace covered cn ()) prog.Behavioral_ir.library_cells;
+  let inst_types =
+    List.sort_uniq compare
+      (List.map (fun (i : Behavioral_ir.binstance) -> i.module_name) m.instances) in
+  let missing = List.filter (fun t -> not (Hashtbl.mem covered t)) inst_types in
+  (try List.iter add_ports (Vhdl_to_behavioral.lookup_xil_primitive_ports missing)
+   with _ -> ());
+  (* Xilinx HARD primitives (GTXE2_COMMON/GTXE2_CHANNEL, …) have no unisim
+     primitive .vhd, so the VHDL lookup above supplies nothing for them and the
+     net heuristic then misclassifies an input pin reading an instance-driven
+     net (GTXE2.GTREFCLK0 <- IBUFDS_GTE2.O) as an OUTPUT.  That fragments the
+     shared refclk net — the GT's GTREFCLK0 orphans driverless (Vivado REQP-51).
+     Fall back to the authoritative xil_primitive_ports.json (the same source
+     bir_to_edif uses for EDIF interfaces) for any still-uncovered type. *)
+  List.iter (fun t ->
+    if not (Hashtbl.mem covered t) then
+      match Hashtbl.find_opt (Lazy.force Bir_to_edif.xil_json_ports) t with
+      | Some ports ->
+          List.iter (fun (pn, dir, _w) ->
+            if not (Hashtbl.mem pd_tbl (t, pn)) then
+              Hashtbl.replace pd_tbl (t, pn) dir) ports
+      | None -> ()) inst_types;
+  let port_dir mn port = Hashtbl.find_opt pd_tbl (mn, port) in
+  let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
   let l = Fpga_synth.Bir_to_aig.lower_circuit circ in
   let mapped = Fpga_synth.Fpga_map.map_lowered
     ~io:(io_flag <> 0) ~k:k_lut ~name:m.name l in
@@ -594,6 +677,16 @@ let lflatten prog_h =
 let loptimize prog_h =
   let label, p = find_prog prog_h in
   let p', _ = Behavioral_optimize.optimize_full p in
+  hadd (Prog (label, p'))
+
+(* Lift attributed adder/mul subcells (sv_decomp_adder/mul) to abstract
+   BBinOp BAdd/BMul.  On the FPGA synthesis path run with ARCH_SUBST_FPGA=1
+   so the lift is unconditional (CARRY4/DSP is the one FPGA choice, no cert
+   needed) -- bir_to_aig then lowers the abstract op onto CARRY4/DSP48
+   instead of a LUT-mapped prefix tree. *)
+let larch_subst prog_h =
+  let label, p = find_prog prog_h in
+  let p', _n = Behavioral_arch_subst.substitute_program p in
   hadd (Prog (label, p'))
 
 let lffrip mod_h =
@@ -950,6 +1043,8 @@ module MakeLib
                        (wrap1 lliberty);
         "expand",     V.efunc (V.string **-> V.string **->> V.string)
                        (wrap2 lexpand);
+        "expand_fpga", V.efunc (V.string **->> V.string) (wrap1 lexpand_fpga);
+        "expand_fpga_h", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lexpand_fpga_h);
         "gate_miter", V.efunc (V.string **-> V.string **-> V.string
                                **-> V.string **->> V.string)
                        (wrap4 lgate_miter);
@@ -990,6 +1085,7 @@ module MakeLib
                            (wrap1 lparse_v_cells);
         "flatten",        V.efunc (V.string **->> V.string) (wrap1 lflatten);
         "optimize",       V.efunc (V.string **->> V.string) (wrap1 loptimize);
+        "arch_subst",     V.efunc (V.string **->> V.string) (wrap1 larch_subst);
         "ffrip",          V.efunc (V.string **->> V.string) (wrap1 lffrip);
         "register_analyse", V.efunc (V.string **->> V.string)
                              (wrap1 lregister_analyse);
@@ -998,6 +1094,8 @@ module MakeLib
         "prep_for_z3",    V.efunc (V.string **->> V.string)
                            (wrap1 lprep_for_z3);
         "owner",          V.efunc (V.string **->> V.string) (wrap1 lowner);
+        "read_nextpnr_json", V.efunc (V.string **->> V.string)
+                              (wrap1 lread_nextpnr_json);
         "read_edif",      V.efunc (V.string **->> V.string) (wrap1 lread_edif);
         "read_edif_structural",
                           V.efunc (V.string **->> V.string)

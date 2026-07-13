@@ -381,7 +381,8 @@ let parse_cell (t : token) : cell_t option =
 let cell_is_primitive (c : cell_t) : bool =
   c.cinsts = [] && c.cnets = []
 
-let convert_cell (c : cell_t) : bmodule =
+let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
+                 (c : cell_t) : bmodule =
   (* Identify GND/VCC primitive instances so we can collapse the EDIF
      "<const0>" / "<const1>" broadcast nets into the BIR's GND/VCC
      sentinels.  Without this, CARRY4 chain CI/CYINIT/DI ties end up as
@@ -426,6 +427,11 @@ let convert_cell (c : cell_t) : bmodule =
   List.iter (fun (p : pinfo) ->
     Hashtbl.replace port_width p.pname p.pwidth) c.cports;
   let is_port_name nm = Hashtbl.mem port_width nm in
+  (if Sys.getenv_opt "SVS_PORT_DEBUG" <> None && c.cname = "timer" then begin
+     Printf.eprintf "[ports] cell=%s nports=%d\n" c.cname (List.length c.cports);
+     List.iter (fun (p:pinfo) -> Printf.eprintf "   port %s w=%d\n" p.pname p.pwidth) c.cports;
+     Printf.eprintf "   is_port_name E = %b\n" (Hashtbl.mem port_width "E")
+   end);
   (* net_name -> (port_name, bir_bit_index).  EDIF (member P k) indexes
      by declaration order, k=0 = MSB for "P[hi:lo]"; BIR bit i = LSB+i,
      so bir_bit = port_width - 1 - k. *)
@@ -526,13 +532,38 @@ let convert_cell (c : cell_t) : bmodule =
             pcs := (pin, net_to_expr_aliased nm) :: !pcs
         end else begin
           (* Vivado-EDIF convention: (member P k) indexes by declaration
-             order, so for "P[hi:lo]" k=0 = Verilog MSB.  Sort ascending
-             k = MSB-first list; BConcat consumes its list MSB-first
-             directly, so we do NOT reverse here. *)
-          let sorted = List.sort (fun (a, _) (b, _) ->
-            compare (match a with Some x -> x | None -> -1)
-                    (match b with Some x -> x | None -> -1)) entries in
-          let bits = List.map (fun (_, nm) -> net_to_expr_aliased nm) sorted in
+             order, so for "P[hi:lo]" k=0 = Verilog MSB.  BConcat consumes
+             its list MSB-first, so position p (0-based from the front) is
+             member p.  We MUST emit the FULL port width, inserting a
+             dangling net for any absent member -- otherwise a SPARSE bus
+             collapses its live bits onto the low indices and every bit
+             lands on the wrong physical pin.  (Real failures this caused:
+             a CARRY4 whose only live CO bit is COUT=member 0 emitted CO[0]
+             instead of CO[3]/COUT, so nextpnr could not route the carry
+             cascade; an adder slice driving just O[member 0..2] -> the
+             slice's D/C/B flops emitted O[0..2] instead of O[1..3], so the
+             sum bits missed their dedicated O->FF paths.)  Dense buses
+             (every member present, e.g. a 4-bit CARRY4 S, const-tied DI)
+             are unchanged: the gap branch never fires.  Width comes from
+             the instantiated cell's port declaration; fall back to
+             max-member+1 for unknown cells. *)
+          let max_k = List.fold_left (fun acc (idx, _) ->
+            match idx with Some k -> max acc k | None -> acc) (-1) entries in
+          let decl_w =
+            match Hashtbl.find_opt cell_pw i.icell with
+            | Some h -> (match Hashtbl.find_opt h pin with Some w -> w | None -> 0)
+            | None -> 0
+          in
+          let width = if decl_w > max_k then decl_w else max_k + 1 in
+          let bits = List.init width (fun pos ->
+            match List.find_map (fun (idx, nm) ->
+                    if idx = Some pos then Some nm else None) entries with
+            | Some nm -> net_to_expr_aliased nm
+            | None ->
+              (* Absent member: a fresh dangling 1-bit net, unique per
+                 (inst, pin, member), so present members keep their
+                 absolute positions and the gap drives/listens to nothing. *)
+              BVar (Printf.sprintf "$svs_unconn$%s$%s$%d" i.iname pin pos)) in
           pcs := (pin, BConcat bits) :: !pcs
         end
       end) pin_entries;
@@ -571,25 +602,35 @@ let convert (filename : string) : bprogram =
   in
   let modules       = ref [] in
   let library_cells = ref [] in
-  List.iter (fun lib_items ->
-    List.iter (fun tok ->
-      match parse_cell tok with
-      | None ->
-        Printf.printf "  cell None\n%!"
-      | Some c when cell_is_primitive c ->
-        Printf.printf "  prim: %s (%d ports)\n%!" c.cname (List.length c.cports);
-        let lps = List.map (fun p ->
-          { port_name      = p.pname;
-            port_direction = (match p.pdir with
-                              | `Output -> `Output
-                              | _       -> `Input);
-            port_width     = p.pwidth }) c.cports in
-        library_cells := (c.cname, lps) :: !library_cells
-      | Some c ->
-        Printf.printf "  user: %s (%d ports, %d insts, %d nets)\n%!"
-          c.cname (List.length c.cports) (List.length c.cinsts) (List.length c.cnets);
-        modules := convert_cell c :: !modules
-    ) lib_items
-  ) library_items;
+  (* First pass: parse every cell and record its port widths by name, so
+     instance bus-pin emission can place (member k) at its absolute bit
+     even when the bus is sparse.  A CARRY4's interface (CO/O/DI/S width 4)
+     is declared before the user modules that instantiate it, but cross-
+     library ordering isn't guaranteed, so build the map fully first. *)
+  let all_cells =
+    List.concat_map (fun lib_items -> List.filter_map parse_cell lib_items)
+      library_items in
+  let cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t =
+    Hashtbl.create 256 in
+  List.iter (fun (c : cell_t) ->
+    let h = Hashtbl.create 16 in
+    List.iter (fun (p : pinfo) -> Hashtbl.replace h p.pname p.pwidth) c.cports;
+    Hashtbl.replace cell_pw c.cname h) all_cells;
+  (* Second pass: convert. *)
+  List.iter (fun (c : cell_t) ->
+    if cell_is_primitive c then begin
+      Printf.printf "  prim: %s (%d ports)\n%!" c.cname (List.length c.cports);
+      let lps = List.map (fun p ->
+        { port_name      = p.pname;
+          port_direction = (match p.pdir with
+                            | `Output -> `Output
+                            | _       -> `Input);
+          port_width     = p.pwidth }) c.cports in
+      library_cells := (c.cname, lps) :: !library_cells
+    end else begin
+      Printf.printf "  user: %s (%d ports, %d insts, %d nets)\n%!"
+        c.cname (List.length c.cports) (List.length c.cinsts) (List.length c.cnets);
+      modules := convert_cell cell_pw c :: !modules
+    end) all_cells;
   { modules = List.rev !modules;
     library_cells = List.rev !library_cells }

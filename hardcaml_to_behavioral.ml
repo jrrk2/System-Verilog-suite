@@ -27,6 +27,16 @@ open! Base
 open Hardcaml
 module T = Hardcaml.Signal.Type
 
+(* Declared INPUT-port widths, keyed by module name, populated by the caller
+   (sv_lua.lgate_map) before create_circuit.  of_circuit sizes a regrouped
+   input port from the mapped circuit's surviving input bits, but a wide input
+   whose high bits' fanout was pruned/renamed narrows (framing_rdata 64->49,
+   dropping the ARP target_ip/sender_ip bytes and constant-folding the match).
+   Padding each input port back to its declared width -- combined with the
+   `<base>__<i>` bitbus_ref resolution -- reconnects those high bits. *)
+let declared_input_widths : (string, (string * int) list) Base.Hashtbl.t =
+  Hashtbl.create (module String)
+
 (* Pick a stable name for a Hardcaml signal: prefer its first declared
  * name, else fall back to a synthetic `_n<uid>` like fpga_emit does.   *)
 let signal_name s =
@@ -70,6 +80,18 @@ let param_value (p : Parameter.t) : string =
 let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
   let memo : (T.Uid.t, string array) Hashtbl.t =
     Hashtbl.create (module T.Uid) in
+  (* Output-port base names.  A register that directly feeds an output goes
+     through an identity OBUF: register-net and output-port share the source
+     name, so naming the register net after it would collide (self-loop
+     obuf).  Those FFs already have output-port correspondence for LEC, so we
+     leave them anonymous; only INTERNAL registers get the source name. *)
+  let output_bases : (string, unit) Hashtbl.t = Hashtbl.create (module String) in
+  List.iter (Circuit.outputs circ) ~f:(fun s ->
+    match Signal.names s with
+    | n :: _ ->
+        let base = match String.lsplit2 n ~on:'[' with Some (b, _) -> b | None -> n in
+        Hashtbl.set output_bases ~key:base ~data:()
+    | [] -> ());
   let internal_signals : Behavioral_ir.bsignal list ref = ref [] in
   let instances : Behavioral_ir.binstance list ref = ref [] in
   let processes : Behavioral_ir.bprocess list ref = ref [] in
@@ -130,7 +152,46 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
               } :: !instances);
             outs
           | T.Inst { instantiation = inst; _ } ->
-            let outs = Array.init w ~f:(fun _ -> add_internal_net ()) in
+            (* Preserve a source net name on the instance output when the
+               output signal was explicitly named (fpga_map names FF Q
+               outputs with the register net name) — keeps the gate-mapped
+               register Q net name-correspondent with the behavioural source
+               for Z3 LEC (ffrip matches state by name).  Only single-output
+               (width-matched) instances get the name; multi-output boxes
+               (GT/MMCM) keep fresh nets. *)
+            let is_reg_prim =
+              match inst.inst_name with
+              | "FDRE" | "FDCE" | "FDPE" | "FDSE" -> true | _ -> false in
+            (* Register-name preservation is OPT-IN (FPGA_LEC_NAMES) — it can
+               collide a register net with its output port through the identity
+               OBUF (self-loop), so the default netlist/bitstream path keeps the
+               original anonymous nets.  Z3-LEC runs set the env var. *)
+            let lec_names = Option.is_some (Stdlib.Sys.getenv_opt "FPGA_LEC_NAMES") in
+            let named_out =
+              let nm = inst.inst_instance in
+              let base = match String.lsplit2 nm ~on:'[' with Some (b, _) -> b | None -> nm in
+              if lec_names
+                 && is_reg_prim
+                 && String.length nm > 0
+                 && not (String.length nm >= 2 && Char.equal nm.[0] '_'
+                         && Char.equal nm.[1] 'n')
+                 && not (Hashtbl.mem output_bases base)
+                 && List.length inst.inst_outputs = 1
+                 && (match inst.inst_outputs with [ (_, (pw, _)) ] -> pw = w | _ -> false)
+              then Some nm else None in
+            let named_net nm =
+              internal_signals := { Behavioral_ir.name = nm;
+                                    stype = BInt { width = 1; signed = Unsigned };
+                                    direction = `Internal;
+                                    initial_value = None;
+                                    attrs = [] } :: !internal_signals;
+              nm in
+            let outs =
+              match named_out with
+              | Some nm when w = 1 -> [| named_net nm |]
+              | Some nm ->
+                  Array.init w ~f:(fun i -> named_net (Printf.sprintf "%s[%d]" nm i))
+              | None -> Array.init w ~f:(fun _ -> add_internal_net ()) in
             Hashtbl.set memo ~key ~data:outs;
             let input_conns = List.map inst.inst_inputs ~f:(fun (p, sig_) ->
               let sw = Signal.width sig_ in
@@ -239,16 +300,23 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
    * `<base>__<i>` form; bir_to_nextpnr_json's bare-BVar fallback
    * expands `BVar base` against widths, so consumers that reference
    * the whole bus directly still work. *)
+  let declared_w =
+    match Hashtbl.find declared_input_widths (Circuit.name circ) with
+    | Some l -> (fun base -> Option.value (List.Assoc.find l base ~equal:String.equal) ~default:0)
+    | None -> (fun _ -> 0) in
   List.iter (regroup ~dir:`Input input_sigs)
     ~f:(fun (base, w, by_idx) ->
+      (* pad to the declared width so high input bits pruned from the mapped
+         circuit are still declared on the port and reconnect via bitbus_ref. *)
+      let w' = Int.max w (declared_w base) in
       port_signals := { Behavioral_ir.name = base;
-                        stype = BInt { width = w; signed = Unsigned };
+                        stype = BInt { width = w'; signed = Unsigned };
                         direction = `Input;
                         initial_value = None;
                         attrs = [] } :: !port_signals;
       List.iter by_idx ~f:(fun (i, s) ->
         let bit_name =
-          if w = 1 then base
+          if w' = 1 then base
           else Printf.sprintf "%s__%d" base i in
         Hashtbl.set memo ~key:(T.uid s) ~data:[| bit_name |]));
 

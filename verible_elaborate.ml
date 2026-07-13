@@ -89,8 +89,27 @@ let has_tag p t = match tag_of t with
 let rec value_of = function
   | TK_DecNumber n | TK_UnBasedNumber n
   | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n -> n
+  (* real / string / based-literal parameter values (e.g. an MMCM's
+     CLKIN1_PERIOD(16.000000), BANDWIDTH("OPTIMIZED")).  The lexer carries the
+     text in the token payload; without these cases value_of returns the token
+     TAG ("TK_RealTime") and the primitive parameter is emitted as garbage. *)
+  | TK_RealTime s -> s
+  | TK_StringLiteral s -> s
+  | TK_BinBase s | TK_HexBase s | TK_OctBase s | TK_DecBase s -> s
   | SymbolIdentifier id -> id
   | STRING s -> s
+  (* Based literal `<width>'<base><digits>` (e.g. FDSE #(.INIT(1'b1))).
+     Verible surfaces it as TUPLE3(STRING "bin_based_number", <base tok
+     "1'b">, <digits tok "1">).  The generic `TUPLE3 (_, a, _)` case below
+     recurses only into the base and DROPS the digits, truncating "1'b1"
+     to "1'b" — which then reaches the EDIF as a valueless INIT and Vivado
+     reads it as 0.  Concatenate base and digits so the value survives. *)
+  | TUPLE3 (STRING tag, base, digits)
+      when prefix_is "bin_based_number" tag
+        || prefix_is "hex_based_number" tag
+        || prefix_is "oct_based_number" tag
+        || prefix_is "dec_based_number" tag ->
+      value_of base ^ value_of digits
   | TUPLE2 (a, _) | TUPLE3 (_, a, _) -> value_of a
   | TUPLE4 (_, _, _, d) -> value_of d
   | TUPLE6 (_, _, _, _, v, _) -> value_of v   (* parameter_value_byname1 *)

@@ -16,6 +16,39 @@
 
 open Behavioral_ir
 
+(* Authoritative Xilinx primitive port interfaces, dumped from Vivado
+   (get_lib_pins) as JSON: { "CELLTYPE": [ {"name","dir","width"}, ... ] }.
+   Used as the top-priority source for primitive cell interfaces so hard
+   primitives (GTXE2_CHANNEL etc.) declare their EXACT bus widths/directions
+   and link as real architecture primitives instead of black boxes.  Path via
+   env XIL_PRIM_PORTS_JSON, default xilinx_lef/xil_primitive_ports.json. *)
+let xil_json_ports : (string, (string * [`Input|`Output] * int) list) Hashtbl.t Lazy.t =
+  lazy (
+    let tbl = Hashtbl.create 64 in
+    let path =
+      try Sys.getenv "XIL_PRIM_PORTS_JSON"
+      with Not_found ->
+        "/home/jonathan/System-Verilog-suite/xilinx_lef/xil_primitive_ports.json" in
+    (try
+       (match Yojson.Safe.from_file path with
+        | `Assoc cells ->
+            List.iter (fun (cn, ports) ->
+              match ports with
+              | `List ps ->
+                  let plist = List.filter_map (fun p -> match p with
+                    | `Assoc f ->
+                        let gs k = match List.assoc_opt k f with Some (`String s) -> s | _ -> "" in
+                        let gi k = match List.assoc_opt k f with Some (`Int i) -> i | _ -> 1 in
+                        let name = gs "name" in
+                        if name = "" then None
+                        else Some (name, (if gs "dir" = "output" then `Output else `Input), gi "width")
+                    | _ -> None) ps in
+                  Hashtbl.replace tbl cn plist
+              | _ -> ()) cells
+        | _ -> ())
+     with _ -> ());
+    tbl)
+
 (* -------------- EDIF identifier safety -------------- *)
 
 let edif_safe_char c =
@@ -83,6 +116,23 @@ let populate_widths ctx (m : bmodule) =
 
 (* Resolve a port_connection bexpr to its list of net names, LSB first.
  * Constants land on n_VCC / n_GND, single-bit refs on alloc'd net ids. *)
+(* `<base>__<i>` (of_circuit multi-bit-input memo naming) -> bit i of the
+   vector `<base>` (a declared multi-bit signal), so per-bit input references
+   connect to the port bit rather than an orphan scalar net. *)
+let bitbus_ref ctx nm =
+  let n = String.length nm in
+  let rec find i =
+    if i < 1 then None
+    else if nm.[i] = '_' && nm.[i - 1] = '_' then Some i else find (i - 1) in
+  match find (n - 1) with
+  | Some j when j + 1 < n ->
+      let suf = String.sub nm (j + 1) (n - j - 1) in
+      let base = String.sub nm 0 (j - 1) in
+      if suf <> "" && String.for_all (fun c -> c >= '0' && c <= '9') suf
+         && (match Hashtbl.find_opt ctx.widths base with Some w -> w > 1 | None -> false)
+      then Some (base, int_of_string suf) else None
+  | _ -> None
+
 let rec nets_of_conn ctx (e : bexpr) : string list =
   match e with
   | BConst { value; width } ->
@@ -93,23 +143,35 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
   | BConcat es ->
       (* BIR's BConcat is MSB-first; reverse to LSB-first. *)
       List.concat_map (nets_of_conn ctx) (List.rev es)
-  | BSlice { signal; msb; lsb } ->
-      let base = match signal with
-        | BVar nm -> nm
-        | _ -> failwith ("bir_to_edif: slice of non-BVar: "
-                         ^ Behavioral_ir.string_of_bexpr signal) in
+  | BSlice { signal = BVar base; msb; lsb } ->
       let rec range lo hi = if lo > hi then [] else lo :: range (lo + 1) hi in
       List.map (fun i ->
         match const_net base with
         | Some n -> n
         | None   -> net_name_of_id (alloc ctx { base; bit = i }))
         (range lsb msb)
+  | BSlice { signal; msb; lsb } ->
+      (* Slice of a composite (flatten_struct emits a bus as a BConcat of nets,
+         then slices it): expand the inner signal to its LSB-first net list and
+         take [lsb..msb]; out-of-range bits read x -> tie GND (yosys parity). *)
+      let full = Array.of_list (nets_of_conn ctx signal) in
+      let n = Array.length full in
+      let rec range lo hi = if lo > hi then [] else lo :: range (lo + 1) hi in
+      List.map (fun i -> if i >= 0 && i < n then full.(i) else "n_GND")
+        (range lsb msb)
   | BVar nm ->
       (match const_net nm with
        | Some n -> [n]
        | None ->
-           let w = try Hashtbl.find ctx.widths nm with Not_found -> 1 in
-           List.init w (fun i -> net_name_of_id (alloc ctx { base = nm; bit = i })))
+           (match bitbus_ref ctx nm with
+            | Some (base, bit) ->
+                (* of_circuit's `<base>__<i>` multi-bit-input naming -> bit i of
+                   the vector `<base>`, else the reader orphans from the port
+                   bit (driverless net). *)
+                [net_name_of_id (alloc ctx { base; bit })]
+            | None ->
+                let w = try Hashtbl.find ctx.widths nm with Not_found -> 1 in
+                List.init w (fun i -> net_name_of_id (alloc ctx { base = nm; bit = i }))))
   | BSelect { array = BVar nm; index = BConst { value; _ } } ->
       (match const_net nm with
        | Some n -> [n]
@@ -127,6 +189,18 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
  * enums (no quotes, no digits-then-tick) pass through as strings.   *)
 let edif_property_value (v : string) : string =
   let n = String.length v in
+  (* Defensive: a based literal that lost its digits ("1'b", "8'h", …)
+     would otherwise be emitted verbatim and Vivado would silently read
+     the INIT as 0 — the class of bug that killed PCS one-hot FSM init.
+     Refuse to emit a valueless literal; fail loudly at synthesis time. *)
+  (match String.index_opt v '\'' with
+   | Some i when i + 2 = n
+                 && (match Char.lowercase_ascii v.[i + 1] with
+                     | 'b' | 'h' | 'o' | 'd' -> true | _ -> false) ->
+       failwith (Printf.sprintf
+         "edif_property_value: malformed based literal %S (base marker with \
+          no digits) — INIT/parameter truncated upstream" v)
+   | _ -> ());
   if n = 0 then "\"\""
   else if String.for_all (fun c -> c = '0' || c = '1') v then
     Printf.sprintf "\"%d'b%s\"" n v
@@ -144,8 +218,13 @@ let write_edif
   (* Pre-allocate net ids for top-level ports. *)
   let port_bits : (string, [`Input|`Output|`Internal] * int * int list) Hashtbl.t =
     Hashtbl.create 32 in
+  (* `__keep_<net>` outputs are synthetic FF-clock retention handles from
+     of_circuit; they must NOT surface as top-level IO ports (Vivado NSTD-1/
+     UCIO-1 on an unconstrained pad).  Same strip as bir_to_nextpnr_json. *)
+  let is_keep_port nm =
+    String.length nm >= 7 && String.sub nm 0 7 = "__keep_" in
   List.iter (fun (s : bsignal) ->
-    if s.direction <> `Internal then begin
+    if s.direction <> `Internal && not (is_keep_port s.name) then begin
       let w = try Hashtbl.find ctx.widths s.name with Not_found -> 1 in
       let bs = List.init w (fun i -> alloc ctx { base = s.name; bit = i }) in
       Hashtbl.add port_bits s.name (s.direction, w, bs)
@@ -190,15 +269,62 @@ let write_edif
     "OBUFDS", [ "O", `Output, 1; "OB", `Output, 1; "I", `Input, 1 ];
   ] in
 
+  (* Ports actually connected by instances of each primitive type — the EDIF
+     interface MUST declare every one or Vivado's read_edif errors ("Cannot
+     find port X on instance of cell Y"). *)
+  let connected_ports : (string, (string, int) Hashtbl.t) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (i : binstance) ->
+    let h = match Hashtbl.find_opt connected_ports i.module_name with
+      | Some h -> h | None -> let h = Hashtbl.create 16 in Hashtbl.add connected_ports i.module_name h; h in
+    List.iter (fun (pn, e) ->
+      let w = List.length (nets_of_conn ctx e) in
+      let prev = try Hashtbl.find h pn with Not_found -> 0 in
+      Hashtbl.replace h pn (max prev (max 1 w))) i.port_connections) m.instances;
+
   let primtype_ports t : (string * [`Input|`Output] * int) list =
-    match List.assoc_opt t library_cells with
-    | Some ports ->
-        List.map (fun (p : library_port) ->
-          p.port_name, p.port_direction, p.port_width) ports
-    | None ->
-        match List.assoc_opt t xil_primitive_ports with
-        | Some lst -> lst
-        | None -> []
+    (* authoritative direction/width source, best first *)
+    let from_lib =
+      match List.assoc_opt t library_cells with
+      | Some ports when ports <> [] ->
+          Some (List.map (fun (p : library_port) ->
+            p.port_name, p.port_direction, p.port_width) ports)
+      | _ -> None in
+    let from_hard = List.assoc_opt t xil_primitive_ports in
+    let from_vhdl () =
+      match (try Vhdl_to_behavioral.lookup_xil_primitive_ports [t] with _ -> []) with
+      | (_, ports) :: _ ->
+          List.map (fun (p : library_port) ->
+            p.port_name, p.port_direction, p.port_width) ports
+      | [] -> [] in
+    match Hashtbl.find_opt (Lazy.force xil_json_ports) t with
+    | Some l when l <> [] ->
+        (* Authoritative Vivado interface — use EXACTLY (correct widths and
+           directions).  Do NOT bump from connected widths: a single malformed
+           connection (e.g. a gate-map LUT6.I0 with 31 bits) must not widen the
+           declared scalar pin; the per-pin clamp downstream truncates it. *)
+        l
+    | _ ->
+        (* Fallback for primitives absent from the JSON: library_cells / VHDL /
+           hardcoded, bumped to the connected width and unioned with any
+           connected port they omit, so the interface is complete enough to
+           link. *)
+        let base0 = match from_lib, from_hard with
+          | Some l, _ -> l
+          | None, Some l -> l
+          | None, None -> from_vhdl () in
+        let conn_w pn =
+          match Hashtbl.find_opt connected_ports t with
+          | Some h -> (try Hashtbl.find h pn with Not_found -> 0)
+          | None -> 0 in
+        let base = List.map (fun (n, d, w) -> (n, d, max w (conn_w n))) base0 in
+        let known = List.map (fun (n, _, _) -> n) base in
+        let extra =
+          match Hashtbl.find_opt connected_ports t with
+          | None -> []
+          | Some h ->
+              Hashtbl.fold (fun pn w acc ->
+                if List.mem pn known then acc else (pn, `Input, w) :: acc) h [] in
+        base @ extra
   in
 
   let buf = Buffer.create (256 * 1024) in
@@ -260,10 +386,53 @@ let write_edif
   pp "          (instance n_GND_inst (viewref netlist (cellref GND (libraryref hdi_primitives))))\n";
   pp "          (instance n_VCC_inst (viewref netlist (cellref VCC (libraryref hdi_primitives))))\n";
 
+  (* write_edif emits UNBUFFERED outputs.  of_circuit inserts a per-output-port
+     identity LUT6 buffer (INIT=64'hFFFFFFFF00000000, all six inputs tied) as a
+     nextpnr-xilinx OUTMUX workaround; for Vivado that is pure redundancy (it
+     disconnects an explicit OBUF from its pad and forces Vivado to re-insert
+     IO buffers).  Bypass each such buffer by aliasing its INPUT net to its
+     OUTPUT net (so the real driver connects straight through) and dropping it.
+     write_nextpnr_json keeps the buffers. *)
+  let key_of_conn = function
+    | BVar nm ->
+        (match const_net nm with Some _ -> None | None ->
+         (match bitbus_ref ctx nm with
+          | Some (b, i) -> Some { base = b; bit = i }
+          | None -> Some { base = nm; bit = 0 }))
+    | BSlice { signal = BVar b; msb; lsb } when msb = lsb -> Some { base = b; bit = lsb }
+    | BSelect { array = BVar b; index = BConst { value; _ } } -> Some { base = b; bit = value }
+    | _ -> None in
+  let is_ident_obuf (i : binstance) =
+    String.equal i.module_name "LUT6"
+    && List.mem ("INIT", "64'hFFFFFFFF00000000") i.param_strs
+    && (match List.assoc_opt "I0" i.port_connections with
+        | Some i0 ->
+            List.for_all (fun p ->
+              match List.assoc_opt p i.port_connections with Some e -> e = i0 | None -> false)
+              ["I1"; "I2"; "I3"; "I4"; "I5"]
+        | None -> false) in
+  (* only bypass a buffer whose OUTPUT is a top-level OUTPUT PORT (the one that
+     sits between an explicit OBUF and the pad); intermediate buffers on
+     internal nets stay (bypassing them disconnects the fabric). *)
+  let out_ports : (string, unit) Hashtbl.t = Hashtbl.create 32 in
+  List.iter (fun (s : bsignal) ->
+    if s.direction = `Output then Hashtbl.replace out_ports s.name ()) m.signals;
+  let ident_names : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (i : binstance) ->
+    if is_ident_obuf i then
+      match List.assoc_opt "O" i.port_connections, List.assoc_opt "I0" i.port_connections with
+      | Some o, Some i0 ->
+          (match key_of_conn o, key_of_conn i0 with
+           | Some ok, Some ik when ok <> ik && Hashtbl.mem out_ports ok.base ->
+               Hashtbl.replace ident_names i.inst_name ();
+               Hashtbl.replace ctx.ids ik (alloc ctx ok)
+           | _ -> ())
+      | _ -> ()) m.instances;
   (* Emit each cell instance with its INIT/property parameters. *)
   let is_skipped_cell = function "GND" | "VCC" -> true | _ -> false in
   let live_cells = List.filter (fun (i : binstance) ->
-    not (is_skipped_cell i.module_name)) m.instances in
+    not (is_skipped_cell i.module_name)
+    && not (Hashtbl.mem ident_names i.inst_name)) m.instances in
   List.iter (fun (i : binstance) ->
     pp "          (instance %s (viewref netlist (cellref %s (libraryref hdi_primitives)))"
       (edif_safe_id i.inst_name) (edif_safe_id i.module_name);
@@ -292,20 +461,37 @@ let write_edif
     let inst_id = edif_safe_id i.inst_name in
     let ports = primtype_ports i.module_name in
     List.iter (fun (pin, expr) ->
-      let nets = nets_of_conn ctx expr in
       let pin_w = match List.find_opt (fun (p, _, _) -> p = pin) ports with
         | Some (_, _, w) -> w
         | None -> 1 in
+      (* Clamp the connection to the pin's declared width: a scalar pin (LUT
+         I0, etc.) must connect to exactly ONE net.  A malformed wider
+         connection (a gate-map edge case producing a bus on a 1-bit LUT input)
+         would otherwise emit that pin into every net's member list, which
+         Vivado rejects as a multiply-connected pin. *)
+      let nets =
+        let all = nets_of_conn ctx expr in
+        if List.length all > pin_w then
+          List.filteri (fun i _ -> i < pin_w) all
+        else all in
+      let pin_dir = match List.find_opt (fun (p, _, _) -> p = pin) ports with
+        | Some (_, d, _) -> d | None -> `Input in
       List.iteri (fun bit_i net ->
-        let pref =
-          if pin_w = 1 then
-            Printf.sprintf "(portref %s (instanceref %s))"
-              (edif_safe_id pin) inst_id
-          else
-            Printf.sprintf "(portref (member %s %d) (instanceref %s))"
-              (edif_safe_id pin) (mem_idx ~w:pin_w bit_i) inst_id
-        in
-        add_use net pref) nets
+        (* A cell OUTPUT folded to a constant (net n_GND/n_VCC) must not drive
+           the tie net — that is a multiply-driven-net DRC.  Skip it (the
+           output is left dangling; consumers already read the tie directly). *)
+        if pin_dir = `Output && (net = "n_GND" || net = "n_VCC") then ()
+        else begin
+          let pref =
+            if pin_w = 1 then
+              Printf.sprintf "(portref %s (instanceref %s))"
+                (edif_safe_id pin) inst_id
+            else
+              Printf.sprintf "(portref (member %s %d) (instanceref %s))"
+                (edif_safe_id pin) (mem_idx ~w:pin_w bit_i) inst_id
+          in
+          add_use net pref
+        end) nets
     ) i.port_connections) live_cells;
 
   (* Constant tie drivers. *)

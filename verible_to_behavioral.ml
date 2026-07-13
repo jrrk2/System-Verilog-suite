@@ -2661,6 +2661,18 @@ let extract_instances ~pkgs ~params tok =
           mod_name := Some id
       | _ -> ()
     ) base;
+    (* Extract the instantiation's `#(.NAME(value), …)` parameter overrides so
+       EXTERNAL primitive instances (MMCME2_ADV CLKIN1_PERIOD=16.0, RAMB36E1
+       INITs, GTXE2 line-rate config) keep their configuration -- otherwise
+       every primitive comes out with zero params and Vivado DRCs on e.g.
+       CLKIN1_PERIOD=0.  Integers -> param_values, everything else (reals,
+       strings, enums) -> param_strs. *)
+    let base_overrides = extract_overrides base in
+    let base_pvals, base_pstrs =
+      List.fold_left (fun (iv, sv) (name, s) ->
+        match int_of_string_opt s with
+        | Some i -> ((name, i) :: iv, sv)
+        | None   -> (iv, (name, s) :: sv)) ([], []) base_overrides in
     let inst_nodes = collect_by (has_tag (fun t ->
       prefix_is "non_anonymous_gate_instance" t ||
       prefix_is "module_instance" t)) base in
@@ -2752,7 +2764,7 @@ let extract_instances ~pkgs ~params tok =
             Some {
               inst_name = prefixed_inst;
               module_name = m;
-              param_values = []; param_strs = [];
+              param_values = base_pvals; param_strs = base_pstrs;
               port_connections = List.rev !port_conns;
             }
       | _ -> None

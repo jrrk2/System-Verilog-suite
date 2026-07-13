@@ -247,7 +247,7 @@ let _ = List.iter (fun (str,key) -> if str <> "" then Hashtbl.add esymbols (Stri
 ("ENDPRAGMA", Edif2.ENDPRAGMA);
 ("ENDOFFILE", Edif2.ENDOFFILE);
 ("EMPTYEDIF", Edif2.EMPTYEDIF);
-("E", Edif2.E);
+(* "E" scaled-number keyword removed: collides with Vivado signal names like E[7:0]; (e mant exp) is unused. *)
 ("Duration", Edif2.Duration);
 ("Dot", Edif2.Dot);
 ("Dominates", Edif2.Dominates);

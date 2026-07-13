@@ -28,20 +28,48 @@ let const_of_name = function
 (* Net key — what we put in the (signal_base, bit) -> id table.        *)
 type net_key = { base : string; bit : int }
 
-(* Net id allocator.  Constants short-circuit to C "0"/"1".            *)
+(* Net id allocator.  Constants are emitted the way nextpnr-xilinx writes its
+   ROUTED json (which is what json2dcp consumes): as references to two real
+   nets $PACKER_GND_NET / $PACKER_VCC_NET, NOT yosys-style C "0"/"1" string
+   bits.  json2dcp maps those net names to GLOBAL_LOGIC0/1; it does not parse
+   string consts in cell connections.  Ids 2 and 3 are reserved for them. *)
 type ctx = {
   next_id     : int ref;
   ids         : (net_key, int) Hashtbl.t;
   net_names   : (string, int list) Hashtbl.t;     (* base -> bit ids, in bit-order *)
   widths      : (string, int) Hashtbl.t;          (* signal-name -> declared width *)
+  gnd_id      : int;
+  vcc_id      : int;
+  gnd_used    : bool ref;
+  vcc_used    : bool ref;
 }
 
 let mk_ctx () = {
-  next_id   = ref 2;
+  next_id   = ref 4;          (* 0/1 yosys-reserved; 2/3 = GND/VCC packer nets *)
   ids       = Hashtbl.create 4096;
   net_names = Hashtbl.create 1024;
   widths    = Hashtbl.create 1024;
+  gnd_id    = 2;
+  vcc_id    = 3;
+  gnd_used  = ref false;
+  vcc_used  = ref false;
 }
+
+(* A constant bit.  Two conventions:
+   - DEFAULT ($PACKER nets): emit a reference to a real $PACKER_GND_NET /
+     $PACKER_VCC_NET net.  This is what json2dcp / the Vivado read_edif path
+     consumes, and how nextpnr writes its own ROUTED json.
+   - NEXTPNR_JSON_CONST_STRINGS=1 (DIRECT nextpnr consumption of natively-
+     compiled Verilog): emit yosys-style "0"/"1" string bits.  Feeding a
+     $PACKER_VCC_NET *input* net to nextpnr COLLIDES with the const network
+     nextpnr builds itself during packing -- it rebinds the name to a device
+     VCC wire (e.g. CMT_TOP_SW4END0_1), orphaning cells that still reference
+     the old net -> post-pack check() assertion (nets.find). *)
+let const_strings = Sys.getenv_opt "NEXTPNR_JSON_CONST_STRINGS" <> None
+let const_bit ctx (is_one : bool) : bit =
+  if const_strings then C (if is_one then "1" else "0")
+  else if is_one then (ctx.vcc_used := true; I ctx.vcc_id)
+  else                (ctx.gnd_used := true; I ctx.gnd_id)
 
 (* Populate the widths table from the bmodule's signal declarations.
  * Lets bits_of_conn expand a bare `BVar name` reference into its full
@@ -75,9 +103,36 @@ let rec resolve_bit_ref (e : bexpr) : (string * int option) option =
   | BVar nm -> Some (nm, None)
   | BSelect { array = BVar nm; index = BConst { value; _ } } ->
       Some (nm, Some value)
+  | BSelect { array; index = BConst { value; _ } } ->
+      (* Nested select, e.g. Vivado EDIF renders a scalar top-level port
+         as IO_CLK_P[0][0].  Resolve the inner ref: indexing a scalar
+         (None) gives that bit; a redundant outer [0] on an already-
+         resolved bit is the identity. *)
+      (match resolve_bit_ref array with
+       | Some (nm, None)                  -> Some (nm, Some value)
+       | Some (nm, Some b) when value = 0 -> Some (nm, Some b)
+       | _ -> None)
   | BConcat _ ->
       (* Vivado EDIF doesn't emit concatenations on instance pins. *)
       None
+  | _ -> None
+
+(* Recognise of_circuit's multi-bit-input memo naming `<base>__<i>` and map it
+   to bit i of the vector `<base>` (a declared multi-bit signal).  Without this
+   a per-bit input reference `framing_rdata__40` allocates its own scalar net,
+   disconnected from the port bit `framing_rdata[40]` -> driverless net. *)
+let bitbus_ref ctx nm =
+  let n = String.length nm in
+  let rec find i =
+    if i < 1 then None
+    else if nm.[i] = '_' && nm.[i - 1] = '_' then Some i else find (i - 1) in
+  match find (n - 1) with
+  | Some j when j + 1 < n ->
+      let suf = String.sub nm (j + 1) (n - j - 1) in
+      let base = String.sub nm 0 (j - 1) in
+      if suf <> "" && String.for_all (fun c -> c >= '0' && c <= '9') suf
+         && (match Hashtbl.find_opt ctx.widths base with Some w -> w > 1 | None -> false)
+      then Some (base, int_of_string suf) else None
   | _ -> None
 
 (* Resolve a port connection's bexpr to its list of net bits.  Scalar
@@ -89,38 +144,62 @@ let rec bits_of_conn ctx (e : bexpr) : bit list =
          IBUFDS_GTE2).  Emit one `C "0"` / `C "1"` per bit, LSB first. *)
       let rec range i = if i >= width then [] else
         let b = (value lsr i) land 1 in
-        C (if b = 1 then "1" else "0") :: range (i + 1) in
+        const_bit ctx (b = 1) :: range (i + 1) in
       range 0
   | BConcat es ->
       (* BIR's BConcat is MSB-first by convention; reverse to get the
          LSB-first order yosys-JSON `bits` lists use. *)
       List.concat_map (bits_of_conn ctx) (List.rev es)
-  | BSlice { signal; msb; lsb } ->
-      (* Expand signal[msb:lsb] as the LSB-first list of single-bit refs
-         signal[lsb], signal[lsb+1], ..., signal[msb]. *)
-      let base = match signal with
-        | BVar nm -> nm
-        | _ -> failwith ("bir_to_nextpnr_json: slice of non-BVar signal: "
-                         ^ Behavioral_ir.string_of_bexpr signal)
-      in
+  | BSlice { signal = BVar base; msb; lsb } ->
+      (* Expand base[msb:lsb] as the LSB-first list of single-bit refs
+         base[lsb], base[lsb+1], ..., base[msb]. *)
       let rec range lo hi = if lo > hi then [] else lo :: range (lo + 1) hi in
       List.map (fun i ->
         match const_of_name base with
-        | Some s -> C s
+        | Some s -> const_bit ctx (s = "1")
         | None -> I (alloc ctx { base; bit = i })
+      ) (range lsb msb)
+  | BSlice { signal; msb; lsb } ->
+      (* Slice of a composite signal (e.g. flatten_struct emits a bus as a
+         BConcat of individual nets, then slices it): expand the inner signal
+         to its full LSB-first bit list and take indices [lsb..msb]. *)
+      let full = Array.of_list (bits_of_conn ctx signal) in
+      let n = Array.length full in
+      let rec range lo hi = if lo > hi then [] else lo :: range (lo + 1) hi in
+      List.map (fun i ->
+        if i >= 0 && i < n then full.(i)
+        else begin
+          (* Out-of-range bit-select: Verilog reads x here (yosys ties it to
+             0).  Match that instead of failing so a design with a benign
+             over-select still emits. *)
+          Printf.eprintf
+            "[bir_to_nextpnr_json] WARN: slice bit %d of a width-%d composite \
+             out of range -> tied 0\n" i n;
+          const_bit ctx false
+        end
       ) (range lsb msb)
   | _ ->
       (match resolve_bit_ref e with
         | Some (nm, _) when const_of_name nm <> None ->
-            [C (match const_of_name nm with Some s -> s | None -> assert false)]
+            [const_bit ctx (const_of_name nm = Some "1")]
         | Some (nm, Some bit) -> [I (alloc ctx { base = nm; bit })]
         | Some (nm, None    ) ->
-            (* Bare `BVar nm` reference — expand to nm's declared
-             * width if known, else fall back to one bit.  Multi-bit
-             * expansion is essential for CARRY4 inputs like .S(_671)
-             * where _671 is a 4-bit wire. *)
-            let w = try Hashtbl.find ctx.widths nm with Not_found -> 1 in
-            List.init w (fun i -> I (alloc ctx { base = nm; bit = i }))
+            (match bitbus_ref ctx nm with
+             | Some (base, bit) ->
+                 (* of_circuit names a multi-bit INPUT port's bit-i reference
+                  * `<base>__<i>` (hardcaml_to_behavioral line ~252).  Resolve
+                  * it to bit i of the vector `<base>` so the reader connects
+                  * to the actual port bit instead of an orphan scalar net —
+                  * the driverless-net bug that made Vivado opt trim the
+                  * design. *)
+                 [I (alloc ctx { base; bit })]
+             | None ->
+                 (* Bare `BVar nm` reference — expand to nm's declared
+                  * width if known, else fall back to one bit.  Multi-bit
+                  * expansion is essential for CARRY4 inputs like .S(_671)
+                  * where _671 is a 4-bit wire. *)
+                 let w = try Hashtbl.find ctx.widths nm with Not_found -> 1 in
+                 List.init w (fun i -> I (alloc ctx { base = nm; bit = i })))
         | None ->
             failwith ("bir_to_nextpnr_json: unsupported pin expression: "
                       ^ Behavioral_ir.string_of_bexpr e))
@@ -295,9 +374,14 @@ let yosys_json
 
   (* Pre-allocate net ids for top-level ports so they are stable.
      For vector ports, we allocate one id per bit. *)
+  (* `__keep_<net>` outputs are synthetic retention handles added by
+     behavioral_to_hardcaml to stop Hardcaml pruning clock-only boxes
+     (IBUFDS/BUFG); they must NOT surface as top-level IO ports/pads. *)
+  let is_keep_port nm =
+    String.length nm >= 7 && String.sub nm 0 7 = "__keep_" in
   let port_bits = Hashtbl.create 64 in
   List.iter (fun (s : bsignal) ->
-    if s.direction <> `Internal then begin
+    if s.direction <> `Internal && not (is_keep_port s.name) then begin
       let w = match s.stype with
         | BInt { width; _ } -> width
         | BBool             -> 1
@@ -371,14 +455,63 @@ let yosys_json
     ) port_bits []
   in
 
+  (* nextpnr emits every netname SINGLE-BIT; json2dcp keys each net by bits[0],
+     so a multi-bit entry (e.g. a bus collected under one base name) would lose
+     its higher bits at import.  Split any multi-bit net into name[i] per bit. *)
+  let emit_net nm hide ids acc =
+    match ids with
+    | [i] -> (nm, `Assoc [ "hide_name", `Int hide;
+                           "bits", `List [ `Int i ];
+                           "attributes", `Assoc [] ]) :: acc
+    | _ ->
+        List.fold_left (fun (k, a) i ->
+          (k + 1,
+           (Printf.sprintf "%s[%d]" nm k, `Assoc [
+              "hide_name", `Int hide;
+              "bits", `List [ `Int i ];
+              "attributes", `Assoc [] ]) :: a)) (0, acc) ids |> snd
+  in
   let netnames =
     Hashtbl.fold (fun nm ids acc ->
-      (nm, `Assoc [
-        "hide_name",  `Int (if Hashtbl.mem port_bits nm then 0 else 1);
-        "bits",       `List (List.map (fun i -> `Int i) ids);
-        "attributes", `Assoc [];
-      ]) :: acc
+      emit_net nm (if Hashtbl.mem port_bits nm then 0 else 1) ids acc
     ) ctx.net_names []
+  in
+  (* nextpnr emits every top-level PORT net in netnames too (not just in
+     `ports`).  json2dcp builds its net-id map from netnames only, so a port
+     net absent here is "unknown net" at a driver pin (e.g. OBUF.O -> led[i]).
+     nextpnr emits ALL netnames SINGLE-BIT (a bus is split into name[i] per
+     bit); json2dcp keys each net by bits[0], so a multi-bit bus entry would
+     lose its higher bits.  Split each port net into one single-bit netname per
+     bit (name for width 1, name[i] for buses) to match nextpnr. *)
+  let netnames =
+    Hashtbl.fold (fun nm (_dir, bs) acc ->
+      if Hashtbl.mem ctx.net_names nm then acc
+      else if List.length bs <= 1 then
+        (nm, `Assoc [
+           "hide_name",  `Int 0;
+           "bits",       `List (List.map bit_json bs);
+           "attributes", `Assoc [];
+         ]) :: acc
+      else
+        (* bus: one single-bit netname per bit, LSB = name[0] *)
+        List.fold_left (fun (i, a) b ->
+          (i + 1,
+           (Printf.sprintf "%s[%d]" nm i, `Assoc [
+              "hide_name",  `Int 0;
+              "bits",       `List [ bit_json b ];
+              "attributes", `Assoc [];
+            ]) :: a)) (0, acc) bs |> snd
+    ) port_bits netnames
+  in
+  (* Emit the constant nets json2dcp expects (maps them to GLOBAL_LOGIC0/1). *)
+  let const_net nm id =
+    (nm, `Assoc [ "hide_name", `Int 1;
+                  "bits", `List [ `Int id ];
+                  "attributes", `Assoc [] ]) in
+  let netnames =
+    (if !(ctx.gnd_used) then [const_net "$PACKER_GND_NET" ctx.gnd_id] else [])
+    @ (if !(ctx.vcc_used) then [const_net "$PACKER_VCC_NET" ctx.vcc_id] else [])
+    @ netnames
   in
 
   `Assoc [

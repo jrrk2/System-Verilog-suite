@@ -7,6 +7,21 @@
 open Behavioral_ir
 open Hardcaml
 
+(* Clamp a dynamic shift/index amount to clog2(width) bits before
+   [Signal.log_shift].  log_shift builds one barrel stage per amount bit
+   (stage k shifts by 2^k), so a 64-bit amount (e.g. a mis-widened
+   `{bank, 6'b0}` bank-select shift in a multi-bank RAM) creates a 2^63
+   stage that overflows OCaml's native int to a NEGATIVE shift and crashes
+   Hardcaml's srl.  A shift >= the operand width yields 0 anyway, so
+   ceil(log2 width) bits is exact for every real shift and removes the
+   overflow. *)
+let clog2 n = let rec f n a = if n <= 1 then a else f ((n + 1) / 2) (a + 1) in max 1 (f n 0)
+let log_shift_clamped op s amt =
+  let needed = clog2 (Signal.width s) in
+  let amt' =
+    if Signal.width amt > needed then Signal.select amt (needed - 1) 0 else amt in
+  Signal.log_shift op s amt'
+
 (* Context for tracking signals during conversion *)
 type conv_context = {
   mutable signals: (string * Signal.t) list;
@@ -33,7 +48,32 @@ type conv_context = {
      mappers (FPGA → FDRE INIT; ASIC → "would-need-explicit-reset"
      check) can read it back. *)
   initial_values: (string, int * int) Hashtbl.t;  (* name -> (width, value) *)
+  (* Net names tied to a constant by a GND/VCC primitive instance in the
+     source (`GND GND_1 (.G(GND_2))` → GND_2 = 0, `VCC VCC_1 (.P(VCC_2))`
+     → VCC_2 = 1).  Those tie cells are pruned during mapping, so a
+     consumer resolving the net to the tie's dead box-output wire would
+     land on a driverless net (Vivado Opt 31-2 / NDRV).  [get_signal]
+     resolves any such name straight to a hardcaml constant. Value: true =
+     one (VCC), false = zero (GND). *)
+  const_nets: (string, bool) Hashtbl.t;
 }
+
+(* Collect net names that a GND/VCC primitive instance ties to a constant,
+   plus the well-known `<const0>`/`<const1>` sentinels. *)
+let collect_const_nets (bmod : Behavioral_ir.bmodule) =
+  let t = Hashtbl.create 16 in
+  Hashtbl.replace t "GND" false; Hashtbl.replace t "<const0>" false;
+  Hashtbl.replace t "VCC" true;  Hashtbl.replace t "<const1>" true;
+  List.iter (fun (i : Behavioral_ir.binstance) ->
+    let one = match i.module_name with "VCC" -> Some true | "GND" -> Some false | _ -> None in
+    match one with
+    | None -> ()
+    | Some v ->
+      (* the single output port (G for GND, P for VCC) names the const net *)
+      List.iter (fun (_port, e) -> match e with
+        | Behavioral_ir.BVar nm -> Hashtbl.replace t nm v
+        | _ -> ()) i.port_connections) bmod.instances;
+  t
 
 (* Get width from behavioral IR type *)
 let rec width_of_btype = function
@@ -44,6 +84,17 @@ let rec width_of_btype = function
 
 (* Get signal from context *)
 let get_signal ctx name =
+  (* Constant-sentinel nets: the source ties these with GND/VCC primitive
+     instances (`GND GND (.G(<const0>))`).  Those tie cells are pruned during
+     mapping, so a consumer that resolves `<const0>` to the tie's (now dead)
+     box-output wire ends up on a DRIVERLESS net — Vivado flags it (e.g. an
+     SRL D pin, Opt 31-2).  Resolve the sentinels straight to a hardcaml
+     constant instead; of_circuit re-emits constant instance inputs as the
+     "GND"/"VCC" nets that bir_to_edif/_json tie to n_GND/n_VCC. *)
+  match Hashtbl.find_opt ctx.const_nets name with
+  | Some true  -> Signal.vdd
+  | Some false -> Signal.gnd
+  | None ->
   match List.assoc_opt name ctx.signals with
   | Some s -> s
   | None ->
@@ -257,13 +308,13 @@ let rec expr_to_signal ctx = function
            let s = if result_width > Signal.width s_lhs
                    then Signal.uresize s_lhs result_width else s_lhs in
            (try Signal.(sll s (Signal.to_int s_rhs))
-            with _ -> Signal.log_shift Signal.sll s s_rhs)
+            with _ -> log_shift_clamped Signal.sll s s_rhs)
        | BShr ->
            (try Signal.(srl s_lhs (Signal.to_int s_rhs))
-            with _ -> Signal.log_shift Signal.srl s_lhs s_rhs)
+            with _ -> log_shift_clamped Signal.srl s_lhs s_rhs)
        | BAshr ->
            (try Signal.(sra s_lhs (Signal.to_int s_rhs))
-            with _ -> Signal.log_shift Signal.sra s_lhs s_rhs)
+            with _ -> log_shift_clamped Signal.sra s_lhs s_rhs)
        | BEq -> Signal.(s_lhs ==: s_rhs)
        | BNe -> Signal.(s_lhs <>: s_rhs)
        | BLt -> Signal.(s_lhs <: s_rhs)
@@ -356,7 +407,7 @@ let rec expr_to_signal ctx = function
             | BConst { value; _ } when value >= 0 && value < w_arr ->
                 Signal.select s_array value value
             | _ ->
-                let shifted = Signal.log_shift Signal.srl s_array s_index in
+                let shifted = log_shift_clamped Signal.srl s_array s_index in
                 Signal.select shifted 0 0)
        | Some elem_w ->
            let total_w = Signal.width s_array in
@@ -943,6 +994,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
     reset = None;
     array_elem_w = Hashtbl.create 8; reset_falling = false;
     initial_values = Hashtbl.create 16;
+    const_nets = collect_const_nets bmod;
   } in
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
@@ -974,6 +1026,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
    real circuit that can be passed to [Rtl.print] for Verilog
    emission and [Lib_map.map_bexpr] for technology mapping. *)
 let create_circuit ?(emit_instances = false) ?(detect_loops = true)
+    ?(port_dir : (string -> string -> [ `Input | `Output ] option) = fun _ _ -> None)
     (bmod : Behavioral_ir.bmodule) =
   let scope = Scope.create () in
   let inputs = build_inputs bmod in
@@ -985,6 +1038,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     reset = None;
     array_elem_w = Hashtbl.create 8; reset_falling = false;
     initial_values = Hashtbl.create 16;
+    const_nets = collect_const_nets bmod;
   } in
 
   (* Clock/reset get bound by [process_to_always] when each
@@ -1057,6 +1111,97 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     | BCombinational { body; _ } -> scan_lhs None body)
     bmod.processes;
 
+  (* Black-box instance OUTPUT wires are pre-created HERE, before the
+     register pre-pass, so a register clocked by an internal box output
+     (a BUFG/MMCM driving `cpu_clk` used by top-level FFs) binds its
+     Reg_spec clock to the actual box-output wire instead of an unbound
+     free input (which flatten later promotes to a driverless top port,
+     tripping Vivado NSTD-1/UCIO-1 and orphaning the clock tree).
+     [box_out_nets] records these net names so the register pre-pass
+     skips them (they are driven by the Inst, not by a process). *)
+  let box_out_nets = ref [] in
+  let inst_infos =
+    if not emit_instances then []
+    else begin
+      let module_inputs =
+        List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+          if s.direction = `Input then Some s.name else None) bmod.signals in
+      let sig_decl_width nm =
+        match
+          List.find_opt (fun (s : Behavioral_ir.bsignal) -> s.name = nm) bmod.signals
+        with
+        | Some s -> width_of_btype s.stype
+        | None -> 1 in
+      let base_is_box_output v =
+        not (Hashtbl.mem driver_proc v) && not (List.mem v module_inputs) in
+      (* Classify an instance PORT.  Authoritative source: the primitive's
+         declared port direction (from library_cells / Vivado unisim VHDL) —
+         essential because the net heuristic below misclassifies an instance
+         INPUT that reads a net driven by ANOTHER instance (e.g. MMCM.CLKIN1
+         reading sysclk from a BUFG) as an output, which multi-drives the net
+         and disconnects the clock tree.  Falls back to the net-usage heuristic
+         only when the direction is unknown. *)
+      let heuristic_output = function
+        | BVar v -> base_is_box_output v
+        (* A primitive output wired through a bus-slice — e.g. a multi-bank
+           RAM's `.DOA(douta_w[b*64 +: 32])` or a GT output into a wide bus —
+           is still an OUTPUT.  Without this the box loses its outputs and
+           bir_to_aig prunes it as dead (dropping GT/RAMB/IO). *)
+        | BSlice { signal = BVar v; _ } -> base_is_box_output v
+        | _ -> false in
+      let port_is_output mn port e =
+        match port_dir mn port with
+        | Some `Output -> true
+        | Some `Input -> false
+        | None -> heuristic_output e in
+      (* sliced box-output drivers, grouped by the bus var they drive *)
+      let partial : (string, (int * int * Signal.t) list) Hashtbl.t =
+        Hashtbl.create 16 in
+      let infos = List.map (fun (i : Behavioral_ir.binstance) ->
+        let outs, ins =
+          List.partition (fun (port, e) -> port_is_output i.module_name port e)
+            i.port_connections in
+        let out_wires =
+          List.filter_map (fun (port, e) ->
+            match e with
+            | BVar v ->
+                let wire = Signal.wire (sig_decl_width v) in
+                (* Name the box-output wire with its net name so a register
+                   clocked by it (e.g. a top-level FF on a BUFG's O net
+                   `cpu_clk`) reports rb_clock = "cpu_clk" downstream, letting
+                   fpga_map bridge the FF clock to the on-chip driver instead
+                   of minting a driverless clock pad. *)
+                let _ = Signal.(--) wire v in
+                ctx.signals <- (v, wire) :: ctx.signals;
+                box_out_nets := v :: !box_out_nets;
+                Some (port, wire)
+            | BSlice { signal = BVar base; msb; lsb } ->
+                let wire = Signal.wire (msb - lsb + 1) in
+                let prev = try Hashtbl.find partial base with Not_found -> [] in
+                Hashtbl.replace partial base ((lsb, msb, wire) :: prev);
+                box_out_nets := base :: !box_out_nets;
+                Some (port, wire)
+            | _ -> None) outs in
+        (i, out_wires, ins)) bmod.instances in
+      (* Assemble each bus that several boxes drive slices of into one signal
+         (LSB..MSB, gaps tied 0) and register it so processes reading the bus
+         resolve to the box outputs. *)
+      Hashtbl.iter (fun base drivers ->
+        let max_msb = List.fold_left (fun a (_, m, _) -> max a m) 0 drivers in
+        let width =
+          let d = sig_decl_width base in if d > max_msb then d else max_msb + 1 in
+        let sorted = List.sort (fun (l1, _, _) (l2, _, _) -> compare l1 l2) drivers in
+        let pieces = ref [] and pos = ref 0 in
+        List.iter (fun (lsb, msb, w) ->
+          if lsb > !pos then pieces := Signal.zero (lsb - !pos) :: !pieces;
+          pieces := w :: !pieces;
+          pos := msb + 1) sorted;
+        if !pos < width then pieces := Signal.zero (width - !pos) :: !pieces;
+        (* !pieces is MSB-first (ascending-lsb inserts prepend the highest last) *)
+        ctx.signals <- (base, Signal.concat_msb !pieces) :: ctx.signals) partial;
+      infos
+    end in
+
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     (* Record per-element width for BArray signals so [BSelect] can
        slice the flat representation correctly when index is dynamic. *)
@@ -1065,7 +1210,12 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
          Hashtbl.replace ctx.array_elem_w s.name (width_of_btype element)
      | _ -> ());
     if s.direction <> `Input
-       && not (List.mem_assoc s.name ctx.variables) then begin
+       && not (List.mem_assoc s.name ctx.variables)
+       (* Skip nets driven by a black-box instance output (pre-created
+          above as wires in ctx.signals): they must NOT get a competing
+          Always.Variable / never-written zero stub, which would shadow
+          the box-output wire and re-orphan a clock net like cpu_clk. *)
+       && not (List.mem s.name !box_out_nets) then begin
       let w = width_of_btype s.stype in
       (* If this signal is never written by ANY process — outputs left
          dangling by the source RTL (gqa_attention's kv_wr_addr,
@@ -1161,34 +1311,11 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
      in ctx.signals so reads inside the processes resolve to them; the
      Inst itself is built after the processes run (its inputs need the
      process-computed driver signals). *)
-  let inst_infos =
-    if not emit_instances then []
-    else begin
-      let module_inputs =
-        List.filter_map (fun (s : Behavioral_ir.bsignal) ->
-          if s.direction = `Input then Some s.name else None) bmod.signals in
-      let sig_decl_width nm =
-        match
-          List.find_opt (fun (s : Behavioral_ir.bsignal) -> s.name = nm) bmod.signals
-        with
-        | Some s -> width_of_btype s.stype
-        | None -> 1 in
-      let conn_is_output = function
-        | BVar v -> not (Hashtbl.mem driver_proc v) && not (List.mem v module_inputs)
-        | _ -> false in
-      List.map (fun (i : Behavioral_ir.binstance) ->
-        let outs, ins =
-          List.partition (fun (_, e) -> conn_is_output e) i.port_connections in
-        let out_wires =
-          List.filter_map (fun (port, e) ->
-            match e with
-            | BVar v ->
-                let wire = Signal.wire (sig_decl_width v) in
-                ctx.signals <- (v, wire) :: ctx.signals;
-                Some (port, wire)
-            | _ -> None) outs in
-        (i, out_wires, ins)) bmod.instances
-    end in
+  (* [box_out_nets] / [inst_infos] are built EARLIER (just after the
+     driver_proc scan, before the register pre-pass) so that a register
+     whose CLOCK is an internal instance output (e.g. a top-level FF
+     clocked by a BUFG's O net named `cpu_clk`) can bind its Reg_spec to
+     that box-output wire.  See the hoisted block above. *)
 
   (* Coalesce all BCombinational processes into a single one before
      lowering.  Each [Always.compile] call drives the underlying wire
@@ -1282,8 +1409,14 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
             else Parameter.Value.String s in
           Parameter.create ~name:n ~value) i.param_strs in
       let parameters = int_params @ str_params in
+      (* Hardcaml instance/module names may only contain alphanumerics or
+         `_ $ . [ ]`; flattened Xilinx-IP hierarchy names carry '/' path
+         separators (e.g. pcs_pma_block_i/transceiver_inst/.../gtxe2_i) — map
+         them to '_' so Instantiation.create accepts them. *)
+      let hc_name s = String.map (fun c -> if c = '/' then '_' else c) s in
       let omap =
-        Instantiation.create () ~name:i.module_name ~instance:i.inst_name
+        Instantiation.create () ~name:(hc_name i.module_name)
+          ~instance:(hc_name i.inst_name)
           ~parameters ~inputs ~outputs in
       List.iter (fun (port, ow) ->
         let osig = Base.Map.find_exn omap port in
@@ -1307,6 +1440,41 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
         in
         Some (Signal.output s.name driver)
     | _ -> None) bmod.signals in
+
+  (* Retain instance-boundary outputs that no declared output reaches — the
+     clk_p→IBUFDS→BUFG→MMCM clock tree drives clock nets only, so Hardcaml
+     would prune those buffers.  Expose each as a `__keep_<net>` output so the
+     box survives; bir_to_nextpnr_json strips `__keep_` ports from the emitted
+     netlist so they never become IO pads.  Legacy drop-the-buffers behaviour
+     is restored by defining SVS_LEGACY_CLOCKBUF_DROP. *)
+  let outputs =
+    if Sys.getenv_opt "SVS_LEGACY_CLOCKBUF_DROP" <> None then outputs
+    else begin
+      (* Every flip-flop's clock net is reachable by construction; flag it so
+         the clock tree that drives it (IBUFDS→BUFG→MMCM→BUFG) survives
+         Hardcaml's data-output-only pruning.  Retain ONLY the FF-clock nets
+         (which are box outputs — a BUFG.O): retaining intermediate box outputs
+         like the IBUFDS→BUFG link would add an output-buffer LUT that splits
+         that net. *)
+      let clock_names =
+        List.fold_left (fun acc p -> match p with
+          | BSequential { clock; _ } -> clock :: acc
+          | _ -> acc) [] bmod.processes in
+      let declared name =
+        List.exists (fun (s : Behavioral_ir.bsignal) ->
+          s.name = name && s.direction = `Output) bmod.signals in
+      let seen = Hashtbl.create 16 in
+      let extra = List.filter_map (fun name ->
+        if Hashtbl.mem seen name || declared name
+           || not (List.mem name clock_names) then None
+        else begin
+          Hashtbl.add seen name ();
+          match List.assoc_opt name ctx.signals with
+          | Some sig_ -> Some (Signal.output ("__keep_" ^ name) sig_)
+          | None -> None
+        end) !box_out_nets in
+      outputs @ extra
+    end in
 
   let config = { Circuit.Config.default with detect_combinational_loops = detect_loops } in
   Circuit.create_exn ~config ~name:bmod.name outputs
