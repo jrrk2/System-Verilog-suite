@@ -944,7 +944,20 @@ let () =
         design's own clocks); single-region nets keep TOPO_BUF_TYPE (BUFR). *)
      let buf_type = getenv_default "TOPO_BUF_TYPE" "BUFR" in
      let region_rows = getenv_int "TOPO_REGION_ROWS" 50 in
-     let gbuf_max = getenv_int "TOPO_BUFG_GMAX" 16 in
+     (* Third architectural ceiling: only 12 global clock spines reach any one
+        clock region, and the DESIGN's own clocks (BUFG/BUFGCTRL) need theirs
+        first -- 16 inserted BUFGs starved the RX recovered clock of a spine
+        (design clock net unroutable).  Budget inserted globals to what's left
+        under the ceiling; the overflow is handled by the auto-FT driver
+        replication in fabric (no dedicated resources). *)
+     let design_bufg =
+       let seen = Hashtbl.create 16 in
+       Hashtbl.iter (fun _ (cn, dty) ->
+           if dty = "BUFG" || dty = "BUFGCTRL" then Hashtbl.replace seen cn ()) drv;
+       Hashtbl.length seen in
+     let gbuf_max = getenv_int "TOPO_BUFG_GMAX" (max 0 (12 - design_bufg - 1)) in
+     Printf.eprintf "global budget: %d design BUFG/BUFGCTRL -> %d insertable BUFG\n"
+       design_bufg gbuf_max;
      let xmid = List.fold_left (fun a s -> max a s.sx) 0 all_slices / 2 in
      let n_regions sinks =
        List.length (List.sort_uniq compare (List.filter_map (fun (cn,_,_) ->
