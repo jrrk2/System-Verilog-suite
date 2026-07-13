@@ -1339,4 +1339,354 @@ let () =
      let ob = open_out_gen [Open_append; Open_creat] 0o644 bels_path in
      List.iter (fun s -> Printf.fprintf ob "%s\n" s) !ftstamps; close_out ob;
      Printf.eprintf "feedthroughs: %d LUT1 relays + %d buffers (%d %s + %d BUFHCE + %d BUFG wide) -> %s (+%d stamps)\n"
-       !ftn !nbufg (!nbufg - !ngbuf - !nbufh) buf_type !nbufh !ngbuf outj (List.length !ftstamps))
+       !ftn !nbufg (!nbufg - !ngbuf - !nbufh) buf_type !nbufh !ngbuf outj (List.length !ftstamps);
+
+     (* ===== CARRY-SLICE COMPLETION (OCaml port of carry_stamp.py) ==========
+        Emits a SECOND json (TOPO_STAMPED_JSON) with all BEL stamps applied
+        as cell attributes AND every BEL'd CARRY4's slice laid out explicitly.
+        nextpnr-xilinx has no site-level LUT routethru, so:
+          S[k] LUT-driven  -> stamp the driver at <site>/<slot>6LUT
+          S[k] FF/ext      -> identity LUT1 (INIT=10) at the 6LUT, rewire S
+          S[k]=GND         -> const-0 LUT1 (INIT=00) fed by a LOCAL net (a
+                              0-INIT LUT needs no global GND route)
+          DI[k]=GND        -> const-0 LUT1 at the <slot>5LUT (O5->DI), input
+                              shared with the 6LUT occupant (fracture rule)
+          DI[k] FF/LUT6    -> identity LUT1 at the 5LUT (DI adoption in
+                              pack_carry_xc7 covers LUT1-5 only)
+          O[k] sum-FF      -> stamp at <site>/<slot>FF
+        Plus TARGETED same-slot feedback relays (CARRY_FB_NETS file): a
+        counter's bit-0 inverter reading its own slot's Q loses the marginal
+        same-tile bounce under congestion; relay via a neighbour slice.
+        Blanket relaying of all such pairs REGRESSED 13->65 skips. *)
+     let belmap = Hashtbl.create 8192 in
+     Array.iter (fun c ->
+         if stamp_all || not (skip_kind (kind_of_lef c.Pack_to_lef.pc_lef)) then
+         match cell_site.(Hashtbl.find name2id c.Pack_to_lef.pc_name) with
+         | Some site -> List.iter (fun (prim, suffix) ->
+             Hashtbl.replace belmap prim (site.sname ^ "/" ^ suffix)) c.Pack_to_lef.pc_bels
+         | None -> ()) cells;
+     List.iter (fun s -> match String.index_opt s '\t' with
+         | Some i -> Hashtbl.replace belmap (String.sub s 0 i)
+                       (String.sub s (i+1) (String.length s - i - 1))
+         | None -> ()) !ftstamps;
+     let slot_l = [| "A"; "B"; "C"; "D" |] in
+     (* cell tables from the FT-edited json *)
+     let ctype = Hashtbl.create 8192 and cconns = Hashtbl.create 8192 in
+     let cdirs = Hashtbl.create 8192 in
+     List.iter (fun (cn, c) ->
+         (match member "type" c with `String t -> Hashtbl.replace ctype cn t | _ -> ());
+         (match member "port_directions" c with
+          | `Assoc d -> Hashtbl.replace cdirs cn d | _ -> ());
+         (match member "connections" c with
+          | `Assoc conns ->
+            let tbl = Hashtbl.create 8 in
+            List.iter (fun (p, bl) -> match bl with
+                | `List l -> Hashtbl.replace tbl p (Array.of_list l)
+                | _ -> ()) conns;
+            Hashtbl.replace cconns cn tbl
+          | _ -> ())) cells_j'';
+     let conn_of cn p = match Hashtbl.find_opt cconns cn with
+       | Some t -> Hashtbl.find_opt t p | None -> None in
+     let int_of = function `Int i -> Some i | _ -> None in
+     (* net-bit driver (cellname, type) via declared output directions *)
+     let cs_drv = Hashtbl.create 8192 in
+     let cs_gnd = Hashtbl.create 64 in
+     List.iter (fun (cn, _) ->
+         let t = try Hashtbl.find ctype cn with Not_found -> "" in
+         let dirs = try Hashtbl.find cdirs cn with Not_found -> [] in
+         (match Hashtbl.find_opt cconns cn with
+          | Some tbl -> Hashtbl.iter (fun p bits ->
+              let isout = (match List.assoc_opt p dirs with
+                  | Some (`String "output") -> true | _ -> false)
+                  || (dirs = [] && (p = "O" || p = "Q" || p = "CO" || p = "G" || p = "P")) in
+              if isout then Array.iter (fun b -> match int_of b with
+                  | Some i -> Hashtbl.replace cs_drv i (cn, t);
+                    if t = "GND" then Hashtbl.replace cs_gnd i ()
+                  | None -> ()) bits) tbl
+          | None -> ())) cells_j'';
+     let cs_occ = Hashtbl.create 8192 in
+     Hashtbl.iter (fun cn bel -> Hashtbl.replace cs_occ bel cn) belmap;
+     (* rewrites: (cell,port,idx) -> new bit ; created buffer cells *)
+     let cs_rewire = Hashtbl.create 256 and cs_cells = ref [] in
+     let mk_lut1 name init inbit outbit bel =
+       cs_cells := (name, `Assoc [
+           "type", `String "LUT1";
+           "parameters", `Assoc ["INIT", `String init];
+           "attributes", `Assoc ["BEL", `String bel];
+           "port_directions", `Assoc ["I0", `String "input"; "O", `String "output"];
+           "connections", `Assoc ["I0", `List [`Int inbit]; "O", `List [`Int outbit]]
+         ]) :: !cs_cells;
+       Hashtbl.replace cs_occ bel name in
+     let n_sbuf = ref 0 and n_slut = ref 0 and n_sff = ref 0 and n_dil = ref 0 in
+     (* D-bit -> FF cellname, for sum-FF slotting *)
+     let ff_by_d = Hashtbl.create 4096 in
+     List.iter (fun (cn, _) ->
+         let t = try Hashtbl.find ctype cn with Not_found -> "" in
+         if String.length t >= 2 && String.sub t 0 2 = "FD" then
+           match conn_of cn "D" with
+           | Some a when Array.length a > 0 ->
+             (match int_of a.(0) with Some i -> Hashtbl.replace ff_by_d i cn | None -> ())
+           | _ -> ()) cells_j'';
+     let is_lut15 t = t = "LUT1" || t = "LUT2" || t = "LUT3" || t = "LUT4" || t = "LUT5" in
+     List.iter (fun (cn, _) ->
+         if (try Hashtbl.find ctype cn with Not_found -> "") = "CARRY4" then
+         match Hashtbl.find_opt belmap cn with
+         | Some bel when Filename.basename bel = "CARRY4" ->
+           let site = Filename.dirname bel in
+           let getp p = match conn_of cn p with Some a -> a | None -> [||] in
+           let sarr = getp "S" and diarr = getp "DI" and oarr = getp "O" in
+           let slot_in = Array.make 4 None in
+           (* local (non-GND) net for const-0 LUT inputs *)
+           let local_net () =
+             let r = ref None in
+             Array.iter (fun b -> match int_of b with
+                 | Some i when !r = None && not (Hashtbl.mem cs_gnd i) ->
+                   (match Hashtbl.find_opt cs_drv i with
+                    | Some (_, t) when String.length t >= 2 && String.sub t 0 2 = "FD" ->
+                      r := Some i
+                    | _ -> ())
+                 | _ -> ()) sarr;
+             if !r = None then
+               List.iter (fun p -> match conn_of cn p with
+                   | Some a when Array.length a > 0 && !r = None ->
+                     (match int_of a.(0) with
+                      | Some i when not (Hashtbl.mem cs_gnd i) -> r := Some i
+                      | _ -> ())
+                   | _ -> ()) ["CYINIT"; "CI"];
+             !r in
+           Array.iteri (fun k b ->
+               if k < 4 then match int_of b with
+               | None -> ()
+               | Some sb ->
+                 let slot6 = Printf.sprintf "%s/%s6LUT" site slot_l.(k) in
+                 let d = Hashtbl.find_opt cs_drv sb in
+                 let is_gnd = Hashtbl.mem cs_gnd sb in
+                 (match d with
+                  | Some (dn, dt) when String.length dt >= 3 && String.sub dt 0 3 = "LUT"
+                                       && not is_gnd ->
+                    (match Hashtbl.find_opt cs_occ slot6 with
+                     | Some who when who <> dn ->
+                       Printf.eprintf "carry-stamp: slot collision %s (%s vs %s)\n" slot6 who dn
+                     | _ ->
+                       Hashtbl.replace belmap dn slot6; Hashtbl.replace cs_occ slot6 dn;
+                       incr n_slut;
+                       (* record the occupant's I0 net (its A1 pin) for 5LUT
+                          pin sharing -- MUST be I0-first order, not Hashtbl
+                          order, or DIgnd picks a net on a different pin and
+                          re-creates the A1 double-booking *)
+                       (match Hashtbl.find_opt cconns dn with
+                        | Some t ->
+                          (try List.iter (fun p -> match Hashtbl.find_opt t p with
+                               | Some a when Array.length a > 0 ->
+                                 (match int_of a.(0) with
+                                  | Some i -> slot_in.(k) <- Some i; raise Exit
+                                  | None -> ())
+                               | _ -> ()) ["I0"; "I1"; "I2"; "I3"; "I4"; "I5"]
+                           with Exit -> ())
+                        | None -> ()))
+                  | _ ->
+                    if not (Hashtbl.mem cs_occ slot6) then begin
+                      let src, init = if is_gnd then (local_net (), "00")
+                                      else (Some sb, "10") in
+                      match src with
+                      | None -> ()
+                      | Some src ->
+                        let nb = newbit () in
+                        mk_lut1 (Printf.sprintf "%s$Srt$%d" cn k) init src nb slot6;
+                        Hashtbl.replace cs_rewire (cn, "S", k) nb;
+                        slot_in.(k) <- Some src; incr n_sbuf
+                    end)) sarr;
+           Array.iteri (fun k b ->
+               if k < 4 then match int_of b with
+               | None -> ()
+               | Some db ->
+                 let is_gnd = Hashtbl.mem cs_gnd db in
+                 let d = Hashtbl.find_opt cs_drv db in
+                 let adoptable = (match d with
+                     | Some (_, dt) -> not is_gnd && is_lut15 dt
+                     | None -> false) in
+                 let slot5 = Printf.sprintf "%s/%s5LUT" site slot_l.(k) in
+                 if not adoptable && not (Hashtbl.mem cs_occ slot5) then begin
+                   if is_gnd then begin
+                     (* const-0: input = the occupant's first net -> shared A1 *)
+                     match slot_in.(k) with
+                     | Some src ->
+                       let nb = newbit () in
+                       mk_lut1 (Printf.sprintf "%s$DIgnd$%d" cn k) "00" src nb slot5;
+                       Hashtbl.replace cs_rewire (cn, "DI", k) nb; incr n_dil
+                     | None -> ()
+                   end else begin
+                     (* FF/LUT6-driven DI passthrough.  PIN-ALIGN with the 6LUT
+                        occupant: nextpnr pin-maps each fractured LUT I0->A1,
+                        I1->A2... per cell, so a lone LUT1 with a different net
+                        double-books sitewire A1 (SLICE_X2Y65/A1 overused by 2
+                        nets -> the "->A1 unroutable" class).  Mirror the
+                        occupant's inputs on I0..In-1, DI net on the next pin,
+                        INIT = top-input passthrough (upper half ones). *)
+                     let occ_ins = ref [] in
+                     (match Hashtbl.find_opt cs_occ (Printf.sprintf "%s/%s6LUT" site slot_l.(k)) with
+                      | None -> ()
+                      | Some occ6 ->
+                        (match Hashtbl.find_opt cconns occ6 with
+                         | None -> ()
+                         | Some t ->
+                           List.iter (fun p -> match Hashtbl.find_opt t p with
+                               | Some a when Array.length a > 0 ->
+                                 (match int_of a.(0) with
+                                  | Some i -> occ_ins := i :: !occ_ins | None -> ())
+                               | _ -> ()) ["I0"; "I1"; "I2"; "I3"; "I4"; "I5"]));
+                     let occ_ins = List.rev !occ_ins in
+                     (* truncate at the DI net if it is already an occupant pin *)
+                     let occ_ins =
+                       let rec take acc = function
+                         | [] -> List.rev acc
+                         | x :: _ when x = db -> List.rev acc
+                         | x :: tl -> take (x :: acc) tl in
+                       take [] occ_ins in
+                     let n_in = List.length occ_ins + 1 in
+                     if n_in <= 5 then begin
+                       let nb = newbit () in
+                       let half = 1 lsl (n_in - 1) in
+                       let init = String.make half '1' ^ String.make half '0' in
+                       let ins = occ_ins @ [db] in
+                       let conns = List.mapi (fun i b2 ->
+                           (Printf.sprintf "I%d" i, `List [`Int b2])) ins
+                           @ ["O", `List [`Int nb]] in
+                       let dirs = List.mapi (fun i _ ->
+                           (Printf.sprintf "I%d" i, `String "input")) ins
+                           @ ["O", `String "output"] in
+                       let name = Printf.sprintf "%s$DIrt$%d" cn k in
+                       cs_cells := (name, `Assoc [
+                           "type", `String (Printf.sprintf "LUT%d" n_in);
+                           "parameters", `Assoc ["INIT", `String init];
+                           "attributes", `Assoc ["BEL", `String slot5];
+                           "port_directions", `Assoc dirs;
+                           "connections", `Assoc conns]) :: !cs_cells;
+                       Hashtbl.replace cs_occ slot5 name;
+                       Hashtbl.replace cs_rewire (cn, "DI", k) nb; incr n_dil
+                     end
+                   end
+                 end) diarr;
+           Array.iteri (fun k b ->
+               if k < 4 then match int_of b with
+               | None -> ()
+               | Some ob ->
+                 match Hashtbl.find_opt ff_by_d ob with
+                 | Some fn when not (Hashtbl.mem belmap fn) ->
+                   let slotff = Printf.sprintf "%s/%sFF" site slot_l.(k) in
+                   if not (Hashtbl.mem cs_occ slotff) then begin
+                     Hashtbl.replace belmap fn slotff; Hashtbl.replace cs_occ slotff fn;
+                     incr n_sff
+                   end
+                 | _ -> ()) oarr
+         | _ -> ()) cells_j'';
+     (* targeted same-slot feedback relays (CARRY_FB_NETS: one net name/line) *)
+     let n_fb = ref 0 in
+     (match Sys.getenv_opt "CARRY_FB_NETS" with
+      | None -> ()
+      | Some f when not (Sys.file_exists f) -> ()
+      | Some f ->
+        let fbn = Hashtbl.create 16 in
+        let ic = open_in f in
+        (try while true do
+             let l = String.trim (input_line ic) in
+             if l <> "" then Hashtbl.replace fbn l ()
+           done with End_of_file -> close_in ic);
+        (* bit -> netname *)
+        let bit2name = Hashtbl.create 8192 in
+        (match member "netnames" topm' with
+         | `Assoc nns -> List.iter (fun (nm, nn) ->
+             match member "bits" nn with
+             | `List bl -> List.iter (fun b -> match int_of b with
+                 | Some i when not (Hashtbl.mem bit2name i) ->
+                   Hashtbl.replace bit2name i nm
+                 | _ -> ()) bl
+             | _ -> ()) nns
+         | _ -> ());
+        (* real SLICE site set for neighbour lookup *)
+        let slice_sites = Hashtbl.create 65536 in
+        List.iter (fun s -> Hashtbl.replace slice_sites s.sname ()) all_slices;
+        let free_neighbour site =
+          match String.index_opt site 'X', String.index_opt site 'Y' with
+          | Some xi, Some yi when yi > xi ->
+            (try
+               let x = int_of_string (String.sub site (xi+1) (yi - xi - 1)) in
+               let y = int_of_string (String.sub site (yi+1) (String.length site - yi - 1)) in
+               let r = ref None in
+               List.iter (fun (dx, dy) ->
+                   if !r = None then begin
+                     let ns = Printf.sprintf "SLICE_X%dY%d" (x+dx) (y+dy) in
+                     if Hashtbl.mem slice_sites ns then
+                       Array.iter (fun sl ->
+                           let bel = Printf.sprintf "%s/%s6LUT" ns sl in
+                           if !r = None && not (Hashtbl.mem cs_occ bel) then r := Some bel)
+                         slot_l
+                   end)
+                 [(1,0);(-1,0);(0,1);(0,-1);(1,1);(-1,1);(1,-1);(-1,-1)];
+               !r
+             with _ -> None)
+          | _ -> None in
+        Hashtbl.iter (fun cn bel ->
+            let t = try Hashtbl.find ctype cn with Not_found -> "" in
+            if String.length t >= 3 && String.sub t 0 3 = "LUT"
+               && Filename.check_suffix bel "6LUT" then begin
+              let site = Filename.dirname bel in
+              let leaf = Filename.basename bel in
+              let slot = String.sub leaf 0 1 in
+              match Hashtbl.find_opt cconns cn with
+              | None -> ()
+              | Some tbl -> Hashtbl.iter (fun p a ->
+                  if p <> "O" && Array.length a > 0 then
+                    match int_of a.(0) with
+                    | None -> ()
+                    | Some ib ->
+                      match Hashtbl.find_opt cs_drv ib with
+                      | Some (dn, dt) when String.length dt >= 2 && String.sub dt 0 2 = "FD"
+                          && Hashtbl.find_opt belmap dn = Some (site ^ "/" ^ slot ^ "FF")
+                          && (match Hashtbl.find_opt bit2name ib with
+                              | Some nm -> Hashtbl.mem fbn nm | None -> false) ->
+                        (match free_neighbour site with
+                         | Some rbel ->
+                           let nb = newbit () in
+                           mk_lut1 (Printf.sprintf "%s$fbrelay$%s" cn p) "10" ib nb rbel;
+                           Hashtbl.replace cs_rewire (cn, p, 0) nb; incr n_fb
+                         | None -> ())
+                      | _ -> ()) tbl
+            end) (Hashtbl.copy belmap));
+     (* rebuild: apply belmap as attributes.BEL + cs_rewire to connections *)
+     let stamp_attr cn c = match c with
+       | `Assoc a ->
+         let bel = Hashtbl.find_opt belmap cn in
+         let a = List.map (fun (k, v) ->
+             if k = "connections" then match v with
+               | `Assoc conns -> (k, `Assoc (List.map (fun (port, bits) ->
+                   match bits with
+                   | `List bl -> (port, `List (List.mapi (fun idx b ->
+                       match Hashtbl.find_opt cs_rewire (cn, port, idx) with
+                       | Some nb -> `Int nb | None -> b) bl))
+                   | _ -> (port, bits)) conns))
+               | _ -> (k, v)
+             else if k = "attributes" then match bel, v with
+               | Some b, `Assoc attrs ->
+                 (k, `Assoc (("BEL", `String b) :: List.remove_assoc "BEL" attrs))
+               | _ -> (k, v)
+             else (k, v)) a in
+         let a = if bel <> None && not (List.mem_assoc "attributes" a) then
+             a @ ["attributes", `Assoc ["BEL", `String (Option.get bel)]] else a in
+         `Assoc a
+       | _ -> c in
+     let cells_st = List.map (fun (cn, c) -> (cn, stamp_attr cn c)) cells_j''
+                    @ List.rev !cs_cells in
+     let topm_st = (match topm' with `Assoc a ->
+         `Assoc (List.map (fun (k, v) ->
+             if k = "cells" then (k, `Assoc cells_st) else (k, v)) a)
+       | _ -> topm') in
+     let j_st = (match j' with `Assoc a ->
+         `Assoc (List.map (fun (k, v) -> if k <> "modules" then (k, v) else
+             match v with `Assoc ms -> (k, `Assoc (List.map (fun (nm, m) ->
+                 if nm = topname then (nm, topm_st) else (nm, m)) ms)) | _ -> (k, v)) a)
+       | _ -> j') in
+     let outst = getenv_default "TOPO_STAMPED_JSON" "/tmp/arp_stamped_ocaml.json" in
+     Y.to_file outst j_st;
+     Printf.eprintf "carry-stamp: %d S-buffers, %d S-LUTs, %d sum-FFs, %d DI-5LUTs, %d fb-relays -> %s\n"
+       !n_sbuf !n_slut !n_sff !n_dil !n_fb outst)
