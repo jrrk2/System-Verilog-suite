@@ -179,23 +179,50 @@ for cn, c in list(cells.items()):
                         ins.add(v[0])
                 if db not in ins and len(ins) + 1 > 5:
                     continue  # would be an illegal fracture; leave for nextpnr
-        if is_gnd:
-            # const-0 generator: INIT=0 fed by the slot's 6LUT input net
-            # (fracture legality: 5LUT shares A-pins with the 6LUT occupant)
-            if slot_in[k] is None:
-                continue
-            src, init, tag = slot_in[k], "00", "DIgnd"
-        else:
-            # FF/external-driven DI: identity buffer passing the net to DI via
-            # O5 (pre-empts nextpnr's unconstrained di_feed, which HeAP can't
-            # bind when the carry is BEL-pinned)
-            src, init, tag = db, "10", "DIrt"
         maxbit += 1
         onet = maxbit
+        if is_gnd:
+            # const-0 generator: INIT=0 fed by the slot's 6LUT input net.
+            # SAME net as the occupant's first pin -> shared A1, no conflict.
+            if slot_in[k] is None:
+                continue
+            tag = "DIgnd"
+            buf = {"type": "LUT1",
+                   "port_directions": {"I0": "input", "O": "output"},
+                   "connections": {"I0": [slot_in[k]], "O": [onet]},
+                   "parameters": {"INIT": "00"}, "attributes": {"BEL": slot5}}
+        else:
+            # FF/LUT6-driven DI passthrough.  PIN-ALIGN with the 6LUT occupant:
+            # nextpnr pin-maps each fractured LUT's I0->A1, I1->A2... per cell,
+            # so a LUT1 here with a DIFFERENT net than the occupant's first pin
+            # double-books sitewire A1 (seen: SLICE_X2Y65/A1 overused by 2 nets
+            # -> the whole "->A1 unroutable" class).  Mirror the occupant's
+            # input nets on I0..In-1 and put the DI net on the NEXT pin; INIT =
+            # passthrough of the top input (upper half ones).
+            tag = "DIrt"
+            occ6 = occupied.get(f"{site}/{SLOT[k]}6LUT")
+            occ_ins = []
+            if occ6 is not None:
+                oc = cells.get(occ6) or new_cells.get(occ6)
+                for pp in ("I0", "I1", "I2", "I3", "I4", "I5"):
+                    v2 = (oc.get("connections", {}) if oc else {}).get(pp, [])
+                    if v2 and is_int(v2[0]):
+                        occ_ins.append(v2[0])
+            if db in occ_ins:
+                occ_ins = occ_ins[:occ_ins.index(db)]  # DI net already a pin
+            if len(occ_ins) + 1 > 5:
+                continue  # cannot align within the 5 shared pins
+            n_in = len(occ_ins) + 1
+            init = "1" * (1 << (n_in - 1)) + "0" * (1 << (n_in - 1))
+            conns = {f"I{i}": [b2] for i, b2 in enumerate(occ_ins)}
+            conns[f"I{n_in-1}"] = [db]
+            conns["O"] = [onet]
+            dirs = {p: "input" for p in conns if p != "O"}
+            dirs["O"] = "output"
+            buf = {"type": f"LUT{n_in}", "port_directions": dirs,
+                   "connections": conns,
+                   "parameters": {"INIT": init}, "attributes": {"BEL": slot5}}
         bufname = f"{cn}${tag}${k}"
-        buf = {"type": "LUT1", "port_directions": {"I0": "input", "O": "output"},
-               "connections": {"I0": [src], "O": [onet]},
-               "parameters": {"INIT": init}, "attributes": {"BEL": slot5}}
         claim(slot5, bufname)
         new_cells[bufname] = buf
         newDI[k] = onet
@@ -221,6 +248,88 @@ for cn, c in list(cells.items()):
                     except SystemExit:
                         pass  # slot taken; leave FF for nextpnr
                 break
+
+# --- same-slot FF->LUT feedback relays -------------------------------------
+# A counter bit-0 inverter (S[0]=~Q[0]) sits at x6LUT with its input driven by
+# the SAME slot's xFF Q.  The chipdb cannot route a same-slot Q->imux bounce
+# (AQ->A1 fails at any visit cap), so relay the feedback through an identity
+# LUT1 in a NEIGHBOUR slice: two ordinary inter-slice arcs.
+import re as _re
+known_sites = set()
+try:
+    fp = json.load(open("/tmp/virtex7_floorplan.json"))
+    for s_ in fp.get("sites", []):
+        n = s_.get("name", "")
+        if n.startswith("SLICE_"):
+            known_sites.add(n)
+except Exception:
+    pass
+for cn2, c2 in cells.items():
+    b = c2.get("attributes", {}).get("BEL", "")
+    if b:
+        known_sites.add(b.split("/")[0])
+def free_neighbour_lut(site):
+    m = _re.match(r"SLICE_X(\d+)Y(\d+)$", site)
+    if not m:
+        return None
+    x, y = int(m.group(1)), int(m.group(2))
+    for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1)):
+        ns = f"SLICE_X{x+dx}Y{y+dy}"
+        if ns not in known_sites:
+            continue
+        for sl in SLOT:
+            bel = f"{ns}/{sl}6LUT"
+            if bel not in occupied:
+                return bel
+    return None
+# TARGETED only: blanket relaying of all 388 same-slot feedbacks REGRESSED
+# 13->65 skips (the extra double-hop arcs congested the X2/X3 carry-column
+# INT and created ~15 new marginal losers).  Relay only the nets listed in
+# $CARRY_FB_NETS (one net name per line, from the previous route's skips).
+import os
+fb_nets = set()
+fbf = os.environ.get("CARRY_FB_NETS")
+if fbf and os.path.exists(fbf):
+    fb_nets = {l.strip() for l in open(fbf) if l.strip()}
+bit2name = {}
+for nm, nn in mod.get("netnames", {}).items():
+    for b in nn.get("bits", []):
+        if isinstance(b, int) and b not in bit2name:
+            bit2name[b] = nm
+n_fb = 0
+for cn2, c2 in list(cells.items()) + list(new_cells.items()):
+    b = c2.get("attributes", {}).get("BEL", "")
+    if "/"  not in b or not b.endswith("6LUT") or not c2["type"].startswith("LUT"):
+        continue
+    site, leaf = b.split("/")
+    slot_letter = leaf[0]
+    conns = c2.get("connections", {})
+    for pp, v in list(conns.items()):
+        if pp == "O" or not v or not is_int(v[0]):
+            continue
+        d = drv.get(v[0])
+        if d is None or not d[1].startswith("FD"):
+            continue
+        dbel = (cells.get(d[0]) or {}).get("attributes", {}).get("BEL", "")
+        if dbel != f"{site}/{slot_letter}FF":
+            continue  # only the unroutable same-slot Q->imux case
+        if bit2name.get(v[0]) not in fb_nets:
+            continue  # targeted: only nets the previous route actually failed
+        rbel = free_neighbour_lut(site)
+        if rbel is None:
+            continue
+        maxbit += 1
+        onet = maxbit
+        rname = f"{cn2}$fbrelay${pp}"
+        cells[rname] = {"type": "LUT1",
+                        "port_directions": {"I0": "input", "O": "output"},
+                        "connections": {"I0": [v[0]], "O": [onet]},
+                        "parameters": {"INIT": "10"},
+                        "attributes": {"BEL": rbel}}
+        occupied[rbel] = rname
+        conns[pp] = [onet]
+        n_fb += 1
+print(f"same-slot feedback relays: {n_fb}")
 
 cells.update(new_cells)
 json.dump(j, open(out_json, "w"))
