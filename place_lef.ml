@@ -936,6 +936,22 @@ let () =
      let bufg_max = getenv_int "TOPO_BUFG_MAX" 20 in
      let is_ctrl p = p = "CE" || p = "R" || p = "S" || p = "PRE" || p = "CLR" || p = "SR" in
      let nbufg = ref 0 and bufcells = ref [] in
+     (* REGION-AWARE buffer choice: a BUFR only drives its OWN clock region
+        (~50 CLB rows x half the die), so a control net whose sinks straddle
+        clock regions can NEVER be driven by one BUFR -- those arcs fail by
+        construction (seen as the $frontend$/BUFR_x/O residual).  Wide nets go
+        on a true global BUFG (budget TOPO_BUFG_GMAX, 32 sites minus the
+        design's own clocks); single-region nets keep TOPO_BUF_TYPE (BUFR). *)
+     let buf_type = getenv_default "TOPO_BUF_TYPE" "BUFR" in
+     let region_rows = getenv_int "TOPO_REGION_ROWS" 50 in
+     let gbuf_max = getenv_int "TOPO_BUFG_GMAX" 12 in
+     let xmid = List.fold_left (fun a s -> max a s.sx) 0 all_slices / 2 in
+     let n_regions sinks =
+       List.length (List.sort_uniq compare (List.filter_map (fun (cn,_,_) ->
+           match Hashtbl.find_opt inst2pos cn with
+           | Some (x, y) -> Some ((if x > xmid then 1 else 0), y / region_rows)
+           | None -> None) sinks)) in
+     let ngbuf = ref 0 in
      (* buffer the highest-fanout control nets first (within budget) *)
      let ctrl_nets = Hashtbl.fold (fun bit sinks acc ->
          match Hashtbl.find_opt drv bit with
@@ -946,10 +962,15 @@ let () =
      List.iter (fun (_, bit) ->
          if !nbufg < bufg_max then begin
            let sinks = Hashtbl.find snk bit in
-           let nb = newbit () in
-           let bname = Printf.sprintf "$cebuf$%d" !nbufg in incr nbufg;
-           bufcells := (bname, bit, nb) :: !bufcells;
-           List.iter (fun (cn,port,idx) -> Hashtbl.replace rewire (cn,port,idx) nb) sinks
+           let wide = n_regions sinks > 1 in
+           if wide && !ngbuf >= gbuf_max then ()   (* out of globals: leave in fabric *)
+           else begin
+             let btype = if wide then (incr ngbuf; "BUFG") else buf_type in
+             let nb = newbit () in
+             let bname = Printf.sprintf "$cebuf$%d" !nbufg in incr nbufg;
+             bufcells := (bname, bit, nb, btype) :: !bufcells;
+             List.iter (fun (cn,port,idx) -> Hashtbl.replace rewire (cn,port,idx) nb) sinks
+           end
          end)
        (List.sort (fun (a,_) (b,_) -> compare b a) ctrl_nets);
      Hashtbl.iter (fun bit sinks ->
@@ -1083,18 +1104,17 @@ let () =
                          | _ -> (port, bits)) conns))
                   | _ -> (k,v)) a)
             | _ -> c))) cells_j in
-     (* regional buffer cell (BUFR default; BUFHCE/BUFG selectable).  BUFR/BUFHCE
-        need CE tied high; BUFR also CLR low + BYPASS (no clock division). *)
-     let buf_type = getenv_default "TOPO_BUF_TYPE" "BUFR" in
-     let buf_cell bit nb =
-       let params = if buf_type = "BUFR" then ["parameters", `Assoc ["BUFR_DIVIDE", `String "BYPASS"]] else [] in
+     (* regional/global buffer cell, per-net type (BUFR narrow / BUFG wide).
+        BUFR/BUFHCE need CE tied high; BUFR also CLR low + BYPASS (no divide). *)
+     let buf_cell bit nb btype =
+       let params = if btype = "BUFR" then ["parameters", `Assoc ["BUFR_DIVIDE", `String "BYPASS"]] else [] in
        let pdirs = ["I", `String "input"; "O", `String "output"]
-         @ (if buf_type = "BUFG" then [] else ["CE", `String "input"])
-         @ (if buf_type = "BUFR" then ["CLR", `String "input"] else []) in
+         @ (if btype = "BUFG" then [] else ["CE", `String "input"])
+         @ (if btype = "BUFR" then ["CLR", `String "input"] else []) in
        let conns = ["I", `List [`Int bit]; "O", `List [`Int nb]]
-         @ (if buf_type = "BUFG" then [] else ["CE", `List [`String "1"]])
-         @ (if buf_type = "BUFR" then ["CLR", `List [`String "0"]] else []) in
-       `Assoc (("type", `String buf_type) :: params
+         @ (if btype = "BUFG" then [] else ["CE", `List [`String "1"]])
+         @ (if btype = "BUFR" then ["CLR", `List [`String "0"]] else []) in
+       `Assoc (("type", `String btype) :: params
                @ ["port_directions", `Assoc pdirs; "connections", `Assoc conns]) in
      let replica_or_relay bit nb dcn_opt =
        match dcn_opt with
@@ -1114,9 +1134,21 @@ let () =
        | None -> ft_cell bit nb in
      let cells_j'' = cells_j'
        @ List.map (fun (ftname, bit, nb, dcn_opt) -> (ftname, replica_or_relay bit nb dcn_opt)) !newcells
-       @ List.map (fun (bname, bit, nb) -> (bname, buf_cell bit nb)) !bufcells in
+       @ List.map (fun (bname, bit, nb, btype) -> (bname, buf_cell bit nb btype)) !bufcells in
+     (* NAME every inserted net: without a netnames entry nextpnr's frontend
+        auto-names them $frontend$N, making route failures unattributable.
+        With names, a failing relay/buffer output is directly identifiable. *)
+     let nn_entry nm nb = (nm, `Assoc ["hide_name", `Int 0; "bits", `List [`Int nb];
+                                       "attributes", `Assoc []]) in
+     let extra_nn =
+       List.map (fun (ftname, _bit, nb, _d) -> nn_entry (ftname ^ "_o") nb) !newcells
+       @ List.map (fun (bname, _bit, nb, _t) -> nn_entry (bname ^ "_o") nb) !bufcells in
      let topm' = (match topm with `Assoc a ->
-         `Assoc (List.map (fun (k,v) -> if k = "cells" then (k, `Assoc cells_j'') else (k,v)) a)
+         `Assoc (List.map (fun (k,v) ->
+             if k = "cells" then (k, `Assoc cells_j'')
+             else if k = "netnames" then
+               (match v with `Assoc nn -> (k, `Assoc (nn @ extra_nn)) | _ -> (k,v))
+             else (k,v)) a)
        | _ -> topm) in
      let j' = (match j with `Assoc a ->
          `Assoc (List.map (fun (k,v) -> if k <> "modules" then (k,v) else
@@ -1127,5 +1159,5 @@ let () =
      Y.to_file outj j';
      let ob = open_out_gen [Open_append; Open_creat] 0o644 bels_path in
      List.iter (fun s -> Printf.fprintf ob "%s\n" s) !ftstamps; close_out ob;
-     Printf.eprintf "feedthroughs: %d LUT1 relays + %d %s regional buffers -> %s (+%d stamps)\n"
-       !ftn !nbufg buf_type outj (List.length !ftstamps))
+     Printf.eprintf "feedthroughs: %d LUT1 relays + %d buffers (%d %s + %d BUFG wide) -> %s (+%d stamps)\n"
+       !ftn !nbufg (!nbufg - !ngbuf) buf_type !ngbuf outj (List.length !ftstamps))
