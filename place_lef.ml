@@ -959,11 +959,6 @@ let () =
      Printf.eprintf "global budget: %d design BUFG/BUFGCTRL -> %d insertable BUFG\n"
        design_bufg gbuf_max;
      let xmid = List.fold_left (fun a s -> max a s.sx) 0 all_slices / 2 in
-     let n_regions sinks =
-       List.length (List.sort_uniq compare (List.filter_map (fun (cn,_,_) ->
-           match Hashtbl.find_opt inst2pos cn with
-           | Some (x, y) -> Some ((if x > xmid then 1 else 0), y / region_rows)
-           | None -> None) sinks)) in
      let ngbuf = ref 0 in
      (* buffer the highest-fanout control nets first (within budget) *)
      let ctrl_nets = Hashtbl.fold (fun bit sinks acc ->
@@ -1004,32 +999,49 @@ let () =
            match Hashtbl.find_opt snk bit with
            | Some sinks -> load_regions sinks | None -> ()) drv;
      let hused = Hashtbl.create 8 and nbufh = ref 0 in
+     let region_ok r n =    (* n more tracks in region r stay under the 12-track row *)
+       let g = try Hashtbl.find gload r with Not_found -> 0 in
+       let h = try Hashtbl.find hused r with Not_found -> 0 in
+       g + h + n + hclk_margin <= 12 in
+     let take_bufh r =
+       Hashtbl.replace hused r (1 + (try Hashtbl.find hused r with Not_found -> 0));
+       incr nbufh in
+     let add_buf bit btype sel =
+       let nb = newbit () in
+       let bname = Printf.sprintf "$cebuf$%d" !nbufg in incr nbufg;
+       bufcells := (bname, bit, nb, btype) :: !bufcells;
+       List.iter (fun (cn,port,idx) -> Hashtbl.replace rewire (cn,port,idx) nb) sel in
      List.iter (fun (_, bit) ->
          if !nbufg < bufg_max then begin
            let sinks = Hashtbl.find snk bit in
-           let wide = n_regions sinks > 1 in
-           let btype =
-             if wide then
-               (if !ngbuf < gbuf_max then (incr ngbuf; load_regions sinks; "BUFG") else "")
-             else begin
-               let reg = reg_of sinks in
-               let c = try Hashtbl.find rused reg with Not_found -> 0 in
-               if c < bufr_per_region then (Hashtbl.replace rused reg (c + 1); buf_type)
-               else begin
-                 let g = try Hashtbl.find gload reg with Not_found -> 0 in
-                 let h = try Hashtbl.find hused reg with Not_found -> 0 in
-                 if !nbufh < bufh_max && g + h + hclk_margin < 12 then begin
-                   Hashtbl.replace hused reg (h + 1); incr nbufh; "BUFHCE"
-                 end
-                 else if !ngbuf < gbuf_max then (incr ngbuf; load_regions sinks; "BUFG")
-                 else ""                                  (* leave to fabric replication *)
-               end
-             end in
-           if btype <> "" then begin
-             let nb = newbit () in
-             let bname = Printf.sprintf "$cebuf$%d" !nbufg in incr nbufg;
-             bufcells := (bname, bit, nb, btype) :: !bufcells;
-             List.iter (fun (cn,port,idx) -> Hashtbl.replace rewire (cn,port,idx) nb) sinks
+           let regs = regions_of sinks in
+           if List.length regs > 1 then begin
+             (* WIDE net: one BUFHCE PER SINK REGION, all fed from the source in
+                fabric.  Regional-track cost is IDENTICAL to a BUFG entering each
+                region, but no global spine / BUFG site is consumed.  Falls back
+                to a single BUFG only when a region's HCLK row is full. *)
+             if bufh_max > 0 && !nbufh + List.length regs <= bufh_max
+                && List.for_all (fun r -> region_ok r 1) regs then
+               List.iter (fun r ->
+                   let rsinks = List.filter (fun (cn,_,_) ->
+                       match Hashtbl.find_opt inst2pos cn with
+                       | Some (x, y) -> ((if x > xmid then 1 else 0), y / region_rows) = r
+                       | None -> false) sinks in
+                   if rsinks <> [] then begin take_bufh r; add_buf bit "BUFHCE" rsinks end)
+                 regs
+             else if !ngbuf < gbuf_max then begin
+               incr ngbuf; load_regions sinks; add_buf bit "BUFG" sinks
+             end
+           end else begin
+             let reg = reg_of sinks in
+             let c = try Hashtbl.find rused reg with Not_found -> 0 in
+             if c < bufr_per_region then begin
+               Hashtbl.replace rused reg (c + 1); add_buf bit buf_type sinks
+             end else if bufh_max > 0 && !nbufh < bufh_max && region_ok reg 1 then begin
+               take_bufh reg; add_buf bit "BUFHCE" sinks
+             end else if !ngbuf < gbuf_max then begin
+               incr ngbuf; load_regions sinks; add_buf bit "BUFG" sinks
+             end                                          (* else: fabric replication *)
            end
          end)
        (List.sort (fun (a,_) (b,_) -> compare b a) ctrl_nets);
