@@ -944,7 +944,7 @@ let () =
         design's own clocks); single-region nets keep TOPO_BUF_TYPE (BUFR). *)
      let buf_type = getenv_default "TOPO_BUF_TYPE" "BUFR" in
      let region_rows = getenv_int "TOPO_REGION_ROWS" 50 in
-     let gbuf_max = getenv_int "TOPO_BUFG_GMAX" 12 in
+     let gbuf_max = getenv_int "TOPO_BUFG_GMAX" 16 in
      let xmid = List.fold_left (fun a s -> max a s.sx) 0 all_slices / 2 in
      let n_regions sinks =
        List.length (List.sort_uniq compare (List.filter_map (fun (cn,_,_) ->
@@ -959,13 +959,33 @@ let () =
            let c = List.length (List.filter (fun (_,p,_) -> is_ctrl p) sinks) in
            if c >= bufg_thresh && c * 2 >= List.length sinks then (c, bit) :: acc else acc
          | _ -> acc) snk [] in
+     (* Per-region BUFR SITE budget: only ~4 BUFR sites per clock-region side.
+        If more single-region nets target one region than it has sites, nextpnr
+        spills the extra BUFRs into a region with no loads (seen: BUFR_X0Y12/14 =
+        region row 3, sinks in rows 0-2) and every arc fails.  Cap BUFRs per
+        sink-region (TOPO_BUFR_PER_REGION) and PROMOTE the overflow to BUFG. *)
+     let bufr_per_region = getenv_int "TOPO_BUFR_PER_REGION" 4 in
+     let rused = Hashtbl.create 8 in
+     let reg_of sinks =
+       match List.find_map (fun (cn,_,_) ->
+           match Hashtbl.find_opt inst2pos cn with
+           | Some (x, y) -> Some ((if x > xmid then 1 else 0), y / region_rows)
+           | None -> None) sinks with
+       | Some r -> r | None -> (0, 0) in
      List.iter (fun (_, bit) ->
          if !nbufg < bufg_max then begin
            let sinks = Hashtbl.find snk bit in
            let wide = n_regions sinks > 1 in
-           if wide && !ngbuf >= gbuf_max then ()   (* out of globals: leave in fabric *)
-           else begin
-             let btype = if wide then (incr ngbuf; "BUFG") else buf_type in
+           let btype =
+             if wide then (if !ngbuf < gbuf_max then (incr ngbuf; "BUFG") else "")
+             else begin
+               let reg = reg_of sinks in
+               let c = try Hashtbl.find rused reg with Not_found -> 0 in
+               if c < bufr_per_region then (Hashtbl.replace rused reg (c + 1); buf_type)
+               else if !ngbuf < gbuf_max then (incr ngbuf; "BUFG")   (* region full: promote *)
+               else ""                                                (* leave in fabric *)
+             end in
+           if btype <> "" then begin
              let nb = newbit () in
              let bname = Printf.sprintf "$cebuf$%d" !nbufg in incr nbufg;
              bufcells := (bname, bit, nb, btype) :: !bufcells;
