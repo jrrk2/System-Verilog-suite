@@ -523,6 +523,49 @@ let () =
       done done
     end in
   let total_overflow () = Array.fold_left (fun a d -> a +. ov d) 0.0 rudy in
+  (* LONG-LINE / track resource model.  RUDY treats all wire as fungible, but a
+     long net consumes SCARCE long-distance tracks (7-series LH/LV long lines) in
+     the corridor it crosses -- which is exactly what nextpnr's router exhausts on
+     the long spans we fail on, and what HPWL/RUDY miss.  Cut-based demand: for
+     each net, every vertical cut inside its bbox carries 1 unit of HORIZONTAL
+     track demand (spread over the rows it may route through); every horizontal
+     cut carries 1 unit of VERTICAL demand (spread over columns).  Overflow where
+     a cut's per-band demand exceeds the available track capacity. *)
+  let ll_w = getenv_float "TOPO_LL_W" 0.0 in
+  let ll_on = ll_w > 0.0 in
+  let hcap = getenv_float "TOPO_LL_HCAP" (float cong_bin) in
+  let vcap = getenv_float "TOPO_LL_VCAP" (float cong_bin) in
+  let hcut = Array.make (nbx * nby) 0.0 in
+  let vcut = Array.make (nbx * nby) 0.0 in
+  let hov d = if d > hcap then d -. hcap else 0.0 in
+  let vov d = if d > vcap then d -. vcap else 0.0 in
+  let net_track_acc nid sign hacc vacc =
+    let cs = net_cells.(nid) in
+    let mnx = ref max_int and mxx = ref min_int and mny = ref max_int and mxy = ref min_int and cnt = ref 0 in
+    Array.iter (fun i -> if is_placed i then begin incr cnt;
+        if pos_x.(i) < !mnx then mnx := pos_x.(i);
+        if pos_x.(i) > !mxx then mxx := pos_x.(i);
+        if pos_y.(i) < !mny then mny := pos_y.(i);
+        if pos_y.(i) > !mxy then mxy := pos_y.(i) end) cs;
+    if !cnt >= 2 then begin
+      let bx0 = (!mnx - cbx0) / cong_bin and bx1 = (!mxx - cbx0) / cong_bin in
+      let by0 = (!mny - cby0) / cong_bin and by1 = (!mxy - cby0) / cong_bin in
+      let nrows = float (by1 - by0 + 1) and ncols = float (bx1 - bx0 + 1) in
+      (* horizontal wire crosses each vertical cut in [bx0,bx1), spread over rows *)
+      for bxc = bx0 to bx1 - 1 do
+        for by = by0 to by1 do
+          if bxc >= 0 && bxc < nbx && by >= 0 && by < nby then hacc (by * nbx + bxc) (sign /. nrows)
+        done
+      done;
+      (* vertical wire crosses each horizontal cut in [by0,by1), spread over cols *)
+      for byc = by0 to by1 - 1 do
+        for bx = bx0 to bx1 do
+          if bx >= 0 && bx < nbx && byc >= 0 && byc < nby then vacc (byc * nbx + bx) (sign /. ncols)
+        done
+      done
+    end in
+  let track_overflow () =
+    Array.fold_left (fun a d -> a +. hov d) 0.0 hcut +. Array.fold_left (fun a d -> a +. vov d) 0.0 vcut in
   let net_stamp = Array.make !nnets 0 and stamp_ctr = ref 0 in
   let anneal () =
     let mv = ref [] in
@@ -556,6 +599,14 @@ let () =
         Printf.eprintf "site-density: target fill=%.2f, peak cap=%.1f/bin, initial peak occ=%d\n"
           site_frac peakcap peak
       end;
+      if ll_on then begin
+        Array.fill hcut 0 (nbx * nby) 0.0; Array.fill vcut 0 (nbx * nby) 0.0;
+        for n = 0 to !nnets - 1 do
+          net_track_acc n 1.0 (fun b a -> hcut.(b) <- hcut.(b) +. a) (fun b a -> vcut.(b) <- vcut.(b) +. a)
+        done;
+        Printf.eprintf "long-line: hcap=%.1f vcap=%.1f, initial track overflow=%.0f\n"
+          hcap vcap (track_overflow ())
+      end;
       (* delta over the union of affected cells' nets; apply new positions,
          return (delta, restore-thunk data). *)
       let eval_delta moved newpos =
@@ -568,14 +619,22 @@ let () =
         (* congestion: accumulate the affected nets' OLD RUDY (negated) *)
         let cmap = Hashtbl.create 32 in
         let acc b a = Hashtbl.replace cmap b ((try Hashtbl.find cmap b with Not_found -> 0.0) +. a) in
+        let hmap = Hashtbl.create 32 and vmap = Hashtbl.create 32 in
+        let hacc b a = Hashtbl.replace hmap b ((try Hashtbl.find hmap b with Not_found -> 0.0) +. a) in
+        let vacc b a = Hashtbl.replace vmap b ((try Hashtbl.find vmap b with Not_found -> 0.0) +. a) in
         if cong_on then List.iter (fun n -> net_rudy_acc n (-1.0) acc) !nets;
+        if ll_on then List.iter (fun n -> net_track_acc n (-1.0) hacc vacc) !nets;
         let olds = List.map (fun i -> (pos_x.(i), pos_y.(i))) moved in
         List.iter2 (fun i (nx, ny) -> pos_x.(i) <- nx; pos_y.(i) <- ny) moved newpos;
         let after = List.fold_left (fun a n -> a + net_hpwl n) 0 !nets in
         (* add the NEW RUDY -> cmap now holds per-bin demand delta *)
         if cong_on then List.iter (fun n -> net_rudy_acc n (1.0) acc) !nets;
+        if ll_on then List.iter (fun n -> net_track_acc n (1.0) hacc vacc) !nets;
         let dcong = if not cong_on then 0.0 else
           Hashtbl.fold (fun b d a -> a +. (ov (rudy.(b) +. d) -. ov rudy.(b))) cmap 0.0 in
+        let dtrack = if not ll_on then 0.0 else
+          (Hashtbl.fold (fun b d a -> a +. (hov (hcut.(b) +. d) -. hov hcut.(b))) hmap 0.0)
+          +. (Hashtbl.fold (fun b d a -> a +. (vov (vcut.(b) +. d) -. vov vcut.(b))) vmap 0.0) in
         (* site-occupancy delta: -1 at each moved cell's old bin, +1 at its new
            bin (swaps cancel); penalise pushing a bin past site_cap. *)
         let omap = Hashtbl.create 8 in
@@ -585,7 +644,8 @@ let () =
         end;
         let sdelta = if not site_on then 0.0 else
           Hashtbl.fold (fun b d a -> a +. (sov b (occbin.(b) + d) -. sov b occbin.(b))) omap 0.0 in
-        (float (after - before) +. cong_w *. dcong +. site_w *. sdelta, olds, cmap, omap) in
+        (float (after - before) +. cong_w *. dcong +. site_w *. sdelta +. ll_w *. dtrack,
+         olds, cmap, omap, hmap, vmap) in
       let accepted = ref 0 in
       for _ = 1 to moves do
         let i = mv.(Random.int m) in
@@ -598,12 +658,16 @@ let () =
             let moved, newpos =
               if j = -1 then [i], [(s.sx, s.sy)]
               else [i; j], [(s.sx, s.sy); (si.sx, si.sy)] in
-            let delta, olds, cmap, omap = eval_delta moved newpos in
+            let delta, olds, cmap, omap, hmap, vmap = eval_delta moved newpos in
             let accept = delta <= 0.0 || Random.float 1.0 < exp (-. delta /. !t) in
             if accept then begin
               incr accepted;
               if cong_on then Hashtbl.iter (fun b d -> rudy.(b) <- rudy.(b) +. d) cmap;
               if site_on then Hashtbl.iter (fun b d -> occbin.(b) <- occbin.(b) + d) omap;
+              if ll_on then begin
+                Hashtbl.iter (fun b d -> hcut.(b) <- hcut.(b) +. d) hmap;
+                Hashtbl.iter (fun b d -> vcut.(b) <- vcut.(b) +. d) vmap
+              end;
               (* commit site bookkeeping *)
               if j = -1 then begin
                 si.used <- false; Hashtbl.remove occ si.sname;
@@ -619,7 +683,8 @@ let () =
         t := !t *. alpha
       done;
       Printf.eprintf "SA: %d/%d moves accepted (%.1f%%)\n" !accepted moves (100. *. float !accepted /. float moves);
-      if cong_on then Printf.eprintf "congestion: final overflow=%.0f\n" (total_overflow ())
+      if cong_on then Printf.eprintf "congestion: final overflow=%.0f\n" (total_overflow ());
+      if ll_on then Printf.eprintf "long-line: final track overflow=%.0f\n" (track_overflow ())
     end in
 
   (* ======================================================================= *)
