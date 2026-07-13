@@ -17,7 +17,9 @@ picks a free site of the required kind nearest the target coordinate.
 import json, re, sys
 from collections import Counter
 
-DB = "/home/jonathan/prjxray/database/virtex7/xc7vx485t/tilegrid.json"
+import os
+DB = os.environ.get("PRJXRAY_TILEGRID",
+    os.path.expanduser("~/prjxray/database/virtex7/xc7vx485t/tilegrid.json"))
 
 def kind_of(site, stype):
     if site.startswith("SLICE_"):

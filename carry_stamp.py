@@ -13,7 +13,7 @@ lay out its whole slice explicitly --
 slot: k=0->A, 1->B, 2->C, 3->D.
 Usage: carry_stamp.py <ft_json> <bels> <out_json>
 """
-import json, sys
+import json, sys, os
 
 ft_json, bels_path, out_json = sys.argv[1], sys.argv[2], sys.argv[3]
 j = json.load(open(ft_json))
@@ -70,7 +70,7 @@ def is_int(b):
 import re as _re0
 _known_sites = set()
 try:
-    _fp = json.load(open("/tmp/virtex7_floorplan.json"))
+    _fp = json.load(open(os.environ.get("CARRY_FLOORPLAN","/tmp/virtex7_floorplan.json")))
     for _s in _fp.get("sites", []):
         if _s.get("name", "").startswith("SLICE_"):
             _known_sites.add(_s["name"])
@@ -323,7 +323,7 @@ for cn, c in list(cells.items()):
 import re as _re
 known_sites = set()
 try:
-    fp = json.load(open("/tmp/virtex7_floorplan.json"))
+    fp = json.load(open(os.environ.get("CARRY_FLOORPLAN","/tmp/virtex7_floorplan.json")))
     for s_ in fp.get("sites", []):
         n = s_.get("name", "")
         if n.startswith("SLICE_"):
