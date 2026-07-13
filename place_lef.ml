@@ -688,14 +688,112 @@ let () =
     end in
 
   (* ======================================================================= *)
+  (* FIGURE OF MERIT: routability statistics computed natively (no external  *)
+  (* post-processing) so the placer can OPTIMISE on them, not just report:   *)
+  (*   - per-bin site occupancy vs real capacity (peak %, full bins, >=90%)  *)
+  (*   - net span histogram (spans beyond long-line reach)                   *)
+  (*   - RUDY wire overflow, long-line track overflow, site overflow        *)
+  (* fom_value composes them with the ACTIVE anneal weights, so restart      *)
+  (* selection optimises the same objective the anneal accepts moves on.     *)
+  (* ======================================================================= *)
+  let fom_stats () =
+    let hp, worst = total_hpwl () in
+    let nb = nbx * nby in
+    (* per-bin placed SLICE-cell count vs real SLICE sites in the bin *)
+    let nsites = Array.make nb 0 and occf = Array.make nb 0 in
+    Array.iter (fun s -> let b = bin_idx s.sx s.sy in if b >= 0 then nsites.(b) <- nsites.(b) + 1)
+      region_arr;
+    Array.iteri (fun i _ -> if is_placed i then
+        match cell_site.(i) with
+        | Some s when String.length s.sname >= 6 && String.sub s.sname 0 6 = "SLICE_" ->
+            let b = bin_idx pos_x.(i) pos_y.(i) in if b >= 0 then occf.(b) <- occf.(b) + 1
+        | _ -> ()) cells;
+    let full = ref 0 and near = ref 0 and peak = ref 0.0 in
+    Array.iteri (fun b n -> if n > 0 then begin
+        let r = float occf.(b) /. float n in
+        if r > !peak then peak := r;
+        if occf.(b) >= n then incr full else if r >= 0.9 then incr near
+      end) nsites;
+    (* net span histogram (same coord space the anneal optimises) *)
+    let sp12 = ref 0 and sp24 = ref 0 and spmax = ref 0 in
+    for n = 0 to !nnets - 1 do
+      let mnx = ref max_int and mxx = ref min_int and mny = ref max_int and mxy = ref min_int
+      and c = ref 0 in
+      Array.iter (fun i -> if is_placed i then begin incr c;
+          if pos_x.(i) < !mnx then mnx := pos_x.(i);
+          if pos_x.(i) > !mxx then mxx := pos_x.(i);
+          if pos_y.(i) < !mny then mny := pos_y.(i);
+          if pos_y.(i) > !mxy then mxy := pos_y.(i) end) net_cells.(n);
+      if !c >= 2 then begin
+        let sp = max (!mxx - !mnx) (!mxy - !mny) in
+        if sp > !spmax then spmax := sp;
+        if sp > 12 then incr sp12;
+        if sp > 24 then incr sp24
+      end
+    done;
+    (* wire / track / site overflows, recomputed fresh from current positions *)
+    Array.fill rudy 0 nb 0.0;
+    for n = 0 to !nnets - 1 do net_rudy_acc n 1.0 (fun b a -> rudy.(b) <- rudy.(b) +. a) done;
+    let rovf = total_overflow () in
+    Array.fill hcut 0 nb 0.0; Array.fill vcut 0 nb 0.0;
+    for n = 0 to !nnets - 1 do
+      net_track_acc n 1.0 (fun b a -> hcut.(b) <- hcut.(b) +. a)
+        (fun b a -> vcut.(b) <- vcut.(b) +. a)
+    done;
+    let tovf = track_overflow () in
+    let sovf = ref 0.0 in
+    Array.iteri (fun b o -> sovf := !sovf +. sov b o) occf;
+    (hp, worst, !peak, !full, !near, !sp12, !sp24, !spmax, rovf, tovf, !sovf) in
+  let fom_value () =
+    let (hp, _, _, _, _, _, _, _, rovf, tovf, sovf) = fom_stats () in
+    float hp +. cong_w *. rovf +. site_w *. sovf +. ll_w *. tovf in
+  let fom_report () =
+    let (hp, worst, peak, full, near, sp12, sp24, spmax, rovf, tovf, sovf) = fom_stats () in
+    Printf.eprintf
+      "FOM: hpwl=%d worst=%d | bins: peak=%.0f%% full=%d near90=%d | spans: >12=%d >24=%d max=%d | ovf: rudy=%.0f site=%.0f track=%.0f | composite=%.0f\n"
+      hp worst (100. *. peak) full near sp12 sp24 spmax rovf sovf tovf
+      (float hp +. cong_w *. rovf +. site_w *. sovf +. ll_w *. tovf) in
+  (* multi-restart: run the anneal TOPO_RESTARTS times from the same seed
+     placement with different RNG streams, keep the placement with the best
+     composite FOM.  This is the first internal consumer of fom_value. *)
+  let anneal_multi () =
+    let restarts = getenv_int "TOPO_RESTARTS" 1 in
+    if restarts <= 1 then anneal ()
+    else begin
+      let snap () = (Array.copy pos_x, Array.copy pos_y, Array.copy cell_site,
+                     Hashtbl.copy occ, Array.map (fun s -> s.used) region_arr) in
+      let restore (px, py, cs, oc, us) =
+        Array.blit px 0 pos_x 0 (Array.length px);
+        Array.blit py 0 pos_y 0 (Array.length py);
+        Array.blit cs 0 cell_site 0 (Array.length cs);
+        Hashtbl.reset occ; Hashtbl.iter (fun k v -> Hashtbl.replace occ k v) oc;
+        Array.iteri (fun k s -> s.used <- us.(k)) region_arr in
+      let base = snap () in
+      let best = ref None in
+      for r = 1 to restarts do
+        restore base;
+        Random.init (seed + 7919 * (r - 1));
+        anneal ();
+        let f = fom_value () in
+        Printf.eprintf "restart %d/%d: composite FOM=%.0f\n" r restarts f;
+        (match !best with
+         | Some (bf, _) when bf <= f -> ()
+         | _ -> best := Some (f, snap ()))
+      done;
+      match !best with
+      | Some (bf, st) -> restore st; Printf.eprintf "restarts: kept best FOM=%.0f\n" bf
+      | None -> ()
+    end in
+
+  (* ======================================================================= *)
   (* Drive the selected pipeline.                                             *)
   (* ======================================================================= *)
   Printf.printf "mode=%s  region=%d sites (fill target %.2f, n_slice=%d)\n"
     mode (Array.length region_arr) fill n_slice;
   (match mode with
-   | "analytic" -> analytic (); anneal ()
+   | "analytic" -> analytic (); anneal_multi ()
    | "sa"       -> constructive (); let h0, _ = total_hpwl () in
-                   Printf.eprintf "SA seed HPWL=%d\n" h0; anneal ()
+                   Printf.eprintf "SA seed HPWL=%d\n" h0; anneal_multi ()
    | "region"   -> constructive ()
    | "greedy" | _ -> constructive ());
 
@@ -716,6 +814,7 @@ let () =
     Printf.printf "SLICE bbox X[%d..%d] Y[%d..%d] = %dx%d = %d sites, fill=%.1f%%\n"
       !mnx !mxx !mny !mxy w h (w * h) (100. *. float !nsl /. float (w * h))
   end;
+  fom_report ();
   let placed_path = getenv_default "PLACED_OUT" "/tmp/counter_placed.txt" in
   let bels_path = getenv_default "BELS_OUT" "/tmp/counter_bels.txt" in
   let oc = open_out placed_path in
