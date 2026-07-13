@@ -250,7 +250,11 @@ let pack (m : bmodule) : result =
                  (Hashtbl.find inst_by_name dn).port_connections
            | _ -> ())
       | None -> () in
-    do_lut "I0" la; do_lut "I1" lb;
+    (* nextpnr's F7[la]MUX reads I0 from the SECOND lane (B/D) and I1 from the
+       FIRST (A/C): I0<->B6LUT, I1<->A6LUT.  Assigning I0->la crosses both mux
+       inputs, so every MUXF7 data path becomes an impossible A6LUT_O6<->B6LUT_O6
+       route (the whole sender_mac/sender_ip/target_ip readback residual). *)
+    do_lut "I0" lb; do_lut "I1" la;
     (!bels, !conns) in
   (* MUXF8 groups first (absorb the two feeding MUXF7 + their LUTs) *)
   List.iter (fun (i : binstance) ->
