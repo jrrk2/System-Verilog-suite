@@ -501,8 +501,34 @@ let lgate_map mod_h k_lut io_flag =
   let port_dir mn port = Hashtbl.find_opt pd_tbl (mn, port) in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
   let l = Fpga_synth.Bir_to_aig.lower_circuit circ in
+  (* Cost mode for the LUT cover, selectable via env so the timing-driven
+     mapping can be exercised without recompiling.  Default `Area keeps the
+     historical (compact, deep) behaviour.
+       GATE_MAP_MODE = area | delay | mixed[:N]   (N = slack tolerance, default 1)
+       GATE_MAP_LUTPACK=1   enable LUT packing (area recovery)
+       GATE_MAP_MFS2=1      enable mfs2 don't-care optimisation *)
+  let mode : Fpga_synth.Lut_cover.cost_mode =
+    match Sys.getenv_opt "GATE_MAP_MODE" with
+    | Some "delay" -> `Delay
+    | Some s when String.length s >= 5 && String.sub s 0 5 = "mixed" ->
+        let tol =
+          if String.length s > 6 && s.[5] = ':'
+          then (try int_of_string (String.sub s 6 (String.length s - 6)) with _ -> 1)
+          else 1 in
+        `Mixed tol
+    | _ -> `Area in
+  let envflag v = Sys.getenv_opt v = Some "1" in
+  let lutpack = envflag "GATE_MAP_LUTPACK" in
+  let mfs2 = envflag "GATE_MAP_MFS2" in
+  let mfs2_var = envflag "GATE_MAP_MFS2_VAR" || mfs2 in
+  let mfs2_odc = envflag "GATE_MAP_MFS2_ODC" || mfs2 in
+  let aig_balance =
+    match Sys.getenv_opt "GATE_MAP_AIG_BALANCE" with
+    | Some s -> (try int_of_string s with _ -> 0)
+    | None -> 0 in
   let mapped = Fpga_synth.Fpga_map.map_lowered
-    ~io:(io_flag <> 0) ~k:k_lut ~name:m.name l in
+    ~io:(io_flag <> 0) ~k:k_lut ~name:m.name
+    ~mode ~lutpack ~mfs2_var_elim:mfs2_var ~mfs2_odc ~aig_balance l in
   hadd (Mapped (m.name, mapped))
 
 (* Dump a Mapped circuit as cell-mapped Verilog via Hardcaml.Rtl,
@@ -608,6 +634,37 @@ let laugment_prog_with_primitives prog_h =
   let p' = { p with modules = p.modules @ impl_mods } in
   hadd (Prog (label ^ "+prims", p'))
 
+(* No-Vivado replacement for augment_prog_with_primitives: instead of parsing
+ * Vivado's unisim VHDL, synthesise each Xilinx primitive body directly as BIR
+ * from the binstance's INIT/params (Xil_prim_models).  Each instance is
+ * specialised to a uniquely-named body baking in its INIT, so flatten_for_z3
+ * — which inlines without parameter substitution and caches by module_name —
+ * gets the right function per instance.  Use this on BOTH miter sides. *)
+let laugment_xil_models prog_h =
+  let label, p = find_prog prog_h in
+  let p' = Xil_prim_models.augment_program p in
+  hadd (Prog (label ^ "+xilmodels", p'))
+
+(* Read an actual nextpnr post-P&R netlist (yosys JSON from `nextpnr --write`)
+ * into structural BIR, reconstructing logical primitives from the X_ORIG_TYPE
+ * / X_ORIG_PORT attributes (Nextpnr_json_to_behavioral).  Pair with
+ * augment_xil_models + miter to check the pack/place mapping against source. *)
+let lread_nextpnr_json path =
+  let p = Nextpnr_json_to_behavioral.read_program path in
+  let label = match p.modules with m :: _ -> m.name | [] -> "nextpnr" in
+  hadd (Prog (label, p))
+
+(* Physical routing-completeness report: which FF D-pins are not actually
+ * reached by their net's ROUTING (the bypass-FFMUX defect signature). *)
+let lroute_check path = Nextpnr_json_to_behavioral.route_report path
+
+let lxil_models_coverage prog_h =
+  let _, p = find_prog prog_h in
+  let cov = Xil_prim_models.coverage p in
+  if cov = [] then "(no modelled primitives)"
+  else String.concat " "
+         (List.map (fun (k, n) -> Printf.sprintf "%s=%d" k n) cov)
+
 (* Lift a Mapped Circuit.t directly into BIR as a structural bprogram
  * with a single bmodule, preserving bus widths on top-level ports.
  * Bypasses the lossy write_cellmapped_v + ver_front re-parse loop that
@@ -687,6 +744,18 @@ let loptimize prog_h =
 let larch_subst prog_h =
   let label, p = find_prog prog_h in
   let p', _n = Behavioral_arch_subst.substitute_program p in
+  hadd (Prog (label, p'))
+
+(* Gate-map-safe logical optimisation: constant-prop + DCE + CSE, but NO SSA
+   (SSA mints multi-driver writebacks that crash Behavioral_to_hardcaml) and no
+   register inference.  Shrinks the BIR before gate_map without breaking it. *)
+let loptimize_logic prog_h =
+  let label, p = find_prog prog_h in
+  let cfg = { Behavioral_optimize.default_config with
+              enable_ssa = false;
+              enable_register_inference = false;
+              verbose = false } in
+  let p', _ = Behavioral_optimize.optimize_custom cfg p in
   hadd (Prog (label, p'))
 
 let lffrip mod_h =
@@ -1086,6 +1155,7 @@ module MakeLib
         "flatten",        V.efunc (V.string **->> V.string) (wrap1 lflatten);
         "optimize",       V.efunc (V.string **->> V.string) (wrap1 loptimize);
         "arch_subst",     V.efunc (V.string **->> V.string) (wrap1 larch_subst);
+        "optimize_logic", V.efunc (V.string **->> V.string) (wrap1 loptimize_logic);
         "ffrip",          V.efunc (V.string **->> V.string) (wrap1 lffrip);
         "register_analyse", V.efunc (V.string **->> V.string)
                              (wrap1 lregister_analyse);
@@ -1123,6 +1193,14 @@ module MakeLib
                                (wrap1 lexpand_primitives_for_z3);
         "augment_prog_with_primitives", V.efunc (V.string **->> V.string)
                                (wrap1 laugment_prog_with_primitives);
+        "augment_xil_models", V.efunc (V.string **->> V.string)
+                               (wrap1 laugment_xil_models);
+        "read_nextpnr_json", V.efunc (V.string **->> V.string)
+                               (wrap1 lread_nextpnr_json);
+        "route_check", V.efunc (V.string **->> V.string)
+                               (wrap1 lroute_check);
+        "xil_models_coverage", V.efunc (V.string **->> V.string)
+                               (wrap1 lxil_models_coverage);
         "mapped_to_prog",     V.efunc (V.string **->> V.string)
                                (wrap1 lmapped_to_prog);
       ] g;
@@ -1142,6 +1220,13 @@ module MakeLib
         "set_status",  V.efunc (V.string **->> V.string)
                        (wrap1 lgui_set_status);
         "quit",        V.efunc (V.unit **->> V.string)   (wrap1 lgui_quit);
+      ] g;
+      (* OS module — this embedded lua-ml has no standard `os` table,
+         so expose the handful of bits recipes need.  getenv returns
+         Lua nil for unset variables (via V.option). *)
+      C.register_module "os" [
+        "getenv", V.efunc (V.string **->> V.option V.string)
+                   (fun k -> Sys.getenv_opt k);
       ] g
   end
 end

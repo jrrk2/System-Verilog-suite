@@ -1,0 +1,6 @@
+print("== P&R netlist vs source RTL ==")
+impl = svd.read_nextpnr_json("/Users/jonathan/nextpnr-xilinx/xilinx/examples/counter25/routed.json")
+impl = svd.augment_xil_models(impl)
+spec = svd.parse("verible-ext", "top", {"/Users/jonathan/nextpnr-xilinx/xilinx/examples/counter25/top.v"})
+spec = svd.augment_xil_models(spec)
+print("VERDICT: " .. svd.miter(svd.pick(spec,"top"), svd.pick(impl,"top")))

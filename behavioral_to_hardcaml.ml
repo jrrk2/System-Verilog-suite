@@ -547,13 +547,49 @@ let rec stmt_to_always ~is_reg ctx alw = function
       ) cases in
       let default_alw =
         List.rev (List.fold_left (stmt_to_always ~is_reg ctx) [] default) in
-      let rec build_cases = function
+      (* Verilog `case` is PRIORITY (first match wins; casez/casex and
+         duplicate/overlapping keys are not disjoint).  A balanced (parallel)
+         mux tree is only SOUND when mutual exclusion is proven.  We prove it
+         the cheap, certain way: every key is a constant and, after coercion to
+         the selector width, all keys are pairwise distinct.  Otherwise keep the
+         linear priority chain (exact Verilog semantics). *)
+      let key_const (value, _) = match value with
+        | BConst { value = v; _ } ->
+            if sel_w >= 62 then Some v else Some (v land ((1 lsl sel_w) - 1))
+        | _ -> None in
+      let keys = List.map key_const cases in
+      (* Opt-in (BALANCED_CASE=1): default keeps the exact-Verilog priority
+         chain so other flows are untouched. *)
+      let balanced_case_enabled = Sys.getenv_opt "BALANCED_CASE" = Some "1" in
+      let mutually_exclusive =
+        balanced_case_enabled
+        && List.for_all (fun k -> k <> None) keys
+        && (let ks = List.filter_map (fun x -> x) keys in
+            List.length (List.sort_uniq compare ks) = List.length ks) in
+      let split_half l =
+        let n = List.length l in
+        let rec go i acc = function
+          | x :: xs when i < n / 2 -> go (i + 1) (x :: acc) xs
+          | rest -> (List.rev acc, rest) in
+        go 0 [] l in
+      let rec build_priority = function
         | [] -> default_alw
         | (value, body) :: rest ->
-            let cond = Signal.(sel_signal ==: value) in
-            [Always.if_ cond body (build_cases rest)]
+            [ Always.if_ Signal.(sel_signal ==: value) body (build_priority rest) ]
       in
-      build_cases case_list @ alw
+      let rec build_balanced = function
+        | [] -> default_alw
+        | [ (value, body) ] ->
+            [ Always.if_ Signal.(sel_signal ==: value) body default_alw ]
+        | cs ->
+            let lo, hi = split_half cs in
+            let lo_match =
+              List.fold_left (fun acc (v, _) -> Signal.(acc |: (sel_signal ==: v)))
+                Signal.gnd lo in
+            [ Always.if_ lo_match (build_balanced lo) (build_balanced hi) ]
+      in
+      (if mutually_exclusive then build_balanced case_list
+       else build_priority case_list) @ alw
 
   | BWhile _ | BFor _ ->
       (* Loops need to be unrolled by behavioral_unroll.ml first. *)
