@@ -295,6 +295,114 @@ let pack (m : bmodule) : result =
       end)
     m.instances;
 
+  (* 1c. Distributed-RAM write-port grouping: RAM32X1D / RAM64X1D (and the _1
+        inverted-WCLK variants) -> whole-slice SLICEM_DRAM packed cells.  yosys
+        memory_libmap emits BIT-SLICE LUTRAM primitives (one RAM32X1D per data
+        bit); instances sharing a WRITE PORT -- same WCLK, same WE, same write
+        address A0..A{4,5} -- can legally cohabit one SLICEM (that is exactly
+        what Vivado's RAM32M/RAM64M macros encode).  Left to the generic
+        fallback each bit claimed its OWN SLICEM site, scattering a 72-bit
+        memory across 72 slices and stranding the shared write-address nets.
+
+        Slot allocation mirrors nextpnr xilinx/pack_dram.cc's RAM32X1D /
+        RAM64X1D group path (z descends from D=3): each new slice burns the
+        D6LUT on the write-address base cell nextpnr creates, EXCEPT that the
+        first member's SPO folds into that base (z==2 fold).  Each connected
+        read port (SPO/DPO) takes one 6LUT slot (RAM32X1D is packed via
+        create_dram_lut = RAMD64E on a 6LUT with GND-padded address, NOT as
+        5/6LUT RAMD32 pairs -- only the RAM32M macro path uses those).  So the
+        capacity is 3 DPO-only or 2 dual-port X1D per slice, not 4.
+
+        pc_bels stamps EACH ORIGINAL primitive at its primary slot (SP slot if
+        SPO is connected, else the DP slot).  NB: nextpnr's pack_dram X1D path
+        currently DISSOLVES the original cells into /ADDR /SP /DP subcells and
+        drops their BEL attrs (the b649145a propagation fix covers only
+        RAM32M/RAM64M) -- the stamps pin the SVS placement and are ready for
+        the same fix to be extended to the X1D path.
+
+        The _1 variants write on the FALLING WCLK edge: they are grouped
+        SEPARATELY even when all port nets match (the group key includes the
+        primitive type), and the packed cell carries a WCLK_INV Const-true
+        marker so downstream never merges opposite-polarity groups. *)
+  let dram_kind t = match String.uppercase_ascii t with
+    | "RAM32X1D" -> Some (5, false)
+    | "RAM32X1D_1" -> Some (5, true)
+    | "RAM64X1D" -> Some (6, false)
+    | "RAM64X1D_1" -> Some (6, true)
+    | _ -> None in
+  let dg_order = ref [] in
+  let dgroups : (string * netkey option * netkey option * netkey option list,
+                 binstance list ref) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (i : binstance) ->
+      match dram_kind i.module_name with
+      | Some (abits, _) when not (Hashtbl.mem absorbed i.inst_name) ->
+          let wa = List.init abits (fun k -> port_bit i.inst_name (Printf.sprintf "A%d" k) 0) in
+          let key = (String.uppercase_ascii i.module_name,
+                     port_bit i.inst_name "WCLK" 0, port_bit i.inst_name "WE" 0, wa) in
+          (match Hashtbl.find_opt dgroups key with
+           | Some l -> l := i :: !l
+           | None -> Hashtbl.add dgroups key (ref [ i ]); dg_order := key :: !dg_order)
+      | _ -> ())
+    m.instances;
+  List.iter (fun key ->
+      let (ty, wclk, we, wa) = key in
+      let members = List.rev !(Hashtbl.find dgroups key) in
+      let abits, inv = match dram_kind ty with Some x -> x | None -> assert false in
+      let slice_idx = ref 0 in
+      (* current slice under construction: (inst, sp_slot opt, dp_slot opt) *)
+      let cur = ref [] and z = ref (-1) in
+      let flush () =
+        (match List.rev !cur with
+         | [] -> ()
+         | ((i0 : binstance), _, _) :: _ as mems ->
+             let conns = ref [] and bels = ref [] in
+             let put k v = conns := (k, v) :: !conns in
+             (match wclk with Some v -> put "WCLK" v | None -> ());
+             (match we with Some v -> put "WE" v | None -> ());
+             List.iteri (fun k b ->
+                 match b with Some v -> put (Printf.sprintf "WA%d" k) v | None -> ()) wa;
+             if inv then put "WCLK_INV" (Const true);   (* polarity marker, no HPWL *)
+             List.iter (fun ((inst : binstance), sp, dp) ->
+                 let prim = match sp with Some s -> s | None ->
+                   (match dp with Some d -> d | None -> 3) in
+                 bels := (inst.inst_name, lane_letter prim ^ "6LUT") :: !bels;
+                 (match port_bit inst.inst_name "D" 0 with
+                  | Some v -> put (lane_letter prim ^ "D") v | None -> ());
+                 (match sp, port_bit inst.inst_name "SPO" 0 with
+                  | Some s, Some v -> put (lane_letter s ^ "SPO") v | _ -> ());
+                 (match dp with
+                  | Some d ->
+                      (match port_bit inst.inst_name "DPO" 0 with
+                       | Some v -> put (lane_letter d ^ "DPO") v | None -> ());
+                      for k = 0 to abits - 1 do
+                        match port_bit inst.inst_name (Printf.sprintf "DPRA%d" k) 0 with
+                        | Some v -> put (Printf.sprintf "%sDPRA%d" (lane_letter d) k) v
+                        | None -> ()
+                      done
+                  | None -> ())) mems;
+             add ~bels:(List.rev !bels)
+               (Printf.sprintf "%s$dram%s%d" i0.inst_name (if inv then "_n" else "") !slice_idx)
+               "SLICEM_DRAM" (List.rev !conns);
+             incr slice_idx; bump "DRAM-group->SLICEM_DRAM");
+        cur := []; z := -1 in
+      List.iter (fun (inst : binstance) ->
+          let has p = match port_bit inst.inst_name p 0 with Some (Net _) -> true | _ -> false in
+          let spo = has "SPO" and dpo = has "DPO" in
+          let zsz = (if spo then 1 else 0) + (if dpo then 1 else 0) in
+          if zsz > 0 then begin      (* dead RAM (no read port): generic fallback *)
+            if !z < 0 || !z - zsz + 1 < 0 then (flush (); z := 2);
+            let sp_slot =
+              if not spo then None
+              else if !z = 2 then Some 3          (* fold into the D6LUT base *)
+              else (let s = Some !z in decr z; s) in
+            let dp_slot = if dpo then (let s = Some !z in decr z; s) else None in
+            Hashtbl.replace absorbed inst.inst_name (); bump (ty ^ " grouped");
+            cur := (inst, sp_slot, dp_slot) :: !cur
+          end)
+        members;
+      flush ())
+    (List.rev !dg_order);
+
   (* 1b. LUT + FF pairing -> SLICE_LOGIC (the recognition for the LUT-mapped
         main flow: gate_map is AIG+LUT-cover, no CARRY4).  Pack an FF with the
         LUT that drives its D (and that LUT's fanin), up to 4 pairs per slice,
