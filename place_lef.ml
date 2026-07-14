@@ -747,7 +747,15 @@ let () =
            +. coh_w *. dcoh,
          olds, cmap, omap, hmap, vmap) in
       let accepted = ref 0 in
-      for _ = 1 to moves do
+      (* Periodic progress to stderr (unbuffered) -- a 900k-move anneal is
+         minutes of otherwise total silence, which reads as a hang. *)
+      let prog_every = max 1 (moves / 20) in
+      let t_start = Sys.time () in
+      for mvno = 1 to moves do
+        if mvno mod prog_every = 0 then
+          Printf.eprintf "  SA %3d%%  moves=%d/%d  accepted=%d  temp=%.2f  %.0fs\n%!"
+            (100 * mvno / moves) mvno moves !accepted !t
+            (Sys.time () -. t_start);
         let i = mv.(Random.int m) in
         let s = region_arr.(Random.int (Array.length region_arr)) in
         let si = match cell_site.(i) with Some s -> s | None -> assert false in
