@@ -421,9 +421,27 @@ let yosys_json
                          bit = !(ctx.next_id) })) in
         bits @ pads
     in
+    (* A cell OUTPUT pin must never drive the constant network: an
+     * out-of-range bit-select (bits_of_conn ties it to const-0, matching
+     * Verilog x-read semantics) is fine on an INPUT, but on an OUTPUT it makes
+     * the cell a second driver of the shared GND/VCC net → nextpnr rejects the
+     * design with "multiply driven".  Redirect any const bit on an output pin
+     * to a fresh dead net so the degenerate driver stands alone. *)
+    let sanitize_output_bits pin bits =
+      List.mapi (fun idx b ->
+        let is_const = match b with
+          | C _ -> true
+          | I id -> id = ctx.gnd_id || id = ctx.vcc_id in
+        if is_const then
+          I (alloc ctx { base = "__oor_" ^ i.inst_name ^ "_" ^ pin; bit = idx })
+        else b) bits
+    in
     let conns =
       List.map (fun (pin, expr) ->
-        pin, bits_json (pad_bits_to_width pin (bits_of_conn ctx expr)))
+        let bits = bits_of_conn ctx expr in
+        let bits = if dir_of_pin pin = `Output then sanitize_output_bits pin bits
+                   else bits in
+        pin, bits_json (pad_bits_to_width pin bits))
         i.port_connections in
     let dirs =
       List.map (fun (pin, _) -> pin, `String (dir_str (dir_of_pin pin)))
