@@ -49,7 +49,11 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
      circuit output): register D-cones + instance input-port cones. *)
   let d_names = Hash_set.create (module String) in
   List.iter l.regs ~f:(fun r ->
-    List.iter r.Bir_to_aig.rb_d_names ~f:(Hash_set.add d_names));
+    List.iter r.Bir_to_aig.rb_d_names ~f:(Hash_set.add d_names);
+    (* The lifted enable cone (rb_enable) is an internal net feeding the FF's
+       CE pin — route it into d_sig like a D-cone, else it leaks out as a
+       driverless top-level output and CE defaults to vdd (enable lost). *)
+    Option.iter r.Bir_to_aig.rb_enable ~f:(Hash_set.add d_names));
   List.iter l.insts ~f:(fun ib ->
     List.iter ib.Bir_to_aig.ib_in_ports ~f:(fun (_, bits) ->
       List.iter bits ~f:(Hash_set.add d_names)));

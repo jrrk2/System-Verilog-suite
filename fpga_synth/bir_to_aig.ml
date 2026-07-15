@@ -519,6 +519,25 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
               | T.Wire { driver; _ } when not (is_empty !driver) -> resolve !driver
               | _ -> s
             in
+            (if (match Stdlib.Sys.getenv_opt "CE_LIFT_STATS" with
+                 | Some "1" -> true | _ -> false) then begin
+               let is_self s = uid_int (resolve s) = uid_int sig_ in
+               let is_const s = match resolve s with T.Const _ -> true | _ -> false in
+               let self_mux s = match resolve s with
+                 | T.Mux { cases = [ a; b ]; select; _ }
+                   when S.width select = 1 && (is_self a || is_self b) -> true
+                 | _ -> false in
+               let cls = match resolve d with
+                 | T.Mux { cases = [ a; b ]; select; _ } when S.width select = 1 ->
+                   if is_self a || is_self b then "EN_TOP"
+                   else if (is_const a && self_mux b) || (is_const b && self_mux a)
+                   then "RST_over_EN"
+                   else if is_const a || is_const b then "RST_only"
+                   else "MUX_other"
+                 | T.Mux _ -> "MUX_wide"
+                 | _ -> "PLAIN" in
+               Stdlib.Printf.eprintf "CE_LIFT_STAT %s\n" cls
+             end);
             let rb_enable, eff_d =
               match resolve d with
               | T.Mux { select; cases = [ c0; c1 ]; _ }

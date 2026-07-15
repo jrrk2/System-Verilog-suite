@@ -1195,8 +1195,6 @@ module MakeLib
                                (wrap1 laugment_prog_with_primitives);
         "augment_xil_models", V.efunc (V.string **->> V.string)
                                (wrap1 laugment_xil_models);
-        "read_nextpnr_json", V.efunc (V.string **->> V.string)
-                               (wrap1 lread_nextpnr_json);
         "route_check", V.efunc (V.string **->> V.string)
                                (wrap1 lroute_check);
         "xil_models_coverage", V.efunc (V.string **->> V.string)
