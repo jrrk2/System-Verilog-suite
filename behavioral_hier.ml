@@ -16,6 +16,61 @@ open Behavioral_ir
 let pname prefix name =
   if prefix = "" then name else prefix ^ "__" ^ name
 
+(* Parse a Verilog literal ("W'bBITS" / "W'hHEX" / "W'dN" / plain int) into a
+   CONSTANT bexpr.  A value wider than an OCaml int (e.g. a 64-bit LUT INIT) is
+   split into <=31-bit BConst chunks under an MSB-first BConcat, so the encoder
+   (which slices a BConcat as extract-of-concat) resolves any part-select of it.
+   Used to substitute module PARAMETER values into an inlined child body — an
+   unsubstituted wide param would otherwise encode as a free Z3 variable. *)
+let const_bexpr_of_verilog (s : string) : bexpr option =
+  let s = String.trim s in
+  match String.index_opt s '\'' with
+  | None -> (try Some (BConst { value = int_of_string s; width = 32 }) with _ -> None)
+  | Some ap ->
+    let width = try int_of_string (String.trim (String.sub s 0 ap)) with _ -> 0 in
+    if width <= 0 then None else begin
+      let rest = String.sub s (ap + 1) (String.length s - ap - 1) in
+      let base = if String.length rest > 0 then Char.lowercase_ascii rest.[0] else 'b' in
+      let digits = if String.length rest > 1 then String.sub rest 1 (String.length rest - 1) else "" in
+      let digits = String.concat "" (String.split_on_char '_' digits) in
+      let bits =
+        match base with
+        | 'b' -> digits
+        | 'h' ->
+          let buf = Buffer.create (String.length digits * 4) in
+          String.iter (fun c ->
+            let v = match c with
+              | '0'..'9' -> Char.code c - Char.code '0'
+              | 'a'..'f' -> Char.code c - Char.code 'a' + 10
+              | _ -> 0 in
+            Buffer.add_string buf (Printf.sprintf "%d%d%d%d"
+              ((v lsr 3) land 1) ((v lsr 2) land 1) ((v lsr 1) land 1) (v land 1))) digits;
+          Buffer.contents buf
+        | 'd' ->
+          (try let v = int_of_string digits in
+             String.init width (fun i -> if (v lsr (width - 1 - i)) land 1 = 1 then '1' else '0')
+           with _ -> "")
+        | _ -> "" in
+      if bits = "" then None else begin
+        (* normalise to exactly `width` bits, MSB-first *)
+        let n = String.length bits in
+        let bits = if n >= width then String.sub bits (n - width) width
+                   else String.make (width - n) '0' ^ bits in
+        let rec chunks i acc =
+          if i >= width then List.rev acc
+          else
+            let len = min 31 (width - i) in
+            let v = int_of_string ("0b" ^ String.sub bits i len) in
+            chunks (i + len) (BConst { value = v; width = len } :: acc) in
+        match chunks 0 [] with
+        | [ c ] -> Some c
+        | cs -> Some (BConcat cs)
+      end
+    end
+
+let bit_width_of_int v = if v <= 1 then 1 else
+  let rec f n = if v lsr n = 0 then n else f (n + 1) in f 0
+
 (* Walk an expression. Substitution wins over prefixing: if a BVar's
  * name is in `subst`, replace with that bexpr verbatim (its sub-
  * expressions stay in *parent* scope, so we don't recurse into them).
@@ -153,12 +208,28 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
      pcpi_*, …) must also map to their parent net — otherwise an internal
      read becomes inst__port (prefixed, undriven) while the driver uses the
      parent net via lhs_subst, splitting them. *)
-  let subst = List.filter_map (fun (formal, actual) ->
+  let port_subst = List.filter_map (fun (formal, actual) ->
     match List.assoc_opt formal port_dirs, actual with
     | Some `Input, _ -> Some (formal, actual)
     | Some `Output, BVar _ -> Some (formal, actual)
     | _ -> None
   ) inst.port_connections in
+  (* PARAMETER substitution: a child body reference to a module parameter
+     (e.g. a LUT's 64-bit INIT) must become its CONSTANT value, else the Z3
+     encoder mints it as a free variable.  Wide values go through
+     const_bexpr_of_verilog (BConcat of 31-bit chunks).  Ports win over params
+     if a name somehow collides. *)
+  let param_subst =
+    let from_strs = List.filter_map (fun (name, s) ->
+      match const_bexpr_of_verilog s with Some e -> Some (name, e) | None -> None)
+      inst.param_strs in
+    let from_vals = List.filter_map (fun (name, v) ->
+      if List.mem_assoc name from_strs then None
+      else Some (name, BConst { value = v; width = bit_width_of_int v }))
+      inst.param_values in
+    from_strs @ from_vals in
+  let subst = port_subst @
+    List.filter (fun (n, _) -> not (List.mem_assoc n port_subst)) param_subst in
   let lhs_subst = List.filter_map (fun (formal, actual) ->
     match List.assoc_opt formal port_dirs, actual with
     | Some `Output, BVar n -> Some (formal, n)
