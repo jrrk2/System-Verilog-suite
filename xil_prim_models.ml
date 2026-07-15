@@ -219,6 +219,8 @@ let synth (i : binstance) : bmodule option =
         let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
             [("IS_D_INVERTED","D"); ("IS_CE_INVERTED","CE"); ("IS_S_INVERTED","S")] in
         Some (ff_body ~ty:"FDSE" ~set_val:true ~ctrl_pin:"S" ~init ~inv)
+    | "INV"   -> Some (buf_body ~name:"INV"  ~ins:["I"] ~out:"O" ~rhs:(notb (v "I")))
+    | "BUF"   -> Some (buf_body ~name:"BUF"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))
     | "IBUF"  -> Some (buf_body ~name:"IBUF"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))
     | "OBUF"  -> Some (buf_body ~name:"OBUF"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))
     | "BUFG"  -> Some (buf_body ~name:"BUFG"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))

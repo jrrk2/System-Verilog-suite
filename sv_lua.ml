@@ -296,36 +296,238 @@ let lpick prog_h top =
  *      to BBinOp ops gated on a `verify-arch` certificate.
  *   2. Behavioral_hier — transiently flatten what remains for Z3.
  * The source bprograms are not modified. *)
-let prep_for_z3 (m : bmodule) (p : bprogram) : bmodule =
+(* Cut every STATEFUL / ANALOGUE / UNKNOWN black-box instance in the picked
+ * top module into external I/O with TIED variables, so the miter can compare
+ * the logic around it instead of bailing INCONCLUSIVE:
+ *   - each black-box OUTPUT net  -> a primary INPUT  (the miter constrains
+ *     common inputs equal by name, so the read is the SAME free variable in
+ *     both designs — a "tied variable" shared across the two flows);
+ *   - each black-box INPUT net   -> a primary OUTPUT (compared by name, so
+ *     both flows must drive the box identically: address/data/we, GT config…).
+ * A box is cut when it is (a) not a user module, (b) has no combinational
+ * model in Xil_prim_models (so it is stateful RAM / SRL / GT / MMCM / …), and
+ * (c) has a known port-direction surface.  This mirrors how Behavioral_ffrip
+ * turns an FF's Q into a tied input and its D into a compared output.
+ * Disable with CUT_BLACKBOX=0. *)
+let cut_blackboxes ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmodule =
+  let open Behavioral_ir in
+  if (match Sys.getenv_opt "CUT_BLACKBOX" with Some "0" -> true | _ -> false)
+  then m
+  else begin
+    let is_user name = List.exists (fun (mm : bmodule) -> mm.name = name) p.modules in
+    let is_trusted name = List.mem name trusted in
+    (* Port directions for a TRUSTED user submodule come from its own
+     * declared signal directions (module ports keep RTL names across flows,
+     * so these tied/compared boundary nets match name-to-name between the two
+     * designs — the whole point of comparing bottom-up at module ports). *)
+    let user_port_dirs name =
+      match List.find_opt (fun (mm : bmodule) -> mm.name = name) p.modules with
+      | None -> None
+      | Some mm -> Some (List.filter_map (fun (s : bsignal) ->
+          match s.direction with
+          | `Input  -> Some (s.name, `Input,  0)
+          | `Output -> Some (s.name, `Output, 0)
+          | `Internal -> None) mm.signals) in
+    let port_dirs name =
+      if is_trusted name then user_port_dirs name
+      else Hashtbl.find_opt (Lazy.force Bir_to_edif.xil_json_ports) name in
+    (* Distributed-RAM (RAM32X1D/RAM32M/RAM64M/RAM*X1S/…) are absent from the
+     * Xilinx port-JSON oracle, but their pin directions are unambiguous by
+     * name: SPO/DPO/O/DO* are the async read outputs, everything else feeds
+     * the write/address side. *)
+    let is_dram name =
+      let u = String.uppercase_ascii name in
+      String.length u >= 5 && String.sub u 0 3 = "RAM" && u.[3] <> 'B' in
+    let dram_dir pin : [ `Input | `Output ] =
+      let u = String.uppercase_ascii pin in
+      let pre s = String.length u >= String.length s && String.sub u 0 (String.length s) = s in
+      if u = "SPO" || u = "DPO" || u = "O" || pre "DO" then `Output else `Input in
+    (* Bidirectional / pad primitives absent from the oracle: the fabric-side
+     * output pin (O) is a read from the pad → tied input; I/T are driven by
+     * fabric → compared outputs; the IO pad itself is external → ignored. *)
+    let is_iopad name = name = "IOBUF" || name = "IOBUFDS" in
+    let iopad_dir pin : [ `Input | `Output ] = if pin = "O" then `Output else `Input in
+    (* pin-direction oracle: JSON, then RAM, then IO-pad fallback *)
+    let pin_dir name pin : [ `Input | `Output ] option =
+      match port_dirs name with
+      | Some ps -> List.find_map (fun (pn, d, _) -> if pn = pin then Some d else None) ps
+      | None ->
+          if is_dram name then Some (dram_dir pin)
+          else if is_iopad name && pin <> "IO" && pin <> "IOB" then Some (iopad_dir pin)
+          else None in
+    let cutable (i : binstance) =
+      if is_trusted i.module_name then true (* proven-equivalent submodule → black-box *)
+      else
+        (not (is_user i.module_name))
+        && (match Xil_prim_models.synth i with None -> true | Some _ -> false)
+        && (port_dirs i.module_name <> None || is_dram i.module_name
+            || is_iopad i.module_name) in
+    let rec bases = function
+      | BVar n -> [ n ]
+      | BSlice { signal; _ } -> bases signal
+      | BSelect { array; _ } -> bases array
+      | BConcat es -> List.concat (List.map bases es)
+      | BReplicate { value; _ } -> bases value
+      | _ -> [] in
+    let cut_insts, keep_insts = List.partition cutable m.instances in
+    if cut_insts = [] then m
+    else begin
+      (* width of a connected expression, from the base net's declaration *)
+      let sigw = Hashtbl.create 128 in
+      List.iter (fun (s : bsignal) ->
+        let w = match s.stype with BInt { width; _ } -> width | BBool -> 1 | _ -> 0 in
+        if w > 0 then Hashtbl.replace sigw s.name w) m.signals;
+      let expr_w e = match bases e with
+        | n :: _ -> (match Hashtbl.find_opt sigw n with Some w -> w | None -> 1)
+        | [] -> 1 in
+      (* Each cut cell's pin becomes a boundary signal named <inst>/<pin> — a
+       * CANONICAL name (RTL instance + primitive port), identical across the
+       * two flows, so the miter's by-name input-equality / output-comparison
+       * actually ties the two designs (a connected-net name would differ). *)
+      let new_sigs = ref [] and new_assigns = ref [] in
+      let n_in = ref 0 and n_out = ref 0 in
+      let mk_sig name w dir =
+        new_sigs := { name; stype = BInt { width = w; signed = Unsigned };
+                      direction = dir; initial_value = None; attrs = [] } :: !new_sigs in
+      List.iter (fun (i : binstance) ->
+        List.iter (fun (pin, expr) ->
+          match pin_dir i.module_name pin with
+          | Some dir ->
+              let bname = i.inst_name ^ "/" ^ pin in
+              let w = expr_w expr in
+              (match dir with
+               | `Output ->
+                   (* cell drives the net → tie it to a shared free INPUT and
+                      buffer that input onto the original net so downstream
+                      logic reads the tied variable. *)
+                   mk_sig bname w `Input; incr n_in;
+                   (match expr with
+                    | BVar n -> new_assigns := BAssign { lhs = n; rhs = BVar bname } :: !new_assigns
+                    | _ -> ())
+               | `Input ->
+                   (* cell reads the net → expose what drives it as a compared
+                      OUTPUT, so both flows must compute it identically. *)
+                   mk_sig bname w `Output; incr n_out;
+                   new_assigns := BAssign { lhs = bname; rhs = expr } :: !new_assigns)
+          | None -> ()) i.port_connections) cut_insts;
+      let cut_proc = BCombinational
+        { name = "__blackbox_cut"; sensitivity = []; body = List.rev !new_assigns } in
+      Printf.eprintf
+        "[cut_blackbox] %s: cut %d black boxes -> %d tied inputs + %d compared outputs (cell/pin named)\n"
+        m.name (List.length cut_insts) !n_in !n_out;
+      { m with instances = keep_insts;
+               signals = m.signals @ List.rev !new_sigs;
+               processes = m.processes @ [ cut_proc ] }
+    end
+  end
+
+let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmodule =
   let p, _n = Behavioral_arch_subst.substitute_program p in
   match List.find_opt (fun (mm : bmodule) -> mm.name = m.name) p.modules with
   | None -> m
   | Some m' ->
+      let m' = cut_blackboxes ~trusted m' p in
       if m'.instances = [] then m'
-      else Behavioral_hier.flatten_for_z3 p ~top:m'.name
+      else
+        let p' = { p with modules =
+          List.map (fun (mm : bmodule) -> if mm.name = m'.name then m' else mm)
+            p.modules } in
+        Behavioral_hier.flatten_for_z3 p' ~top:m'.name
 
-let lmiter a_h b_h =
-  let (_, ma, pa) = find_mod a_h in
-  let (_, mb, pb) = find_mod b_h in
-  (* prep_for_z3 internally calls Behavioral_hier.flatten_for_z3 which
-   * registers any unresolved binstance into Behavioral_hier.unresolved.
-   * Drain it on both sides before deciding the verdict — per
-   * feedback-no-silent-lossage, an unresolved instance is its own
-   * verification-failure category, distinct from EQUIVALENT/DIFFER. *)
+(* One module's cross-design verdict, with [trusted] submodules black-boxed
+ * (not flattened) on both sides. *)
+let miter_core ?(trusted : string list = []) (ma, pa) (mb, pb) : string =
   let _ = Behavioral_hier.take_unresolved () in   (* clear any stale *)
-  let ma' = prep_for_z3 ma pa in
+  let ma' = prep_for_z3 ~trusted ma pa in
   let unres_a = Behavioral_hier.take_unresolved () in
-  let mb' = prep_for_z3 mb pb in
+  let mb' = prep_for_z3 ~trusted mb pb in
   let unres_b = Behavioral_hier.take_unresolved () in
   let unres = unres_a @ unres_b in
   if unres <> [] then begin
     let summary = String.concat ", "
-      (List.map (fun (_, inst, ty) -> Printf.sprintf "%s:%s" inst ty)
-         unres) in
+      (List.map (fun (_, inst, ty) -> Printf.sprintf "%s:%s" inst ty) unres) in
     Printf.sprintf "INCONCLUSIVE — %d unresolved primitive bodies: %s"
       (List.length unres) summary
-  end else if Z3_miter.check_miter_equivalence ma' mb' then "EQUIVALENT"
-  else "DIFFER"
+  end else
+    (try if Z3_miter.check_miter_equivalence ma' mb' then "EQUIVALENT" else "DIFFER"
+     with e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
+
+let lmiter a_h b_h =
+  let (_, ma, pa) = find_mod a_h in
+  let (_, mb, pb) = find_mod b_h in
+  miter_core (ma, pa) (mb, pb)
+
+(* ── Compositional bottom-up hierarchical miter ─────────────────────────
+ * Compare two whole programs (two synthesis flows of the same RTL) module
+ * by module in LEAVES-FIRST topo order.  Each module is mitered with its
+ * already-proven-equivalent submodules BLACK-BOXED to tied I/O (their read
+ * outputs become shared free inputs, their driven inputs become compared
+ * outputs) rather than flattened — so an EQUIVALENT verdict on a parent is
+ * an assume-guarantee proof resting on its children's separately-proven
+ * equivalence.  A submodule is only flattened (inlined) into its parent when
+ * it did NOT prove equivalent, to localize the divergence.  Returns a
+ * multi-line report; the first divergent module in topo order is the tightest
+ * localization of a real mismatch. *)
+let lmiter_hier a_prog_h b_prog_h top =
+  (* RAW programs carry the full user hierarchy (topo order); the EXPANDED
+   * programs abstract every user-submodule instance as an uninterpreted
+   * function (Fpga_prim_expand.set_user_ports) — identical on both sides, so
+   * children cancel and each module is verified against its OWN logic + child
+   * wiring, children NOT flattened.  cut_blackboxes additionally ties stateful
+   * / analogue primitives (RAM/GT).  Leaves-first order makes the first DIFFER
+   * the tightest localization; a parent's EQUIVALENT is assume-guarantee over
+   * its (separately-verified) children. *)
+  let _, pa_raw = find_prog a_prog_h in
+  let _, pb_raw = find_prog b_prog_h in
+  let names p = List.map (fun (m : bmodule) -> m.name) p.modules in
+  let common =
+    let nb = names pb_raw in
+    List.filter (fun n -> List.mem n nb) (names pa_raw) in
+  let by_name p n = List.find_opt (fun (m : bmodule) -> m.name = n) p.modules in
+  (* leaves-first topo order over the RAW common-module instance DAG *)
+  let order = ref [] and visited = Hashtbl.create 32 in
+  let rec dfs n =
+    if List.mem n common && not (Hashtbl.mem visited n) then begin
+      Hashtbl.add visited n ();
+      (match by_name pa_raw n with
+       | Some m ->
+           let kids = List.sort_uniq compare
+             (List.filter_map (fun (i : binstance) ->
+                if List.mem i.module_name common then Some i.module_name else None)
+                m.instances) in
+           List.iter dfs kids
+       | None -> ());
+      order := n :: !order
+    end in
+  (if List.mem top common then dfs top else List.iter dfs common);
+  let ordered = List.rev !order in
+  (* expand each side, abstracting its own user submodules as UFs *)
+  Fpga_prim_expand.set_user_ports pa_raw.Behavioral_ir.modules;
+  let pa = Fpga_prim_expand.expand_program pa_raw in
+  Fpga_prim_expand.set_user_ports pb_raw.Behavioral_ir.modules;
+  let pb = Fpga_prim_expand.expand_program pb_raw in
+  let n_eq = ref 0 in
+  let buf = Buffer.create 256 in
+  List.iter (fun n ->
+    match by_name pa n, by_name pb n with
+    | Some ma, Some mb ->
+        let kids = List.sort_uniq compare
+          (List.filter_map (fun (i : binstance) ->
+             if List.mem i.module_name common then Some i.module_name else None)
+             (match by_name pa_raw n with Some m -> m.instances | None -> [])) in
+        let verdict = miter_core (ma, pa) (mb, pb) in
+        if verdict = "EQUIVALENT" then incr n_eq;
+        Buffer.add_string buf
+          (Printf.sprintf "HIER %-34s %s%s\n" n verdict
+             (if kids = [] then ""
+              else "  [children abstracted: " ^ String.concat "," kids ^ "]"))
+    | _ -> ()) ordered;
+  Buffer.add_string buf
+    (Printf.sprintf "HIER-SUMMARY %d/%d modules EQUIVALENT%s"
+       !n_eq (List.length ordered)
+       (if !n_eq = List.length ordered && ordered <> []
+        then " → whole design EQUIVALENT (assume-guarantee)" else ""));
+  Buffer.contents buf
 
 let default_lib () =
   let home = try Sys.getenv "HOME" with Not_found -> "" in
@@ -1108,6 +1310,9 @@ module MakeLib
                        (wrap2 lpick);
         "miter",      V.efunc (V.string **-> V.string **->> V.string)
                        (wrap2 lmiter);
+        "miter_hier", V.efunc (V.string **-> V.string **-> V.string
+                               **->> V.string)
+                       (wrap3 lmiter_hier);
         "liberty",    V.efunc (V.string **->> V.string)
                        (wrap1 lliberty);
         "expand",     V.efunc (V.string **-> V.string **->> V.string)

@@ -199,6 +199,15 @@ let expand_instance (i : binstance) : bprocess list * bool =
      | [ o ] -> [ comb ("exp_" ^ o) [ BAssign { lhs = o; rhs = List.hd (bits_of src @ [zero]) } ] ], false
      | _ -> [], true)
   end
+  else if m = "INV" then begin
+    let src = match port_expr i "I" with Some e -> e | None -> in_bit0 i "I0" in
+    (match out_nets i "O" with
+     | [ o ] -> [ comb ("exp_" ^ o)
+         [ BAssign { lhs = o; rhs = BUnOp { op = BNot;
+             operand = List.hd (bits_of src @ [zero]);
+             result_type = BInt { width = 1; signed = Unsigned } } } ] ], false
+     | _ -> [], true)
+  end
   else match m with
   | "FDRE" | "FDCE" | "FDPE" | "FDSE" ->
       let clk = (match port_expr i "C" with Some e -> e | None -> zero) in
