@@ -95,6 +95,37 @@ module Fdre = struct
     { O.q = Map.find_exn outs "Q" }
 end
 
+(* FDSE: D flip-flop with clock-enable + SYNCHRONOUS set (to 1).  The S
+   counterpart of FDRE, for a sync-reset register bit whose reset VALUE is 1.
+   S (like R) has priority over CE. *)
+module Fdse = struct
+  module I = struct
+    type 'a t =
+      { c  : 'a [@rtlname "C"]
+      ; ce : 'a [@rtlname "CE"]
+      ; s  : 'a [@rtlname "S"]
+      ; d  : 'a [@rtlname "D"]
+      }
+    [@@deriving hardcaml]
+  end
+  module O = struct
+    type 'a t = { q : 'a [@rtlname "Q"] } [@@deriving hardcaml]
+  end
+  let create ?(init : bool = false) ?(instance : string = "") (i : Signal.t I.t)
+    : Signal.t O.t =
+    let parameters =
+      [ Parameter.create ~name:"INIT"
+          ~value:(Parameter.Value.Bit init) ]
+    in
+    let inputs = [ "C", i.c; "CE", i.ce; "S", i.s; "D", i.d ] in
+    let instance = if String.length instance = 0 then None else Some instance in
+    let outs =
+      Instantiation.create ~parameters ?instance () ~name:"FDSE" ~inputs
+        ~outputs:[ "Q", 1 ]
+    in
+    { O.q = Map.find_exn outs "Q" }
+end
+
 (* FDCE: D flip-flop with clock-enable + asynchronous clear. *)
 module Fdce = struct
   module I = struct

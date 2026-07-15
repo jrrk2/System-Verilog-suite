@@ -202,6 +202,17 @@ type reg_boundary =
          REJECT a register with rb_init <> None and rb_reset = None
          since ASIC FFs have no config-time init — the source code
          must be rewritten with an explicit reset block. *)
+  ; rb_sync_reset : string option
+      (* SYNCHRONOUS reset/set net, lifted from a constant-armed top-level
+         D-mux [mux srst K inner] that behavioral_to_hardcaml folds into the
+         D cone (it does NOT use Hardcaml's async reg_reset for sync resets).
+         Only lifted when rb_reset = None (a FF cannot have both async CLR/PRE
+         and sync R/S).  Per bit: rb_srval bit 1 -> FDSE (sync set to 1),
+         bit 0 -> FDRE (sync reset to 0).  R/S has priority over CE on the
+         primitive, matching the folded [mux srst K (mux en Q dnext)]. *)
+  ; rb_srval : int option
+      (* per-bit synchronous reset VALUE K (LSB-first), the constant arm of
+         the peeled reset mux; selects FDRE vs FDSE and the FF INIT. *)
   }
 
 (* A black-box instance, lowered as a generalized boundary: its OUTPUT
@@ -536,16 +547,60 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
                    else "MUX_other"
                  | T.Mux _ -> "MUX_wide"
                  | _ -> "PLAIN" in
-               Stdlib.Printf.eprintf "CE_LIFT_STAT %s\n" cls
+               let has_async = match rst with Some _ -> 1 | None -> 0 in
+               Stdlib.Printf.eprintf "CE_LIFT_STAT %s async=%d w=%d\n" cls has_async w
              end);
+            let is_const s = match resolve s with T.Const _ -> true | _ -> false in
+            let const_int s =
+              match resolve s with
+              | T.Const { constant; _ } ->
+                let bits = Hardcaml.Bits.to_string constant in
+                let n = String.length bits in
+                let v = ref 0 in
+                for i = 0 to n - 1 do
+                  if Char.equal bits.[i] '1' then v := !v lor (1 lsl (n - 1 - i))
+                done;
+                !v
+              | _ -> 0
+            in
+            (* Synchronous reset/set lift: peel a constant-armed top-level
+               D-mux [mux srst K inner] onto the FF's dedicated R/S pin.
+               behavioral_to_hardcaml folds sync resets into the D cone (it
+               reserves Hardcaml's async reg_reset for true async resets), so
+               without this the reset value + its mux burn a LUT layer that
+               Vivado spends on the FDRE.R / FDSE.S pin instead.  Only lifted
+               when rb_reset = None — a 7-series FF has EITHER async CLR/PRE OR
+               sync R/S, never both.  R/S has priority over CE on the
+               primitive, exactly matching [mux srst K (mux en Q dnext)]. *)
+            let sync_lift_on =
+              match Stdlib.Sys.getenv_opt "CE_SYNC_LIFT" with
+              | Some "0" -> false | _ -> true in
+            let rb_sync_reset, rb_srval, d1 =
+              if Option.is_some rst || not sync_lift_on then (None, None, d)
+              else match resolve d with
+                | T.Mux { select; cases = [ c0; c1 ]; _ }
+                  when S.width select = 1 && is_const c1 && not (is_const c0) ->
+                  (* select=1 -> K (reset active-high); select=0 -> inner. *)
+                  let sr = Printf.sprintf "%s__sr" base in
+                  Queue.enqueue reg_queue (select, [ sr ]);
+                  (Some sr, Some (const_int c1), c0)
+                | T.Mux { select; cases = [ c0; c1 ]; _ }
+                  when S.width select = 1 && is_const c0 && not (is_const c1) ->
+                  (* select=0 -> K (reset active-low); invert so R/S stays
+                     active-high on the primitive. *)
+                  let sr = Printf.sprintf "%s__sr" base in
+                  Queue.enqueue reg_queue (S.( ~: ) select, [ sr ]);
+                  (Some sr, Some (const_int c0), c1)
+                | _ -> (None, None, d)
+            in
             let rb_enable, eff_d =
-              match resolve d with
+              match resolve d1 with
               | T.Mux { select; cases = [ c0; c1 ]; _ }
                 when S.width select = 1 && uid_int (resolve c0) = uid_int sig_ ->
                 let en_name = Printf.sprintf "%s__ce" base in
                 Queue.enqueue reg_queue (select, [ en_name ]);
                 (Some en_name, c1)
-              | _ -> (None, d)
+              | _ -> (None, d1)
             in
             regs :=
               { rb_q_names = q_names
@@ -555,6 +610,8 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
               ; rb_enable
               ; rb_width = w
               ; rb_init = init
+              ; rb_sync_reset
+              ; rb_srval
               }
               :: !regs;
             Queue.enqueue reg_queue (eff_d, d_names);

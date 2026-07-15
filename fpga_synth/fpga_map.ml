@@ -53,7 +53,9 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
     (* The lifted enable cone (rb_enable) is an internal net feeding the FF's
        CE pin — route it into d_sig like a D-cone, else it leaks out as a
        driverless top-level output and CE defaults to vdd (enable lost). *)
-    Option.iter r.Bir_to_aig.rb_enable ~f:(Hash_set.add d_names));
+    Option.iter r.Bir_to_aig.rb_enable ~f:(Hash_set.add d_names);
+    (* Same for the lifted sync reset/set cone feeding R/S. *)
+    Option.iter r.Bir_to_aig.rb_sync_reset ~f:(Hash_set.add d_names));
   List.iter l.insts ~f:(fun ib ->
     List.iter ib.Bir_to_aig.ib_in_ports ~f:(fun (_, bits) ->
       List.iter bits ~f:(Hash_set.add d_names)));
@@ -194,13 +196,29 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
   List.iter l.regs ~f:(fun r ->
     let clk = port_input r.Bir_to_aig.rb_clock in
     let rst = Option.map r.Bir_to_aig.rb_reset ~f:port_input in
-    (* Per-bit INIT extracted from rb_init.  bit i of rb_init is the
-       FDRE INIT for the i-th register bit (LSB first, matching
-       rb_q_names ordering). *)
-    let init_bit i =
-      match r.Bir_to_aig.rb_init with
+    (* Lifted SYNCHRONOUS reset/set net (d_sig-mapped, like CE); when present
+       each bit becomes FDRE (R, srval bit 0) or FDSE (S, srval bit 1). *)
+    let sr =
+      match r.Bir_to_aig.rb_sync_reset with
+      | Some n -> Some (Option.value (Hashtbl.find d_sig n) ~default:Signal.gnd)
+      | None -> None
+    in
+    let srval_bit i =
+      match r.Bir_to_aig.rb_srval with
       | Some v -> (v lsr i) land 1 = 1
       | None -> false
+    in
+    (* Per-bit INIT extracted from rb_init.  bit i of rb_init is the
+       FDRE INIT for the i-th register bit (LSB first, matching
+       rb_q_names ordering).  For a sync-reset bit the power-on INIT follows
+       the reset value (Vivado's convention for a reset-only register). *)
+    let init_bit i =
+      match r.Bir_to_aig.rb_sync_reset with
+      | Some _ -> srval_bit i
+      | None ->
+        (match r.Bir_to_aig.rb_init with
+         | Some v -> (v lsr i) land 1 = 1
+         | None -> false)
     in
     List.iteri (List.zip_exn r.Bir_to_aig.rb_d_names r.Bir_to_aig.rb_q_names)
       ~f:(fun bit (dn, qn) ->
@@ -217,9 +235,17 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
           | None -> Signal.vdd
         in
         let q =
-          match rst with
-          | Some clr -> (Xil_prim.Fdce.create ~instance:qn { c = clk; ce; clr; d }).q
-          | None ->
+          match rst, sr with
+          | Some clr, _ -> (Xil_prim.Fdce.create ~instance:qn { c = clk; ce; clr; d }).q
+          | None, Some srn when srval_bit bit ->
+            (* sync SET to 1 -> FDSE.S *)
+            (Xil_prim.Fdse.create ~init:(init_bit bit) ~instance:qn
+               { c = clk; ce; s = srn; d }).q
+          | None, Some srn ->
+            (* sync RESET to 0 -> FDRE.R *)
+            (Xil_prim.Fdre.create ~init:(init_bit bit) ~instance:qn
+               { c = clk; ce; r = srn; d }).q
+          | None, None ->
             (Xil_prim.Fdre.create ~init:(init_bit bit) ~instance:qn
                { c = clk; ce; r = Signal.gnd; d }).q
         in
