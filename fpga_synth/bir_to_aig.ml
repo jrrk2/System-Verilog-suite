@@ -187,6 +187,13 @@ type reg_boundary =
   ; rb_d_names : string list (* AIG outputs for D bits, LSB-first *)
   ; rb_clock : string
   ; rb_reset : string option (* async reset net, if any *)
+  ; rb_enable : string option
+      (* clock-enable net, if the register's D is an enable feedback mux
+         [mux en dnext Q].  Lifting [en] onto the FDRE/FDCE CE pin (instead
+         of folding the mux + Q-feedback into the D LUT cone) is exactly what
+         the hardware CE pin is for: it saves a LUT input + the fabric-routed
+         feedback loop, and keeps the shared enable off the per-FF D-LUT
+         fanout that otherwise saturates the control network. *)
   ; rb_width : int
   ; rb_init  : int option
       (* BIR-level initial_value, threaded through Hardcaml's
@@ -502,16 +509,36 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
                 if !v = 0 then None else Some !v
               | _ -> None
             in
+            (* Enable extraction: if D is [mux en dnext Q] (Q = this reg's own
+               output fed back), lift [en] onto CE and register only [dnext]
+               as the D cone.  Conservative: only the case-0-is-self form
+               ([mux sel dnext self] = en active-high, hold in else); anything
+               else keeps the full D (correctness over coverage). *)
+            let rec resolve s =
+              match s with
+              | T.Wire { driver; _ } when not (is_empty !driver) -> resolve !driver
+              | _ -> s
+            in
+            let rb_enable, eff_d =
+              match resolve d with
+              | T.Mux { select; cases = [ c0; c1 ]; _ }
+                when S.width select = 1 && uid_int (resolve c0) = uid_int sig_ ->
+                let en_name = Printf.sprintf "%s__ce" base in
+                Queue.enqueue reg_queue (select, [ en_name ]);
+                (Some en_name, c1)
+              | _ -> (None, d)
+            in
             regs :=
               { rb_q_names = q_names
               ; rb_d_names = d_names
               ; rb_clock = clk
               ; rb_reset = rst
+              ; rb_enable
               ; rb_width = w
               ; rb_init = init
               }
               :: !regs;
-            Queue.enqueue reg_queue (d, d_names);
+            Queue.enqueue reg_queue (eff_d, d_names);
             q_lits
           | Inst { instantiation = inst; _ } ->
             let base = Printf.sprintf "i%d" key in

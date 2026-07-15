@@ -205,12 +205,19 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
            of_circuit can name the emitted Q net after it (Stage-2 of the
            register-name-preservation fix for FPGA Z3 LEC — ffrip matches
            state by name). *)
+        (* CE from the lifted enable cone (a d_sig-mapped net, like D), else
+           tied high.  Same enable bit feeds every bit of this register. *)
+        let ce =
+          match r.Bir_to_aig.rb_enable with
+          | Some en -> Option.value (Hashtbl.find d_sig en) ~default:Signal.vdd
+          | None -> Signal.vdd
+        in
         let q =
           match rst with
-          | Some clr -> (Xil_prim.Fdce.create ~instance:qn { c = clk; ce = Signal.vdd; clr; d }).q
+          | Some clr -> (Xil_prim.Fdce.create ~instance:qn { c = clk; ce; clr; d }).q
           | None ->
             (Xil_prim.Fdre.create ~init:(init_bit bit) ~instance:qn
-               { c = clk; ce = Signal.vdd; r = Signal.gnd; d }).q
+               { c = clk; ce; r = Signal.gnd; d }).q
         in
         let q = Signal.(q -- qn) in
         let w = Hashtbl.find_exn q_wire qn in
