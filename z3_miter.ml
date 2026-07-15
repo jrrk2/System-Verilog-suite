@@ -700,11 +700,14 @@ let encode_module bmod suffix =
   let solver = Z3.Solver.mk_simple_solver ctx in
   let ctx_sigs = build_signal_context bmod in
 
-  (* Debug: print inferred widths *)
-  Printf.printf "  Inferred widths for %s (%d signals):\n" bmod.name (List.length ctx_sigs);
-  List.iter (fun (name, width) ->
-    Printf.printf "    %s: %d bits\n" name width
-  ) (List.sort (fun (a,_) (b,_) -> String.compare a b) ctx_sigs);
+  (* Debug: print inferred widths (per-signal only when Z3_MITER_VERBOSE=1 —
+     a switch-level bitstream model has >100k signals, the flood alone dwarfs
+     the solve). *)
+  Printf.printf "  Inferred widths for %s (%d signals)\n" bmod.name (List.length ctx_sigs);
+  if Sys.getenv_opt "Z3_MITER_VERBOSE" = Some "1" then
+    List.iter (fun (name, width) ->
+      Printf.printf "    %s: %d bits\n" name width
+    ) (List.sort (fun (a,_) (b,_) -> String.compare a b) ctx_sigs);
 
   (* Encode all processes *)
   List.iter (encode_process suffix ctx_sigs solver) bmod.processes;
