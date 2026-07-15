@@ -843,12 +843,20 @@ let check_miter_equivalence bmod1 bmod2 =
     (* Constrain the COMMON inputs to be the same (see note above — a side may
        have dropped an unused input). *)
     Printf.printf "Constraining inputs to match...\n";
+    let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
     List.iter (fun (name, width) ->
       if List.mem_assoc name inputs2 then begin
+        (* Widths may diverge across flows (one side inferred a signal wider
+           than the other).  bv_var caches by name+suffix and returns each
+           design's OWN encoded width, so build both at their real widths and
+           constrain only the overlapping low bits equal — leaving any extra
+           high bits free is conservative (never hides a counterexample). *)
+        let w2 = List.assoc name inputs2 in
         let in1 = bv_var name width "_d1" in
-        let in2 = bv_var name width "_d2" in
-        let eq = Z3.Boolean.mk_eq ctx in1 in2 in
-        Z3.Solver.add miter_solver [eq]
+        let in2 = bv_var name w2 "_d2" in
+        let w = min (sz in1) (sz in2) in
+        let lo z = if sz z > w then Z3.BitVector.mk_extract ctx (w - 1) 0 z else z in
+        Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx (lo in1) (lo in2) ]
       end
     ) inputs1;
 
@@ -892,10 +900,17 @@ let check_miter_equivalence bmod1 bmod2 =
     let common_outputs =
       List.filter (fun (n, _) -> List.mem_assoc n outputs2) outputs1 in
     let miter_terms = List.map (fun (name, width) ->
+      (* Same width-divergence handling as the inputs, but for outputs we
+         zero-extend BOTH sides to the wider width and XOR: a nonzero high bit
+         on one side that the other dropped IS a real difference, so it must
+         still surface (never mask a mismatch). *)
+      let w2 = try List.assoc name outputs2 with Not_found -> width in
       let out1 = bv_var name width "_d1" in
-      let out2 = bv_var name width "_d2" in
-      let xor = Z3.BitVector.mk_xor ctx out1 out2 in
-      let zero = Z3.BitVector.mk_numeral ctx "0" width in
+      let out2 = bv_var name w2 "_d2" in
+      let w = max (sz out1) (sz out2) in
+      let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
+      let xor = Z3.BitVector.mk_xor ctx (ext out1) (ext out2) in
+      let zero = Z3.BitVector.mk_numeral ctx "0" w in
       Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero)
     ) common_outputs in
 
