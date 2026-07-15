@@ -844,20 +844,22 @@ let check_miter_equivalence bmod1 bmod2 =
        have dropped an unused input). *)
     Printf.printf "Constraining inputs to match...\n";
     let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
+    let in2_w = Hashtbl.create (List.length inputs2 * 2 + 1) in
+    List.iter (fun (n, w) -> Hashtbl.replace in2_w n w) inputs2;
     List.iter (fun (name, width) ->
-      if List.mem_assoc name inputs2 then begin
+      match Hashtbl.find_opt in2_w name with
+      | Some w2 ->
         (* Widths may diverge across flows (one side inferred a signal wider
            than the other).  bv_var caches by name+suffix and returns each
            design's OWN encoded width, so build both at their real widths and
            constrain only the overlapping low bits equal — leaving any extra
            high bits free is conservative (never hides a counterexample). *)
-        let w2 = List.assoc name inputs2 in
         let in1 = bv_var name width "_d1" in
         let in2 = bv_var name w2 "_d2" in
         let w = min (sz in1) (sz in2) in
         let lo z = if sz z > w then Z3.BitVector.mk_extract ctx (w - 1) 0 z else z in
         Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx (lo in1) (lo in2) ]
-      end
+      | None -> ()
     ) inputs1;
 
     (* Match undriven internal signals across designs. These are reads of
@@ -867,22 +869,24 @@ let check_miter_equivalence bmod1 bmod2 =
      * counterexample by picking different values per side. *)
     let undriven1 = get_undriven_internals bmod1 in
     let undriven2 = get_undriven_internals bmod2 in
+    (* Hash-join, not List.assoc_opt per element: a switch-level bitstream model
+       collapses to tens of thousands of undriven routing/stub nets, and the
+       old O(n^2) filter + per-signal print made the miter hang (44k signals =>
+       ~2G lookups + 44k prints).  Match in O(n) and print only the count. *)
+    let u2 = Hashtbl.create (List.length undriven2 * 2 + 1) in
+    List.iter (fun (n, w) -> Hashtbl.replace u2 n w) undriven2;
     let shared_undriven =
       List.filter (fun (n, w) ->
-        match List.assoc_opt n undriven2 with
-        | Some w2 when w2 = w -> true
-        | _ -> false)
+        match Hashtbl.find_opt u2 n with Some w2 -> w2 = w | None -> false)
         undriven1
     in
     if shared_undriven <> [] then begin
-      Printf.printf "Matching %d undriven internal signal(s) across designs:\n"
+      Printf.printf "Matching %d undriven internal signal(s) across designs\n"
         (List.length shared_undriven);
       List.iter (fun (name, width) ->
-        Printf.printf "  %s (%d bits)\n" name width;
         let in1 = bv_var name width "_d1" in
         let in2 = bv_var name width "_d2" in
-        let eq = Z3.Boolean.mk_eq ctx in1 in2 in
-        Z3.Solver.add miter_solver [eq]
+        Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx in1 in2 ]
       ) shared_undriven
     end;
 
