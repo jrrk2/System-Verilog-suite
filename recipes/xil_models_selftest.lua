@@ -72,4 +72,18 @@ svd.write_cellmapped_v(svd.gate_map(svd.pick(p, "wreg"), 6, 0), "/tmp/wreg_cells
 pass = pass + 1
 print("  wide gate_map 128b/96b + cellmapped write  ->  OK (no overflow)")
 
+-- Vector-port bitbus: a multi-bit input/output design must be EQUIVALENT through
+-- gate_map -> mapped_to_prog -> miter.  Guards prep_for_z3.resolve_input_bitbus
+-- (input `a__i` -> a[i]) and the output-buffer reconstruction (y <- {obuf_y_i__O}).
+-- Before the fix the per-bit input nets and the whole output bus floated free and
+-- ANY vector design DIFFERed spuriously.
+spec = svd.parse("verible", "widek", {D .. "widek.sv"})
+p = svd.parse("verible", "widek", {D .. "widek.sv"})
+p = svd.unroll(p); p = svd.inline(p); p = svd.iflift(p)
+p = svd.blocking_subst(p); p = svd.meminfer(p); p = svd.memlower(p)
+impl = svd.augment_xil_models(svd.mapped_to_prog(svd.gate_map(svd.pick(p, "widek"), 6, 0)))
+v = svd.miter(svd.pick(spec, "widek"), svd.pick(impl, "widek"))
+if v == "EQUIVALENT" then pass = pass + 1 else fail = fail + 1 end
+print("  vector bitbus 128b: behavioral==gatemap  ->  " .. v)
+
 print("== pass=" .. pass .. " fail=" .. fail .. " ==")

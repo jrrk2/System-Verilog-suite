@@ -421,29 +421,137 @@ let cut_blackboxes ?(trusted : string list = []) (m : bmodule) (p : bprogram) : 
     end
   end
 
+(* Miter-only bitbus resolution.  of_circuit (mapped_to_prog) emits a multi-bit
+   INPUT port `base : uint<W>` but wires its consumers to per-bit nets
+   `base__0 .. base__{W-1}` that are reconnected ONLY by the bitbus convention
+   bir_to_nextpnr_json / bir_to_edif apply — the flatten/ffrip/z3 path never
+   drives them, so they float free and the miter spuriously DIFFERs on ANY
+   vector-input design.  Rewrite every read of `base__i` to `base[i:i]` so the
+   port bits reach the consumers.  This touches only the miter's flattened view;
+   of_circuit itself is unchanged (its output also feeds the silicon nextpnr
+   path, which resolves the bitbus its own way). *)
+let resolve_input_bitbus (m : bmodule) : bmodule =
+  let inw : (string, int) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (s : bsignal) ->
+    match s.direction with
+    | `Input ->
+        let w = Behavioral_boundary.width_of_btype s.stype in
+        if w > 1 then Hashtbl.replace inw s.name w
+    | _ -> ()) m.signals;
+  if Hashtbl.length inw = 0 then m
+  else begin
+    (* rightmost "__" split; only a name whose base is a known multi-bit input
+       and whose suffix is an in-range bit index is a bitbus reference. *)
+    let split_bitbus name =
+      let n = String.length name in
+      let rec last_dd i =
+        if i < 0 then None
+        else if name.[i] = '_' && i + 1 < n && name.[i+1] = '_' then Some i
+        else last_dd (i - 1) in
+      match last_dd (n - 2) with
+      | None -> None
+      | Some k ->
+          let base = String.sub name 0 k in
+          let suf = String.sub name (k + 2) (n - k - 2) in
+          (match int_of_string_opt suf, Hashtbl.find_opt inw base with
+           | Some i, Some w when i >= 0 && i < w -> Some (base, i)
+           | _ -> None) in
+    let rec rw e = match e with
+      | BVar n ->
+          (match split_bitbus n with
+           | Some (base, i) -> BSlice { signal = BVar base; msb = i; lsb = i }
+           | None -> e)
+      | BConst _ -> e
+      | BBinOp r -> BBinOp { r with lhs = rw r.lhs; rhs = rw r.rhs }
+      | BUnOp r -> BUnOp { r with operand = rw r.operand }
+      | BSelect r -> BSelect { array = rw r.array; index = rw r.index }
+      | BSlice r -> BSlice { r with signal = rw r.signal }
+      | BConcat es -> BConcat (List.map rw es)
+      | BReplicate r -> BReplicate { r with value = rw r.value }
+      | BCond r -> BCond { condition = rw r.condition;
+                           then_val = rw r.then_val; else_val = rw r.else_val }
+      | BCall r -> BCall { r with args = List.map rw r.args } in
+    let rec rws s = match s with
+      | BAssign r -> BAssign { r with rhs = rw r.rhs }
+      | BIf r -> BIf { condition = rw r.condition;
+                       then_stmts = List.map rws r.then_stmts;
+                       else_stmts = List.map rws r.else_stmts }
+      | BCase r -> BCase { selector = rw r.selector;
+                           cases = List.map (fun (c, b) -> (rw c, List.map rws b)) r.cases;
+                           default = List.map rws r.default }
+      | BWhile r -> BWhile { condition = rw r.condition; body = List.map rws r.body }
+      | BFor r -> BFor { init = rws r.init; condition = rw r.condition;
+                         update = rws r.update; body = List.map rws r.body }
+      | BBlock b -> BBlock (List.map rws b)
+      | BCallStmt r -> BCallStmt { r with args = List.map rw r.args }
+      | BReturn eo -> BReturn (Option.map rw eo) in
+    let rwp = function
+      | BCombinational r -> BCombinational { r with body = List.map rws r.body }
+      | BSequential r -> BSequential { r with body = List.map rws r.body } in
+    (* OUTPUT side: of_circuit drives a multi-bit output port `base` through
+       per-bit buffer instances `obuf_<base>_<i>` whose O pin connects to the bus
+       SLICE `base[i:i]`.  flatten_for_z3 cannot bind an instance output to a
+       slice (a BAssign lhs is a whole signal), so each buffer's value lands in
+       the net `obuf_<base>_<i>__O` and `base` itself floats.  Rebuild the whole
+       port as a concat of its per-bit buffer nets (MSB first), when they all
+       exist.  Scalar outputs use a bare-BVar O connection that flatten already
+       resolves, so they need nothing here. *)
+    let sig_names = Hashtbl.create 256 in
+    List.iter (fun (s : bsignal) -> Hashtbl.replace sig_names s.name ())
+      m.signals;
+    let out_drivers = List.filter_map (fun (s : bsignal) ->
+      match s.direction with
+      | `Output ->
+          let w = Behavioral_boundary.width_of_btype s.stype in
+          if w <= 1 then None
+          else begin
+            let nets = List.init w (fun i ->
+              Printf.sprintf "obuf_%s_%d__O" s.name i) in
+            if List.for_all (Hashtbl.mem sig_names) nets
+            then Some (BAssign { lhs = s.name;
+                                 rhs = BConcat (List.rev_map (fun n -> BVar n) nets) })
+            else None
+          end
+      | _ -> None) m.signals in
+    let processes' = List.map rwp m.processes in
+    let processes' =
+      if out_drivers = [] then processes'
+      else processes' @ [ BCombinational { name = "__out_bitbus";
+                                           sensitivity = [BAny];
+                                           body = out_drivers } ] in
+    { m with
+      processes = processes';
+      instances = List.map (fun (i : binstance) ->
+        { i with port_connections =
+                   List.map (fun (p, e) -> (p, rw e)) i.port_connections }) m.instances }
+  end
+
 let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmodule =
   let p, _n = Behavioral_arch_subst.substitute_program p in
-  match List.find_opt (fun (mm : bmodule) -> mm.name = m.name) p.modules with
-  | None -> m
-  | Some m' ->
-      let m' = cut_blackboxes ~trusted m' p in
-      if m'.instances = [] then m'
-      else
-        let p' = { p with modules =
-          List.map (fun (mm : bmodule) -> if mm.name = m'.name then m' else mm)
-            p.modules } in
-        let flat = Behavioral_hier.flatten_for_z3 p' ~top:m'.name in
-        (* The pre-flatten cut only saw TOP-LEVEL black boxes.  Deep stateful /
-           analogue primitives (GTXE2/MMCME2/RAM64M/SRL…, buried inside user
-           submodules) surface as top-level instances only after flattening.
-           Discard flatten's unresolved report, cut those now-top-level boxes,
-           and re-record only whatever genuinely can't be cut. *)
-        let _ = Behavioral_hier.take_unresolved () in
-        let flat' = cut_blackboxes ~trusted flat p in
-        List.iter (fun (i : Behavioral_ir.binstance) ->
-            Behavioral_hier.unresolved_register ~parent_name:flat'.name i)
-          flat'.instances;
-        flat'
+  let result =
+    match List.find_opt (fun (mm : bmodule) -> mm.name = m.name) p.modules with
+    | None -> m
+    | Some m' ->
+        let m' = cut_blackboxes ~trusted m' p in
+        if m'.instances = [] then m'
+        else
+          let p' = { p with modules =
+            List.map (fun (mm : bmodule) -> if mm.name = m'.name then m' else mm)
+              p.modules } in
+          let flat = Behavioral_hier.flatten_for_z3 p' ~top:m'.name in
+          (* The pre-flatten cut only saw TOP-LEVEL black boxes.  Deep stateful /
+             analogue primitives (GTXE2/MMCME2/RAM64M/SRL…, buried inside user
+             submodules) surface as top-level instances only after flattening.
+             Discard flatten's unresolved report, cut those now-top-level boxes,
+             and re-record only whatever genuinely can't be cut. *)
+          let _ = Behavioral_hier.take_unresolved () in
+          let flat' = cut_blackboxes ~trusted flat p in
+          List.iter (fun (i : Behavioral_ir.binstance) ->
+              Behavioral_hier.unresolved_register ~parent_name:flat'.name i)
+            flat'.instances;
+          flat'
+  in
+  resolve_input_bitbus result
 
 (* One module's cross-design verdict, with [trusted] submodules black-boxed
  * (not flattened) on both sides. *)
