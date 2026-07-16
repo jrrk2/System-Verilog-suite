@@ -130,27 +130,27 @@ let rec expr_to_bexpr ctx = function
            let n =
              try List.length (List.assoc type_name ctx.enum_types)
              with Not_found -> 1 in
-           BConst { value = ord; width = bits_needed n }
+           BConst { value = Z.of_int ord; width = bits_needed n }
        | None -> BVar name)
 
   (* Integer literal *)
   | Double (VhdIntPrimary, Num num_str) ->
       (try
          let value = int_of_string num_str in
-         BConst { value; width = 32 }
-       with _ -> BConst { value = 0; width = 32 })
+         BConst { value = Z.of_int value; width = 32 }
+       with _ -> BConst { value = Z.zero; width = 32 })
 
   (* Bit string literal: "0001", "1100", etc. *)
   | Double (VhdOperatorString, Str bit_str) ->
       (try
          let value = int_of_string ("0b" ^ bit_str) in
-         BConst { value; width = String.length bit_str }
-       with _ -> BConst { value = 0; width = 1 })
+         BConst { value = Z.of_int value; width = String.length bit_str }
+       with _ -> BConst { value = Z.zero; width = 1 })
 
   (* Character literal: '0', '1' *)
   | Double (VhdCharPrimary, Char c) ->
       let value = if c = '1' then 1 else 0 in
-      BConst { value; width = 1 }
+      BConst { value = Z.of_int value; width = 1 }
 
   (* Relational operators *)
   | Triple (VhdEqualRelation, lhs, rhs) ->
@@ -294,7 +294,7 @@ let rec expr_to_bexpr ctx = function
          scalar.  Range-as-value in expr context is rare, mostly
          appears inside aggregate/subtype constraints we already
          destructured elsewhere; keep going. *)
-      BConst { value = 0; width = 1 }
+      BConst { value = Z.zero; width = 1 }
   | Triple (VhdDecreasingRange, hi, _) -> expr_to_bexpr ctx hi
   | Triple (VhdIncreasingRange, _, hi) -> expr_to_bexpr ctx hi
 
@@ -304,20 +304,20 @@ let rec expr_to_bexpr ctx = function
   | Triple (VhdQualifiedAggregate, _, inner) -> expr_to_bexpr ctx inner
 
   (* Physical literals like `5 ns` — non-synthesisable, treat as 0. *)
-  | Double (VhdPhysicalPrimary, _) -> BConst { value = 0; width = 32 }
+  | Double (VhdPhysicalPrimary, _) -> BConst { value = Z.zero; width = 32 }
 
   (* Float / abs / new — rare, non-synthesisable in our scope. *)
-  | Double (VhdFloatPrimary, _) -> BConst { value = 0; width = 32 }
+  | Double (VhdFloatPrimary, _) -> BConst { value = Z.zero; width = 32 }
   | Double (VhdAbsFactor, e) -> expr_to_bexpr ctx e
-  | Double (VhdNewFactor, _) -> BConst { value = 0; width = 1 }
+  | Double (VhdNewFactor, _) -> BConst { value = Z.zero; width = 1 }
 
   (* Bare leaf primary literals that escape the named wrappers.
      Some VHDL parses leave `Num` directly as an atomic literal. *)
   | Num s ->
-      (try BConst { value = int_of_string s; width = 32 }
-       with _ -> BConst { value = 0; width = 32 })
-  | Char '0' -> BConst { value = 0; width = 1 }
-  | Char '1' -> BConst { value = 1; width = 1 }
+      (try BConst { value = Z.of_string s; width = 32 }
+       with _ -> BConst { value = Z.zero; width = 32 })
+  | Char '0' -> BConst { value = Z.zero; width = 1 }
+  | Char '1' -> BConst { value = Z.one; width = 1 }
 
   (* Two-operand form (no leading op) seen in some shapes. *)
   | Double (VhdConcatSimpleExpression, List parts) ->
@@ -346,7 +346,7 @@ let rec expr_to_bexpr ctx = function
            Triple (Vhdelement_association, VhdChoiceOthers,
                    Double (VhdCharPrimary, Char c))) ->
       let v = if c = '1' then 1 else 0 in
-      BConst { value = v; width = 1 }
+      BConst { value = Z.of_int v; width = 1 }
 
   (* `(others => expr)` with non-trivial expr — fall back to the
      inner expr; assignment-time resize / replicate behaviour
@@ -377,7 +377,7 @@ let rec expr_to_bexpr ctx = function
        | [] ->
            (* No indexed parts; just the others-branch (or
               fallback to first element). *)
-           (match pairs with [] -> BConst { value = 0; width = 1 }
+           (match pairs with [] -> BConst { value = Z.zero; width = 1 }
                             | (_, e) :: _ -> e)
        | sorted -> BConcat (List.map snd sorted))
 
@@ -426,7 +426,7 @@ let rec expr_to_bexpr ctx = function
 
   (* Attribute name (like clk'event) - ignore for now *)
   | Double (VhdAttributeName, _) ->
-      BConst { value = 1; width = 1 }
+      BConst { value = Z.one; width = 1 }
 
   (* Record-field access `r.field` (and chained `r.s.field`) flattens
      to a synthetic name `r__s__field`.  VHDL records aren't a
@@ -526,13 +526,13 @@ let rec expr_to_bexpr ctx = function
   | Double (VhdTargetDotted, inner) ->
       expr_to_bexpr ctx inner
 
-  | VhdNone -> BConst { value = 0; width = 1 }
+  | VhdNone -> BConst { value = Z.zero; width = 1 }
 
   (* Bare List in expr context: typically an aggregate body or
      element-association list whose outer wrapper was already
      consumed.  Empty list → 0; single → recurse; multiple → concat
      in MSB-first order. *)
-  | List [] -> BConst { value = 0; width = 1 }
+  | List [] -> BConst { value = Z.zero; width = 1 }
   | List [single] -> expr_to_bexpr ctx single
   | List items -> BConcat (List.map (expr_to_bexpr ctx) items)
 
@@ -552,7 +552,7 @@ let rec expr_to_bexpr ctx = function
   (* Catch-all metavalue characters ('X', 'Z', 'U', 'W', '-' etc.)
      — SystemVerilog metavalues for don't-care/unknown.  Synthesis
      treats them as 0. *)
-  | Char _ -> BConst { value = 0; width = 1 }
+  | Char _ -> BConst { value = Z.zero; width = 1 }
 
   | other ->
       let head_name h =
@@ -576,7 +576,7 @@ let rec expr_to_bexpr ctx = function
              with _ -> "leaf?")
       in
       Printf.eprintf "[vhdl2bir] expr unhandled %s\n%!" shape;
-      BConst { value = 0; width = 1 }
+      BConst { value = Z.zero; width = 1 }
 
 (* Whole-record copy-out: if `lhs` is a known record signal/variable
    and `rhs` is another record name (or evaluates to one), expand the
@@ -680,7 +680,7 @@ and stmt_to_bstmt ctx = function
       let update = BAssign { lhs = i;
                              rhs = BBinOp { op = BAdd;
                                             lhs = BVar i;
-                                            rhs = BConst { value = 1; width = 32 };
+                                            rhs = BConst { value = Z.one; width = 32 };
                                             result_type = BInt { width = 32; signed = Unsigned } } } in
       [BFor { init; condition = cond; update; body = body_stmts }]
 
@@ -903,11 +903,11 @@ let rec elide_clock_guard clk = function
   | [BIf { condition; then_stmts; else_stmts = [] }]
     when (match condition with
           | BBinOp { op = BAnd; rhs = BBinOp { op = BEq;
-                       lhs = BVar c; rhs = BConst { value = 1; _ } }; _ }
-            when c = clk -> true
+                       lhs = BVar c; rhs = BConst { value = zv; _ } }; _ }
+            when c = clk && Z.equal zv Z.one -> true
           | BBinOp { op = BAnd; lhs = BBinOp { op = BEq;
-                       lhs = BVar c; rhs = BConst { value = 1; _ } }; _ }
-            when c = clk -> true
+                       lhs = BVar c; rhs = BConst { value = zv; _ } }; _ }
+            when c = clk && Z.equal zv Z.one -> true
           | _ -> false) -> then_stmts
   | x :: tl -> x :: elide_clock_guard clk tl
 
@@ -918,9 +918,9 @@ let is_clock_guard clk = function
   | BCall { func = ("rising_edge"|"falling_edge"); args = [BVar c] } -> c = clk
   | BSelect { array = BVar ("rising_edge"|"falling_edge"); index = BVar c } -> c = clk
   | BBinOp { op = BAnd; rhs = BBinOp { op = BEq;
-               lhs = BVar c; rhs = BConst { value = 1; _ } }; _ } -> c = clk
+               lhs = BVar c; rhs = BConst { value = zv; _ } }; _ } when Z.equal zv Z.one -> c = clk
   | BBinOp { op = BAnd; lhs = BBinOp { op = BEq;
-               lhs = BVar c; rhs = BConst { value = 1; _ } }; _ } -> c = clk
+               lhs = BVar c; rhs = BConst { value = zv; _ } }; _ } when Z.equal zv Z.one -> c = clk
   | _ -> false
 
 let rec elide_clock_guard_outer clk = function
@@ -1093,7 +1093,7 @@ let extract_architecture ctx entity_name = function
           | BInt { width; _ } -> width | _ -> 1 in
         let signal = {
           name; stype; direction = `Internal;
-          initial_value = Some (BConst { value = 0; width = init_w });
+          initial_value = Some (BConst { value = Z.zero; width = init_w });
           attrs = [];
         } in
         add_signal_type ctx name stype;
@@ -1345,7 +1345,7 @@ let extract_architecture ctx entity_name = function
               | other -> other
             in
             let rec build_chain = function
-              | [] -> BAssign { lhs = dst; rhs = BConst { value = 0; width = 1 } }
+              | [] -> BAssign { lhs = dst; rhs = BConst { value = Z.zero; width = 1 } }
               | [Triple (Vhdconditional_waveform, value, _)] ->
                   (* Final unconditional value (the `else` arm). *)
                   BAssign { lhs = dst; rhs = expr_to_bexpr ctx (unwrap_value value) }
@@ -1356,7 +1356,7 @@ let extract_architecture ctx entity_name = function
                                             rhs = expr_to_bexpr ctx (unwrap_value value) }];
                     else_stmts = [build_chain rest];
                   }
-              | _ -> BAssign { lhs = dst; rhs = BConst { value = 0; width = 1 } }
+              | _ -> BAssign { lhs = dst; rhs = BConst { value = Z.zero; width = 1 } }
             in
             let body = [build_chain alts] in
             processes := BCombinational {

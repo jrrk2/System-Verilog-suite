@@ -29,6 +29,10 @@ child_prog = svd.iflift(child_prog)
 child_prog = svd.blocking_subst(child_prog)
 child_prog = svd.meminfer(child_prog)
 child_prog = svd.memlower(child_prog)
+-- Recognise shift-register chains and map them onto SRL16E/SRLC32E instead of
+-- bit-blasting into FF chains (matches Vivado's SRL inference; big FF savings in
+-- PCS/PMA wait-counters and any distributed-RAM-free delay lines).
+child_prog = svd.srl_infer(child_prog)
 -- FPGA arch choice: lift attributed adder/mul subcells to abstract BAdd/BMul so
 -- gate_map lowers them onto CARRY4/DSP (the one FPGA choice).  Set
 -- ARCH_SUBST_FPGA=1 in the environment to make the lift cert-free.

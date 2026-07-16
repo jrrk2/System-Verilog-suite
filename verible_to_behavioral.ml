@@ -687,19 +687,19 @@ let param_value_to_bexpr id v =
            | 'o' | 'O' -> parse_radix "o" digits
            | _ -> None in
          (match n with
-          | Some n -> BConst { value = n; width = w }
+          | Some n -> BConst { value = Z.of_int n; width = w }
           | None -> BVar id)
      | Some 0 ->
          (* `'1` / `'0` — width inferred elsewhere; use 32 as default *)
          (try
            let bit = String.sub v 1 (String.length v - 1) in
-           if bit = "1" then BConst { value = -1; width = 32 }
-           else if bit = "0" then BConst { value = 0; width = 32 }
+           if bit = "1" then BConst { value = Z.minus_one; width = 32 }
+           else if bit = "0" then BConst { value = Z.zero; width = 32 }
            else BVar id
           with _ -> BVar id)
      | _ ->
          (match parse_dec v with
-          | Some n -> BConst { value = n; width = 32 }
+          | Some n -> BConst { value = Z.of_int n; width = 32 }
           | None -> BVar id))
 
 (* Best-effort expr → bexpr translator. Walks one level at a time,
@@ -727,7 +727,7 @@ let silent_zero ~reason ~width =
   if Lazy.force lenient_mode then begin
     if Lazy.force debug_expr then
       Printf.eprintf "[verible_to_bir] silent zero: %s\n" reason;
-    BConst { value = 0; width }
+    BConst { value = Z.zero; width }
   end else
     raise (Silent_zero_substitution reason)
 
@@ -876,22 +876,15 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        op that doesn't actually depend on the high bits.  Math against
        the high bits is the rare case; if it comes up we'd need an
        arbitrary-precision BConst, which is a separate refactor.    *)
-    let max_digits = match prefix with
-      | "0b" -> 60       (* 60 bits = safe under 63-bit OCaml int  *)
-      | "0o" -> 20       (* 20 * 3 = 60 bits                       *)
-      | "0x" -> 15       (* 15 * 4 = 60 bits                       *)
-      | _    -> 18       (* decimal: 10^18 < 2^63                  *)
-    in
-    let digits_trimmed =
-      let n = String.length digits_clean in
-      if n > max_digits then String.sub digits_clean (n - max_digits) max_digits
-      else digits_clean in
+    (* Exact arbitrary-precision parse: BConst.value is Z.t, so wide literals
+       (64'hFFFF..., 128'h...) are preserved verbatim -- no truncation.  prefix
+       is the base char ("b"/"o"/"x"/"" for dec); Z.of_string wants "0x"/etc. *)
     let value =
-      try int_of_string ("0" ^ prefix ^ digits_trimmed)
+      try Z.of_string ("0" ^ prefix ^ digits_clean)
       with _ ->
-        if Lazy.force lenient_mode then 0
+        if Lazy.force lenient_mode then Z.zero
         else raise (Silent_zero_substitution
-          (Printf.sprintf "sized literal int_of_string %S%S failed" prefix digits))
+          (Printf.sprintf "sized literal Z.of_string %S%S failed" prefix digits))
     in
     BConst { value; width }
   in
@@ -910,12 +903,12 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        * `'1` becomes `64'hFFFFFFFFFFFFFFFF` on a 64-bit LHS rather
        * than the silently-truncated `32'hFFFFFFFF`. *)
       let n2 = String.trim n in
-      if n2 = "'1" then BConst { value = -1; width = 0 }
-      else if n2 = "'0" then BConst { value = 0; width = 0 }
+      if n2 = "'1" then BConst { value = Z.minus_one; width = 0 }
+      else if n2 = "'0" then BConst { value = Z.zero; width = 0 }
       else if n2 = "'x" || n2 = "'z" || n2 = "'X" || n2 = "'Z" then
-        BConst { value = 0; width = 0 }
+        BConst { value = Z.zero; width = 0 }
       else
-        (try BConst { value = int_of_string n; width = 32 }
+        (try BConst { value = Z.of_string n; width = 32 }
          with _ ->
            silent_zero ~width:32
              ~reason:(Printf.sprintf "TK_DecNumber int_of_string %S failed" n))
@@ -929,8 +922,8 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        * width to 8·len.  Most occurrences are `$error`/`$display`
        * arguments (irrelevant to synthesis) or string-parameter
        * comparisons like `WRITE_MODE_A == "WRITE_FIRST"`. *)
-      let v = ref 0 in
-      String.iter (fun c -> v := (!v lsl 8) lor (Char.code c land 0xff)) s;
+      let v = ref Z.zero in
+      String.iter (fun c -> v := Z.logor (Z.shift_left !v 8) (Z.of_int (Char.code c land 0xff))) s;
       BConst { value = !v; width = 8 * String.length s }
   | TUPLE3 (STRING tag, base, digits) when prefix_is "bin_based_number" tag ->
       parse_sized "b" base digits
@@ -979,7 +972,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       let elems = flatten_explist [] body in
       let exprs = List.map recurse elems in
       (match exprs with
-       | [] -> BConst { value = 0; width = 1 }  (* `'{}` — empty *)
+       | [] -> BConst { value = Z.zero; width = 1 }  (* `'{}` — empty *)
        | [single] -> single
        | _ -> BConcat exprs)
   (* Struct assignment pattern `'{f1: x, f2: y}`. The Verible parse
@@ -1056,7 +1049,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                    with Not_found ->
                      (match !default_value with
                       | Some v -> v
-                      | None -> BConst { value = 0; width = 1 })
+                      | None -> BConst { value = Z.zero; width = 1 })
                  ) fields
                in
                (match in_order with
@@ -1068,7 +1061,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                 | [] ->
                     (match !default_value with
                      | Some v -> v
-                     | None -> BConst { value = 0; width = 1 })
+                     | None -> BConst { value = Z.zero; width = 1 })
                 | [single] -> single
                 | _ -> BConcat exprs)))
   (* Replication `{N{value}}` — Verible parses as `expr_primary_braces2`:
@@ -1153,8 +1146,8 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
              inner_b
        | _ ->
            (match eval_int ~pkgs ~params tok with
-            | Some n -> BConst { value = n; width = 32 }
-            | None -> BConst { value = 0; width = 1 }))
+            | Some n -> BConst { value = Z.of_int n; width = 32 }
+            | None -> BConst { value = Z.zero; width = 1 }))
   (* Function-like call: `reference_or_call_base1`. The lexer treats
    * `$unsigned`/`$signed` as ordinary SymbolIdentifier (not
    * SystemTFIdentifier), so they parse through this shape too — both
@@ -1203,7 +1196,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
            (* Other $foo() — fall back to evaluating the integer
             * literal (works for $clog2 et al). *)
            (match eval_int ~pkgs ~params tok with
-            | Some n -> BConst { value = n; width = 32 }
+            | Some n -> BConst { value = Z.of_int n; width = 32 }
             | None ->
                 let inner_shape =
                   try shape_of_tok call_base
@@ -1334,7 +1327,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
            (match eval_int ~pkgs ~params idx with
             | Some i ->
                 (try List.nth elems i
-                 with _ -> BConst { value = 0; width = 1 })
+                 with _ -> BConst { value = Z.zero; width = 1 })
             | None ->
                 let n = List.length elems in
                 (* Balanced BCond mux: (idx == 0) ? e0 : (idx == 1) ? e1 : … *)
@@ -1344,7 +1337,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                     condition = BBinOp {
                       op = BEq;
                       lhs = idx_e;
-                      rhs = BConst { value = i; width = 32 };
+                      rhs = BConst { value = Z.of_int i; width = 32 };
                       result_type = BInt { width = 1; signed = Unsigned } };
                     then_val = List.nth elems i;
                     else_val = build (i + 1) }
@@ -1391,8 +1384,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                        op = BShr; lhs = signal; rhs = base;
                        result_type = result_t } in
                      let mask = BConst {
-                       value = (if w >= 63 then -1
-                                else (1 lsl w) - 1);
+                       value = Z.sub (Z.shift_left Z.one w) Z.one;
                        width = w } in
                      BBinOp { op = BAnd; lhs = shifted; rhs = mask;
                               result_type = result_t }
@@ -1411,14 +1403,13 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                      let base_lsb = BBinOp {
                        op = BSub;
                        lhs = base;
-                       rhs = BConst { value = w - 1; width = 32 };
+                       rhs = BConst { value = Z.of_int (w - 1); width = 32 };
                        result_type = BInt { width = 32; signed = Unsigned } } in
                      let shifted = BBinOp {
                        op = BShr; lhs = signal; rhs = base_lsb;
                        result_type = result_t } in
                      let mask = BConst {
-                       value = (if w >= 63 then -1
-                                else (1 lsl w) - 1);
+                       value = Z.sub (Z.shift_left Z.one w) Z.one;
                        width = w } in
                      BBinOp { op = BAnd; lhs = shifted; rhs = mask;
                               result_type = result_t }
@@ -1480,7 +1471,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                         else idx_e
                     | _ -> idx_e
                   in
-                  let one_bit = BConst { value = 1; width = 1 } in
+                  let one_bit = BConst { value = Z.one; width = 1 } in
                   let res_t = BInt { width = 1; signed = Unsigned } in
                   let shifted = BBinOp {
                     op = BShr;
@@ -1536,7 +1527,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        | Some n ->
            (* Width: at minimum cover the value. 32-bit by default
             * matches what SV unsized-int literals get. *)
-           BConst { value = n; width = 32 }
+           BConst { value = Z.of_int n; width = 32 }
        | None ->
            (* No fold — best-effort: encode as repeated mul if rhs
             * is small. For the unsupported general case, fall back
@@ -1627,7 +1618,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       else if prefix_is "qualified_id" tag then
         (match eval_int ~pkgs ~params
                  (TUPLE4 (STRING tag, lhs, _op, rhs)) with
-         | Some n -> BConst { value = n; width = 32 }
+         | Some n -> BConst { value = Z.of_int n; width = 32 }
          | None -> recurse rhs)
       (* `expression_list_proper`: left-recursive cons of a
        * comma-separated list.  Reaching this node in expression
@@ -1647,7 +1638,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         let raw = flatten [rhs] lhs in
         let exprs = List.map recurse raw in
         match exprs with
-        | [] -> BConst { value = 0; width = 1 }
+        | [] -> BConst { value = Z.zero; width = 1 }
         | [single] -> single
         | xs -> BConcat xs
       end
@@ -1699,7 +1690,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         | other -> [recurse other]
       in
       (match exprs with
-       | [] -> BConst { value = 0; width = 1 }
+       | [] -> BConst { value = Z.zero; width = 1 }
        | [single] -> single
        | xs -> BConcat xs)
   (* `x inside { a, b, c, [lo:hi], ... }` set-membership.
@@ -1744,7 +1735,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         | other -> [arm other]
       in
       (match elems with
-       | [] -> BConst { value = 0; width = 1 }
+       | [] -> BConst { value = Z.zero; width = 1 }
        | first :: rest ->
            List.fold_left (fun acc e ->
              BBinOp { op = BOr; lhs = acc; rhs = e;
@@ -2081,11 +2072,11 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
            | `Range (m_n, l_n) ->
                (match recurse_e m_n, recurse_e l_n with
                 | BConst { value = m; _ }, BConst { value = l; _ } ->
-                    abs (m - l) + 1
+                    abs (Z.to_int m - Z.to_int l) + 1
                 | _ -> 1)
            | `IndexedUp (_, w_n) | `IndexedDown (_, w_n) ->
                (match recurse_e w_n with
-                | BConst { value = w; _ } when w >= 1 -> w
+                | BConst { value = w; _ } when Z.geq w Z.one -> Z.to_int w
                 | _ -> 1)
            | `None ->
                (match List.assoc_opt nm !cur_signal_widths with
@@ -2380,7 +2371,7 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
              rhs = BBinOp {
                op = if delta < 0 then BSub else BAdd;
                lhs = BVar name;
-               rhs = BConst { value = abs delta; width = 32 };
+               rhs = BConst { value = Z.of_int (abs delta); width = 32 };
                result_type = BInt { width = 32; signed = Unsigned };
              }
            } in
@@ -2492,16 +2483,16 @@ let extract_always ~pkgs ~params ~arrays tok =
                | BUnOp { op = BNot; operand = BVar n; _ } when mem n ->
                    `Reset (n, `Neg)
                | BBinOp { op = BEq; lhs = BVar n;
-                          rhs = BConst { value = 0; _ }; _ } when mem n ->
+                          rhs = BConst { value = zv; _ }; _ } when mem n && Z.equal zv Z.zero ->
                    `Reset (n, `Neg)
                | BBinOp { op = BEq; lhs = BVar n;
-                          rhs = BConst { value = 1; _ }; _ } when mem n ->
+                          rhs = BConst { value = zv; _ }; _ } when mem n && Z.equal zv Z.one ->
                    `Reset (n, `Pos)
                | BBinOp { op = BNe; lhs = BVar n;
-                          rhs = BConst { value = 0; _ }; _ } when mem n ->
+                          rhs = BConst { value = zv; _ }; _ } when mem n && Z.equal zv Z.zero ->
                    `Reset (n, `Pos)
                | BBinOp { op = BNe; lhs = BVar n;
-                          rhs = BConst { value = 1; _ }; _ } when mem n ->
+                          rhs = BConst { value = zv; _ }; _ } when mem n && Z.equal zv Z.one ->
                    `Reset (n, `Neg)
                | _ -> `NoReset)
         in
@@ -2964,7 +2955,7 @@ let extract_body_params ~pkgs ~params tok =
           | None ->
               (try
                  match expr_to_bexpr ~pkgs ~params:acc ~arrays:[] v with
-                 | BConst { value; _ } -> Some (string_of_int value)
+                 | BConst { value; _ } -> Some (Z.to_string value)
                  | BConcat elems ->
                      (* Array-typed localparam (`'{e1, …, eN}` initialiser).
                         Register the elements so LUT[i] lookups in the
@@ -3034,7 +3025,7 @@ let extract_body_params ~pkgs ~params tok =
         | None ->
             (try
                match expr_to_bexpr ~pkgs ~params:acc ~arrays:[] v with
-               | BConst { value; _ } -> Some (string_of_int value)
+               | BConst { value; _ } -> Some (Z.to_string value)
                | BConcat elems ->
                    Hashtbl.replace cur_array_params id elems;
                    None
@@ -3727,7 +3718,7 @@ let convert_module ~pkgs (mdecl : module_decl)
                             behavioral_to_hardcaml so reads via BSelect
                             land on the same slot the file declared. *)
                          let parts = List.rev_map (fun v ->
-                           BConst { value = v; width = elem_w }) words in
+                           BConst { value = Z.of_int v; width = elem_w }) words in
                          Some (BCombinational {
                            name = "mem_init_" ^ tgt;
                            sensitivity = [BAny];
@@ -3764,23 +3755,23 @@ let convert_module ~pkgs (mdecl : module_decl)
       | BBinOp { op = BAdd;
                  lhs = BConst { value = a; width = w };
                  rhs = BConst { value = b; _ }; _ } ->
-          BConst { value = a + b; width = w }
+          BConst { value = Z.add a b; width = w }
       | BBinOp { op = BSub;
                  lhs = BConst { value = a; width = w };
                  rhs = BConst { value = b; _ }; _ } ->
-          BConst { value = a - b; width = w }
+          BConst { value = Z.sub a b; width = w }
       | BBinOp { op = BMul;
                  lhs = BConst { value = a; width = w };
                  rhs = BConst { value = b; _ }; _ } ->
-          BConst { value = a * b; width = w }
+          BConst { value = Z.mul a b; width = w }
       | BBinOp r ->
           let lhs' = fold r.lhs and rhs' = fold r.rhs in
           (match lhs', rhs' with
            | BConst { value = a; width = w }, BConst { value = b; _ } ->
                (match r.op with
-                | BAdd -> BConst { value = a + b; width = w }
-                | BSub -> BConst { value = a - b; width = w }
-                | BMul -> BConst { value = a * b; width = w }
+                | BAdd -> BConst { value = Z.add a b; width = w }
+                | BSub -> BConst { value = Z.sub a b; width = w }
+                | BMul -> BConst { value = Z.mul a b; width = w }
                 | _ -> BBinOp { r with lhs = lhs'; rhs = rhs' })
            | _ -> BBinOp { r with lhs = lhs'; rhs = rhs' })
       | e -> e
@@ -3795,7 +3786,7 @@ let convert_module ~pkgs (mdecl : module_decl)
            | BConst { value = idx; _ } ->
                let bucket =
                  try Hashtbl.find mem_writes arr with Not_found -> [] in
-               Hashtbl.replace mem_writes arr ((idx, data) :: bucket);
+               Hashtbl.replace mem_writes arr ((Z.to_int idx, data) :: bucket);
                None
            | _ -> Some p)
       | _ -> Some p
@@ -3840,10 +3831,10 @@ let convert_module ~pkgs (mdecl : module_decl)
          instead, which is the synthesizable default for an undriven
          output wire and unblocks Hardcaml's Always.compile.            *)
       let filler_at _k =
-        if is_scalar then BConst { value = 0; width = elem_w }
+        if is_scalar then BConst { value = Z.zero; width = elem_w }
         else BSelect {
           array = BVar arr;
-          index = BConst { value = _k; width = 32 };
+          index = BConst { value = Z.of_int _k; width = 32 };
         }
       in
       let parts = ref [] in
@@ -3921,7 +3912,7 @@ let convert_module ~pkgs (mdecl : module_decl)
                   | Some { stype = BArray { size; element = BInt { width=_; _ } }; _ } ->
                       let pairs = Hashtbl.find writes arr in
                       let parts = List.init size (fun k ->
-                        let k_const = BConst { value = k; width = 32 } in
+                        let k_const = BConst { value = Z.of_int k; width = 32 } in
                         let init = BSelect { array = BVar arr;
                                              index = k_const } in
                         List.fold_left (fun acc (idx, data) ->
@@ -4004,7 +3995,7 @@ let convert_module ~pkgs (mdecl : module_decl)
           let slices : (string, (int * int * bexpr) list) Hashtbl.t =
             Hashtbl.create 4 in
           let const_of = function
-            | BConst { value; _ } -> Some value
+            | BConst { value; _ } -> Some (Z.to_int value)
             | _ -> None in
           List.iter (fun stmt ->
             match stmt with
@@ -4079,7 +4070,7 @@ let convert_module ~pkgs (mdecl : module_decl)
             | BCallStmt { func = "@part_sel_write_up";
                           args = [BVar lhs; base; width; data] } ->
                 let const_of = function
-                  | BConst { value; _ } -> Some value
+                  | BConst { value; _ } -> Some (Z.to_int value)
                   | _ -> None in
                 (match const_of width with
                  | Some w when w > 0 ->
@@ -4092,7 +4083,7 @@ let convert_module ~pkgs (mdecl : module_decl)
                      else
                        let n = total_w / w in
                        let parts = List.init n (fun k ->
-                         let k_const = BConst { value = k * w; width = 32 } in
+                         let k_const = BConst { value = Z.of_int (k * w); width = 32 } in
                          let cur_slot = BSlice {
                            signal = BVar lhs;
                            msb = (k + 1) * w - 1;

@@ -184,7 +184,7 @@ let rec expr_to_signal ctx = function
   | BConst { value; width } ->
       (* clamp to >=1: a 0-width constant (degenerate slice / empty
          literal in flattened picorv32) would crash hardcaml's of_int. *)
-      Signal.of_int ~width:(max 1 width) value
+      Signal.of_int ~width:(max 1 width) (Z.to_int value)
 
   | BBinOp { op; lhs; rhs; result_type } ->
       let s_lhs0 = expr_to_signal ctx lhs in
@@ -277,15 +277,15 @@ let rec expr_to_signal ctx = function
              | _ -> false in
            (match rhs, is_unsigned with
             | BConst { value = c; _ }, true ->
-                (match pow2_log2 c with
+                (match pow2_log2 (Z.to_int c) with
                  | Some k when op = BDiv -> Signal.srl s_lhs k
                  | Some k (* op = BMod *) ->
                      let mask = (1 lsl k) - 1 in
                      Signal.(s_lhs &: of_int ~width:common_w mask)
                  | None ->
                      failwith (Printf.sprintf
-                       "behavioral_to_hardcaml: unsupported %s by non-pow2 constant %d"
-                       (if op = BDiv then "/" else "%") c))
+                       "behavioral_to_hardcaml: unsupported %s by non-pow2 constant %s"
+                       (if op = BDiv then "/" else "%") (Z.to_string c)))
             | _ ->
                 failwith (Printf.sprintf
                   "behavioral_to_hardcaml: unsupported %s — divisor not a positive power-of-two constant (or operation is signed)"
@@ -404,8 +404,8 @@ let rec expr_to_signal ctx = function
               mask so the result width matches SV `pc[idx]` semantics. *)
            let w_arr = Signal.width s_array in
            (match index with
-            | BConst { value; _ } when value >= 0 && value < w_arr ->
-                Signal.select s_array value value
+            | BConst { value; _ } when Z.geq value Z.zero && Z.lt value (Z.of_int w_arr) ->
+                Signal.select s_array (Z.to_int value) (Z.to_int value)
             | _ ->
                 let shifted = log_shift_clamped Signal.srl s_array s_index in
                 Signal.select shifted 0 0)
@@ -555,7 +555,7 @@ let rec stmt_to_always ~is_reg ctx alw = function
          linear priority chain (exact Verilog semantics). *)
       let key_const (value, _) = match value with
         | BConst { value = v; _ } ->
-            if sel_w >= 62 then Some v else Some (v land ((1 lsl sel_w) - 1))
+            if sel_w >= 62 then Some v else Some (Z.logand v (Z.of_int ((1 lsl sel_w) - 1)))
         | _ -> None in
       let keys = List.map key_const cases in
       (* Opt-in (BALANCED_CASE=1): default keeps the exact-Verilog priority
@@ -650,7 +650,8 @@ let rec stmt_to_always ~is_reg ctx alw = function
          the gap. *)
       (match args with
        | [BVar lhs; base_e; BConst { value = w; _ }; data_e]
-         when w > 0 ->
+         when Z.gt w Z.zero ->
+           let w = Z.to_int w in
            let var = get_or_create_var ctx lhs 1 is_reg in
            let total_w = Signal.width (Always.Variable.value var) in
            if total_w = 0 || total_w mod w <> 0 then alw
@@ -919,7 +920,7 @@ let merge_slice_writes ctx body =
         (match const_of m, const_of l with
          | Some msb, Some lsb ->
              let prev = try Hashtbl.find groups arr with Not_found -> [] in
-             Hashtbl.replace groups arr ((msb, lsb, data) :: prev)
+             Hashtbl.replace groups arr ((Z.to_int msb, Z.to_int lsb, data) :: prev)
          | _ -> rest := stmt :: !rest)
     | other -> rest := other :: !rest
   ) body;
@@ -1035,7 +1036,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
     | Some (BConst { value; width }) ->
-        Hashtbl.replace ctx.initial_values s.name (width, value)
+        Hashtbl.replace ctx.initial_values s.name (width, Z.to_int value)
     | _ -> ()) bmod.signals;
   (* Clock/reset get bound by [process_to_always] when each
      BSequential block tells us its clock and reset signal names
@@ -1086,7 +1087,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
     | Some (BConst { value; width }) ->
-        Hashtbl.replace ctx.initial_values s.name (width, value)
+        Hashtbl.replace ctx.initial_values s.name (width, Z.to_int value)
     | _ -> ()) bmod.signals;
 
   (* Pre-pass: classify each non-input signal and pre-declare an

@@ -432,7 +432,18 @@ let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmo
         let p' = { p with modules =
           List.map (fun (mm : bmodule) -> if mm.name = m'.name then m' else mm)
             p.modules } in
-        Behavioral_hier.flatten_for_z3 p' ~top:m'.name
+        let flat = Behavioral_hier.flatten_for_z3 p' ~top:m'.name in
+        (* The pre-flatten cut only saw TOP-LEVEL black boxes.  Deep stateful /
+           analogue primitives (GTXE2/MMCME2/RAM64M/SRL…, buried inside user
+           submodules) surface as top-level instances only after flattening.
+           Discard flatten's unresolved report, cut those now-top-level boxes,
+           and re-record only whatever genuinely can't be cut. *)
+        let _ = Behavioral_hier.take_unresolved () in
+        let flat' = cut_blackboxes ~trusted flat p in
+        List.iter (fun (i : Behavioral_ir.binstance) ->
+            Behavioral_hier.unresolved_register ~parent_name:flat'.name i)
+          flat'.instances;
+        flat'
 
 (* One module's cross-design verdict, with [trusted] submodules black-boxed
  * (not flattened) on both sides. *)
@@ -606,6 +617,10 @@ let lblocking_subst prog_h =
 let lmeminfer prog_h =
   let label, p = find_prog prog_h in
   hadd (Prog (label, Behavioral_meminfer.infer_program p))
+
+let lsrl_infer prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_srl_infer.infer_program p))
 
 let lmemlower prog_h =
   let label, p = find_prog prog_h in
@@ -1341,6 +1356,7 @@ module MakeLib
         "unroll",         V.efunc (V.string **->> V.string) (wrap1 lunroll);
         "inline",         V.efunc (V.string **->> V.string) (wrap1 linline);
         "iflift",         V.efunc (V.string **->> V.string) (wrap1 liflift);
+        "srl_infer",      V.efunc (V.string **->> V.string) (wrap1 lsrl_infer);
         "blocking_subst", V.efunc (V.string **->> V.string)
                            (wrap1 lblocking_subst);
         "meminfer",       V.efunc (V.string **->> V.string) (wrap1 lmeminfer);

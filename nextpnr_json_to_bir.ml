@@ -104,19 +104,19 @@ let read_netlist (path : string)
   let const_nets = Sys.getenv_opt "SVS_CONST_NETS" <> None in
   if const_nets then (bump "svs_vcc" 1; bump "svs_gnd" 1);
   let ref_of_bit = function
-    | `String "1" -> if const_nets then BVar "svs_vcc" else BConst { value = 1; width = 1 }
-    | `String "0" -> if const_nets then BVar "svs_gnd" else BConst { value = 0; width = 1 }
+    | `String "1" -> if const_nets then BVar "svs_vcc" else BConst { value = Z.one; width = 1 }
+    | `String "0" -> if const_nets then BVar "svs_gnd" else BConst { value = Z.zero; width = 1 }
     | `Int id ->
-        if Hashtbl.mem vcc id then (if const_nets then BVar "svs_vcc" else BConst { value = 1; width = 1 })
-        else if Hashtbl.mem gnd id then (if const_nets then BVar "svs_gnd" else BConst { value = 0; width = 1 })
+        if Hashtbl.mem vcc id then (if const_nets then BVar "svs_vcc" else BConst { value = Z.one; width = 1 })
+        else if Hashtbl.mem gnd id then (if const_nets then BVar "svs_gnd" else BConst { value = Z.zero; width = 1 })
         else (match Hashtbl.find_opt id2ref id with
               | Some (nm, idx) ->
-                  BSelect { array = BVar nm; index = BConst { value = idx; width = 32 } }
+                  BSelect { array = BVar nm; index = BConst { value = Z.of_int idx; width = 32 } }
               | None ->
                   let nm = Printf.sprintf "unnamed_%d" id in
                   bump nm 1;
-                  BSelect { array = BVar nm; index = BConst { value = 0; width = 32 } })
-    | _ -> BConst { value = 0; width = 1 } in
+                  BSelect { array = BVar nm; index = BConst { value = Z.zero; width = 32 } })
+    | _ -> BConst { value = Z.zero; width = 1 } in
 
   (* build one binstance per (non-skipped) cell *)
   let instances = List.filter_map (fun (inst, cj) ->
@@ -139,7 +139,7 @@ let read_netlist (path : string)
                clkdiv2 divider FF (CE tied low => no toggle => dead cpu_clk). *)
             let r = match U.to_list bj with
               | b :: _ -> ref_of_bit b
-              | [] -> BConst { value = (if opin = "CE" then 1 else 0); width = 1 } in
+              | [] -> BConst { value = (if opin = "CE" then Z.one else Z.zero); width = 1 } in
             let base, idx = split_pin opin in
             (match idx with
              | None -> Hashtbl.replace scalar base r

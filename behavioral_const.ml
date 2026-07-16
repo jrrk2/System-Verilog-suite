@@ -115,14 +115,14 @@ let eval_unop op v =
 
 (* Convert constant value to expression *)
 let const_to_expr = function
-  | CInt (value, width) -> BConst { value; width }
-  | CBool true -> BConst { value = 1; width = 1 }
-  | CBool false -> BConst { value = 0; width = 1 }
+  | CInt (value, width) -> BConst { value = Z.of_int value; width }
+  | CBool true -> BConst { value = Z.one; width = 1 }
+  | CBool false -> BConst { value = Z.zero; width = 1 }
   | CUnknown -> failwith "Cannot convert unknown to expression"
 
 (* Convert expression to constant value *)
 let expr_to_const ctx = function
-  | BConst { value; width } -> CInt (value, width)
+  | BConst { value; width } -> CInt (Z.to_int value, width)
   | BVar var ->
       (try Hashtbl.find ctx.constants var with Not_found -> CUnknown)
   | _ -> CUnknown
@@ -453,7 +453,7 @@ let module_constants bmod =
   ) pairs;
   Hashtbl.fold (fun name rhss acc ->
     let const_of = function
-      | BConst { value; width } -> Some (CInt (value, width))
+      | BConst { value; width } -> Some (CInt (Z.to_int value, width))
       | _ -> None
     in
     let consts = List.map const_of rhss in
@@ -730,7 +730,7 @@ let normalize_one_arg sig_widths arg formal_w =
             (strip_signed_anywhere inner)
       | Some actual_w ->
           (* actual_w < formal_w: zero-extend (unsigned actuals). *)
-          let pad = BConst { value = 0; width = formal_w - actual_w } in
+          let pad = BConst { value = Z.zero; width = formal_w - actual_w } in
           BConcat [pad; strip_signed_anywhere inner]
 
 let normalize_call_args sig_widths formals args =

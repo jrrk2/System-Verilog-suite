@@ -68,7 +68,7 @@ let rec sigspec_to_bexpr = function
             (int_of_string s, 32)
         with _ -> (0, 1)
       in
-      BConst { value; width }
+      BConst { value = Z.of_int value; width }
   | SigConcat xs -> BConcat (List.map sigspec_to_bexpr xs)
 
 (* Lookup helper: given a cell, find the connection on a named pin. *)
@@ -128,8 +128,8 @@ let assign_or_slice_write name slice rhs =
       BCallStmt {
         func = "@slice_write";
         args = [BVar name;
-                BConst { value = hi; width = 32 };
-                BConst { value = lo; width = 32 };
+                BConst { value = Z.of_int hi; width = 32 };
+                BConst { value = Z.of_int lo; width = 32 };
                 rhs] }
 
 let bool_t = BInt { width = 1; signed = Unsigned }
@@ -282,7 +282,7 @@ let cell_to_bprocess (c : rtlil_cell) =
            let rst_val = try
              let v = List.assoc "SRST_VALUE" c.cell_params in
              sigspec_to_bexpr (SigConst v)
-           with Not_found -> BConst { value = 0; width = yw }
+           with Not_found -> BConst { value = Z.zero; width = yw }
            in
            let rst_pol =
              try int_of_string (List.assoc "SRST_POLARITY" c.cell_params)
@@ -341,7 +341,7 @@ let cell_to_bprocess (c : rtlil_cell) =
              let v = List.assoc "ARST_VALUE" c.cell_params in
              let pv = sigspec_to_bexpr (SigConst v) in
              pv
-           with Not_found -> BConst { value = 0; width = yw }
+           with Not_found -> BConst { value = Z.zero; width = yw }
            in
            let rst_pol =
              try int_of_string (List.assoc "ARST_POLARITY" c.cell_params)
@@ -424,7 +424,7 @@ let cell_to_bprocess (c : rtlil_cell) =
            let rst_val = try
              let v = List.assoc "ARST_VALUE" c.cell_params in
              sigspec_to_bexpr (SigConst v)
-           with Not_found -> BConst { value = 0; width = yw }
+           with Not_found -> BConst { value = Z.zero; width = yw }
            in
            let rst_pol =
              try int_of_string (List.assoc "ARST_POLARITY" c.cell_params)
@@ -573,7 +573,7 @@ and collect_one chain acc = function
                         BConst { value = hi; _ };
                         BConst { value = lo; _ };
                         rhs] } ->
-      { cond_chain = List.rev chain; target = t; hi; lo; rhs } :: acc
+      { cond_chain = List.rev chain; target = t; hi = Z.to_int hi; lo = Z.to_int lo; rhs } :: acc
   | BBlock ss -> collect_slices chain acc ss
   | BIf { condition; then_stmts; else_stmts } ->
       let acc = collect_slices ((condition, true) :: chain) acc then_stmts in

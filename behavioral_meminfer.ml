@@ -50,7 +50,7 @@ open Behavioral_ir
 (* ─── Helpers ─────────────────────────────────────────────────────────── *)
 
 let is_const_int = function BConst _ -> true | _ -> false
-let const_value = function BConst { value; _ } -> value | _ -> 0
+let const_value = function BConst { value; _ } -> Z.to_int value | _ -> 0
 let const_width = function BConst { width; _ } -> width | _ -> 32
 
 (* Walk all expressions in a statement tree and collect names of
@@ -191,10 +191,10 @@ let try_extract_const_rom selector cases default =
  *    sel == k0 ? v0 : (sel == k1 ? v1 : ... default)  *)
 let build_rom_lookup selector pairs default =
   let default_expr = match default with
-    | Some (v, w) -> BConst { value = v; width = w }
+    | Some (v, w) -> BConst { value = Z.of_int v; width = w }
     | None ->
         (* No default — fall through to 0 *)
-        BConst { value = 0;
+        BConst { value = Z.zero;
                  width = (match pairs with
                           | (_, _, w) :: _ -> w
                           | _ -> 1) }
@@ -203,9 +203,9 @@ let build_rom_lookup selector pairs default =
     BCond {
       condition = BBinOp { op = BEq;
                            lhs = selector;
-                           rhs = BConst { value = k; width = w };
+                           rhs = BConst { value = Z.of_int k; width = w };
                            result_type = BBool };
-      then_val = BConst { value = v; width = w };
+      then_val = BConst { value = Z.of_int v; width = w };
       else_val = acc;
     }
   ) pairs default_expr

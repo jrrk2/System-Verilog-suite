@@ -36,7 +36,7 @@ let parse_signal_name (name : string) : string * int option =
 let net_to_expr (net_name : string) : bexpr =
   let (base, idx_opt) = parse_signal_name net_name in
   match idx_opt with
-  | Some idx -> BSelect { array = BVar base; index = BConst { value = idx; width = 32 } }
+  | Some idx -> BSelect { array = BVar base; index = BConst { value = Z.of_int idx; width = 32 } }
   | None     -> BVar base
 
 let btype_for_width w = BInt { width = w; signed = Unsigned }
@@ -516,7 +516,7 @@ let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
     match Hashtbl.find_opt port_alias nm with
     | Some (pnm, bit) ->
       BSelect { array = BVar pnm;
-                index = BConst { value = bit; width = 32 } }
+                index = BConst { value = Z.of_int bit; width = 32 } }
     | None -> net_to_expr nm
   in
   let instances = List.map (fun (i : inst_t) ->

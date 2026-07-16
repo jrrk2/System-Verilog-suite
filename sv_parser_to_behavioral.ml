@@ -528,7 +528,7 @@ let rec parse_number_node node =
  * 1-bit zero placeholder for shapes we don't model yet so the
  * surrounding expression still has a tree. *)
 let rec expr_to_bexpr ~params node =
-  let zero = BConst { value = 0; width = 1 } in
+  let zero = BConst { value = Z.zero; width = 1 } in
   let recurse = expr_to_bexpr ~params in
   match node with
   | Leaf _ -> zero
@@ -603,7 +603,7 @@ let rec expr_to_bexpr ~params node =
           (match children with
            | [Node { name = "Number"; _ } as n] ->
                (match parse_number_node n with
-                | Some (v, w) -> BConst { value = v; width = w }
+                | Some (v, w) -> BConst { value = Z.of_int v; width = w }
                 | None -> zero)
            | [Node { name = "StringLiteral"; _ }] ->
                (* String literals don't have a meaningful bit value
@@ -612,7 +612,7 @@ let rec expr_to_bexpr ~params node =
            | _ -> zero)
       | "Number" ->
           (match parse_number_node node with
-           | Some (v, w) -> BConst { value = v; width = w }
+           | Some (v, w) -> BConst { value = Z.of_int v; width = w }
            | None -> zero)
       | "PrimaryMintypmaxExpression" ->
           (* `( <expr> )`.  The inner Expression is in the
@@ -645,10 +645,10 @@ let rec expr_to_bexpr ~params node =
                     member resolves to a sized constant matching the
                     enum-typed signal). *)
                  match Hashtbl.find_opt enum_member_tbl n with
-                 | Some (ord, width) -> BConst { value = ord; width }
+                 | Some (ord, width) -> BConst { value = Z.of_int ord; width }
                  | None ->
                      (match List.assoc_opt n params with
-                      | Some v -> BConst { value = v; width = 32 }
+                      | Some v -> BConst { value = Z.of_int v; width = 32 }
                       | None -> BVar n)
                in
                (match select_node with
@@ -740,7 +740,7 @@ and apply_select ~params base sel =
                  (match eval_const_expr ~params i with
                   | Some k -> BSlice { signal = current; msb = k; lsb = k }
                   | None ->
-                      let one = BConst { value = 1; width = 1 } in
+                      let one = BConst { value = Z.one; width = 1 } in
                       let res_t = BInt { width = 1; signed = Unsigned } in
                       let shifted = BBinOp {
                         op = BShr;
@@ -996,7 +996,7 @@ let rec stmt_to_bstmt ~params node =
               ~name_is:(fun n -> n = "Expression") in
             match inner with
             | Some e -> rebalance (expr_to_bexpr ~params e)
-            | None -> BConst { value = 1; width = 1 }
+            | None -> BConst { value = Z.one; width = 1 }
           in
           let is_pred = function
             | Node { name = ("CondPredicate" | "ExpressionOrCondPattern"); _ } ->
@@ -1082,8 +1082,8 @@ let rec stmt_to_bstmt ~params node =
                     BCallStmt {
                       func = "@slice_write";
                       args = [BVar name;
-                              BConst { value = hi; width = 32 };
-                              BConst { value = lo; width = 32 };
+                              BConst { value = Z.of_int hi; width = 32 };
+                              BConst { value = Z.of_int lo; width = 32 };
                               rhs_e] }
                 | None -> BAssign { lhs = name; rhs = rhs_e })
            | _ -> BBlock [])
@@ -1121,7 +1121,7 @@ and extract_case ~params children =
     in
     match expr_node with
     | Some t -> rebalance (expr_to_bexpr ~params t)
-    | None -> BConst { value = 0; width = 1 }
+    | None -> BConst { value = Z.zero; width = 1 }
   in
   let items = List.filter (function
     | Node { name = "CaseItem"; _ } -> true
@@ -1213,7 +1213,7 @@ and extract_loop ~params children =
       in
       let cond_b = match cond_node with
         | Some e -> rebalance (expr_to_bexpr ~params e)
-        | None -> BConst { value = 1; width = 1 }
+        | None -> BConst { value = Z.one; width = 1 }
       in
       let update_b = match step_node with
         | Some n ->
@@ -1245,7 +1245,7 @@ and extract_loop ~params children =
         | _ -> false) children in
       let cond_b = match cond_node with
         | Some e -> rebalance (expr_to_bexpr ~params e)
-        | None -> BConst { value = 1; width = 1 }
+        | None -> BConst { value = Z.one; width = 1 }
       in
       let body_stmts = match body_node with
         | Some s -> [stmt_to_bstmt ~params s]
@@ -1747,7 +1747,7 @@ let extract_instances ~params module_node : binstance list =
              let be = match find_first op
                ~name_is:(fun n -> n = "Expression") with
                | Some ex -> expr_to_bexpr ~params ex
-               | None -> BConst { value = 0; width = 1 } in
+               | None -> BConst { value = Z.zero; width = 1 } in
              (Printf.sprintf "$pos%d" i, be))
     in
     match mod_name with

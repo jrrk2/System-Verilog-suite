@@ -48,7 +48,7 @@ let const_of_name = function
 let rec net_bits widths (e : bexpr) : netkey list =
   match e with
   | BConst { value; width } ->
-      List.init width (fun i -> Const (((value lsr i) land 1) = 1))
+      List.init width (fun i -> Const (Z.testbit value i))
   | BConcat es -> List.concat_map (net_bits widths) (List.rev es)
   | BSlice { signal = BVar base; msb; lsb } ->
       List.init (msb - lsb + 1) (fun k ->
@@ -61,7 +61,7 @@ let rec net_bits widths (e : bexpr) : netkey list =
           let w = try Hashtbl.find widths nm with Not_found -> 1 in
           List.init w (fun i -> Net (nm, i)))
   | BSelect { array = BVar nm; index = BConst { value; _ } } -> (
-      match const_of_name nm with Some b -> [ Const b ] | None -> [ Net (nm, value) ])
+      match const_of_name nm with Some b -> [ Const b ] | None -> [ Net (nm, Z.to_int value) ])
   | _ -> []
 
 (* ---- output-pin recognition per Xilinx primitive ------------------------- *)
@@ -555,9 +555,9 @@ let bmodule_of_yosys_json path : bmodule =
   let cells = mj |> U.member "cells" |> U.to_assoc in
   let bit_expr = function
     | `Int id -> BVar (Printf.sprintf "n%d" id)
-    | `String "1" -> BConst { value = 1; width = 1 }
-    | `String "0" -> BConst { value = 0; width = 1 }
-    | _ -> BConst { value = 0; width = 1 } in
+    | `String "1" -> bconst_int 1 1
+    | `String "0" -> bconst_int 0 1
+    | _ -> bconst_int 0 1 in
   let instances = List.map (fun (inst, cj) ->
       let ptype = cj |> U.member "type" |> U.to_string in
       let conns = try cj |> U.member "connections" |> U.to_assoc with _ -> [] in

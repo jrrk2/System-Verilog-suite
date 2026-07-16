@@ -56,7 +56,7 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
   match e with
   | BConst { value; width } ->
       let rec range i = if i >= width then [] else
-        let b = (value lsr i) land 1 in
+        let b = (if Z.testbit value i then 1 else 0) in
         (if b = 1 then "n_VCC" else "n_GND") :: range (i + 1) in
       range 0
   | BConcat es ->
@@ -81,7 +81,7 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
   | BSelect { array = BVar nm; index = BConst { value; _ } } ->
       (match const_net nm with
        | Some n -> [n]
-       | None   -> [net_name_of_id (alloc ctx { base = nm; bit = value })])
+       | None   -> [net_name_of_id (alloc ctx { base = nm; bit = Z.to_int value })])
   | _ ->
       failwith ("bir_to_verilog_netlist: unsupported pin expression: "
                 ^ Behavioral_ir.string_of_bexpr e)

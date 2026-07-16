@@ -245,7 +245,7 @@ let infer_sequential_registers ctx proc_name clock clock_edge reset reset_edge b
       in
 
       (* TODO: Extract reset value from reset branch *)
-      let reset_value = Some (BConst { value = 0; width }) in
+      let reset_value = Some (BConst { value = Z.zero; width }) in
 
       let reg_info = {
         reg_name = original_signal;

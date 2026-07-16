@@ -25,7 +25,7 @@ let pname prefix name =
 let const_bexpr_of_verilog (s : string) : bexpr option =
   let s = String.trim s in
   match String.index_opt s '\'' with
-  | None -> (try Some (BConst { value = int_of_string s; width = 32 }) with _ -> None)
+  | None -> (try Some (BConst { value = Z.of_string s; width = 32 }) with _ -> None)
   | Some ap ->
     let width = try int_of_string (String.trim (String.sub s 0 ap)) with _ -> 0 in
     if width <= 0 then None else begin
@@ -61,7 +61,7 @@ let const_bexpr_of_verilog (s : string) : bexpr option =
           else
             let len = min 31 (width - i) in
             let v = int_of_string ("0b" ^ String.sub bits i len) in
-            chunks (i + len) (BConst { value = v; width = len } :: acc) in
+            chunks (i + len) (BConst { value = Z.of_int v; width = len } :: acc) in
         match chunks 0 [] with
         | [ c ] -> Some c
         | cs -> Some (BConcat cs)
@@ -225,7 +225,7 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
       inst.param_strs in
     let from_vals = List.filter_map (fun (name, v) ->
       if List.mem_assoc name from_strs then None
-      else Some (name, BConst { value = v; width = bit_width_of_int v }))
+      else Some (name, BConst { value = Z.of_int v; width = bit_width_of_int v }))
       inst.param_values in
     from_strs @ from_vals in
   let subst = port_subst @

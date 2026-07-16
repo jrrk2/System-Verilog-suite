@@ -22,8 +22,8 @@ open Behavioral_ir
 let b1 = BInt { width = 1; signed = Unsigned }
 
 let v n          = BVar n
-let c0           = BConst { value = 0; width = 1 }
-let c1           = BConst { value = 1; width = 1 }
+let c0           = BConst { value = Z.zero; width = 1 }
+let c1           = BConst { value = Z.one; width = 1 }
 let notb e       = BUnOp  { op = BNot; operand = e; result_type = b1 }
 let andb a b     = BBinOp { op = BAnd; lhs = a; rhs = b; result_type = b1 }
 let orb  a b     = BBinOp { op = BOr;  lhs = a; rhs = b; result_type = b1 }
@@ -195,6 +195,38 @@ let buf_body ~name ~ins ~out ~rhs =
   empty_mod name signals [proc]
 
 (* ---------------------------------------------------------------------- *)
+(* CARRY4: 4-bit carry chain.  unisim model: c0 = CI|CYINIT ;              *)
+(*   CO[i] = S[i] ? carry_in[i] : DI[i] ;  O[i] = S[i] ^ carry_in[i]       *)
+(* where carry_in = {CO[2],CO[1],CO[0],c0}.  Pure combinational.           *)
+(* ---------------------------------------------------------------------- *)
+let carry4_body () =
+  let sig_w name w dir =
+    { name; stype = BInt { width = w; signed = Unsigned };
+      direction = dir; initial_value = None; attrs = [] } in
+  let seli name i = BSlice { signal = v name; msb = i; lsb = i } in
+  let xorb a b = BBinOp { op = BXor; lhs = a; rhs = b; result_type = b1 } in
+  let mux se c d = BCond { condition = se; then_val = c; else_val = d } in
+  let c0 = orb (v "CI") (v "CYINIT") in
+  let co i = v (Printf.sprintf "co%d" i) in
+  let carry_in = [| c0; co 0; co 1; co 2 |] in
+  let assigns =
+    List.init 4 (fun i ->
+      BAssign { lhs = Printf.sprintf "co%d" i;
+                rhs = mux (seli "S" i) carry_in.(i) (seli "DI" i) })
+    @ [ BAssign { lhs = "O";
+                  rhs = BConcat (List.rev (List.init 4 (fun i ->
+                          xorb (seli "S" i) carry_in.(i)))) };
+        BAssign { lhs = "CO"; rhs = BConcat [ co 3; co 2; co 1; co 0 ] } ] in
+  let signals =
+    [ sig_w "CI" 1 `Input; sig_w "CYINIT" 1 `Input;
+      sig_w "DI" 4 `Input; sig_w "S" 4 `Input;
+      sig_w "co0" 1 `Internal; sig_w "co1" 1 `Internal;
+      sig_w "co2" 1 `Internal; sig_w "co3" 1 `Internal;
+      sig_w "CO" 4 `Output; sig_w "O" 4 `Output ] in
+  let proc = BCombinational { name = "comb"; sensitivity = [BAny]; body = assigns } in
+  empty_mod "CARRY4" signals [proc]
+
+(* ---------------------------------------------------------------------- *)
 (* Dispatch: binstance -> specialised body bmodule (or None if unknown).   *)
 (* ---------------------------------------------------------------------- *)
 let lut_arity = function
@@ -219,6 +251,21 @@ let synth (i : binstance) : bmodule option =
         let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
             [("IS_D_INVERTED","D"); ("IS_CE_INVERTED","CE"); ("IS_S_INVERTED","S")] in
         Some (ff_body ~ty:"FDSE" ~set_val:true ~ctrl_pin:"S" ~init ~inv)
+    | "FDCE" ->
+        (* async CLR -> 0. For a cycle-based next-state miter the async/sync
+           distinction is irrelevant (both give Q'=CLR?0:CE?D:Q); modelling it
+           the SAME on both flows makes it cancel. *)
+        let init = match param_lookup i "INIT" with Some s -> s | None -> "0" in
+        let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
+            [("IS_D_INVERTED","D"); ("IS_CE_INVERTED","CE"); ("IS_CLR_INVERTED","CLR")] in
+        Some (ff_body ~ty:"FDCE" ~set_val:false ~ctrl_pin:"CLR" ~init ~inv)
+    | "FDPE" ->
+        (* async PRE -> 1. *)
+        let init = match param_lookup i "INIT" with Some s -> s | None -> "1" in
+        let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
+            [("IS_D_INVERTED","D"); ("IS_CE_INVERTED","CE"); ("IS_PRE_INVERTED","PRE")] in
+        Some (ff_body ~ty:"FDPE" ~set_val:true ~ctrl_pin:"PRE" ~init ~inv)
+    | "CARRY4" -> Some (carry4_body ())
     | "INV"   -> Some (buf_body ~name:"INV"  ~ins:["I"] ~out:"O" ~rhs:(notb (v "I")))
     | "BUF"   -> Some (buf_body ~name:"BUF"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))
     | "IBUF"  -> Some (buf_body ~name:"IBUF"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))

@@ -154,7 +154,7 @@ let tile_ports (g : tile_geom) : Behavioral_ir.library_port list =
 open Behavioral_ir
 
 let uint w = BInt { width = w; signed = Unsigned }
-let kconst v w = BConst { value = v; width = w }
+let kconst v w = BConst { value = Z.of_int v; width = w }
 let isig name w : bsignal =
   { name; stype = uint w; direction = `Internal; initial_value = None; attrs = [] }
 

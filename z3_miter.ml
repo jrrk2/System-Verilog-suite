@@ -202,7 +202,7 @@ let rec expr_to_z3 suffix ctx_sigs = function
       bv_var name width suffix
 
   | BConst { value; width } ->
-      Z3.BitVector.mk_numeral ctx (string_of_int value) width
+      Z3.BitVector.mk_numeral ctx (Z.to_string value) width
 
   | BBinOp { op; lhs; rhs; result_type } ->
       let z3_lhs0 = expr_to_z3 suffix ctx_sigs lhs in
@@ -414,14 +414,14 @@ let rec expr_to_z3 suffix ctx_sigs = function
             (match eval_const lhs, eval_const rhs with
              | Some a, Some b ->
                  (match op with
-                  | BAdd -> Some (a + b)
-                  | BSub -> Some (a - b)
-                  | BMul -> Some (a * b)
+                  | BAdd -> Some (Z.add a b)
+                  | BSub -> Some (Z.sub a b)
+                  | BMul -> Some (Z.mul a b)
                   | _ -> None)
              | _ -> None)
         | BSlice { signal; msb; lsb } ->
             (match eval_const signal with
-             | Some v -> Some ((v lsr lsb) land ((1 lsl (msb - lsb + 1)) - 1))
+             | Some v -> Some (Z.logand (Z.shift_right v lsb) (Z.sub (Z.shift_left Z.one (msb - lsb + 1)) Z.one))
              | None -> None)
         | _ -> None
       in
@@ -435,6 +435,7 @@ let rec expr_to_z3 suffix ctx_sigs = function
       let size = arr_w / elem_w in
       (match eval_const index with
        | Some value ->
+           let value = Z.to_int value in
            if value >= size then
              Z3.BitVector.mk_numeral ctx "0" elem_w
            else
@@ -902,10 +903,42 @@ let check_miter_equivalence bmod1 bmod2 =
      * and `Q__D_d1 ?= Q__D_d2` falls out of the output XOR. *)
     ignore ctx2;
 
-    (* Build miter: XOR all outputs (which now include the FF D pins) *)
-    Printf.printf "Building miter circuit (XOR outputs)...\n";
     let common_outputs =
       List.filter (fun (n, _) -> List.mem_assoc n outputs2) outputs1 in
+    (* CONE-LEVEL mode (Z3_MITER_PER_CONE): check each common output (every
+       FF's <Q>__D next-state cone + each primary output) on its OWN, with
+       push/pop, so a structural state mismatch on a few cones (SVS bit-blasts
+       SRL/RAM into FF-chains while the other side black-boxes them) is
+       localized instead of collapsing the whole design to one DIFFER. *)
+    if Sys.getenv_opt "Z3_MITER_PER_CONE" <> None then begin
+      Printf.printf "Per-cone miter over %d common outputs (FF-D cones + primary outs)...\n"
+        (List.length common_outputs);
+      let neq = ref 0 and ndiff = ref 0 and diffs = ref [] in
+      List.iter (fun (name, width) ->
+        let w2 = try List.assoc name outputs2 with Not_found -> width in
+        let out1 = bv_var name width "_d1" in
+        let out2 = bv_var name w2 "_d2" in
+        let w = max (sz out1) (sz out2) in
+        let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
+        let xor = Z3.BitVector.mk_xor ctx (ext out1) (ext out2) in
+        let zero = Z3.BitVector.mk_numeral ctx "0" w in
+        Z3.Solver.push miter_solver;
+        Z3.Solver.add miter_solver
+          [ Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero) ];
+        (match Z3.Solver.check miter_solver [] with
+         | Z3.Solver.UNSATISFIABLE -> incr neq
+         | _ -> incr ndiff; if List.length !diffs < 60 then diffs := name :: !diffs);
+        Z3.Solver.pop miter_solver 1) common_outputs;
+      Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
+      Printf.printf "  PER-CONE: %d EQUIVALENT, %d DIFFER\n" !neq !ndiff;
+      Printf.printf "═══════════════════════════════════════════════════════════════\n";
+      if !diffs <> [] then
+        Printf.printf "  first differing cones: %s\n"
+          (String.concat ", " (List.rev !diffs));
+      !ndiff = 0
+    end else begin
+    (* Build miter: XOR all outputs (which now include the FF D pins) *)
+    Printf.printf "Building miter circuit (XOR outputs)...\n";
     let miter_terms = List.map (fun (name, width) ->
       (* Same width-divergence handling as the inputs, but for outputs we
          zero-extend BOTH sides to the wider width and XOR: a nonzero high bit
@@ -996,6 +1029,7 @@ let check_miter_equivalence bmod1 bmod2 =
         Printf.printf "Z3 could not determine equivalence.\n";
         Printf.printf "Reason: %s\n\n" (Z3.Solver.get_reason_unknown miter_solver);
         false
+    end
   end
 
 (* High-level API: verify two behavioral IR programs *)

@@ -15,13 +15,13 @@ let rec token_to_bexpr = function
   | TK_DecNumber n ->
       (try
         let value = int_of_string n in
-        BConst { value; width = 32 }
-      with _ -> BConst { value = 0; width = 1 })
+        BConst { value = Z.of_int value; width = 32 }
+      with _ -> BConst { value = Z.zero; width = 1 })
   | TK_UnBasedNumber n ->
       (try
         let value = int_of_string n in
-        BConst { value; width = 32 }
-      with _ -> BConst { value = 0; width = 1 })
+        BConst { value = Z.of_int value; width = 32 }
+      with _ -> BConst { value = Z.zero; width = 1 })
 
   (* Binary operations *)
   | TUPLE4 (STRING "add_expr2", left, PLUS, right) ->
@@ -137,31 +137,31 @@ let rec token_to_bexpr = function
         let width_str = String.sub width_base 0 (String.index width_base '\'') in
         let width = int_of_string width_str in
         let value = int_of_string ("0b" ^ digits) in
-        BConst { value; width }
-      with _ -> BConst { value = 0; width = 1 })
+        BConst { value = Z.of_int value; width }
+      with _ -> BConst { value = Z.zero; width = 1 })
 
   | TUPLE3 (STRING "hex_based_number1", TK_HexBase width_base, TK_HexDigits digits) ->
       (try
         let width_str = String.sub width_base 0 (String.index width_base '\'') in
         let width = int_of_string width_str in
         let value = int_of_string ("0x" ^ digits) in
-        BConst { value; width }
-      with _ -> BConst { value = 0; width = 1 })
+        BConst { value = Z.of_int value; width }
+      with _ -> BConst { value = Z.zero; width = 1 })
 
   | TUPLE3 (STRING "dec_based_number1", TK_DecBase width_base, TK_DecDigits digits) ->
       (try
         let width_str = String.sub width_base 0 (String.index width_base '\'') in
         let width = int_of_string width_str in
         let value = int_of_string digits in
-        BConst { value; width }
-      with _ -> BConst { value = 0; width = 1 })
+        BConst { value = Z.of_int value; width }
+      with _ -> BConst { value = Z.zero; width = 1 })
 
   (* Unwrap wrappers *)
   | TUPLE3 (STRING "expression_or_dist1", expr, _) -> token_to_bexpr expr
   | TUPLE3 (STRING "sequence_repetition_expr1", expr, _) -> token_to_bexpr expr
   | TLIST [single] -> token_to_bexpr single
 
-  | _ -> BConst { value = 0; width = 1 }
+  | _ -> BConst { value = Z.zero; width = 1 }
 
 (* Convert assign_info to behavioral IR statement *)
 let convert_assign (assign : assign_info) =

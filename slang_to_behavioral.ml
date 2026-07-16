@@ -221,11 +221,11 @@ let parse_const value_str type_str =
                with _ -> 0)
           | _ -> (try int_of_string rest with _ -> 0)
         in
-        BConst { value = v; width = w }
-    | _ -> BConst { value = (try int_of_string s with _ -> 0);
+        BConst { value = Z.of_int v; width = w }
+    | _ -> BConst { value = (try Z.of_string s with _ -> Z.zero);
                     width = total_w }
   end else
-    BConst { value = (try int_of_string s with _ -> 0);
+    BConst { value = (try Z.of_string s with _ -> Z.zero);
              width = total_w }
 
 (* ─── Expressions ────────────────────────────────────────────────── *)
@@ -250,7 +250,7 @@ let rec expr_to_bexpr j =
   | "LValueReference" ->
       (match !lvalue_ref_ctx with
        | Some e -> e
-       | None -> BConst { value = 0; width = 1 })
+       | None -> BConst { value = Z.zero; width = 1 })
   | "NamedValue" ->
       (* Resolve in priority order:
        *   1. Inline `constant` annotation (slang's evaluator certain).
@@ -287,10 +287,10 @@ let rec expr_to_bexpr j =
       let op_s = match str_field "op" j with Some s -> s | None -> "" in
       let lhs = match assoc "left" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let rhs = match assoc "right" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let t = match str_field "type" j with Some s -> s | None -> "logic" in
       let w, _, _ = parse_type t in
       (match bop_of_string op_s with
@@ -301,7 +301,7 @@ let rec expr_to_bexpr j =
       let op_s = match str_field "op" j with Some s -> s | None -> "" in
       let operand = match assoc "operand" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let t = match str_field "type" j with Some s -> s | None -> "logic" in
       let w, _, _ = parse_type t in
       let result_type =
@@ -328,15 +328,15 @@ let rec expr_to_bexpr j =
         | first :: _ ->
             (match assoc "expr" first with
              | Some j' -> expr_to_bexpr j'
-             | None -> BConst { value = 0; width = 1 })
-        | [] -> BConst { value = 0; width = 1 }
+             | None -> BConst { value = Z.zero; width = 1 })
+        | [] -> BConst { value = Z.zero; width = 1 }
       in
       let then_val = match assoc "left" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let else_val = match assoc "right" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       BCond { condition = cond; then_val; else_val }
   | "Concatenation" ->
       (* `operands` is a list, MSB-first per SV convention — same
@@ -347,27 +347,27 @@ let rec expr_to_bexpr j =
       let count = match assoc "count" j with
         | Some j' ->
             (match expr_to_bexpr j' with
-             | BConst { value; _ } -> value
+             | BConst { value; _ } -> Z.to_int value
              | _ -> 1)
         | None -> 1
       in
       let value = match assoc "concat" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 }
+        | None -> BConst { value = Z.zero; width = 1 }
       in
       BReplicate { count; value }
   | "ElementSelect" ->
       let arr = match assoc "value" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let idx = match assoc "selector" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       BSelect { array = arr; index = idx }
   | "RangeSelect" ->
       let arr = match assoc "value" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       (* Slang annotates the resolved value of arithmetic msb/lsb
        * expressions in the `constant` field as `"<width>'d<num>"` or
        * `"<width>'h<hex>"`. Trust that when present — otherwise
@@ -396,7 +396,7 @@ let rec expr_to_bexpr j =
              | Some n -> n
              | None ->
                  match expr_to_bexpr j' with
-                 | BConst { value; _ } -> value
+                 | BConst { value; _ } -> Z.to_int value
                  | _ -> 0)
         | None -> 0 in
       let msb = resolve "left" in
@@ -406,7 +406,7 @@ let rec expr_to_bexpr j =
       (* Type cast — value-preserving for our integer arithmetic. *)
       (match assoc "operand" j with
        | Some j' -> expr_to_bexpr j'
-       | None -> BConst { value = 0; width = 1 })
+       | None -> BConst { value = Z.zero; width = 1 })
   | "Assignment" ->
       (* Embedded assignment as an expression — usually return the RHS.
          But for task-call output arguments, slang wraps the argument as
@@ -419,9 +419,9 @@ let rec expr_to_bexpr j =
        | Some j' when kind_of j' = "EmptyArgument" ->
            (match assoc "left" j with
             | Some l -> expr_to_bexpr l
-            | None -> BConst { value = 0; width = 1 })
+            | None -> BConst { value = Z.zero; width = 1 })
        | Some j' -> expr_to_bexpr j'
-       | None -> BConst { value = 0; width = 1 })
+       | None -> BConst { value = Z.zero; width = 1 })
   | "Call" ->
       (* Function call: `{ "subroutine": "<addr> <name>", "arguments": [...] }`.
          z3_miter treats unresolved BCalls as uninterpreted functions —
@@ -444,7 +444,7 @@ let rec expr_to_bexpr j =
   | _ ->
       (* Unrecognised — emit a placeholder zero. Matching strict mode
        * here would catch shapes the converter doesn't model. *)
-      BConst { value = 0; width = 1 }
+      BConst { value = Z.zero; width = 1 }
 
 (* ─── Statements ─────────────────────────────────────────────────── *)
 
@@ -489,7 +489,7 @@ let rec lhs_to_bstmt l rhs =
         | None -> None in
       let idx = match assoc "selector" l with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       (match name_opt with
        | Some n -> BCallStmt {
            func = "@mem_write";
@@ -505,10 +505,10 @@ let rec lhs_to_bstmt l rhs =
         | None -> "Simple" in
       let left_e = match assoc "left" l with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let right_e = match assoc "right" l with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       (match name_opt with
        | None -> BBlock []
        | Some n ->
@@ -554,8 +554,8 @@ let rec stmt_to_bstmt j =
         | first :: _ ->
             (match assoc "expr" first with
              | Some j' -> expr_to_bexpr j'
-             | None -> BConst { value = 0; width = 1 })
-        | [] -> BConst { value = 0; width = 1 }
+             | None -> BConst { value = Z.zero; width = 1 })
+        | [] -> BConst { value = Z.zero; width = 1 }
       in
       let then_stmts = match assoc "ifTrue" j with
         | Some j' -> [stmt_to_bstmt j']
@@ -584,7 +584,7 @@ let rec stmt_to_bstmt j =
                  | None -> ());
                 let rhs = match assoc "right" inner with
                   | Some r -> expr_to_bexpr r
-                  | None -> BConst { value = 0; width = 1 } in
+                  | None -> BConst { value = Z.zero; width = 1 } in
                 lvalue_ref_ctx := saved;
                 lhs_to_bstmt l rhs
             | "Call" ->
@@ -617,14 +617,14 @@ let rec stmt_to_bstmt j =
          z3_miter can equate the two frontends' function bodies.    *)
       let rhs = match assoc "expr" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       (match !current_function_name with
        | Some fname -> BAssign { lhs = fname; rhs }
        | None -> BReturn (Some rhs))
   | "Case" ->
       let sel = match assoc "expr" j with
         | Some j' -> expr_to_bexpr j'
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let items = list_field "items" j in
       let cases, default =
         List.fold_left (fun (cs, def) ci ->
@@ -848,7 +848,7 @@ let extract_processes members_raw =
           | None -> "?" in
         let rhs = match assoc "right" assignment with
           | Some r -> expr_to_bexpr r
-          | None -> BConst { value = 0; width = 1 } in
+          | None -> BConst { value = Z.zero; width = 1 } in
         Some (BCombinational {
           name = "assign_" ^ lhs;
           sensitivity = [BAny];
@@ -1056,7 +1056,7 @@ let extract_instances members_raw =
                 | Some "Out", "Assignment" ->
                     (match assoc "left" expr_node with
                      | Some j -> expr_to_bexpr j
-                     | None -> BConst { value = 0; width = 1 })
+                     | None -> BConst { value = Z.zero; width = 1 })
                 | _ -> expr_to_bexpr expr_node
               in
               if pname = "" then None

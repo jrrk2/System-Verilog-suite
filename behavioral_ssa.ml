@@ -308,7 +308,7 @@ and ssa_slice_write ctx ~lhs ~m_e ~l_e ~data ~fallback =
   let m' = rename_expr ctx m_e in
   let l' = rename_expr ctx l_e in
   let data' = rename_expr ctx data in
-  let const_of = function BConst { value; _ } -> Some value | _ -> None in
+  let const_of = function BConst { value; _ } -> Some (Z.to_int value) | _ -> None in
   match const_of m', const_of l',
         Hashtbl.find_opt ctx.widths lhs with
   | Some msb, Some lsb, Some total_w when total_w > 0 && msb >= lsb ->
@@ -336,7 +336,7 @@ and ssa_slice_write ctx ~lhs ~m_e ~l_e ~data ~fallback =
 and ssa_part_sel_write ctx ~func ~lhs ~base_e ~w_e ~data ~fallback =
   let base' = rename_expr ctx base_e in
   let w'    = rename_expr ctx w_e in
-  let const_of = function BConst { value; _ } -> Some value | _ -> None in
+  let const_of = function BConst { value; _ } -> Some (Z.to_int value) | _ -> None in
   match const_of base', const_of w' with
   | Some base, Some w when w > 0 ->
       let msb, lsb = match func with
@@ -344,8 +344,8 @@ and ssa_part_sel_write ctx ~func ~lhs ~base_e ~w_e ~data ~fallback =
         | "@part_sel_write_down" -> base, base - w + 1
         | _ -> base + w - 1, base in
       let bw = match w' with BConst { width; _ } -> width | _ -> 32 in
-      let m_e = BConst { value = msb; width = bw } in
-      let l_e = BConst { value = lsb; width = bw } in
+      let m_e = BConst { value = Z.of_int msb; width = bw } in
+      let l_e = BConst { value = Z.of_int lsb; width = bw } in
       ssa_slice_write ctx ~lhs ~m_e ~l_e ~data ~fallback
   | _ -> fallback
 

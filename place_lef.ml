@@ -170,6 +170,63 @@ let () =
                  pos_x.(i) <- s.sx; pos_y.(i) <- s.sy; Hashtbl.replace occ s.sname i in
   let is_placed i = cell_site.(i) <> None in
 
+  (* ---- TOPO_GUIDE: copy placement of corresponding cells from a reference ----
+     build (guide file line = "cellname<TAB>BEL", BEL = SLICE_XxYy[/subbel]).
+     Matched cells are pinned to the reference SITE and frozen (skipped by the
+     constructive/SA engines).  TOPO_GUIDE_STRIP removes a hierarchy segment
+     from the guide's names before matching, so a wrapper level that differs
+     between designs (e.g. "eth_macro1.") does not block correspondence.
+     "assuming the same hierarchy": names must be the SAME synthesis (yosys
+     flatten of the identical netlist) -- a guide from a different synthesis of
+     the same RTL will NOT match (cell names diverge). *)
+  (match Sys.getenv_opt "TOPO_GUIDE" with
+   | Some path ->
+       let strip = getenv_default "TOPO_GUIDE_STRIP" "" in
+       let remove_substr s sub =
+         if sub = "" then s else begin
+           let ls = String.length s and lb = String.length sub in
+           let buf = Buffer.create ls and i = ref 0 in
+           while !i < ls do
+             if !i + lb <= ls && String.sub s !i lb = sub
+             then i := !i + lb
+             else (Buffer.add_char buf s.[!i]; incr i)
+           done; Buffer.contents buf
+         end in
+       (* guide: name -> site (sub-bel dropped; nextpnr re-legalises within slice) *)
+       let guide = Hashtbl.create 8192 in
+       (try
+          let ic = open_in path in
+          (try while true do
+             match String.split_on_char '\t' (input_line ic) with
+             | name :: bel :: _ ->
+                 let site = match String.index_opt bel '/' with
+                   | Some k -> String.sub bel 0 k | None -> bel in
+                 Hashtbl.replace guide (remove_substr name strip) site
+             | _ -> ()
+           done with End_of_file -> ()); close_in ic
+        with Sys_error _ -> Printf.eprintf "TOPO_GUIDE: cannot read %s\n" path);
+       let site_by_name : (string, site) Hashtbl.t = Hashtbl.create (ncells * 2) in
+       Hashtbl.iter (fun _k lref ->
+           List.iter (fun s -> Hashtbl.replace site_by_name s.sname s) !lref) fp;
+       (* pc_name carries a packing suffix ("$carry"/"$mux"/"$DIgndx"...) that the
+          guide (a per-primitive placement) lacks -- strip it before matching. *)
+       let base n = match String.index_opt n '$' with
+         | Some k -> String.sub n 0 k | None -> n in
+       let ng = ref 0 and nbusy = ref 0 and nunfit = ref 0 in
+       Array.iteri (fun i c ->
+           if not skip.(i) && not (is_placed i) then
+             match Hashtbl.find_opt guide (remove_substr (base c.Pack_to_lef.pc_name) strip) with
+             | None -> ()
+             | Some sn ->
+                 (match Hashtbl.find_opt site_by_name sn with
+                  | Some s when s.used -> incr nbusy
+                  | Some s when not (fits i s) -> incr nunfit
+                  | Some s -> bind i s; skip.(i) <- true; movable.(i) <- false; incr ng
+                  | None -> ())) cells;
+       Printf.eprintf "TOPO_GUIDE: pinned %d cells (%d site-busy, %d unfit) from %s (strip=%S, %d guide entries)\n"
+         !ng !nbusy !nunfit path strip (Hashtbl.length guide)
+   | None -> ());
+
   (* ---- nets (exclude clock: nets driven by BUFG/MMCM output) ------------- *)
   let clk_nets = Hashtbl.create 16 in
   Array.iter (fun c -> if c.Pack_to_lef.pc_lef = "BUFG" || c.Pack_to_lef.pc_lef = "MMCM" then

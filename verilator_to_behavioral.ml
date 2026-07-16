@@ -202,11 +202,11 @@ let rec expr_to_bexpr = function
   | Const { name; dtype_ref } ->
       let value = parse_const_value name in
       let width = get_width_from_dtype dtype_ref in
-      BConst { value; width }
+      BConst { value = Z.of_int value; width }
 
   | Const' { name } ->
       let value = parse_const_value name in
-      BConst { value; width = 32 }
+      BConst { value = Z.of_int value; width = 32 }
 
   | BinaryOp { op; lhs; rhs; dtype_ref } ->
       let lhs_expr = expr_to_bexpr lhs in
@@ -256,7 +256,7 @@ let rec expr_to_bexpr = function
        | "GTE" | "GTES" -> BBinOp { op = BGe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | _ ->
            if !debug then Printf.eprintf "Warning: Unknown binary op %s\n" op;
-           BConst { value = 0; width = 1 })
+           BConst { value = Z.zero; width = 1 })
 
   | BinaryOp' { op; lhs; rhs } ->
       let lhs_expr = expr_to_bexpr lhs in
@@ -305,7 +305,7 @@ let rec expr_to_bexpr = function
        | "GTE" | "GTES" -> BBinOp { op = BGe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | _ ->
            if !debug then Printf.eprintf "Warning: Unknown binary op %s\n" op;
-           BConst { value = 0; width = 1 })
+           BConst { value = Z.zero; width = 1 })
 
   | UnaryOp { op; operand; dtype_ref } ->
       let operand_expr = expr_to_bexpr operand in
@@ -342,7 +342,7 @@ let rec expr_to_bexpr = function
              | Replicate { count; src; _ }
              | Replicate' { count; src; _ } ->
                  let n = match expr_to_bexpr count with
-                   | BConst { value; _ } -> value | _ -> 1
+                   | BConst { value; _ } -> Z.to_int value | _ -> 1
                  in
                  n * width_of_ast src
              | _ -> width
@@ -357,7 +357,7 @@ let rec expr_to_bexpr = function
                  BSlice { signal = operand_expr;
                           msb = from_w - 1; lsb = from_w - 1 }
                else
-                 BConst { value = 0; width = 1 }
+                 BConst { value = Z.zero; width = 1 }
              in
              BConcat [
                BReplicate { count = pad; value = pad_value };
@@ -401,7 +401,7 @@ let rec expr_to_bexpr = function
       let signal_expr = expr_to_bexpr expr in
       let const_int_of t =
         match expr_to_bexpr t with
-        | BConst { value; _ } -> Some value
+        | BConst { value; _ } -> Some (Z.to_int value)
         | _ -> None
       in
       let lsb_const = Option.bind lsb const_int_of in
@@ -418,9 +418,9 @@ let rec expr_to_bexpr = function
            (* Dynamic part-select on a vector. *)
            let lsb_expr = match lsb with
              | Some l -> expr_to_bexpr l
-             | None -> BConst { value = 0; width = 32 }
+             | None -> BConst { value = Z.zero; width = 32 }
            in
-           let mask = (1 lsl width_const) - 1 in
+           let mask = Z.sub (Z.shift_left Z.one width_const) Z.one in
            let shifted =
              BBinOp { op = BShr;
                       lhs = signal_expr; rhs = lsb_expr;
@@ -430,7 +430,7 @@ let rec expr_to_bexpr = function
            if width_const = 1 then
              BBinOp { op = BAnd;
                       lhs = shifted;
-                      rhs = BConst { value = 1; width = 1 };
+                      rhs = BConst { value = Z.one; width = 1 };
                       result_type = BInt { width = 1; signed = Unsigned } }
            else
              BBinOp { op = BAnd;
@@ -450,7 +450,7 @@ let rec expr_to_bexpr = function
 
   | Replicate { count; src; _ } | Replicate' { count; src; _ } ->
       let count_val = match expr_to_bexpr count with
-        | BConst { value; _ } -> value
+        | BConst { value; _ } -> Z.to_int value
         | _ -> 1
       in
       let value_expr = expr_to_bexpr src in
@@ -463,7 +463,7 @@ let rec expr_to_bexpr = function
 
   | other ->
       strict_bail "expression" "expr_to_bexpr" other;
-      BConst { value = 0; width = 1 }
+      BConst { value = Z.zero; width = 1 }
 
 (* Convert Verilator statement to behavioral IR statement *)
 let rec stmt_to_bstmt = function
@@ -506,7 +506,7 @@ let rec stmt_to_bstmt = function
             | Some name ->
                 let const_int_of t =
                   match expr_to_bexpr t with
-                  | BConst { value; _ } -> Some value
+                  | BConst { value; _ } -> Some (Z.to_int value)
                   | _ -> None
                 in
                 let lsb_const   = Option.bind lsb   const_int_of in
@@ -518,17 +518,17 @@ let rec stmt_to_bstmt = function
                      BCallStmt {
                        func = "@slice_write";
                        args = [ BVar name
-                              ; BConst { value = hi; width = 32 }
-                              ; BConst { value = lo; width = 32 }
+                              ; BConst { value = Z.of_int hi; width = 32 }
+                              ; BConst { value = Z.of_int lo; width = 32 }
                               ; rhs_e ];
                      }
                  | _ ->
                      let lsb_e = match lsb with
                        | Some l -> expr_to_bexpr l
-                       | None   -> BConst { value = 0; width = 32 } in
+                       | None   -> BConst { value = Z.zero; width = 32 } in
                      let width_e = match width with
                        | Some w -> expr_to_bexpr w
-                       | None   -> BConst { value = 1; width = 32 } in
+                       | None   -> BConst { value = Z.one; width = 32 } in
                      BCallStmt {
                        func = "@part_sel_write_up";
                        args = [ BVar name; lsb_e; width_e; rhs_e ];
@@ -875,7 +875,7 @@ let cell_to_bprocess = function
                   [BIf {
                     condition = r;
                     then_stmts = [BAssign {
-                      lhs = q; rhs = BConst { value = 0; width = 64 }
+                      lhs = q; rhs = BConst { value = Z.zero; width = 64 }
                     }];
                     else_stmts = [gated_data];
                   }]

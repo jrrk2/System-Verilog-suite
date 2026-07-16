@@ -30,7 +30,7 @@ let max_unroll = 1024
  * an expression. Used to specialise the loop body for one specific
  * induction-variable value. *)
 let rec subst_expr var value = function
-  | BVar n when n = var -> BConst { value; width = 32 }
+  | BVar n when n = var -> BConst { value = Z.of_int value; width = 32 }
   | BVar _ as e -> e
   | BConst _ as e -> e
   | BBinOp { op; lhs; rhs; result_type } ->
@@ -85,7 +85,7 @@ let rec subst_stmt var value = function
 (* Recover an integer literal from an expression after constant-
  * folding the trivial cases. Returns None for anything dynamic. *)
 let rec const_int = function
-  | BConst { value; _ } -> Some value
+  | BConst { value; _ } -> Some (Z.to_int value)
   | BBinOp { op; lhs; rhs; _ } ->
       (match const_int lhs, const_int rhs with
        | Some l, Some r ->
@@ -118,7 +118,7 @@ let eval_cond i_var i_val cond =
             | BEq -> Some (l = r)  | BNe -> Some (l <> r)
             | _ -> None)
        | _ -> None)
-  | BConst { value; _ } -> Some (value <> 0)
+  | BConst { value; _ } -> Some (not (Z.equal value Z.zero))
   | _ -> None
 
 (* If `update` is `i := <const expr in i>`, return a function that

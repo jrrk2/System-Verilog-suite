@@ -48,8 +48,8 @@ let parse_init_bits (s : string) : bool array =
       end
 
 (* ---- port helpers ---------------------------------------------------- *)
-let one = BConst { value = 1; width = 1 }
-let zero = BConst { value = 0; width = 1 }
+let one = BConst { value = Z.one; width = 1 }
+let zero = BConst { value = Z.zero; width = 1 }
 
 let port_expr (i : binstance) name = List.assoc_opt name i.port_connections
 
@@ -59,7 +59,7 @@ let rec bits_of (e : bexpr) : bexpr list =
   match e with
   | BConcat es -> List.rev (List.concat_map (fun x -> List.rev (bits_of x)) es)
   | BConst { value; width } ->
-      List.init width (fun b -> BConst { value = (value lsr b) land 1; width = 1 })
+      List.init width (fun b -> BConst { value = (if Z.testbit value b then Z.one else Z.zero); width = 1 })
   | BSlice { signal = BVar n; msb; lsb } ->
       List.init (msb - lsb + 1) (fun b -> BVar (Printf.sprintf "%s[%d]" n (lsb + b)))
   | other -> [ other ]
@@ -111,8 +111,8 @@ let comb name body =
    bus.  Clock-enable folds into the data (d_ce = CE ? D : Q); a SYNC reset
    also folds into the data (matches how ffrip represents the behavioural
    reg's reset in its D-cone); an ASYNC reset stays a register-port property. *)
-let is_vcc = function BVar "VCC" -> true | BConst { value = 1; _ } -> true | _ -> false
-let is_gnd = function BVar "GND" -> true | BConst { value = 0; _ } -> true | _ -> false
+let is_vcc = function BVar "VCC" -> true | BConst { value = zv; _ } when Z.equal zv Z.one -> true | _ -> false
+let is_gnd = function BVar "GND" -> true | BConst { value = zv; _ } when Z.equal zv Z.zero -> true | _ -> false
 
 let ff_process ~qn ~clk ~ce ~d ~rst ~rst_async ~rst_val =
   (* Drop the CE-hold mux when CE is tied high (the common case) so the

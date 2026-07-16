@@ -65,7 +65,7 @@ let rec lut_mux_tree (inputs : bexpr list) (init_bits : int list) : bexpr =
   match inputs with
   | [] ->
       let b = match init_bits with [b] -> b | _ -> 0 in
-      BConst { value = b; width = 1 }
+      BConst { value = Z.of_int b; width = 1 }
   | hi :: rest ->
       (* Split init_bits in half: lower half = output when hi=0, upper
          half = output when hi=1. *)
@@ -166,8 +166,8 @@ let map_rtl_primitive cell_type inputs =
                               result_type = BInt { width = 1; signed = Unsigned } })
        | _ -> None)
 
-  | "GND" -> Some (BConst { value = 0; width = 1 })
-  | "VCC" -> Some (BConst { value = 1; width = 1 })
+  | "GND" -> Some (BConst { value = Z.zero; width = 1 })
+  | "VCC" -> Some (BConst { value = Z.one; width = 1 })
 
   | _ -> None
 
@@ -261,7 +261,7 @@ let convert_cell (edif : edif_data) =
   let net_to_expr net_name =
     let (base, idx_opt) = parse_signal_name net_name in
     match idx_opt with
-    | Some idx -> BSelect { array = BVar base; index = BConst { value = idx; width = 32 } }
+    | Some idx -> BSelect { array = BVar base; index = BConst { value = Z.of_int idx; width = 32 } }
     | None -> BVar base
   in
 
@@ -402,7 +402,7 @@ let convert_cell (edif : edif_data) =
   let pin_or_zero inst pin =
     match get_pin_net inst pin with
     | Some e -> e
-    | None -> BConst { value = 0; width = 1 } in
+    | None -> BConst { value = Z.zero; width = 1 } in
 
   (* Create continuous assignments for primitives.  Sequential elements
      (LUT/MUXF outputs that are direct combinational, plus Xilinx FFs)
@@ -469,11 +469,11 @@ let convert_cell (edif : edif_data) =
            let d_with_sync_rst_set =
              if k.sync_rst then
                BCond { condition = pin_or_zero inst.name "R";
-                       then_val  = BConst { value = 0; width = 1 };
+                       then_val  = BConst { value = Z.zero; width = 1 };
                        else_val  = d_e }
              else if k.sync_set then
                BCond { condition = pin_or_zero inst.name "S";
-                       then_val  = BConst { value = 1; width = 1 };
+                       then_val  = BConst { value = Z.one; width = 1 };
                        else_val  = d_e }
              else d_e in
            let rhs = match ce_e with
@@ -486,12 +486,12 @@ let convert_cell (edif : edif_data) =
            if k.async_clr then
              [BIf { condition = pin_or_zero inst.name "CLR";
                     then_stmts = [BAssign { lhs = q_name;
-                                           rhs = BConst { value = 0; width = 1 } }];
+                                           rhs = BConst { value = Z.zero; width = 1 } }];
                     else_stmts = core_assign }]
            else if k.async_pre then
              [BIf { condition = pin_or_zero inst.name "PRE";
                     then_stmts = [BAssign { lhs = q_name;
-                                           rhs = BConst { value = 1; width = 1 } }];
+                                           rhs = BConst { value = Z.one; width = 1 } }];
                     else_stmts = core_assign }]
            else core_assign in
          let reset, reset_async =

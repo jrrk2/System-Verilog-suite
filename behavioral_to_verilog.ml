@@ -76,9 +76,9 @@ let rec verilog_of_expr = function
       else sanitize_name name
   | BConst { value; width } ->
       if width = 1 then
-        Printf.sprintf "1'b%d" value
+        Printf.sprintf "1'b%s" (Z.to_string value)
       else
-        Printf.sprintf "%d'd%d" width value
+        Printf.sprintf "%d'd%s" width (Z.to_string value)
   | BBinOp { op; lhs; rhs; _ } ->
       Printf.sprintf "(%s %s %s)"
         (verilog_of_expr lhs)
@@ -91,7 +91,7 @@ let rec verilog_of_expr = function
   | BSelect { array; index } ->
       (* For constant indices, use simple integer format *)
       let index_str = match index with
-        | BConst { value; _ } -> string_of_int value
+        | BConst { value; _ } -> Z.to_string value
         | _ -> verilog_of_expr index
       in
       Printf.sprintf "%s[%s]"

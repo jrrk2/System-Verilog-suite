@@ -50,7 +50,7 @@ let debug = Sys.getenv_opt "BOUNDARY_DEBUG" <> None
 
 let rec render_expr = function
   | BVar n -> n
-  | BConst { value; width } -> Printf.sprintf "%d'd%d" width value
+  | BConst { value; width } -> Printf.sprintf "%d'd%s" width (Z.to_string value)
   | BSlice { signal; msb; lsb } ->
       Printf.sprintf "%s[%d:%d]" (render_expr signal) msb lsb
   | BConcat es -> "{" ^ String.concat "," (List.map render_expr es) ^ "}"

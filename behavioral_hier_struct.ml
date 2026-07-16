@@ -109,7 +109,8 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
        | BConcat es, BConst { value; _ } ->
            (* MSB-first concat: bit i is at position (width-1 - i).        *)
            let w = List.length es in
-           if value >= 0 && value < w then List.nth es (w - 1 - value)
+           let vi = Z.to_int value in
+           if vi >= 0 && vi < w then List.nth es (w - 1 - vi)
            else BSelect { array = array'; index }
        | _ -> BSelect { array = array'; index })
   | BConst _ -> e
@@ -141,7 +142,7 @@ and bit_select (expr : bexpr) (bit : int) : bexpr =
       (* Select one bit of a multi-bit constant (e.g. parent ties a 2-bit
        * port to 2'b11); without this, a single-bit reference would keep the
        * whole constant and land a 2-bit value on a 1-bit cell pin. *)
-      BConst { value = (value lsr bit) land 1; width = 1 }
+      BConst { value = (if Z.testbit value bit then Z.one else Z.zero); width = 1 }
   | BSelect _ -> expr  (* parent already bit-selected; assume scalar *)
   | _         -> expr
 

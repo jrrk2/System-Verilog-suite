@@ -94,7 +94,7 @@ let collect_write_sites m_name body =
         (* default fires when no key matches *)
         let none_match =
           match arm_preds with
-          | [] -> BConst { value = 1; width = 1 }
+          | [] -> BConst { value = Z.one; width = 1 }
           | first :: rest ->
               List.fold_left (fun acc p -> bool_and acc (bool_not p))
                 (bool_not first) rest
@@ -121,11 +121,11 @@ let fold_write_sites sites =
       (* unconditional first-listed; later sites can override only if
        * later-listed.  But the unconditional path predicate = 1 means
        * later mutex branches will only fire when their guard does. *)
-      let init_we = BConst { value = 1; width = 1 } in
+      let init_we = BConst { value = Z.one; width = 1 } in
       let init_addr = addr and init_data = data in
       let we, addr, data = List.fold_left (fun (we, a, d) (p, na, nd) ->
         let cond = match p with
-          | None -> BConst { value = 1; width = 1 }
+          | None -> BConst { value = Z.one; width = 1 }
           | Some p -> p in
         bool_or we cond,
         BCond { condition = cond; then_val = na; else_val = a },
@@ -135,7 +135,7 @@ let fold_write_sites sites =
   | (Some p0, addr0, data0) :: rest ->
       let we, addr, data = List.fold_left (fun (we, a, d) (p, na, nd) ->
         let cond = match p with
-          | None -> BConst { value = 1; width = 1 }
+          | None -> BConst { value = Z.one; width = 1 }
           | Some p -> p in
         bool_or we cond,
         BCond { condition = cond; then_val = na; else_val = a },
@@ -180,7 +180,7 @@ let collect_read_sites m_name body =
           bool_eq selector k) cases in
         let none =
           match arm_preds with
-          | [] -> BConst { value = 1; width = 1 }
+          | [] -> BConst { value = Z.one; width = 1 }
           | first :: rest ->
               List.fold_left (fun acc p -> bool_and acc (bool_not p))
                 (bool_not first) rest in
@@ -200,7 +200,7 @@ let fold_read_sites sites =
   | (_, addr0) :: rest ->
       Some (List.fold_left (fun acc (p, na) ->
         let cond = match p with
-          | None -> BConst { value = 1; width = 1 }
+          | None -> BConst { value = Z.one; width = 1 }
           | Some p -> p in
         BCond { condition = cond; then_val = na; else_val = acc }
       ) addr0 rest)
@@ -213,10 +213,10 @@ let mk_signal name width =
 (* Map a Mem_macro_resolve port_shape into an unsigned-zero literal of
  * the right width — used for csb1 = 0, etc. *)
 let zero_lit width =
-  BConst { value = 0; width }
+  BConst { value = Z.zero; width }
 
 let one_lit width =
-  BConst { value = (1 lsl width) - 1; width }
+  BConst { value = Z.sub (Z.shift_left Z.one width) Z.one; width }
 
 (* Find the writing process for [m_name] (a BSequential containing an
  * @mem_write of m_name); idem for the reading process (any process
@@ -476,7 +476,7 @@ let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
        let pad5 e =
          let aw = bits_needed mm.depth in
          if aw >= 5 then e
-         else BConcat [ BConst { value = 0; width = 5 - aw }; e ]
+         else BConcat [ BConst { value = Z.zero; width = 5 - aw }; e ]
        in
        let w_addr5 = pad5 w_addr in
        let rs1_a5  = pad5 addr_a in
@@ -507,9 +507,9 @@ let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
        let di_slice lo =
          if lo + 1 < dw then BSlice { signal = w_data; msb = lo + 1; lsb = lo }
          else if lo < dw then
-           BConcat [ BConst { value = 0; width = 1 }
+           BConcat [ BConst { value = Z.zero; width = 1 }
                    ; BSlice { signal = w_data; msb = lo; lsb = lo } ]
-         else BConst { value = 0; width = 2 }
+         else BConst { value = Z.zero; width = 2 }
        in
        (* Build one copy's RAM32M instances + per-instance read output names.
           read_addr = the 5-bit address feeding ADDRA/B/C of this copy.    *)
@@ -821,7 +821,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
              (* Pad/truncate the BIR address expression to addr_w bits.
                 bexpr widths are implicit in the suite, so we just feed it
                 in via a BConcat with zero-extension where needed. *)
-             let zext_const = BConst { value = 0; width = max 1 (addr_w - bits_needed mm.depth) } in
+             let zext_const = BConst { value = Z.zero; width = max 1 (addr_w - bits_needed mm.depth) } in
              if bits_needed mm.depth >= addr_w then e
              else BConcat [ zext_const; e ]
            in

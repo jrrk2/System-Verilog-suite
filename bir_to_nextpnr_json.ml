@@ -102,15 +102,15 @@ let rec resolve_bit_ref (e : bexpr) : (string * int option) option =
   match e with
   | BVar nm -> Some (nm, None)
   | BSelect { array = BVar nm; index = BConst { value; _ } } ->
-      Some (nm, Some value)
+      Some (nm, Some (Z.to_int value))
   | BSelect { array; index = BConst { value; _ } } ->
       (* Nested select, e.g. Vivado EDIF renders a scalar top-level port
          as IO_CLK_P[0][0].  Resolve the inner ref: indexing a scalar
          (None) gives that bit; a redundant outer [0] on an already-
          resolved bit is the identity. *)
       (match resolve_bit_ref array with
-       | Some (nm, None)                  -> Some (nm, Some value)
-       | Some (nm, Some b) when value = 0 -> Some (nm, Some b)
+       | Some (nm, None)                  -> Some (nm, Some (Z.to_int value))
+       | Some (nm, Some b) when Z.equal value Z.zero -> Some (nm, Some b)
        | _ -> None)
   | BConcat _ ->
       (* Vivado EDIF doesn't emit concatenations on instance pins. *)
@@ -143,7 +143,7 @@ let rec bits_of_conn ctx (e : bexpr) : bit list =
       (* Verilog literal on an instance pin (e.g. `.CEB(1'b0)` on
          IBUFDS_GTE2).  Emit one `C "0"` / `C "1"` per bit, LSB first. *)
       let rec range i = if i >= width then [] else
-        let b = (value lsr i) land 1 in
+        let b = (if Z.testbit value i then 1 else 0) in
         const_bit ctx (b = 1) :: range (i + 1) in
       range 0
   | BConcat es ->

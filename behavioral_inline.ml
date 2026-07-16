@@ -187,7 +187,7 @@ let rec body_to_expr fname bindings = function
       let default_expr =
         match body_to_expr fname bindings default with
         | Some e -> e
-        | None -> BConst { value = 0; width = 1 } in
+        | None -> BConst { value = Z.zero; width = 1 } in
       let result = List.fold_right (fun (case_val, case_body) acc ->
         match body_to_expr fname bindings case_body with
         | None -> acc  (* skip uninlinable case *)

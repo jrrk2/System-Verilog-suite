@@ -31,7 +31,7 @@ open Behavioral_ir
 let decompose_idx = function
   | BBinOp { op = BAdd; lhs; rhs = BConst { value; _ } } -> (lhs, value)
   | BBinOp { op = BAdd; lhs = BConst { value; _ }; rhs } -> (rhs, value)
-  | BConst { value; width } -> (BConst { value = 0; width }, value)
+  | BConst { value; width } -> (BConst { value = Z.zero; width }, value)
   | other -> (other, 0)
 
 (* Const-fold trivial arithmetic on bexprs: BAdd/BSub/BMul of two
@@ -720,7 +720,7 @@ let try_merge_bytewise_run = function
                  BIf {
                    condition = (match any_enable with
                                 | Some c -> c
-                                | None -> BConst { value = 1; width = 1 });
+                                | None -> BConst { value = Z.one; width = 1 });
                    then_stmts = [BCallStmt {
                      func = "@mem_write";
                      args = [BVar arr0; addr0; combined_data];

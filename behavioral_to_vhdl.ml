@@ -103,7 +103,7 @@ let is_arith = function
 let rec vhdl_of_expr e =
   match e with
   | BVar name -> sanitize name
-  | BConst { value; width } -> vhdl_const ~width value
+  | BConst { value; width } -> vhdl_const ~width (Z.to_int value)
   | BBinOp { op; lhs; rhs; result_type } ->
       let l_str = vhdl_of_expr lhs in
       let r_str = vhdl_of_expr rhs in
@@ -140,7 +140,7 @@ let rec vhdl_of_expr e =
   | BSelect { array; index } ->
       Printf.sprintf "%s(%s)" (vhdl_of_expr array)
         (match index with
-         | BConst { value; _ } -> string_of_int value
+         | BConst { value; _ } -> Z.to_string value
          | other -> Printf.sprintf "to_integer(unsigned(%s))" (vhdl_of_expr other))
   | BSlice { signal; msb; lsb } ->
       if msb = lsb then Printf.sprintf "%s(%d)" (vhdl_of_expr signal) msb
@@ -251,9 +251,9 @@ let split_async_reset reset reset_edge body =
         | BVar n when n = rst -> pol = `Pos
         | BUnOp { op = BNot; operand = BVar n; _ } when n = rst -> pol = `Neg
         | BBinOp { op = BEq; lhs = BVar n;
-                   rhs = BConst { value = 1; _ }; _ } when n = rst -> pol = `Pos
+                   rhs = BConst { value = zv; _ }; _ } when n = rst && Z.equal zv Z.one -> pol = `Pos
         | BBinOp { op = BEq; lhs = BVar n;
-                   rhs = BConst { value = 0; _ }; _ } when n = rst -> pol = `Neg
+                   rhs = BConst { value = zv; _ }; _ } when n = rst && Z.equal zv Z.zero -> pol = `Neg
         | _ -> false
       in
       let rec scan = function

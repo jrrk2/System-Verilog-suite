@@ -186,9 +186,9 @@ let read_program ?top (path : string) : bprogram =
         (match Hashtbl.find_opt regbit id with
          | Some (base, idx) -> BSlice { signal = BVar base; msb = idx; lsb = idx }
          | None -> Hashtbl.replace ids id (); BVar (netname id))
-    | `String "1" -> BConst { value = 1; width = 1 }
-    | _ -> BConst { value = 0; width = 1 } in
-  let resolve_opt = function Some b -> resolve_bit b | None -> BConst { value = 0; width = 1 } in
+    | `String "1" -> BConst { value = Z.one; width = 1 }
+    | _ -> BConst { value = Z.zero; width = 1 } in
+  let resolve_opt = function Some b -> resolve_bit b | None -> BConst { value = Z.zero; width = 1 } in
   let conn_expr bitsj =
     match U.to_list bitsj with
     | [b] -> resolve_bit b
@@ -227,11 +227,11 @@ let read_program ?top (path : string) : bprogram =
       | Some (`Int cid) -> Hashtbl.replace ids cid (); netname cid
       | _ -> "clk" in
     let nextbit i = match byidx i with
-      | None -> BConst { value = 0; width = 1 }
+      | None -> BConst { value = Z.zero; width = 1 }
       | Some f ->
           let self = BSlice { signal = BVar base; msb = i; lsb = i } in
           let setv = if f.ty = "FDSE" || f.ty = "FDPE"
-                     then BConst { value = 1; width = 1 } else BConst { value = 0; width = 1 } in
+                     then BConst { value = Z.one; width = 1 } else BConst { value = Z.zero; width = 1 } in
           let load = BCond { condition = resolve_opt f.ce; then_val = d_expr f; else_val = self } in
           BCond { condition = resolve_opt f.rs; then_val = setv; else_val = load } in
     let parts = ref [] in
@@ -241,7 +241,7 @@ let read_program ?top (path : string) : bprogram =
     List.iter (fun f -> if String.trim f.init = "1" then init_val := !init_val lor (1 lsl f.idx)) bits;
     reg_signals := { name = base; stype = BInt { width; signed = Unsigned };
                      direction = `Internal;
-                     initial_value = Some (BConst { value = !init_val; width }); attrs = [] }
+                     initial_value = Some (BConst { value = Z.of_int !init_val; width }); attrs = [] }
                    :: !reg_signals;
     BSequential { name = base ^ "_reg"; clock = clk_name; clock_edge = `Pos;
                   reset = None; reset_edge = None; reset_async = false;

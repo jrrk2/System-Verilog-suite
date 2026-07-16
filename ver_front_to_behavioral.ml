@@ -100,7 +100,7 @@ let rec expr_to_bexpr = function
   | ID id -> BVar id.Idhash.id
   | (INT _ | INTNUM _ | DECNUM _ | HEXNUM _ | BINNUM _) as c ->
       let (value, width) = parse_const c in
-      BConst { value; width }
+      BConst { value = Z.of_int value; width }
   | TRIPLE (BITSEL, ID id, idx) ->
       BSelect {
         array = BVar id.Idhash.id;
@@ -139,7 +139,7 @@ let rec expr_to_bexpr = function
       BUnOp { op = BNot;
               operand = expr_to_bexpr a;
               result_type = BInt { width = 64; signed = Unsigned } }
-  | _ -> BConst { value = 0; width = 1 }
+  | _ -> BConst { value = Z.zero; width = 1 }
 
 (* Extract the underlying base name and (optional) bit index from a Pin
  * expression. q[3] → ("q", Some 3); plain VarRef q → ("q", None). *)
@@ -459,7 +459,7 @@ let cell_to_bprocess (c : cell_inst) =
         let pre_pin   = pin_expr "PRE" c.pins in
         let clr_pin   = pin_expr "CLR" c.pins in
         let ce_pin    = pin_expr "CE"  c.pins in
-        let zero = BConst { value = 0; width = 64 } in
+        let zero = BConst { value = Z.zero; width = 64 } in
         (* All-ones at whatever width Q resolves to — z3_miter widens the
          * BConst-zero to Q's width and ~0 then becomes the proper
          * all-ones mask. Used for the async PRE (preset-to-1) case. *)
@@ -567,7 +567,7 @@ let cell_to_bprocess (c : cell_inst) =
        | Some lhs -> Some (BCombinational {
            name = Printf.sprintf "VCC_inst_%s" c.inst_name;
            sensitivity = [BAny];
-           body = [BAssign { lhs; rhs = BConst { value = 1; width = 1 } }];
+           body = [BAssign { lhs; rhs = BConst { value = Z.one; width = 1 } }];
          })
        | None -> None)
   | "GND" ->
@@ -575,7 +575,7 @@ let cell_to_bprocess (c : cell_inst) =
        | Some lhs -> Some (BCombinational {
            name = Printf.sprintf "GND_inst_%s" c.inst_name;
            sensitivity = [BAny];
-           body = [BAssign { lhs; rhs = BConst { value = 0; width = 1 } }];
+           body = [BAssign { lhs; rhs = BConst { value = Z.zero; width = 1 } }];
          })
        | None -> None)
   (* RTL_BSEL: dynamic bit-select. Pins:
@@ -596,7 +596,7 @@ let cell_to_bprocess (c : cell_inst) =
                  op = BAnd;
                  lhs = BBinOp { op = BShr; lhs = i_src; rhs = s_idx;
                                 result_type = bool_t };
-                 rhs = BConst { value = 1; width = 1 };
+                 rhs = BConst { value = Z.one; width = 1 };
                  result_type = bool_t;
                };
              }];

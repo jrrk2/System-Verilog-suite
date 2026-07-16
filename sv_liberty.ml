@@ -207,8 +207,8 @@ let parse_function_to_bexpr (input_map : (string * Behavioral_ir.bexpr) list)
   let len = String.length s in
   let pos = ref 0 in
   let bool1 = Behavioral_ir.BInt { width = 1; signed = Unsigned } in
-  let one  = Behavioral_ir.BConst { value = 1; width = 1 } in
-  let zero = Behavioral_ir.BConst { value = 0; width = 1 } in
+  let one  = Behavioral_ir.BConst { value = Z.one; width = 1 } in
+  let zero = Behavioral_ir.BConst { value = Z.zero; width = 1 } in
   let mk_and a b = Behavioral_ir.BBinOp { op = BAnd; lhs = a; rhs = b;
                                           result_type = bool1 } in
   let mk_or  a b = Behavioral_ir.BBinOp { op = BOr;  lhs = a; rhs = b;

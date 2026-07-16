@@ -45,7 +45,7 @@ let actual_dest port_map name =
   | Some (BSlice { signal = BVar n; msb; lsb }) when msb = lsb ->
       Some (DBit (n, msb))
   | Some (BSelect { array = BVar n; index = BConst { value; _ } }) ->
-      Some (DBit (n, value))
+      Some (DBit (n, Z.to_int value))
   | Some _ | None -> None
 
 let bit_wire_name bus idx = bus ^ "__b" ^ string_of_int idx
@@ -136,11 +136,11 @@ let expand_instance lib (inst : binstance)
              let e1 =
                match ff.clear with
                | None -> e0
-               | Some c -> with_async (parse_func env c) 0 e0 in
+               | Some c -> with_async (parse_func env c) Z.zero e0 in
              let e2 =
                match ff.preset with
                | None -> e1
-               | Some p -> with_async (parse_func env p) 1 e1 in
+               | Some p -> with_async (parse_func env p) Z.one e1 in
              e2
            in
            let stmts =

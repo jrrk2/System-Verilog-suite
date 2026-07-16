@@ -212,7 +212,7 @@ let rip_module (m : bmodule) : bmodule =
             let rec render = function
               | BVar n -> n
               | BConst { value; width } ->
-                  Printf.sprintf "%d'd%d" width value
+                  Printf.sprintf "%d'd%s" width (Z.to_string value)
               | BBinOp { op; lhs; rhs; _ } ->
                   let s = match op with
                     | BEq -> "==" | BNe -> "!=" | BAdd -> "+"

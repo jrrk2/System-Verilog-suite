@@ -22,7 +22,7 @@ type btype =
 (* Expressions *)
 type bexpr =
   | BVar of string
-  | BConst of { value: int; width: int }
+  | BConst of { value: Z.t; width: int }   (* arbitrary-precision: never truncate wide literals *)
   | BBinOp of { op: binop; lhs: bexpr; rhs: bexpr; result_type: btype }
   | BUnOp of { op: unop; operand: bexpr; result_type: btype }
   | BSelect of { array: bexpr; index: bexpr }  (* array[index] *)
@@ -196,6 +196,15 @@ type bprogram = {
 } [@@deriving yojson]
 
 (* ========================================================================= *)
+(* Arbitrary-precision constant helpers (BConst.value : Z.t)                  *)
+(* ========================================================================= *)
+
+(* Construct a BConst from a native int (the common small-literal case). *)
+let bconst_int (v : int) (w : int) : bexpr = BConst { value = Z.of_int v; width = w }
+(* Construct a BConst from a Z.t value. *)
+let bconst_z (v : Z.t) (w : int) : bexpr = BConst { value = v; width = w }
+
+(* ========================================================================= *)
 (* Pretty printing *)
 (* ========================================================================= *)
 
@@ -222,7 +231,7 @@ let string_of_unop = function
 
 let rec string_of_bexpr = function
   | BVar name -> name
-  | BConst { value; width } -> Printf.sprintf "%d'%d" width value
+  | BConst { value; width } -> Printf.sprintf "%d'%s" width (Z.to_string value)
   | BBinOp { op; lhs; rhs; _ } ->
       Printf.sprintf "(%s %s %s)" (string_of_bexpr lhs) (string_of_binop op) (string_of_bexpr rhs)
   | BUnOp { op; operand; _ } ->

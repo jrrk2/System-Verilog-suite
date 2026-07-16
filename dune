@@ -7,12 +7,12 @@
  (name svs_place_core)
  (wrapped false)
  (modules behavioral_ir pack_to_lef)
- (libraries str yojson))
+ (libraries str yojson zarith))
 
 (executables
  (names place_lef pack_to_lef_main)
  (modules place_lef pack_to_lef_main)
- (libraries svs_place_core str yojson))
+ (libraries svs_place_core str yojson zarith))
 
 (ocamllex
  (modules Source_text_verible_lex Rtlil_input_lex surelog_uhdm_lex liberty_lex))
@@ -30,7 +30,7 @@
           
           sv_main_unified sv_parse sv_transform sv_tran_struct
           behavioural_to_opt_ir opt_ir_to_sv opt_ir_to_behavioral opt_ir_naming sv_opt_ir
-          behavioral_unroll behavioral_mem_merge behavioral_inline behavioral_iflift behavioral_meminfer behavioral_ffrip behavioral_share behavioral_sanity behavioral_blocking_subst behavioral_flatten behavioral_hier behavioral_boundary mem_macro_resolve behavioral_memlower fpga_bram_resolve
+          behavioral_unroll behavioral_mem_merge behavioral_inline behavioral_iflift behavioral_meminfer behavioral_srl_infer behavioral_ffrip behavioral_share behavioral_sanity behavioral_blocking_subst behavioral_flatten behavioral_hier behavioral_boundary mem_macro_resolve behavioral_memlower fpga_bram_resolve
           verible_elaborate verible_to_behavioral verible_emit_source rtlil_to_behavioral
           slang_to_behavioral
           sv_verify_hardcaml sv_memory sv_liberty sv_gate_map gate_netlist_to_behavioral
@@ -57,7 +57,7 @@
           
           vhdl_semantic_checker
           vhdl_parse vhdl_elaborate vhdl_expr_to_ir vhdl_process_extract vhdl_to_ir vhdl_to_ir_direct vhdl_to_ir_iterate vhdl_ir_to_opt_ir interactive_client interactive_client_v2 nlview_to_verilog)
- (libraries svs_place_core str yojson unix base fpga_synth hardcaml hardcaml_circuits z3 vhd_front ver_front lua-ml linenoise lef_def lablgtk3 edif2_lib)
+ (libraries svs_place_core str yojson zarith unix base fpga_synth hardcaml hardcaml_circuits z3 vhd_front ver_front lua-ml linenoise lef_def lablgtk3 edif2_lib)
  (preprocess (pps ppx_deriving_yojson)))
 
 (env
