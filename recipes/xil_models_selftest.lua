@@ -40,4 +40,36 @@ v = svd.miter(svd.pick(gold, "srl"), svd.pick(p, "srl"))
 if v == "EQUIVALENT" then pass = pass + 1 else fail = fail + 1 end
 print("  srl_infer end-to-end  ->  " .. v)
 
+-- ── Synthesis-path regressions ────────────────────────────────────────────
+-- Wide-constant bit-exactness through behavioral const-prop: a 128-bit literal
+-- must survive the pipeline + optimize with NO Z.to_int overflow and NO
+-- truncation.  Guards behavioral_const.expr_to_const (Z.Overflow -> CUnknown) and
+-- proves the constant is preserved exactly (a truncated literal would make the
+-- optimized side's XOR disagree on the high bits -> DIFFER).  optimize is the
+-- pass that crashed before the fix.
+spec = svd.parse("verible", "widek", {D .. "widek.sv"})
+o = svd.parse("verible", "widek", {D .. "widek.sv"})
+o = svd.unroll(o); o = svd.inline(o); o = svd.iflift(o)
+o = svd.blocking_subst(o); o = svd.meminfer(o); o = svd.memlower(o)
+o = svd.optimize(o)
+v = svd.miter(svd.pick(spec, "widek"), svd.pick(o, "widek"))
+if v == "EQUIVALENT" then pass = pass + 1 else fail = fail + 1 end
+print("  wide-const 128b: behavioral optimize bit-exact  ->  " .. v)
+
+-- Wide gate_map crash-guards: a 128-bit const XOR and a 96-bit register with a
+-- wide init must gate_map without Z.Overflow — exercises behavioral_to_hardcaml
+-- signal_of_z (wide BConst) and the initial_values Z.t path.  The write also
+-- exercises write_cellmapped_v's completeness guard on the positive (fully
+-- mapped) path.  Reaching the print => no crash / no false abort.
+p = svd.parse("verible", "widek", {D .. "widek.sv"})
+p = svd.unroll(p); p = svd.inline(p); p = svd.iflift(p)
+p = svd.blocking_subst(p); p = svd.meminfer(p); p = svd.memlower(p)
+svd.write_cellmapped_v(svd.gate_map(svd.pick(p, "widek"), 6, 0), "/tmp/widek_cells.v")
+p = svd.parse("verible", "wreg", {D .. "wreg.sv"})
+p = svd.unroll(p); p = svd.inline(p); p = svd.iflift(p)
+p = svd.blocking_subst(p); p = svd.meminfer(p); p = svd.memlower(p)
+svd.write_cellmapped_v(svd.gate_map(svd.pick(p, "wreg"), 6, 0), "/tmp/wreg_cells.v")
+pass = pass + 1
+print("  wide gate_map 128b/96b + cellmapped write  ->  OK (no overflow)")
+
 print("== pass=" .. pass .. " fail=" .. fail .. " ==")
