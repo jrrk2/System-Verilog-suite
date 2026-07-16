@@ -67,6 +67,7 @@ let pack_module (m : bmodule) : bmodule =
     let to_drop = ref [] in
     let packed_procs = ref [] in
     let buses_packed = ref [] in
+    let bus_widths = ref [] in
     Hashtbl.iter (fun (sem, bus) entries ->
       let max_idx = List.fold_left (fun a (i, _, _) -> max a i) 0 entries in
       let needed = max_idx + 1 in
@@ -74,6 +75,7 @@ let pack_module (m : bmodule) : bmodule =
         Printf.eprintf "[ffpack] %s bus=%s |entries|=%d max=%d\n"
           m.name bus (List.length entries) max_idx;
       if List.length entries = needed then begin
+        bus_widths := (bus, needed) :: !bus_widths;
         let sorted_msb_first =
           List.sort (fun (a, _, _) (b, _, _) -> compare b a) entries in
         let rhs_list = List.map (fun (_, r, _) -> r) sorted_msb_first in
@@ -114,7 +116,18 @@ let pack_module (m : bmodule) : bmodule =
         Str.string_match (bit_signal_re bus) s.name 0
       ) !buses_packed)
     ) m.signals in
-    { m with signals = kept_signals;
+    (* Declare the packed bus itself when it isn't already a signal/port — the
+     * per-bit `bus__b<i>` decls were just dropped, and downstream refs to them
+     * (FF hold branch, output buffers) are rewritten to `bus[i]`, so the bus
+     * must exist.  Preserve an existing decl (e.g. a registered output port). *)
+    let bus_decls =
+      List.filter_map (fun (bus, w) ->
+        if List.exists (fun (s : bsignal) -> s.name = bus) kept_signals then None
+        else Some { name = bus;
+                    stype = BInt { width = w; signed = Unsigned };
+                    direction = `Internal; initial_value = None; attrs = [] })
+        !bus_widths in
+    { m with signals = kept_signals @ bus_decls;
              processes = kept @ List.rev !packed_procs }
 
 let pack_program (p : bprogram) : bprogram =

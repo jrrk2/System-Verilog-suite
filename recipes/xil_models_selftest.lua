@@ -86,4 +86,22 @@ v = svd.miter(svd.pick(spec, "widek"), svd.pick(impl, "widek"))
 if v == "EQUIVALENT" then pass = pass + 1 else fail = fail + 1 end
 print("  vector bitbus 128b: behavioral==gatemap  ->  " .. v)
 
+-- Sequential FF-state-naming alignment (needs FPGA_LEC_NAMES=1): fpga_map splits
+-- a multi-bit register into `<reg>__b<i>` FDREs; prep_for_z3 iflift-collapses the
+-- FDRE bodies, ffpack re-packs them into a bus FF, the reg-bitbus resolver maps
+-- `<reg>__b<i>` -> reg[i], and the undriven-net tie grounds the floating FDRE.R /
+-- GND -- so ffrip's state cones line up by name with the behavioural bus reg.
+function seq_equiv(name)
+  local s = svd.parse("verible", name, {D .. name .. ".sv"})
+  local p = svd.parse("verible", name, {D .. name .. ".sv"})
+  p = svd.unroll(p); p = svd.inline(p); p = svd.iflift(p)
+  p = svd.blocking_subst(p); p = svd.meminfer(p); p = svd.memlower(p)
+  local im = svd.augment_xil_models(svd.mapped_to_prog(svd.gate_map(svd.pick(p, name), 6, 0)))
+  local vv = svd.miter(svd.pick(s, name), svd.pick(im, name))
+  if vv == "EQUIVALENT" then pass = pass + 1 else fail = fail + 1 end
+  print("  seq FF-align " .. name .. "  ->  " .. vv)
+end
+seq_equiv("seqreg")
+seq_equiv("seqmux")
+
 print("== pass=" .. pass .. " fail=" .. fail .. " ==")

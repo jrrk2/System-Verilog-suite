@@ -431,18 +431,37 @@ let cut_blackboxes ?(trusted : string list = []) (m : bmodule) (p : bprogram) : 
    of_circuit itself is unchanged (its output also feeds the silicon nextpnr
    path, which resolves the bitbus its own way). *)
 let resolve_input_bitbus (m : bmodule) : bmodule =
+  (* inw = multi-bit INPUT ports (port bitbus `base__<i>`);
+     allw = every multi-bit signal (register bitbus `base__b<i>`, produced by
+     fpga_map's per-bit register split + ffpack's re-pack). *)
   let inw : (string, int) Hashtbl.t = Hashtbl.create 16 in
+  let allw : (string, int) Hashtbl.t = Hashtbl.create 64 in
   List.iter (fun (s : bsignal) ->
-    match s.direction with
-    | `Input ->
-        let w = Behavioral_boundary.width_of_btype s.stype in
-        if w > 1 then Hashtbl.replace inw s.name w
-    | _ -> ()) m.signals;
-  if Hashtbl.length inw = 0 then m
+    let w = Behavioral_boundary.width_of_btype s.stype in
+    if w > 1 then begin
+      Hashtbl.replace allw s.name w;
+      if s.direction = `Input then Hashtbl.replace inw s.name w
+    end) m.signals;
+  if Hashtbl.length allw = 0 then m
   else begin
-    (* rightmost "__" split; only a name whose base is a known multi-bit input
-       and whose suffix is an in-range bit index is a bitbus reference. *)
-    let split_bitbus name =
+    let all_digits s = s <> "" && String.for_all (fun c -> c >= '0' && c <= '9') s in
+    (* register bitbus: rightmost "__b<digits>" whose base is any multi-bit sig *)
+    let split_reg name =
+      let n = String.length name in
+      let rec find i =
+        if i < 0 then None
+        else if i + 2 < n && name.[i] = '_' && name.[i+1] = '_' && name.[i+2] = 'b'
+                && all_digits (String.sub name (i+3) (n-i-3))
+        then
+          let base = String.sub name 0 i in
+          let idx = int_of_string (String.sub name (i+3) (n-i-3)) in
+          (match Hashtbl.find_opt allw base with
+           | Some w when idx >= 0 && idx < w -> Some (base, idx)
+           | _ -> find (i - 1))
+        else find (i - 1) in
+      find (n - 4) in
+    (* port bitbus: rightmost "__<digits>" whose base is a multi-bit input port *)
+    let split_port name =
       let n = String.length name in
       let rec last_dd i =
         if i < 0 then None
@@ -456,11 +475,56 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
           (match int_of_string_opt suf, Hashtbl.find_opt inw base with
            | Some i, Some w when i >= 0 && i < w -> Some (base, i)
            | _ -> None) in
+    let split_bitbus name =
+      match split_reg name with Some r -> Some r | None -> split_port name in
+    (* Set of nets that HAVE a driver: ports, every process assign target, and
+       (conservatively) every net touched by a surviving black-box instance.  A
+       read of anything else is an unconnected pin, which Xilinx defaults to 0 —
+       e.g. a CARRY4 whose CI is omitted (only CYINIT wired), or a floating GND/
+       VCC.  Undriven, they float free and the miter reports spurious diffs. *)
+    let driven : (string, unit) Hashtbl.t = Hashtbl.create 256 in
+    List.iter (fun (s : bsignal) ->
+      match s.direction with
+      | `Input | `Output -> Hashtbl.replace driven s.name ()
+      | _ -> ()) m.signals;
+    let rec add_lhs = function
+      | BAssign { lhs; _ } -> Hashtbl.replace driven lhs ()
+      | BIf { then_stmts; else_stmts; _ } ->
+          List.iter add_lhs then_stmts; List.iter add_lhs else_stmts
+      | BCase { cases; default; _ } ->
+          List.iter (fun (_, b) -> List.iter add_lhs b) cases;
+          List.iter add_lhs default
+      | BWhile { body; _ } -> List.iter add_lhs body
+      | BFor { init; update; body; _ } ->
+          add_lhs init; add_lhs update; List.iter add_lhs body
+      | BBlock b -> List.iter add_lhs b
+      | BCallStmt _ | BReturn _ -> () in
+    List.iter (function
+      | BCombinational { body; _ } -> List.iter add_lhs body
+      | BSequential { body; _ } -> List.iter add_lhs body) m.processes;
+    let rec add_vars = function
+      | BVar n -> Hashtbl.replace driven n ()
+      | BConst _ -> ()
+      | BBinOp { lhs; rhs; _ } -> add_vars lhs; add_vars rhs
+      | BUnOp { operand; _ } -> add_vars operand
+      | BSelect { array; index } -> add_vars array; add_vars index
+      | BSlice { signal; _ } -> add_vars signal
+      | BConcat es -> List.iter add_vars es
+      | BReplicate { value; _ } -> add_vars value
+      | BCond { condition; then_val; else_val } ->
+          add_vars condition; add_vars then_val; add_vars else_val
+      | BCall { args; _ } -> List.iter add_vars args in
+    List.iter (fun (i : binstance) ->
+      List.iter (fun (_, e) -> add_vars e) i.port_connections) m.instances;
+    let c0 = BConst { value = Z.zero; width = 1 } in
+    let c1 = BConst { value = Z.one; width = 1 } in
     let rec rw e = match e with
+      | BVar "GND" -> c0
+      | BVar "VCC" -> c1
       | BVar n ->
           (match split_bitbus n with
            | Some (base, i) -> BSlice { signal = BVar base; msb = i; lsb = i }
-           | None -> e)
+           | None -> if Hashtbl.mem driven n then e else c0)
       | BConst _ -> e
       | BBinOp r -> BBinOp { r with lhs = rw r.lhs; rhs = rw r.rhs }
       | BUnOp r -> BUnOp { r with operand = rw r.operand }
@@ -551,6 +615,13 @@ let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmo
             flat'.instances;
           flat'
   in
+  (* fpga_map bit-blasts a W-bit register into W 1-bit FDREs driving
+     `<bus>__b<i>`, so ffrip yields W independent Q/D cones while the behavioural
+     reference has a single bus-level cone — the names never match.  Collapse the
+     FDRE-model conditional bodies to a single BAssign (iflift) and re-pack the
+     per-bit FFs into one bus FF (ffpack) so state lines up by name.  Then
+     resolve the multi-bit-port bitbus. *)
+  let result = Behavioral_ffpack.pack_module (Behavioral_iflift.lift_module result) in
   resolve_input_bitbus result
 
 (* One module's cross-design verdict, with [trusted] submodules black-boxed
