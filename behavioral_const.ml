@@ -120,9 +120,16 @@ let const_to_expr = function
   | CBool false -> BConst { value = Z.zero; width = 1 }
   | CUnknown -> failwith "Cannot convert unknown to expression"
 
-(* Convert expression to constant value *)
+(* Convert expression to constant value.  CInt carries an OCaml int, so a
+   literal wider than 63 bits (which BConst.value now holds exactly as a Z.t)
+   cannot be represented — treat it as non-constant rather than crashing in
+   Z.to_int.  Skipping const-folding on such a literal is conservative: it is
+   preserved verbatim in the BConst, never mis-folded. *)
 let expr_to_const ctx = function
-  | BConst { value; width } -> CInt (Z.to_int value, width)
+  | BConst { value; width } ->
+      (match Z.to_int value with
+       | v -> CInt (v, width)
+       | exception Z.Overflow -> CUnknown)
   | BVar var ->
       (try Hashtbl.find ctx.constants var with Not_found -> CUnknown)
   | _ -> CUnknown
