@@ -238,24 +238,31 @@ let rec expr_to_signal ctx = function
         | Some "dadda"   -> Some Hardcaml_circuits.Mul.Config.Dadda
         | _ -> None
       in
+      (* When the result is wider than the operands (`[8:0] y = a + b` with 8-bit
+         a,b), widen the operands to the result width before adding so the
+         carry-out lands in the high bit instead of being dropped by same-width
+         `+:` (which would leave y[8] = 0). *)
+      let add_w = max common_w result_width in
       (match op with
        | BAdd ->
            (match prefix_sum_config () with
-            | None -> Signal.(s_lhs +: s_rhs)
+            | None -> Signal.(uresize s_lhs add_w +: uresize s_rhs add_w)
             | Some config ->
                 let s_full = Hardcaml_circuits.Prefix_sum.create
                   (module Signal) ~config
-                  ~input1:s_lhs ~input2:s_rhs ~carry_in:Signal.gnd in
-                Signal.select s_full (common_w - 1) 0)
+                  ~input1:(Signal.uresize s_lhs add_w)
+                  ~input2:(Signal.uresize s_rhs add_w) ~carry_in:Signal.gnd in
+                Signal.select s_full (add_w - 1) 0)
        | BSub ->
            (match prefix_sum_config () with
-            | None -> Signal.(s_lhs -: s_rhs)
+            | None -> Signal.(uresize s_lhs add_w -: uresize s_rhs add_w)
             | Some config ->
                 (* a - b = a + ~b + 1, via prefix-sum with carry_in=1 *)
                 let s_full = Hardcaml_circuits.Prefix_sum.create
                   (module Signal) ~config
-                  ~input1:s_lhs ~input2:Signal.(~: s_rhs) ~carry_in:Signal.vdd in
-                Signal.select s_full (common_w - 1) 0)
+                  ~input1:(Signal.uresize s_lhs add_w)
+                  ~input2:Signal.(~: (uresize s_rhs add_w)) ~carry_in:Signal.vdd in
+                Signal.select s_full (add_w - 1) 0)
        | BMul ->
            (match mul_config () with
             | None -> Signal.(s_lhs *: s_rhs)

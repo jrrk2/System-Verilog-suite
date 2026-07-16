@@ -104,4 +104,11 @@ end
 seq_equiv("seqreg")
 seq_equiv("seqmux")
 
+-- CARRY4 arithmetic: guards (a) behavioral_to_hardcaml widening the add to the
+-- result width so the carry-out isn't dropped (y[8] of [8:0]=a+b), and (b)
+-- flatten_for_z3 fanning out a CARRY4's concat .O/.CO ports to their per-bit nets
+-- (else the sum/carry float and the undriven-tie zeros them).
+seq_equiv("addcarry")   -- combinational (no FFs; seq_equiv still works)
+seq_equiv("counter")    -- FF alignment + CARRY4 increment together
+
 print("== pass=" .. pass .. " fail=" .. fail .. " ==")

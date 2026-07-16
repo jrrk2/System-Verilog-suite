@@ -258,9 +258,31 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
     List.fold_left (fun acc proc ->
       sub_process ~subst ~lhs_subst ~prefix proc :: acc
     ) parent.processes child.processes in
+  (* An OUTPUT port wired to a CONCAT of 1-bit nets — e.g. a CARRY4's
+     `.O({_n_4,_n_3,_n_2,_n_1})` / `.CO(...)` — can't go through lhs_subst (which
+     maps a formal to a single parent net).  The child writes the whole port
+     `<inst>__<formal>`; fan it out bit-wise to the concat's nets (MSB-first) so
+     they aren't left undriven.  Without this the CARRY4 sum/carry nets float. *)
+  let fanout_procs =
+    List.filter_map (fun (formal, actual) ->
+      match List.assoc_opt formal port_dirs, actual with
+      | Some `Output, BConcat parts
+        when List.for_all (function BVar _ -> true | _ -> false) parts ->
+          let w = List.length parts in
+          let src = pname prefix formal in
+          let body = List.mapi (fun j part ->
+            let bit = w - 1 - j in
+            match part with
+            | BVar n -> BAssign { lhs = n;
+                                  rhs = BSlice { signal = BVar src; msb = bit; lsb = bit } }
+            | _ -> assert false) parts in
+          Some (BCombinational { name = pname prefix (formal ^ "__fanout");
+                                 sensitivity = [BAny]; body })
+      | _ -> None
+    ) inst.port_connections in
   { parent with
     signals   = new_signals;
-    processes = new_processes }
+    processes = fanout_procs @ new_processes }
 
 (* Flatten a top-level module by recursively inlining every reachable
  * binstance. Memoised by module name so cells used multiple times only
