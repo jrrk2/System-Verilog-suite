@@ -37,6 +37,24 @@ module T = Hardcaml.Signal.Type
 let declared_input_widths : (string, (string * int) list) Base.Hashtbl.t =
   Hashtbl.create (module String)
 
+(* Gate-map completeness check.  Returns a histogram of the un-techmapped RTL
+   node kinds still present in [circ] — exactly the set of_circuit refuses to
+   lower (Op2/Mux/Reg/Memory).  An empty result means the circuit is fully
+   cell-mapped (only Inst/Const/Wire/Select/Cat/Not).  write_cellmapped_v uses
+   this to abort rather than silently emit a half-mapped netlist (the 0-cell-
+   instance / all-combinational-assigns stub failure mode). *)
+let unmapped_node_kinds (circ : Circuit.t) : (string * int) list =
+  let counts : (string, int) Hashtbl.t = Hashtbl.create (module String) in
+  let bump k = Hashtbl.update counts k ~f:(function None -> 1 | Some n -> n + 1) in
+  Signal_graph.iter (Signal_graph.create (Circuit.outputs circ)) ~f:(fun s ->
+    match s with
+    | T.Op2 _ -> bump "Op2"
+    | T.Mux _ -> bump "Mux"
+    | T.Reg _ -> bump "Reg"
+    | T.Multiport_mem _ | T.Mem_read_port _ -> bump "Memory"
+    | _ -> ());
+  Hashtbl.to_alist counts
+
 (* Pick a stable name for a Hardcaml signal: prefer its first declared
  * name, else fall back to a synthetic `_n<uid>` like fpga_emit does.   *)
 let signal_name s =

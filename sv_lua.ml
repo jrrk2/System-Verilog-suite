@@ -751,7 +751,20 @@ let lgate_map mod_h k_lut io_flag =
 (* Dump a Mapped circuit as cell-mapped Verilog via Hardcaml.Rtl,
  * suitable for ver_front to re-parse into structural BIR. *)
 let lwrite_cellmapped_v mapped_h path =
-  let _, circ = find_mapped mapped_h in
+  let name, circ = find_mapped mapped_h in
+  (* Refuse to write a netlist that isn't fully techmapped — otherwise
+     Hardcaml.Rtl.output re-elaborates the surviving RTL operators as
+     behavioural assigns and produces a 0-cell-instance stub that looks like a
+     valid cellmapped netlist but carries none of the gate structure. *)
+  (match Hardcaml_to_behavioral.unmapped_node_kinds circ with
+   | [] -> ()
+   | viol ->
+       let s = String.concat ", "
+         (List.map (fun (k, n) -> Printf.sprintf "%s=%d" k n) viol) in
+       failwith (Printf.sprintf
+         "write_cellmapped_v: circuit '%s' is NOT fully cell-mapped (%s still \
+          present) — run gate_map/fpga_map first; refusing to write a \
+          half-mapped stub to %s" name s path));
   let oc = Stdlib.open_out path in
   Stdlib.Fun.protect ~finally:(fun () -> Stdlib.close_out oc)
     (fun () ->

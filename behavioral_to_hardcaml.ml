@@ -7,6 +7,17 @@
 open Behavioral_ir
 open Hardcaml
 
+(* Width-safe constant builder.  BConst.value is an arbitrary-precision Z.t, so
+   a literal wider than 63 bits (common once whole SGMII/PCS designs flatten —
+   96/128-bit shift-reg inits, wide config vectors) overflows Z.to_int and
+   crashes create_circuit.  Build the exact bit pattern at the requested width
+   directly instead of routing through int.  Z.testbit reads the correct low
+   bits even for a negative (two's-complement) value. *)
+let signal_of_z ~width value =
+  let w = max 1 width in
+  let s = String.init w (fun i -> if Z.testbit value (w - 1 - i) then '1' else '0') in
+  Signal.of_constant (Constant.of_binary_string s)
+
 (* Clamp a dynamic shift/index amount to clog2(width) bits before
    [Signal.log_shift].  log_shift builds one barrel stage per amount bit
    (stage k shifts by 2^k), so a 64-bit amount (e.g. a mis-widened
@@ -47,7 +58,7 @@ type conv_context = {
      onto the Reg signal's [reg_reset_value] field and downstream
      mappers (FPGA → FDRE INIT; ASIC → "would-need-explicit-reset"
      check) can read it back. *)
-  initial_values: (string, int * int) Hashtbl.t;  (* name -> (width, value) *)
+  initial_values: (string, int * Z.t) Hashtbl.t;  (* name -> (width, value) *)
   (* Net names tied to a constant by a GND/VCC primitive instance in the
      source (`GND GND_1 (.G(GND_2))` → GND_2 = 0, `VCC VCC_1 (.P(VCC_2))`
      → VCC_2 = 1).  Those tie cells are pruned during mapping, so a
@@ -140,7 +151,7 @@ let get_or_create_var ctx name width is_reg =
         match Hashtbl.find_opt ctx.initial_values name with
         | None -> spec
         | Some (init_w, init_v) ->
-          let const = Signal.of_int ~width:(max width init_w) init_v in
+          let const = signal_of_z ~width:(max width init_w) init_v in
           let const = if Signal.width const = width then const
                       else Signal.uresize const width in
           (* If no source-level reset is wired, point [~reset] at gnd
@@ -184,7 +195,7 @@ let rec expr_to_signal ctx = function
   | BConst { value; width } ->
       (* clamp to >=1: a 0-width constant (degenerate slice / empty
          literal in flattened picorv32) would crash hardcaml's of_int. *)
-      Signal.of_int ~width:(max 1 width) (Z.to_int value)
+      signal_of_z ~width value
 
   | BBinOp { op; lhs; rhs; result_type } ->
       let s_lhs0 = expr_to_signal ctx lhs in
@@ -1036,7 +1047,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
     | Some (BConst { value; width }) ->
-        Hashtbl.replace ctx.initial_values s.name (width, Z.to_int value)
+        Hashtbl.replace ctx.initial_values s.name (width, value)
     | _ -> ()) bmod.signals;
   (* Clock/reset get bound by [process_to_always] when each
      BSequential block tells us its clock and reset signal names
@@ -1087,7 +1098,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
     | Some (BConst { value; width }) ->
-        Hashtbl.replace ctx.initial_values s.name (width, Z.to_int value)
+        Hashtbl.replace ctx.initial_values s.name (width, value)
     | _ -> ()) bmod.signals;
 
   (* Pre-pass: classify each non-input signal and pre-declare an
@@ -1308,7 +1319,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
         match Hashtbl.find_opt ctx.initial_values s.name with
         | None -> spec
         | Some (init_w, init_v) ->
-          let const = Signal.of_int ~width:(max w init_w) init_v in
+          let const = signal_of_z ~width:(max w init_w) init_v in
           let const = if Signal.width const = w then const
                       else Signal.uresize const w in
           Reg_spec.override spec ~reset_to:const
