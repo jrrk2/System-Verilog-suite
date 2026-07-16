@@ -29,9 +29,9 @@ open Behavioral_ir
    `mem[chunk*16 + 5]` → idx = BBinOp{BAdd, BBinOp{BMul, chunk, 16}, BConst 5}
                             → (chunk*16, 5) *)
 let decompose_idx = function
-  | BBinOp { op = BAdd; lhs; rhs = BConst { value; _ } } -> (lhs, value)
-  | BBinOp { op = BAdd; lhs = BConst { value; _ }; rhs } -> (rhs, value)
-  | BConst { value; width } -> (BConst { value = Z.zero; width }, value)
+  | BBinOp { op = BAdd; lhs; rhs = BConst { value; _ } } -> (lhs, Z.to_int value)
+  | BBinOp { op = BAdd; lhs = BConst { value; _ }; rhs } -> (rhs, Z.to_int value)
+  | BConst { value; width } -> (BConst { value = Z.zero; width }, Z.to_int value)
   | other -> (other, 0)
 
 (* Const-fold trivial arithmetic on bexprs: BAdd/BSub/BMul of two
@@ -42,11 +42,11 @@ let rec fold_const = function
       let l' = fold_const r.lhs and r' = fold_const r.rhs in
       (match r.op, l', r' with
        | BAdd, BConst { value = a; width = w }, BConst { value = b; _ } ->
-           BConst { value = a + b; width = w }
+           BConst { value = Z.add a b; width = w }
        | BSub, BConst { value = a; width = w }, BConst { value = b; _ } ->
-           BConst { value = a - b; width = w }
+           BConst { value = Z.sub a b; width = w }
        | BMul, BConst { value = a; width = w }, BConst { value = b; _ } ->
-           BConst { value = a * b; width = w }
+           BConst { value = Z.mul a b; width = w }
        | _ -> BBinOp { r with lhs = l'; rhs = r' })
   | other -> other
 
@@ -60,9 +60,9 @@ let decompose_data = function
   | BSlice { signal; msb; lsb } when msb >= lsb ->
       Some (signal, lsb, msb - lsb + 1)
   | BCall { func = "@part_select_up";
-            args = [signal; base_e; BConst { value = w; _ }] } when w > 0 ->
+            args = [signal; base_e; BConst { value = w; _ }] } when Z.gt w Z.zero ->
       (match fold_const base_e with
-       | BConst { value = b; _ } -> Some (signal, b, w)
+       | BConst { value = b; _ } -> Some (signal, Z.to_int b, Z.to_int w)
        | _ -> None)
   | _ -> None
 
@@ -135,12 +135,12 @@ let merge_run array_widths arr base_expr writes =
         let off = if k_min = 0 then base_expr
                   else BBinOp { op = BAdd;
                                 lhs = base_expr;
-                                rhs = BConst { value = k_min; width = 32 };
+                                rhs = BConst { value = Z.of_int k_min; width = 32 };
                                 result_type = BInt { width = 32; signed = Unsigned } } in
         if elem_w = 1 then off
         else BBinOp { op = BMul;
                       lhs = off;
-                      rhs = BConst { value = elem_w; width = 32 };
+                      rhs = BConst { value = Z.of_int elem_w; width = 32 };
                       result_type = BInt { width = 32; signed = Unsigned } }
       in
       let data_slice =
@@ -154,7 +154,7 @@ let merge_run array_widths arr base_expr writes =
         args = [
           BVar arr;
           bit_base;
-          BConst { value = slice_w; width = 32 };
+          BConst { value = Z.of_int slice_w; width = 32 };
           data_slice;
         ];
       } in
@@ -204,8 +204,8 @@ let try_merge_part_sel_run target_widths arr writes total_w =
             func = "@part_sel_write_up";
             args = [
               BVar arr;
-              BConst { value = first_off; width = 32 };
-              BConst { value = span; width = 32 };
+              BConst { value = Z.of_int first_off; width = 32 };
+              BConst { value = Z.of_int span; width = 32 };
               merged_data;
             ];
           } in
@@ -222,7 +222,7 @@ type widths_ctx = {
    bit offset.  Returns Some lit on success. *)
 let fold_offset = function
   | e -> (match fold_const e with
-          | BConst { value; _ } -> Some value
+          | BConst { value; _ } -> Some (Z.to_int value)
           | _ -> None)
 
 (* Scan a flat list of statements and merge adjacent runs of
@@ -276,7 +276,8 @@ let rec scan_block (ctx : widths_ctx) stmts =
                  merged :: scan_block ctx !tail)
   | (BCallStmt { func = "@part_sel_write_up";
                  args = [BVar arr; base_e; BConst { value = w; _ }; data] })
-    as s :: rest when w > 0 ->
+    as s :: rest when Z.gt w Z.zero ->
+      let w = Z.to_int w in
       (* Adjacent @part_sel_write_up runs to the SAME scalar register
          with constant base offsets — collapse to a single write
          per the "all locations written → single write" rule.
@@ -294,10 +295,10 @@ let rec scan_block (ctx : widths_ctx) stmts =
              | (BCallStmt { func = "@part_sel_write_up";
                             args = [BVar arr2; base2;
                                     BConst { value = w2; _ }; data2] }) :: rest2
-               when arr2 = arr && w2 > 0 ->
+               when arr2 = arr && Z.gt w2 Z.zero ->
                  (match fold_offset base2 with
                   | Some off2 ->
-                      writes := (off2, w2, data2) :: !writes;
+                      writes := (off2, Z.to_int w2, data2) :: !writes;
                       incr consumed;
                       tail := rest2
                   | None -> stop := true)
@@ -484,7 +485,7 @@ let rec collect_slice_sites cond acc = function
                         BConst { value = hi; _ };
                         BConst { value = lo; _ };
                         rhs] } ->
-      { cond; target = n; hi; lo; rhs } :: acc
+      { cond; target = n; hi = Z.to_int hi; lo = Z.to_int lo; rhs } :: acc
   | BBlock ss ->
       List.fold_left (collect_slice_sites cond) acc ss
   | BIf { condition; then_stmts; else_stmts } ->

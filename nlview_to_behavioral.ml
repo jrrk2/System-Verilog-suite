@@ -287,7 +287,7 @@ let convert filename =
   let net_to_expr net_name =
     let (base, idx_opt) = parse_signal_name net_name in
     match idx_opt with
-    | Some idx -> BSelect { array = BVar base; index = BConst { value = idx; width = 32 } }
+    | Some idx -> BSelect { array = BVar base; index = BConst { value = Z.of_int idx; width = 32 } }
     | None -> BVar base
   in
 

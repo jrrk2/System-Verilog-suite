@@ -227,6 +227,72 @@ let carry4_body () =
   empty_mod "CARRY4" signals [proc]
 
 (* ---------------------------------------------------------------------- *)
+(* SRL16E / SRLC32E: static-length shift register in one LUT.              *)
+(*   posedge CLK: if CE then sr <= {sr[W-2:0], D}  (D enters bit 0).        *)
+(*   Q  = sr[addr]  (addr from the A pins; SRL16E has A0..A3, SRLC32E a     *)
+(*        5-bit bus A);  SRLC32E also exposes Q31 = sr[31] for cascading.   *)
+(* This is the exact next-state / read semantics srl_infer targets, so a    *)
+(* depth-1 miter of {this model} vs {an explicit reg-chain} proves the pass *)
+(* correct.  The internal register is named `sr` so a same-named RTL        *)
+(* reference aligns under Behavioral_ffrip's by-name state matching.        *)
+(* ---------------------------------------------------------------------- *)
+let sig_wide name w dir ?init () =
+  { name; stype = BInt { width = w; signed = Unsigned };
+    direction = dir; initial_value = init; attrs = [] }
+
+(* addr specification: individual 1-bit pins (LSB first) or a single bus. *)
+type srl_addr = APins of string list | ABus of string * int
+
+(* mux: select sr[addr] where addr = sum_i addr_bits[i]*2^i (LSB first). *)
+let srl_select addr_bits =
+  let k = List.length addr_bits in
+  let bit = Array.of_list addr_bits in
+  let rec go level base =
+    if level < 0 then BSlice { signal = v "sr"; msb = base; lsb = base }
+    else BCond { condition = bit.(level);
+                 then_val = go (level - 1) (base + (1 lsl level));
+                 else_val = go (level - 1) base } in
+  go (k - 1) 0
+
+let srl_body ~ty ~w ~addr ~q31 ~init =
+  let init_z =
+    if only_binary init && init <> "" then
+      (try Z.of_string ("0b" ^ init) with _ -> Z.zero)
+    else Z.zero in
+  let sr_init = BConst { value = init_z; width = w } in
+  (* address bit expressions (LSB first) + the address port signals *)
+  let addr_bits, addr_sigs = match addr with
+    | APins pins ->
+        List.map v pins, List.map (fun p -> sig_ p `Input ()) pins
+    | ABus (name, aw) ->
+        List.init aw (fun i -> BSlice { signal = v name; msb = i; lsb = i }),
+        [ sig_wide name aw `Input () ] in
+  (* sequential shift: if CE then sr <= {sr[W-2:0], D} else sr <= sr *)
+  let shift_rhs = BConcat [ BSlice { signal = v "sr"; msb = w - 2; lsb = 0 }; v "D" ] in
+  let seq = BSequential
+    { name = "seq"; clock = "CLK"; clock_edge = `Pos;
+      reset = None; reset_edge = None; reset_async = false;
+      body = [ BIf { condition = v "CE";
+                     then_stmts = [ BAssign { lhs = "sr"; rhs = shift_rhs } ];
+                     else_stmts = [ BAssign { lhs = "sr"; rhs = v "sr" } ] } ];
+      blocking_vars = [] } in
+  (* combinational read ports *)
+  let read_assigns =
+    BAssign { lhs = "Q"; rhs = srl_select addr_bits }
+    :: (if q31 then [ BAssign { lhs = "Q31";
+                                rhs = BSlice { signal = v "sr"; msb = w - 1; lsb = w - 1 } } ]
+        else []) in
+  let comb = BCombinational { name = "comb"; sensitivity = [BAny]; body = read_assigns } in
+  let signals =
+    [ sig_ "CLK" `Input (); sig_ "CE" `Input (); sig_ "D" `Input () ]
+    @ addr_sigs
+    @ [ sig_wide "sr" w `Internal ~init:sr_init ();
+        sig_ "Q" `Output () ]
+    @ (if q31 then [ sig_ "Q31" `Output () ] else []) in
+  let name = Printf.sprintf "%s__%s" ty (name_frag init) in
+  empty_mod name signals [seq; comb]
+
+(* ---------------------------------------------------------------------- *)
 (* Dispatch: binstance -> specialised body bmodule (or None if unknown).   *)
 (* ---------------------------------------------------------------------- *)
 let lut_arity = function
@@ -266,6 +332,18 @@ let synth (i : binstance) : bmodule option =
             [("IS_D_INVERTED","D"); ("IS_CE_INVERTED","CE"); ("IS_PRE_INVERTED","PRE")] in
         Some (ff_body ~ty:"FDPE" ~set_val:true ~ctrl_pin:"PRE" ~init ~inv)
     | "CARRY4" -> Some (carry4_body ())
+    | "SRL16E" | "SRL16" ->
+        (* INIT is 16-bit; normalize_init ~k:4 renders 2^4 = 16 bits MSB-first *)
+        let raw = match param_lookup i "INIT" with Some s -> s | None -> "0" in
+        let init = normalize_init ~k:4 raw in
+        Some (srl_body ~ty:i.module_name ~w:16
+                ~addr:(APins ["A0"; "A1"; "A2"; "A3"]) ~q31:false ~init)
+    | "SRLC32E" | "SRLC32" ->
+        (* INIT is 32-bit; normalize_init ~k:5 renders 2^5 = 32 bits MSB-first *)
+        let raw = match param_lookup i "INIT" with Some s -> s | None -> "0" in
+        let init = normalize_init ~k:5 raw in
+        Some (srl_body ~ty:i.module_name ~w:32
+                ~addr:(ABus ("A", 5)) ~q31:true ~init)
     | "INV"   -> Some (buf_body ~name:"INV"  ~ins:["I"] ~out:"O" ~rhs:(notb (v "I")))
     | "BUF"   -> Some (buf_body ~name:"BUF"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))
     | "IBUF"  -> Some (buf_body ~name:"IBUF"  ~ins:["I"] ~out:"O" ~rhs:(v "I"))

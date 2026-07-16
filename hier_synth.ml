@@ -106,7 +106,7 @@ let rec render_conn_expr (parent_name : string) (port : string) (e : bexpr)
       (Printf.sprintf "%d'b%s" width
          (let buf = Buffer.create width in
           for i = width - 1 downto 0 do
-            Buffer.add_char buf (if (value lsr i) land 1 = 1 then '1' else '0')
+            Buffer.add_char buf (if Z.testbit value i then '1' else '0')
           done; Buffer.contents buf), [])
   | BBinOp { op; lhs; rhs; _ } ->
       let l, ld = render_conn_expr parent_name port lhs in
