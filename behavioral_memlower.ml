@@ -435,14 +435,19 @@ let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
   | _, None -> skip "RAM32M: no reading process"
   | Some w_idx, Some r_idx ->
     let w_proc = List.nth m.processes w_idx in
-    let r_proc = List.nth m.processes r_idx in
     let w_body = match w_proc with
       | BSequential s -> s.body | _ -> [] in
-    let r_body = match r_proc with
-      | BSequential s -> s.body
-      | BCombinational c -> c.body in
     let w_sites = collect_write_sites mname w_body in
-    let r_sites = collect_read_sites  mname r_body in
+    (* The two read ports of a 1W+2R memory are frequently in SEPARATE assigns
+       (`assign rd0 = mem[ra0]; assign rd1 = mem[ra1];`), i.e. different
+       processes.  find_reading_process only returns the FIRST reader, so
+       collecting read sites from that one process finds a single address and the
+       RAM32M path bails ("expected 2 distinct read addresses, got 1").  Gather
+       read sites from EVERY process (writer has none) so both read ports show. *)
+    let r_sites =
+      List.concat_map (fun p ->
+        let b = match p with BSequential s -> s.body | BCombinational c -> c.body in
+        collect_read_sites mname b) m.processes in
     (* Distinct read addresses, in order of first appearance. *)
     let distinct_addrs =
       List.fold_left (fun acc (_, addr) ->

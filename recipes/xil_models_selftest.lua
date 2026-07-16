@@ -111,4 +111,18 @@ seq_equiv("seqmux")
 seq_equiv("addcarry")   -- combinational (no FFs; seq_equiv still works)
 seq_equiv("counter")    -- FF alignment + CARRY4 increment together
 
+-- Distributed-RAM inference (needs MEMLOWER_FPGA=1): a 1W+2R depth-32 async RAM
+-- must map to RAM32M, NOT bit-blast to FFs.  Structural check (no RAM32M
+-- functional model to miter against): RAM32M present AND no FDRE.  Guards BUG1
+-- (read-address collection across the two separate read assigns).
+p = svd.parse("verible", "ram1w2r32", {D .. "ram1w2r32.sv"})
+p = svd.unroll(p); p = svd.inline(p); p = svd.iflift(p)
+p = svd.blocking_subst(p); p = svd.meminfer(p); p = svd.memlower(p)
+rtxt = svd.insts(svd.pick(svd.mapped_to_prog(svd.gate_map(svd.pick(p, "ram1w2r32"), 6, 0)), "ram1w2r32"))
+if strfind(rtxt, "RAM32M", 1, 1) and not strfind(rtxt, "FDRE", 1, 1) then
+  pass = pass + 1; print("  RAM 1W2R depth-32 -> RAM32M  ->  OK")
+else
+  fail = fail + 1; print("  RAM 1W2R depth-32 -> RAM32M  ->  FAIL (bit-blast?)")
+end
+
 print("== pass=" .. pass .. " fail=" .. fail .. " ==")

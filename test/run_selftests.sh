@@ -18,7 +18,7 @@ eval "$(opam env)" 2>/dev/null || true
 dune build _build/default/sv_suite.exe
 # FPGA_LEC_NAMES makes of_circuit name FF Q nets after the RTL register, which the
 # sequential FF-state-alignment cases need; it's inert for the combinational ones.
-OUT=$(FPGA_LEC_NAMES=1 ./_build/default/sv_suite.exe script recipes/xil_models_selftest.lua 2>&1)
+OUT=$(FPGA_LEC_NAMES=1 MEMLOWER_FPGA=1 ./_build/default/sv_suite.exe script recipes/xil_models_selftest.lua 2>&1)
 echo "$OUT" | grep -E '\->|pass=' || true
 if echo "$OUT" | grep -qE '== pass=[0-9]+ fail=0 =='; then
   echo "SELFTEST PASS"
