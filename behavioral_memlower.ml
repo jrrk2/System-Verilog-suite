@@ -427,7 +427,11 @@ let rec rewrite_reads_s_per_addr m_name addr_to_pin ~fallback = function
  * When WE=1, all 4 ADDR* point at write_addr and all 4 DI* are tied to
  * the write data, so the four internal LUTs stay in sync.  When WE=0,
  * ports A/B/C each read their independent address.                    *)
-let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
+(* Parameterised 1W+2R distributed-RAM lowering.
+   RAM32M: ~prim:"RAM32M" ~pb:2 ~depth_cap:32 ~addr_w:5  (6 read bits per RAM)
+   RAM64M: ~prim:"RAM64M" ~pb:1 ~depth_cap:64 ~addr_w:6  (3 read bits per RAM)
+   Vivado uses exactly this: 2 read copies × ceil(width / (3*pb)) RAMs. *)
+let ram_m_lower_dual_port ~prim ~pb ~depth_cap ~addr_w ~m ~(mm : bmem) ~mname ~skip =
   let writer = find_writing_process mname m.processes in
   let reader = find_reading_process mname m.processes in
   match writer, reader with
@@ -461,6 +465,9 @@ let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
                (List.length distinct_addrs))
      | Some (we_expr, w_addr, w_data), addr_a :: addr_b :: _ ->
        let dw = mm.data_width in
+       (* Read bits per RAM: 3 read ports (A/B/C), each [pb] bits.
+          RAM32M: pb=2 → 6/RAM;  RAM64M: pb=1 → 3/RAM. *)
+       let ram_bits = 3 * pb in
        let orig_clk = match w_proc with BSequential s -> s.clock | _ -> "clk" in
        let rs1_pin = mname ^ "_rs1" in
        let rs2_pin = mname ^ "_rs2" in
@@ -478,87 +485,74 @@ let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
        let w_data  = rewrite_e w_data in
        let addr_a  = rewrite_e addr_a in
        let addr_b  = rewrite_e addr_b in
-       let pad5 e =
+       let padA e =
          let aw = bits_needed mm.depth in
-         if aw >= 5 then e
-         else BConcat [ BConst { value = Z.zero; width = 5 - aw }; e ]
+         if aw >= addr_w then e
+         else BConcat [ BConst { value = Z.zero; width = addr_w - aw }; e ]
        in
-       let w_addr5 = pad5 w_addr in
-       let rs1_a5  = pad5 addr_a in
-       let rs2_a5  = pad5 addr_b in
-       (* SDP-style RAM32M: port D writes (ADDRD = write_addr, DID = data),
-          ports A/B/C read (ADDRA/B/C = read_addr).  Each RAM32M provides
-          6 bits of read per copy (DOA + DOB + DOC = 6 bits) and 8 bits of
-          write (DIA + DIB + DIC + DID = 8 bits — port D's 2 bits are
-          written but not read from this copy).  For 1W + 2R we duplicate
-          the storage: one copy per read port.
-          n_per_copy = ceil(width / 6) RAM32Ms per read view.            *)
-       let n_per_copy = (dw + 5) / 6 in   (* ceil(dw / 6) *)
-       (* INIT for one LUT covering address-range entries, MSB-first 64-bit
-          string. lo_bit picks 2 bits from each init_values[addr].         *)
+       let w_addr5 = padA w_addr in
+       let rs1_a5  = padA addr_a in
+       let rs2_a5  = padA addr_b in
+       (* SDP-style: port D writes (ADDRD = write_addr, DID = data), ports A/B/C
+          read (ADDRA/B/C = read_addr).  Each RAM provides [ram_bits] read bits
+          per copy (DOA+DOB+DOC); for 1W+2R we duplicate the storage, one copy
+          per read port.  n_per_copy = ceil(width / ram_bits). *)
+       let n_per_copy = (dw + ram_bits - 1) / ram_bits in
+       (* INIT for one port, MSB-first 64-bit string: [pb] bits per address,
+          entry [addr] at bit positions [pb*addr .. pb*addr+pb-1]. *)
        let init_for_lut lo_bit =
          let bits = Bytes.make 64 '0' in
          List.iteri (fun addr v ->
-           if addr < 32 then begin
-             let b0 = if lo_bit < dw then (v lsr lo_bit) land 1 else 0 in
-             let b1 = if lo_bit + 1 < dw then (v lsr (lo_bit + 1)) land 1 else 0 in
-             Bytes.set bits (63 - 2 * addr) (Char.chr (Char.code '0' + b0));
-             if 2 * addr + 1 < 64 then
-               Bytes.set bits (63 - 2 * addr - 1) (Char.chr (Char.code '0' + b1))
-           end) mm.init_values;
+           if addr < depth_cap then
+             for j = 0 to pb - 1 do
+               let b = if lo_bit + j < dw then (v lsr (lo_bit + j)) land 1 else 0 in
+               let pos = 63 - (pb * addr + j) in
+               if pos >= 0 then Bytes.set bits pos (Char.chr (Char.code '0' + b))
+             done) mm.init_values;
          Bytes.to_string bits
        in
-       (* Slice a 2-bit chunk from write data, zero-padding past width.    *)
+       (* Slice a [pb]-bit chunk from write data, zero-padding past width. *)
        let di_slice lo =
-         if lo + 1 < dw then BSlice { signal = w_data; msb = lo + 1; lsb = lo }
+         let hi = lo + pb - 1 in
+         if hi < dw then BSlice { signal = w_data; msb = hi; lsb = lo }
          else if lo < dw then
-           BConcat [ BConst { value = Z.zero; width = 1 }
-                   ; BSlice { signal = w_data; msb = lo; lsb = lo } ]
-         else BConst { value = Z.zero; width = 2 }
+           BConcat [ BConst { value = Z.zero; width = hi - (dw - 1) }
+                   ; BSlice { signal = w_data; msb = dw - 1; lsb = lo } ]
+         else BConst { value = Z.zero; width = pb }
        in
-       (* Build one copy's RAM32M instances + per-instance read output names.
-          read_addr = the 5-bit address feeding ADDRA/B/C of this copy.    *)
+       (* Build one copy's RAM instances + per-instance read output names.
+          read_addr5 = the address feeding ADDRA/B/C of this copy. *)
        let build_copy ~tag ~read_addr5 =
          let outs = List.init n_per_copy (fun k ->
            ( Printf.sprintf "%s_%s_a%d" mname tag k
            , Printf.sprintf "%s_%s_b%d" mname tag k
            , Printf.sprintf "%s_%s_c%d" mname tag k )) in
+         let mk_sig nm =
+           { name = nm; stype = BInt { width = pb; signed = Unsigned }
+           ; direction = `Internal; initial_value = None; attrs = [] } in
          let new_sigs =
-           List.concat_map (fun (a, b, c) ->
-             [ { name = a; stype = BInt { width = 2; signed = Unsigned }
-               ; direction = `Internal; initial_value = None; attrs = [] }
-             ; { name = b; stype = BInt { width = 2; signed = Unsigned }
-               ; direction = `Internal; initial_value = None; attrs = [] }
-             ; { name = c; stype = BInt { width = 2; signed = Unsigned }
-               ; direction = `Internal; initial_value = None; attrs = [] } ]) outs
-         in
+           List.concat_map (fun (a, b, c) -> [ mk_sig a; mk_sig b; mk_sig c ]) outs in
          let dod_stubs = List.init n_per_copy (fun k ->
            Printf.sprintf "%s_%s_d%d" mname tag k) in
-         let dod_sigs = List.map (fun nm ->
-           { name = nm; stype = BInt { width = 2; signed = Unsigned }
-           ; direction = `Internal; initial_value = None; attrs = [] }) dod_stubs
-         in
+         let dod_sigs = List.map mk_sig dod_stubs in
          let insts = List.mapi (fun k (a_out, b_out, c_out) ->
-           (* This RAM32M covers bits [6k+5 : 6k] of the width via ports
-              A/B/C (2 bits each); port D's DID gets the remaining 2 bits
-              (lo + 6) — but DOD from this copy isn't used, so those 2 bits
-              are just consistent-storage padding.  When width < 6k+8 we
-              zero-pad the missing slots.                                 *)
-           let lo = 6 * k in
+           (* covers bits [ram_bits*k .. +ram_bits-1] via ports A/B/C ([pb] each);
+              port D's DID gets the next [pb] bits (padding — DOD unused here). *)
+           let lo = ram_bits * k in
            let dod_name = List.nth dod_stubs k in
-           { inst_name = Printf.sprintf "%s_%s_ram32m_%d" mname tag k
-           ; module_name = "RAM32M"
+           { inst_name = Printf.sprintf "%s_%s_%s_%d" mname tag (String.lowercase_ascii prim) k
+           ; module_name = prim
            ; param_values = []
            ; param_strs =
                [ ("INIT_A", init_for_lut lo)
-               ; ("INIT_B", init_for_lut (lo + 2))
-               ; ("INIT_C", init_for_lut (lo + 4))
-               ; ("INIT_D", init_for_lut (lo + 6)) ]
+               ; ("INIT_B", init_for_lut (lo + pb))
+               ; ("INIT_C", init_for_lut (lo + 2 * pb))
+               ; ("INIT_D", init_for_lut (lo + 3 * pb)) ]
            ; port_connections =
                [ ("ADDRA", read_addr5); ("ADDRB", read_addr5)
                ; ("ADDRC", read_addr5); ("ADDRD", w_addr5)
-               ; ("DIA", di_slice lo);       ("DIB", di_slice (lo + 2))
-               ; ("DIC", di_slice (lo + 4)); ("DID", di_slice (lo + 6))
+               ; ("DIA", di_slice lo);        ("DIB", di_slice (lo + pb))
+               ; ("DIC", di_slice (lo + 2 * pb)); ("DID", di_slice (lo + 3 * pb))
                ; ("WCLK", BVar orig_clk);    ("WE", we_expr)
                ; ("DOA", BVar a_out); ("DOB", BVar b_out)
                ; ("DOC", BVar c_out); ("DOD", BVar dod_name) ]
@@ -575,7 +569,7 @@ let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
          let chunks = List.map (fun (a, b, c) ->
            BConcat [ BVar c; BVar b; BVar a ]) outs in
          let cat = BConcat (List.rev chunks) in
-         if dw mod 6 = 0 then cat
+         if dw mod ram_bits = 0 then cat
          else BSlice { signal = cat; msb = dw - 1; lsb = 0 }
        in
        let driver =
@@ -634,8 +628,8 @@ let ram32m_lower_dual_port ~m ~(mm : bmem) ~mname ~skip =
          ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
        in
        Printf.eprintf
-         "[memlower] %s.%s: FPGA 1W+2R async-read → %d × RAM32M (SDP, %d per copy × 2 copies, depth=%d, width=%d)\n"
-         m.name mname (2 * n_per_copy) n_per_copy mm.depth dw;
+         "[memlower] %s.%s: FPGA 1W+2R async-read → %d × %s (SDP, %d per copy × 2 copies, depth=%d, width=%d)\n"
+         m.name mname (2 * n_per_copy) prim n_per_copy mm.depth dw;
        `Lowered (m', None))
 
 (* ──────────── per-memory lowering ──────────── *)
@@ -769,10 +763,17 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
        the rs1 view, B holds rs2, D drives writes; ADDR* mux toggles the
        3 ports between write-broadcast (WE=1) and per-port read (WE=0). *)
     if mm.n_write_ports = 1 && mm.n_read_ports = 2 && mm.depth <= 32 then
-      ram32m_lower_dual_port ~m ~mm ~mname ~skip
+      ram_m_lower_dual_port ~prim:"RAM32M" ~pb:2 ~depth_cap:32 ~addr_w:5
+        ~m ~mm ~mname ~skip
+    else if mm.n_write_ports = 1 && mm.n_read_ports = 2 && mm.depth <= 64 then
+      (* depth 33-64 1W+2R → RAM64M (3 read bits/RAM), matching Vivado's
+         `<width> bits × 2 reads → 2 × ceil(width/3) RAM64M` for the SGMII
+         rx_elastic_buffer and similar delay-line/FIFO memories. *)
+      ram_m_lower_dual_port ~prim:"RAM64M" ~pb:1 ~depth_cap:64 ~addr_w:6
+        ~m ~mm ~mname ~skip
     else if mm.n_write_ports <> 1 || mm.n_read_ports <> 1 then
       skip (Printf.sprintf
-              "FPGA async-read needs 1W+1R or 1W+2R; got %dW+%dR (depth %d)"
+              "FPGA async-read needs 1W+1R or 1W+2R (2R depth<=64); got %dW+%dR (depth %d)"
               mm.n_write_ports mm.n_read_ports mm.depth)
     else if mm.depth > 256 then
       skip (Printf.sprintf "FPGA async-read depth %d > 256 (deeper LUTRAM tiling TODO)" mm.depth)

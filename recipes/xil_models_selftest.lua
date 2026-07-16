@@ -125,4 +125,16 @@ else
   fail = fail + 1; print("  RAM 1W2R depth-32 -> RAM32M  ->  FAIL (bit-blast?)")
 end
 
+-- BUG2 regression: 1W+2R depth-64 async RAM must map to RAM64M (Vivado's choice
+-- for the SGMII rx_elastic_buffer), not bit-blast.  Structural check.
+p = svd.parse("verible", "ram1w2r64", {D .. "ram1w2r64.sv"})
+p = svd.unroll(p); p = svd.inline(p); p = svd.iflift(p)
+p = svd.blocking_subst(p); p = svd.meminfer(p); p = svd.memlower(p)
+rtxt = svd.insts(svd.pick(svd.mapped_to_prog(svd.gate_map(svd.pick(p, "ram1w2r64"), 6, 0)), "ram1w2r64"))
+if strfind(rtxt, "RAM64M", 1, 1) and not strfind(rtxt, "FDRE", 1, 1) then
+  pass = pass + 1; print("  RAM 1W2R depth-64 -> RAM64M  ->  OK")
+else
+  fail = fail + 1; print("  RAM 1W2R depth-64 -> RAM64M  ->  FAIL (bit-blast?)")
+end
+
 print("== pass=" .. pass .. " fail=" .. fail .. " ==")
