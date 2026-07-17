@@ -883,8 +883,11 @@ let lgate_map mod_h k_lut io_flag =
     List.sort_uniq compare
       (List.map (fun (i : Behavioral_ir.binstance) -> i.module_name) m.instances) in
   let missing = List.filter (fun t -> not (Hashtbl.mem covered t)) inst_types in
-  (try List.iter add_ports (Vhdl_to_behavioral.lookup_xil_primitive_ports missing)
-   with _ -> ());
+  (* Authoritative port directions come from the primitive's VHDL entity
+     interface in the Vivado unisim library.  Do NOT swallow a failure here —
+     a silent fallback to the net-usage heuristic misclassifies feedback/clock
+     inputs (MMCM.CLKFBIN, BUFG-fed clocks) as outputs and drops the cell. *)
+  List.iter add_ports (Vhdl_to_behavioral.lookup_xil_primitive_ports missing);
   (* Xilinx HARD primitives (GTXE2_COMMON/GTXE2_CHANNEL, …) have no unisim
      primitive .vhd, so the VHDL lookup above supplies nothing for them and the
      net heuristic then misclassifies an input pin reading an instance-driven
@@ -900,6 +903,29 @@ let lgate_map mod_h k_lut io_flag =
             if not (Hashtbl.mem pd_tbl (t, pn)) then
               Hashtbl.replace pd_tbl (t, pn) dir) ports
       | None -> ()) inst_types;
+  (* No silent lossage: a PRIMITIVE instance (not a user submodule) whose
+     connected ports have no resolved direction would be handed to the
+     net-usage heuristic in create_circuit, which misclassifies and silently
+     DROPS the cell (a BUFG/MMCM/GT vanishes and its clock net orphans).  Fail
+     loudly, naming the primitive.port pairs whose direction we could not read
+     from library_cells / the unisim VHDL interface / xil_primitive_ports.json. *)
+  let user_mods = Hashtbl.create 64 in
+  List.iter (fun (mm : Behavioral_ir.bmodule) -> Hashtbl.replace user_mods mm.name ())
+    prog.Behavioral_ir.modules;
+  let unresolved =
+    List.concat_map (fun (i : Behavioral_ir.binstance) ->
+      if Hashtbl.mem user_mods i.module_name then []
+      else List.filter_map (fun (port, _) ->
+        if Hashtbl.mem pd_tbl (i.module_name, port) then None
+        else Some (i.module_name ^ "." ^ port)) i.port_connections) m.instances
+    |> List.sort_uniq compare in
+  if unresolved <> [] then
+    failwith (Printf.sprintf
+      "gate_map %s: unresolved primitive port directions — no library_cell, \
+       unisim VHDL interface, or xil_primitive_ports.json entry for: %s. The \
+       net heuristic would misclassify these and drop the cell; add the \
+       primitive's port interface."
+      m.Behavioral_ir.name (String.concat ", " unresolved));
   let port_dir mn port = Hashtbl.find_opt pd_tbl (mn, port) in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
   let l = Fpga_synth.Bir_to_aig.lower_circuit circ in

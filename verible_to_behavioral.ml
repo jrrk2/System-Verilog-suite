@@ -4433,7 +4433,7 @@ let name_positional_ports (bmods : bmodule list) : bmodule list =
   List.map (fun (m : bmodule) ->
     { m with instances = List.map resolve_inst m.instances }) bmods
 
-let convert_files_inner ~keep_external ~top files : bprogram =
+let convert_files_inner ~top files : bprogram =
   mem_init_search_paths := discover_init_dirs files;
   if Sys.getenv_opt "MEM_INIT_DEBUG" <> None && !mem_init_search_paths <> [] then
     Printf.eprintf "[mem_init] auto-discovered: %s\n"
@@ -4461,16 +4461,15 @@ let convert_files_inner ~keep_external ~top files : bprogram =
                   Verible_elaborate.inst_specialised key with
           | Some specname -> Some { i with module_name = specname }
           | None ->
-              (* No specialise_design entry → either a dead
-               * generate branch, a non-module identifier the
-               * extractor mis-classified ($clog2-typed locals),
-               * or — when keep_external is true — an external
-               * library cell (Liberty cell, vendor primitive)
-               * that has no SV body in `files`. Default behaviour
-               * drops these so Behavioral_flatten doesn't get
-               * confused by ghost instances; gate-level miters
-               * pass keep_external=true to retain them. *)
-              if keep_external then Some i else None
+              (* No specialise_design entry → an external cell (Liberty cell or
+               * vendor primitive with no SV body in `files`).  Always KEEP it:
+               * silently dropping externals was the confusing `keep_external`
+               * behaviour that made clock/GT/RAM primitives vanish from the
+               * netlist.  A genuinely-unknown name (dead generate branch, a
+               * mis-classified $clog2 local) surfaces LOUDLY downstream — the
+               * gate_map port-direction check reports any cell it can't resolve
+               * to a primitive interface — instead of being hidden here. *)
+              Some i
         ) m.instances in
         Some { m with name = s.s_name; instances = rewritten }
   ) specs in
@@ -4508,13 +4507,13 @@ let convert_files_inner ~keep_external ~top files : bprogram =
     prog attr_tables
 
 let convert_files ~top files : bprogram =
-  convert_files_inner ~keep_external:false ~top files
+  convert_files_inner ~top files
 
-(* Variant that retains unmatched instances. Use for gate-level
- * netlists where every leaf is a Liberty cell with no in-file
- * module declaration. *)
+(* Retained as an alias: external (unmatched) instances are ALWAYS kept now, so
+ * this behaves identically to convert_files.  Kept so existing callers (gate-
+ * level netlist readers) don't break. *)
 let convert_files_with_externals ~top files : bprogram =
-  convert_files_inner ~keep_external:true ~top files
+  convert_files_inner ~top files
 
 (* No-top "read everything" convenience: parse the input files, emit one
  * bmodule per declared module at its body-declared default parameters,
