@@ -1755,7 +1755,7 @@ let extract_port_decl ~pkgs ~params tok =
   walk (function
     | Input -> dir := `Input
     | Output -> dir := `Output
-    | Inout -> dir := `Internal
+    | Inout -> dir := `Input  (* bidirectional -> primary I/O linked var *)
     | _ -> ()
   ) tok;
   (* Collect port names — but skip identifiers that live inside a
@@ -3261,7 +3261,7 @@ let convert_module ~pkgs (mdecl : module_decl)
       walk (function
         | Input -> dir := Some `Input
         | Output -> dir := Some `Output
-        | Inout -> dir := Some `Internal
+        | Inout -> dir := Some `Input  (* bidirectional -> primary I/O linked var *)
         | _ -> ()) p1;
       let explicit_w = extract_range ~pkgs ~params p1 in
       let w_opt =

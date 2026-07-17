@@ -110,6 +110,7 @@ seq_equiv("seqmux")
 -- (else the sum/carry float and the undriven-tie zeros them).
 seq_equiv("addcarry")   -- combinational (no FFs; seq_equiv still works)
 seq_equiv("counter")    -- FF alignment + CARRY4 increment together
+seq_equiv("inout_bidir")-- inout pin -> primary I/O linked var (behavioral==gatemap)
 
 -- RAM64M functional model vs a behavioral reference using the NATURAL memory
 -- semantics (mem_x[ADDRD]<=DIx / mem_x[ADDR]).  Proves the model (4x 64x1 mems,
