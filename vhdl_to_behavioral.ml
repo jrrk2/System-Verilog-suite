@@ -1501,6 +1501,49 @@ let xil_primitive_cache :
   Hashtbl.create 256
 let xil_primitive_missing : (string, unit) Hashtbl.t = Hashtbl.create 64
 
+(* Persistent CACHE of primitive interfaces so the tool runs on machines that
+ * cannot run Vivado (the unisim .vhd files are absent there).  On a Vivado
+ * machine the VHDL entity interface is authoritative and this is written back;
+ * elsewhere it is the fallback.  Same file bir_to_edif reads for EDIF
+ * interfaces (env XIL_PRIM_PORTS_JSON). *)
+let xil_ports_cache_path () =
+  try Sys.getenv "XIL_PRIM_PORTS_JSON"
+  with Not_found ->
+    Filename.concat (Filename.dirname xil_unisims_dir |> fun _ ->
+      "/home/jonathan/System-Verilog-suite/xilinx_lef") "xil_primitive_ports.json"
+
+let dir_of_string = function
+  | "output" | "out" -> `Output
+  | _ -> `Input
+
+let json_cache : (string, Behavioral_ir.library_port list) Hashtbl.t Lazy.t =
+  lazy (
+    let tbl = Hashtbl.create 256 in
+    let path = xil_ports_cache_path () in
+    (if Sys.file_exists path then
+       try match Yojson.Safe.from_file path with
+         | `Assoc entries ->
+             List.iter (fun (cell, ports) ->
+               match ports with
+               | `List ps ->
+                   let plist = List.filter_map (function
+                     | `Assoc kv ->
+                         let get k = List.assoc_opt k kv in
+                         (match get "name", get "dir" with
+                          | Some (`String pn), Some (`String d) ->
+                              let w = match get "width" with
+                                | Some (`Int w) -> w | _ -> 1 in
+                              Some { Behavioral_ir.port_name = pn;
+                                     port_direction = dir_of_string d;
+                                     port_width = w }
+                          | _ -> None)
+                     | _ -> None) ps in
+                   Hashtbl.replace tbl cell plist
+               | _ -> ()) entries
+         | _ -> ()
+       with _ -> ());
+    tbl)
+
 let bmodule_to_library_ports (m : Behavioral_ir.bmodule) :
     Behavioral_ir.library_port list =
   List.filter_map (fun (s : Behavioral_ir.bsignal) ->
@@ -1531,7 +1574,12 @@ let lookup_xil_primitive_ports names :
   let to_parse = List.filter_map (fun n ->
     let p = Filename.concat xil_unisims_dir (n ^ ".vhd") in
     if Sys.file_exists p then Some (n, p)
-    else (Hashtbl.add xil_primitive_missing n (); None)) need in
+    else
+      (* No Vivado unisim .vhd on this machine — serve from the persistent JSON
+         cache so the tool still resolves the interface. *)
+      (match Hashtbl.find_opt (Lazy.force json_cache) n with
+       | Some ports -> Hashtbl.replace xil_primitive_cache n ports; None
+       | None -> Hashtbl.add xil_primitive_missing n (); None)) need in
   if to_parse <> [] then begin
     let paths = List.map snd to_parse in
     (match convert_vhdl_files_to_behavioral paths with
@@ -1573,7 +1621,12 @@ let lookup_xil_primitive_impl names :
   let to_parse = List.filter_map (fun n ->
     let p = Filename.concat xil_unisims_dir (n ^ ".vhd") in
     if Sys.file_exists p then Some (n, p)
-    else (Hashtbl.add xil_primitive_missing n (); None)) need in
+    else
+      (* No Vivado unisim .vhd on this machine — serve from the persistent JSON
+         cache so the tool still resolves the interface. *)
+      (match Hashtbl.find_opt (Lazy.force json_cache) n with
+       | Some ports -> Hashtbl.replace xil_primitive_cache n ports; None
+       | None -> Hashtbl.add xil_primitive_missing n (); None)) need in
   if to_parse <> [] then begin
     let paths = List.map snd to_parse in
     (match convert_vhdl_files_to_behavioral paths with
