@@ -861,11 +861,15 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                  (* plain binary digits, no `%d'b` prefix — see RAM32M note *)
                  [ ("INIT", init_for_bit b) ]
              ; port_connections =
-                 [ ("D",    BSlice { signal = w_data; msb = b; lsb = b })
-                 ; ("A",    a_expr)
-                 ; ("WE",   we_expr)
-                 ; ("WCLK", BVar orig_clk)
-                 ; ("O",    BVar out_name) ]
+                 (* RAM*X1S address is individual 1-bit pins A0..A<addr_w-1>,
+                    not a bus `.A` — the bus form fails strict readers (Vivado
+                    read_edif) and the primitive-port check. *)
+                 ("D",    BSlice { signal = w_data; msb = b; lsb = b })
+                 :: List.init addr_w (fun i ->
+                      (Printf.sprintf "A%d" i, BSlice { signal = a_expr; msb = i; lsb = i }))
+                 @ [ ("WE",   we_expr)
+                   ; ("WCLK", BVar orig_clk)
+                   ; ("O",    BVar out_name) ]
              }) per_bit_outs
            in
            (* Driver concat: read_pin <= {o_(dw-1), ..., o_1, o_0}.       *)
