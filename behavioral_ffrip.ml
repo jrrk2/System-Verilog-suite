@@ -47,21 +47,21 @@ let d_pin_name s = s ^ "__D"
  * state) and fold writes through. Multiple writes within the same
  * branch overwrite (last-write-wins); writes inside conditionals
  * become BConds; unwritten branches keep the prior value. *)
-let rec next_state_after stmts q current =
-  List.fold_left (next_state_after_one q) current stmts
-and next_state_after_one q current = function
+let rec next_state_after ~width_of stmts q current =
+  List.fold_left (next_state_after_one ~width_of q) current stmts
+and next_state_after_one ~width_of q current = function
   | BAssign { lhs; rhs } when lhs = q -> rhs
   | BAssign _ -> current
-  | BBlock ss -> next_state_after ss q current
+  | BBlock ss -> next_state_after ~width_of ss q current
   | BIf { condition; then_stmts; else_stmts } ->
-      let t = next_state_after then_stmts q current in
-      let e = next_state_after else_stmts q current in
+      let t = next_state_after ~width_of then_stmts q current in
+      let e = next_state_after ~width_of else_stmts q current in
       if t == current && e == current then current
       else BCond { condition; then_val = t; else_val = e }
   | BCase { selector; cases; default } ->
-      let def_expr = next_state_after default q current in
+      let def_expr = next_state_after ~width_of default q current in
       List.fold_right (fun (key, ss) acc ->
-        let branch = next_state_after ss q current in
+        let branch = next_state_after ~width_of ss q current in
         if branch == acc then acc
         else BCond {
           condition = BBinOp {
@@ -73,7 +73,30 @@ and next_state_after_one q current = function
         }
       ) cases def_expr
   | BWhile { body; _ } | BFor { body; _ } ->
-      next_state_after body q current
+      next_state_after ~width_of body q current
+  (* A single-BIT write to packed register [q] — `q[idx] <= data`, which the
+     frontend lowers to @mem_write(q, idx, data) — updates [current] via a
+     read-modify-write: (current & ~(1<<idx)) | (zext(data) << idx).  Without
+     this ffrip drops the write and the reg's next-state is wrong (e.g. a RAM64M
+     model's mem_x, or any dynamic bit-select assignment).  Only fires when [data]
+     is 1 bit: a multi-bit @mem_write is a memory-array WORD write with different
+     semantics (idx is a word address), which memlower handles upstream. *)
+  | BCallStmt { func = "@mem_write"; args = [ BVar m; idx; data ] }
+    when m = q &&
+         (match data with
+          | BConst { width; _ } -> width = 1
+          | BSlice { msb; lsb; _ } -> msb = lsb
+          | BVar n -> width_of n = 1
+          | _ -> false) ->
+      let wq = width_of q in
+      let ty = BInt { width = wq; signed = Unsigned } in
+      let op2 op lhs rhs = BBinOp { op; lhs; rhs; result_type = ty } in
+      let one = BConst { value = Z.one; width = wq } in
+      let mask = BUnOp { op = BNot; operand = op2 BShl one idx; result_type = ty } in
+      let data_ext =
+        if wq <= 1 then data
+        else BConcat [ BConst { value = Z.zero; width = wq - 1 }; data ] in
+      op2 BOr (op2 BAnd current mask) (op2 BShl data_ext idx)
   | BCallStmt _ | BReturn _ -> current
 
 (* Collect every Q that appears as a write target anywhere in the
@@ -105,13 +128,13 @@ let rec collect_lhs acc = function
       List.fold_left collect_lhs acc body
   | BCallStmt _ | BReturn _ -> acc
 
-let derive_d_pins body =
+let derive_d_pins ~width_of body =
   let qs =
     List.fold_left collect_lhs [] body
     |> List.sort_uniq compare
   in
   List.map (fun q ->
-    let d_expr = next_state_after body q (BVar q) in
+    let d_expr = next_state_after ~width_of body q (BVar q) in
     (q, d_expr)
   ) qs
 
@@ -194,7 +217,7 @@ let rip_module (m : bmodule) : bmodule =
     match p with
     | BCombinational _ -> new_processes := p :: !new_processes
     | BSequential s ->
-        let pairs = derive_d_pins s.body in
+        let pairs = derive_d_pins ~width_of:lookup_width s.body in
         (* Every Q gets ripped. For Q's that are primary OUTPUT ports we
          * additionally insert a pass-through (Q = Q__Q) so the port
          * remains driven; the input cone still feeds the miter via

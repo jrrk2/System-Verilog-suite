@@ -293,6 +293,59 @@ let srl_body ~ty ~w ~addr ~q31 ~init =
   empty_mod name signals [seq; comb]
 
 (* ---------------------------------------------------------------------- *)
+(* RAM64M: four independent 64x1 memories (mem_a/b/c/d), a common write     *)
+(* address (ADDRD, posedge WCLK when WE), and independent async reads:      *)
+(*   posedge WCLK, WE:  mem_x[ADDRD] <= DIx   (x = a,b,c,d)                  *)
+(*   DOA=mem_a[ADDRA]  DOB=mem_b[ADDRB]  DOC=mem_c[ADDRC]  DOD=mem_d[ADDRD]  *)
+(* (Vivado unisim RAM64M.v).  Each memory is a 64-bit register: the read is  *)
+(* a dynamic bit-select and the write a shift/mask update, so the model is a *)
+(* plain FF+logic body the miter handles (ffrip lifts mem_x as state).       *)
+(* ---------------------------------------------------------------------- *)
+let ram64m_body ~inits =
+  let w64 = BInt { width = 64; signed = Unsigned } in
+  let bnot e = BUnOp  { op = BNot; operand = e; result_type = w64 } in
+  let band a b = BBinOp { op = BAnd; lhs = a; rhs = b; result_type = w64 } in
+  let bor  a b = BBinOp { op = BOr;  lhs = a; rhs = b; result_type = w64 } in
+  let bshl a b = BBinOp { op = BShl; lhs = a; rhs = b; result_type = w64 } in
+  let k64 z = BConst { value = z; width = 64 } in
+  let zext1 e = BConcat [ BConst { value = Z.zero; width = 63 }; e ] in
+  (* mem with bit [idx] set to [di] : (mem & ~(1<<idx)) | (di<<idx) *)
+  let set_bit mem idx di =
+    bor (band mem (bnot (bshl (k64 Z.one) idx))) (bshl (zext1 di) idx) in
+  let ports = [ ("a", "ADDRA", "DIA", "DOA", "INIT_A")
+              ; ("b", "ADDRB", "DIB", "DOB", "INIT_B")
+              ; ("c", "ADDRC", "DIC", "DOC", "INIT_C")
+              ; ("d", "ADDRD", "DID", "DOD", "INIT_D") ] in
+  let init_of key = try List.assoc key inits with Not_found -> String.make 64 '0' in
+  let mem_sig x init_s =
+    let z = if only_binary init_s then (try Z.of_string ("0b" ^ init_s) with _ -> Z.zero)
+            else Z.zero in
+    { name = "mem_" ^ x; stype = w64; direction = `Internal;
+      initial_value = Some (BConst { value = z; width = 64 }); attrs = [] } in
+  let write_body = List.map (fun (x, _, di, _, _) ->
+    BAssign { lhs = "mem_" ^ x;
+              rhs = BCond { condition = v "WE";
+                            then_val = set_bit (v ("mem_" ^ x)) (v "ADDRD") (v di);
+                            else_val = v ("mem_" ^ x) } }) ports in
+  let seq = BSequential { name = "seq"; clock = "WCLK"; clock_edge = `Pos;
+                          reset = None; reset_edge = None; reset_async = false;
+                          body = write_body; blocking_vars = [] } in
+  let read_body = List.map (fun (x, addr, _, dox, _) ->
+    BAssign { lhs = dox;
+              rhs = BSelect { array = v ("mem_" ^ x); index = v addr } }) ports in
+  let comb = BCombinational { name = "comb"; sensitivity = [BAny]; body = read_body } in
+  let signals =
+    [ sig_ "WCLK" `Input (); sig_ "WE" `Input ();
+      sig_wide "ADDRA" 6 `Input (); sig_wide "ADDRB" 6 `Input ();
+      sig_wide "ADDRC" 6 `Input (); sig_wide "ADDRD" 6 `Input ();
+      sig_ "DIA" `Input (); sig_ "DIB" `Input (); sig_ "DIC" `Input (); sig_ "DID" `Input ();
+      sig_ "DOA" `Output (); sig_ "DOB" `Output (); sig_ "DOC" `Output (); sig_ "DOD" `Output () ]
+    @ List.map (fun (x, _, _, _, k) -> mem_sig x (init_of k)) ports in
+  let name = "RAM64M__" ^ Digest.to_hex (Digest.string
+      (String.concat "_" (List.map (fun (_, _, _, _, k) -> init_of k) ports))) in
+  empty_mod name signals [seq; comb]
+
+(* ---------------------------------------------------------------------- *)
 (* Dispatch: binstance -> specialised body bmodule (or None if unknown).   *)
 (* ---------------------------------------------------------------------- *)
 let lut_arity = function
@@ -332,6 +385,11 @@ let synth (i : binstance) : bmodule option =
             [("IS_D_INVERTED","D"); ("IS_CE_INVERTED","CE"); ("IS_PRE_INVERTED","PRE")] in
         Some (ff_body ~ty:"FDPE" ~set_val:true ~ctrl_pin:"PRE" ~init ~inv)
     | "CARRY4" -> Some (carry4_body ())
+    | "RAM64M" ->
+        let ini key = match param_lookup i key with
+          | Some s -> normalize_init ~k:6 s | None -> String.make 64 '0' in
+        Some (ram64m_body ~inits:[ ("INIT_A", ini "INIT_A"); ("INIT_B", ini "INIT_B")
+                                 ; ("INIT_C", ini "INIT_C"); ("INIT_D", ini "INIT_D") ])
     | "SRL16E" | "SRL16" ->
         (* INIT is 16-bit; normalize_init ~k:4 renders 2^4 = 16 bits MSB-first *)
         let raw = match param_lookup i "INIT" with Some s -> s | None -> "0" in

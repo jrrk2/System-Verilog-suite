@@ -111,6 +111,18 @@ seq_equiv("seqmux")
 seq_equiv("addcarry")   -- combinational (no FFs; seq_equiv still works)
 seq_equiv("counter")    -- FF alignment + CARRY4 increment together
 
+-- RAM64M functional model vs a behavioral reference using the NATURAL memory
+-- semantics (mem_x[ADDRD]<=DIx / mem_x[ADDR]).  Proves the model (4x 64x1 mems,
+-- common write addr, async reads) AND ffrip's @mem_write -> read-modify-write
+-- lowering.  Ref regs are named u__mem_* to align with the flattened instance.
+sp = svd.parse("verible", "ram64m_top", {D .. "ram64m_ref.v"})
+sp = svd.unroll(sp); sp = svd.inline(sp); sp = svd.iflift(sp)
+sp = svd.blocking_subst(sp); sp = svd.meminfer(sp); sp = svd.memlower(sp)
+im = svd.augment_xil_models(svd.parse("verible-ext", "ram64m_top", {D .. "ram64m_impl.v"}))
+v = svd.miter(svd.pick(sp, "ram64m_top"), svd.pick(im, "ram64m_top"))
+if v == "EQUIVALENT" then pass = pass + 1 else fail = fail + 1 end
+print("  RAM64M model == behavioral RAM64M  ->  " .. v)
+
 -- Distributed-RAM inference (needs MEMLOWER_FPGA=1): a 1W+2R depth-32 async RAM
 -- must map to RAM32M, NOT bit-blast to FFs.  Structural check (no RAM32M
 -- functional model to miter against): RAM32M present AND no FDRE.  Guards BUG1

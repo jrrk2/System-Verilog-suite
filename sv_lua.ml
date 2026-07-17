@@ -498,6 +498,12 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
       | BFor { init; update; body; _ } ->
           add_lhs init; add_lhs update; List.iter add_lhs body
       | BBlock b -> List.iter add_lhs b
+      (* array / part-select writes drive their first argument — without this the
+         undriven-tie below wrongly grounds a @mem_write-updated register. *)
+      | BCallStmt { func; args }
+        when func = "@mem_write" || func = "@slice_write"
+             || func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+          (match args with BVar arr :: _ -> Hashtbl.replace driven arr () | _ -> ())
       | BCallStmt _ | BReturn _ -> () in
     List.iter (function
       | BCombinational { body; _ } -> List.iter add_lhs body
