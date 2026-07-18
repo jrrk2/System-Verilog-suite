@@ -445,6 +445,48 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
     if w > 1 && s.direction = `Input then Hashtbl.replace inw s.name w) m.signals;
   if Hashtbl.length allw = 0 then m
   else begin
+    (* Canonicalise bracket-string WRITES `base[i] := e` (the expand path's
+       bus-bit outputs: `p_0_in__0[0] := lut`, frontend per-bit `acc_ins[9]
+       := …`) onto the obuf convention `obuf_<base>_<i>__O` when `base` is a
+       DECLARED bus — out_drivers below then reconstructs the bus, and
+       split_bracket redirects bracket READS to it, so string-writers and
+       slice-readers meet on ONE namespace instead of a phantom-scalar /
+       floating-bus split. *)
+    let bw_re = Str.regexp "^\\(.+\\)\\[\\([0-9]+\\)\\]$" in
+    let bw_sigs = ref [] in
+    let bw_lhs lhs =
+      if Str.string_match bw_re lhs 0 then begin
+        let base = Str.matched_group 1 lhs in
+        let bit = Str.matched_group 2 lhs in
+        match Hashtbl.find_opt allw base, int_of_string_opt bit with
+        | Some w, Some b when b >= 0 && b < w ->
+            let ob = Printf.sprintf "obuf_%s_%s__O" base bit in
+            bw_sigs := { name = ob;
+                         stype = BInt { width = 1; signed = Unsigned };
+                         direction = `Internal; initial_value = None;
+                         attrs = [] } :: !bw_sigs;
+            ob
+        | _ -> lhs
+      end else lhs in
+    let rec bw_stmt s = match s with
+      | BAssign r -> BAssign { r with lhs = bw_lhs r.lhs }
+      | BIf r -> BIf { r with then_stmts = List.map bw_stmt r.then_stmts;
+                              else_stmts = List.map bw_stmt r.else_stmts }
+      | BCase r -> BCase { r with cases = List.map (fun (g, b) ->
+                                    (g, List.map bw_stmt b)) r.cases;
+                                  default = List.map bw_stmt r.default }
+      | BWhile r -> BWhile { r with body = List.map bw_stmt r.body }
+      | BFor r -> BFor { r with body = List.map bw_stmt r.body }
+      | BBlock b -> BBlock (List.map bw_stmt b)
+      | _ -> s in
+    let m = { m with
+              processes = List.map (function
+                | BCombinational r ->
+                    BCombinational { r with body = List.map bw_stmt r.body }
+                | BSequential r ->
+                    BSequential { r with body = List.map bw_stmt r.body })
+                m.processes;
+              signals = !bw_sigs @ m.signals } in
     let all_digits s = s <> "" && String.for_all (fun c -> c >= '0' && c <= '9') s in
     (* register bitbus: rightmost "__b<digits>" whose base is any multi-bit sig *)
     let split_reg name =
@@ -476,9 +518,11 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
           (match int_of_string_opt suf, Hashtbl.find_opt inw base with
            | Some i, Some w when i >= 0 && i < w -> Some (base, i)
            | _ -> None) in
-    (* bracket bit read `base[i]` where base is any multi-bit signal — Vivado's
-       internal D-buses (`p_0_in[0]`) reach a cell pin as a bracket-string BVar,
-       not the `__b`/`__` bitbus convention; without this rw ties it to 0. *)
+    (* bracket bit read `base[i]` of a DECLARED bus redirects to the bus —
+       sound only because bracket-string WRITES are canonicalised onto the
+       obuf convention below, so the bus is reconstructed and reader/writer
+       meet on the bus (redirecting reads alone severed them from string
+       writers — rx_axis_packer's cnt increment read a free bus). *)
     let split_bracket name =
       let n = String.length name in
       if n >= 3 && name.[n-1] = ']' then
@@ -718,6 +762,7 @@ let canonicalize_ff_names (m : bmodule) : bmodule =
      state read in its own hold branch, and alias the old Q net to the new
      state so downstream readers stay connected. *)
   let re_seq = Str.regexp "^\\(.+\\)_reg\\(\\[\\([0-9]+\\)\\]\\)?__seq$" in
+  let canon_bracket_re = Str.regexp "^\\(.+\\)\\[\\([0-9]+\\)\\]$" in
   (* EVICT collisions first: Vivado can reuse a register's BASE name for an
      unrelated live net (rand_26: `wire [0:0] a_q` is the shared reset-LUT
      output feeding each \a_q_reg[i]/.R) — packing the canonicalised states
@@ -800,9 +845,31 @@ let canonicalize_ff_names (m : bmodule) : bmodule =
                                   then_val = subst rr.then_val;
                                   else_val = subst rr.else_val }
             | BCall rr -> BCall { rr with args = List.map subst rr.args } in
+          (* Alias target: when the Q net is a BIT OF A DECLARED BUS
+             (Vivado names FF Qs into buses — `\cnt_reg[0]/.Q(p_0_in[3])`),
+             a bracket-STRING assign `p_0_in[0] := …` drives a phantom
+             scalar while every cone reads the BUS slice p_0_in[0:0] —
+             writer/reader split, the bus floats.  Route the alias through
+             `obuf_<bus>_<i>__O`, which resolve_input_bitbus assembles into
+             the bus.  A bracket name whose base is NOT a declared signal
+             (`acc_reg_n_0_[9]` scalar wires) keeps the plain alias. *)
+          let alias_lhs =
+            if Str.string_match canon_bracket_re lhs 0 then begin
+              let base = Str.matched_group 1 lhs in
+              let bit = Str.matched_group 2 lhs in
+              if List.exists (fun (s : bsignal) -> s.name = base) m.signals
+              then begin
+                let ob = Printf.sprintf "obuf_%s_%s__O" base bit in
+                extra_sigs := { name = ob;
+                                stype = BInt { width = 1; signed = Unsigned };
+                                direction = `Internal; initial_value = None;
+                                attrs = [] } :: !extra_sigs;
+                ob
+              end else lhs
+            end else lhs in
           extra_procs := BCombinational {
             name = q_new ^ "__qalias"; sensitivity = [BAny];
-            body = [BAssign { lhs; rhs = BVar q_new }] } :: !extra_procs;
+            body = [BAssign { lhs = alias_lhs; rhs = BVar q_new }] } :: !extra_procs;
           extra_sigs := { name = q_new;
                           stype = BInt { width = 1; signed = Unsigned };
                           direction = `Internal; initial_value = None;

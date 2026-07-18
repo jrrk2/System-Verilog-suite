@@ -114,7 +114,14 @@ let comb name body =
 let is_vcc = function BVar "VCC" -> true | BConst { value = zv; _ } when Z.equal zv Z.one -> true | _ -> false
 let is_gnd = function BVar "GND" -> true | BConst { value = zv; _ } when Z.equal zv Z.zero -> true | _ -> false
 
-let ff_process ~qn ~clk ~ce ~d ~rst ~rst_async ~rst_val =
+let ff_process ~inst ~qn ~clk ~ce ~d ~rst ~rst_async ~rst_val =
+  (* Name the process `<inst>__seq` (same convention as the inline path's
+     xil-model FF processes) — canonicalize_ff_names keys the cross-flow
+     state rename on the INSTANCE name (`acc_reg[0]__seq` → state acc__b0),
+     because Vivado's Q NET name is often unrelated (`acc_reg_n_0_[0]`,
+     `\^a`).  The Q-net-based name hid the instance and the canon never
+     fired under miter_hier's expand path. *)
+  let pname = (if inst = "" then "exp_" ^ qn else inst ^ "__seq") in
   (* Drop the CE-hold mux when CE is tied high (the common case) so the
      packed D-cone doesn't carry dead references to the pre-pack bit nets. *)
   let d_ce = if is_vcc ce then d
@@ -124,7 +131,7 @@ let ff_process ~qn ~clk ~ce ~d ~rst ~rst_async ~rst_val =
   match clk with
   | BVar cn ->
       let mk ?reset ?reset_edge ~reset_async rhs =
-        Some (BSequential { name = "exp_" ^ qn; clock = cn; clock_edge = `Pos;
+        Some (BSequential { name = pname; clock = cn; clock_edge = `Pos;
                             reset; reset_edge; reset_async;
                             body = [ BAssign { lhs = qn; rhs } ];
                             blocking_vars = [] }) in
@@ -221,7 +228,7 @@ let expand_instance (i : binstance) : bprocess list * bool =
         | _      -> reset_arg i "S",   false, 1 in
       (match qn with
        | Some qn ->
-           (match ff_process ~qn ~clk ~ce ~d ~rst ~rst_async ~rst_val with
+           (match ff_process ~inst:i.inst_name ~qn ~clk ~ce ~d ~rst ~rst_async ~rst_val with
             | Some p -> [ p ], false | None -> [], true)
        | None -> [], true)
   | "CARRY4" ->
@@ -259,7 +266,12 @@ let expand_instance (i : binstance) : bprocess list * bool =
          width, so per-port args keep the UF's FuncDecl arg-sorts identical on
          both miter sides.  GND/VCC ties are normalised so a const-tied input
          isn't a free variable. *)
-      let ports = box_ports m in
+      (* CANONICAL port order (by name): the two miter sides learn the module's
+         ports from different sources (netlist decl order vs RTL decl order);
+         the UF argument list must line up positionally or the same function
+         symbol is applied to permuted arguments and the sides never agree. *)
+      let ports = List.sort (fun (a, _, _) (b, _, _) -> compare a b)
+                    (box_ports m) in
       if ports = [] then [], true
       else begin
         let rec norm_e = function
@@ -272,13 +284,30 @@ let expand_instance (i : binstance) : bprocess list * bool =
           | `Input -> Some (match port_expr i p with Some e -> norm_e e | None -> zero)
           | `Output -> None) ports in
         let args = if args = [] then [ zero ] else args in
-        let asgs = List.concat_map (fun (p, dir, _w) ->
+        let asgs = List.concat_map (fun (p, dir, w) ->
           match dir with
           | `Output ->
-              List.mapi (fun bit n ->
-                BAssign { lhs = n;
-                          rhs = BCall { func = Printf.sprintf "%s__%s_%d" m p bit; args } })
-                (out_nets i p)
+              (match out_nets i p with
+               | [ single ] when w > 1 && not (String.contains single ']') ->
+                   (* WHOLE-BUS output connection (`.status_vector(^st)`): the
+                      gate-mapped miter side bit-blasts the same port into w
+                      scalar nets and calls `<m>__<p>_<bit>` PER BIT — one
+                      w-bit call here would give the SAME UF symbol a
+                      different result sort (a different Z3 FuncDecl), so the
+                      sides can never agree.  Emit per-bit calls onto
+                      `single[bit]`; resolve_input_bitbus canonicalises the
+                      bracket-string writes onto the obuf convention and
+                      reconstructs the bus. *)
+                   List.init w (fun bit ->
+                     BAssign { lhs = Printf.sprintf "%s[%d]" single bit;
+                               rhs = BCall { func = Printf.sprintf "%s__%s_%d" m p bit;
+                                             args } })
+               | nets ->
+                   List.mapi (fun bit n ->
+                     BAssign { lhs = n;
+                               rhs = BCall { func = Printf.sprintf "%s__%s_%d" m p bit;
+                                             args } })
+                     nets)
           | `Input -> []) ports in
         if asgs = [] then [], true
         else [ comb ("exp_uf_" ^ i.inst_name) asgs ], false
