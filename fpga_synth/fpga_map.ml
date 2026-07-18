@@ -209,6 +209,16 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
   List.iter l.regs ~f:(fun r ->
     let clk = port_input r.Bir_to_aig.rb_clock in
     let rst = Option.map r.Bir_to_aig.rb_reset ~f:ctrl_signal in
+    (* ACTIVE-LOW async reset (`negedge rst_n`): FDCE.CLR / FDPE.PRE are
+       active-HIGH pins — invert via a LUT1, matching Vivado's netlist form.
+       Wiring the raw net held the FF in reset whenever the reset was
+       DEASSERTED (gmii_rst_sync: PRE = mmcm_locked → MAC permanently reset
+       while the MMCM is locked — found by the Vivado↔SVS cross-flow miter,
+       confirmed in the shipped EDIF). *)
+    let rst =
+      if r.Bir_to_aig.rb_reset_neg
+      then Option.map rst ~f:(fun s -> Xil_prim.lutk ~truth:[ true; false ] [ s ])
+      else rst in
     (* Lifted SYNCHRONOUS reset/set net (d_sig-mapped, like CE); when present
        each bit becomes FDRE (R, srval bit 0) or FDSE (S, srval bit 1). *)
     let sr =

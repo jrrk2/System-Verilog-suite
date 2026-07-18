@@ -273,9 +273,36 @@ let rip_module (m : bmodule) : bmodule =
             (String.concat ", " (List.map fst pairs));
           List.iter (dump 1) s.body
         end;
+        (* ASYNC-reset registers additionally expose `<q>__RST` — the reset
+           condition NORMALISED to active-high (a `negedge rst_n` behavioural
+           reset emits ¬rst_n, matching a netlist FDPE whose PRE net is the
+           inverted signal).  The miter (a) compares the __RST cones across
+           sides and (b) compares the __D cones UNDER both-deasserted — an
+           implementation may fold the preset value into the D cone as well
+           (harmless: PRE dominates in hardware), so the unconditional __D
+           compare differed exactly where D is a don't-care. *)
+        let rst_expr =
+          match s.reset, s.reset_async with
+          | Some r, true ->
+              let e = BVar r in
+              Some (if s.reset_edge = Some `Neg
+                    then BUnOp { op = BNot; operand = e;
+                                 result_type = BInt { width = 1; signed = Unsigned } }
+                    else e)
+          | _ -> None in
         List.iter (fun (q, d_expr) ->
           let w = lookup_width q in
           let d_name = d_pin_name q in
+          (match rst_expr with
+           | Some re ->
+               let rn = q ^ "__RST" in
+               add_signal rn 1 `Output;
+               new_processes := BCombinational {
+                 name = "ffrip_rst_" ^ q;
+                 sensitivity = [BAny];
+                 body = [BAssign { lhs = rn; rhs = re }];
+               } :: !new_processes
+           | None -> ());
           match direction_of q with
           | `Output ->
               (* Output-port FF: insert a fresh primary input Q__Q

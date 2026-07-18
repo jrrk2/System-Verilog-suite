@@ -187,6 +187,12 @@ type reg_boundary =
   ; rb_d_names : string list (* AIG outputs for D bits, LSB-first *)
   ; rb_clock : string
   ; rb_reset : string option (* async reset net, if any *)
+  ; rb_reset_neg : bool
+      (* ACTIVE-LOW async reset (`negedge rst_n` / Hardcaml Edge.Falling).
+         fpga_map must invert the net before FDCE.CLR / FDPE.PRE (which are
+         active-HIGH pins) — wiring it raw held the FF in reset whenever the
+         reset was DEASSERTED (gmii_rst_sync PRE = mmcm_locked uninverted:
+         MAC permanently reset while the MMCM is locked). *)
   ; rb_enable : string option
       (* clock-enable net, if the register's D is an enable feedback mux
          [mux en dnext Q].  Lifting [en] onto the FDRE/FDCE CE pin (instead
@@ -631,6 +637,10 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
               ; rb_d_names = d_names
               ; rb_clock = clk
               ; rb_reset = rst
+              ; rb_reset_neg =
+                  (match register.reg_reset_edge with
+                   | Falling -> true
+                   | Rising -> false)
               ; rb_enable
               ; rb_width = w
               ; rb_init = init

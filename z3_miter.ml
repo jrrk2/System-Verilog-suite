@@ -1329,6 +1329,18 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
       Printf.printf "Per-cone miter over %d common outputs (FF-D cones + primary outs)...\n"
         (List.length common_outputs);
       let neq = ref 0 and ndiff = ref 0 and diffs = ref [] in
+      (* async-reset D-cones compare UNDER reset-deasserted (see ffrip __RST) *)
+      let rst_guards name =
+        if String.length name > 3
+           && String.sub name (String.length name - 3) 3 = "__D" then begin
+          let base = String.sub name 0 (String.length name - 3) in
+          let rn = base ^ "__RST" in
+          if List.mem_assoc rn outputs1 && List.mem_assoc rn outputs2 then
+            let z0 = Z3.BitVector.mk_numeral ctx "0" 1 in
+            [ Z3.Boolean.mk_eq ctx (bv_var rn 1 "_d1") z0;
+              Z3.Boolean.mk_eq ctx (bv_var rn 1 "_d2") z0 ]
+          else []
+        end else [] in
       List.iter (fun (name, width) ->
         let w2 = try List.assoc name outputs2 with Not_found -> width in
         let out1 = bv_var name width "_d1" in
@@ -1339,7 +1351,8 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
         let zero = Z3.BitVector.mk_numeral ctx "0" w in
         Z3.Solver.push miter_solver;
         Z3.Solver.add miter_solver
-          [ Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero) ];
+          (Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero)
+           :: rst_guards name);
         (match Z3.Solver.check miter_solver [] with
          | Z3.Solver.UNSATISFIABLE -> incr neq
          | _ -> incr ndiff; if List.length !diffs < 60 then diffs := name :: !diffs);
@@ -1374,7 +1387,24 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
       let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
       let xor = Z3.BitVector.mk_xor ctx (ext out1) (ext out2) in
       let zero = Z3.BitVector.mk_numeral ctx "0" w in
-      Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero)
+      let differs = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero) in
+      (* async-reset D-cones count as differing only when BOTH resets are
+         deasserted (ffrip's normalised <q>__RST; the reset nets themselves
+         are compared as ordinary outputs) *)
+      let guard =
+        if String.length name > 3
+           && String.sub name (String.length name - 3) 3 = "__D" then begin
+          let base = String.sub name 0 (String.length name - 3) in
+          let rn = base ^ "__RST" in
+          if List.mem_assoc rn outputs1 && List.mem_assoc rn outputs2 then
+            let z0 = Z3.BitVector.mk_numeral ctx "0" 1 in
+            [ Z3.Boolean.mk_eq ctx (bv_var rn 1 "_d1") z0;
+              Z3.Boolean.mk_eq ctx (bv_var rn 1 "_d2") z0 ]
+          else []
+        end else [] in
+      match guard with
+      | [] -> differs
+      | g -> Z3.Boolean.mk_and ctx (differs :: g)
     ) common_outputs in
 
     let miter_terms = miter_terms @ List.map snd bitbus_d_pairs in
