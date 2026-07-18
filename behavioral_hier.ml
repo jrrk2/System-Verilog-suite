@@ -280,9 +280,32 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
                                  sensitivity = [BAny]; body })
       | _ -> None
     ) inst.port_connections in
+  (* An OUTPUT port wired to a single BUS BIT — `.O(y[3])` — is the common case
+     in a synthesised netlist (every LUT/FF drives one bit of an output bus).
+     lhs_subst only maps whole-net (BVar) actuals, so without this the bit floats
+     (reads 0) and the whole bus collapses to 0.  Drive the per-bit net
+     `obuf_<bus>_<i>__O` that resolve_input_bitbus assembles into the port. *)
+  let bit_assigns =
+    List.filter_map (fun (formal, actual) ->
+      match List.assoc_opt formal port_dirs, actual with
+      | Some `Output, BSlice { signal = BVar n; msb; lsb } when msb = lsb ->
+          Some (Printf.sprintf "obuf_%s_%d__O" n msb, pname prefix formal)
+      | Some `Output, BSelect { array = BVar n; index = BConst { value; _ } } ->
+          Some (Printf.sprintf "obuf_%s_%d__O" n (Z.to_int value), pname prefix formal)
+      | _ -> None
+    ) inst.port_connections in
+  let bit_proc =
+    if bit_assigns = [] then []
+    else [ BCombinational { name = pname prefix "__obuf_fanout"; sensitivity = [BAny];
+             body = List.map (fun (dst, src) ->
+               BAssign { lhs = dst; rhs = BVar src }) bit_assigns } ] in
+  let obuf_sigs =
+    List.map (fun (dst, _) ->
+      { name = dst; stype = BInt { width = 1; signed = Unsigned };
+        direction = `Internal; initial_value = None; attrs = [] }) bit_assigns in
   { parent with
-    signals   = new_signals;
-    processes = fanout_procs @ new_processes }
+    signals   = obuf_sigs @ new_signals;
+    processes = fanout_procs @ bit_proc @ new_processes }
 
 (* Flatten a top-level module by recursively inlining every reachable
  * binstance. Memoised by module name so cells used multiple times only

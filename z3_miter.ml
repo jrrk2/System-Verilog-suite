@@ -866,6 +866,285 @@ let check_miter_equivalence bmod1 bmod2 =
       | None -> ()
     ) inputs1;
 
+    (* CONSTANT-STATE constraints (classic LEC constant-register sweep).  A
+       lifted state bit whose next-state (its ffrip `<q>__D` expression) folds
+       to a compile-time constant c is constant in operation (D independent of
+       state and inputs; INIT matches c — the same assumption synthesis makes
+       when it prunes such registers).  Left free, an optimised side that
+       PRUNED those bits (Vivado const-props a register's zero bits away)
+       mismatches the unpruned side through UNREACHABLE states — e.g. SVS keeps
+       a 4-bit a_q whose [3:1] have D=GND while Vivado keeps 1 FF; free upper
+       bits then fabricate counterexamples.  Constrain each side's constant
+       state bits to their constant.  Disable with Z3_MITER_NO_CONST_STATE=1. *)
+    if Sys.getenv_opt "Z3_MITER_NO_CONST_STATE" = None then begin
+      let rec bit_const e j =
+        (* Some 0/1 when bit j of e is a compile-time constant. *)
+        match e with
+        | BConst { value; _ } -> Some (if Z.testbit value j then 1 else 0)
+        | BVar ("GND" | "<const0>") -> if j = 0 then Some 0 else Some 0
+        | BVar ("VCC" | "<const1>") -> if j = 0 then Some 1 else Some 0
+        | BConcat es ->
+            (* MSB-first: walk from LSB end. *)
+            let rec go j = function
+              | [] -> None
+              | el :: rest ->
+                  let w = expr_width el in
+                  if j < w then bit_const el j else go (j - w) rest in
+            go j (List.rev es)
+        | BSlice { signal; msb; lsb } ->
+            let lo = min msb lsb in
+            if j <= abs (msb - lsb) then bit_const signal (lo + j) else Some 0
+        | BCond { condition; then_val; else_val } ->
+            (match bit_const condition 0 with
+             | Some c -> bit_const (if c <> 0 then then_val else else_val) j
+             | None ->
+                 (match bit_const then_val j, bit_const else_val j with
+                  | Some a, Some b when a = b -> Some a
+                  | _ -> None))
+        | BReplicate { value; count } ->
+            let w = expr_width value in
+            if w > 0 && j < w * count then bit_const value (j mod w) else Some 0
+        | _ -> None
+      and expr_width = function
+        | BConst { width; _ } -> width
+        | BSlice { msb; lsb; _ } -> abs (msb - lsb) + 1
+        | BConcat es -> List.fold_left (fun a e -> a + expr_width e) 0 es
+        | BReplicate { value; count } -> count * expr_width value
+        | _ -> 1 in
+      let n_cs = ref 0 in
+      let n_eqr = ref 0 in
+      let constrain_side (bm : bmodule) inputs suffix =
+        let inw = Hashtbl.create 16 in
+        List.iter (fun (n, w) -> Hashtbl.replace inw n w) inputs;
+        (* EQUIVALENT-register grouping (LEC dedup sweep): state bits with
+           STRUCTURALLY IDENTICAL next-state expressions are equal in every
+           reachable state (same D, same INIT assumption as the const sweep).
+           Vivado shares one FF across such bits (`b_q[0]`/`b_q[1]` both load
+           rst_n → one FDRE); the unshared side must know the invariant or the
+           extra bit floats free and fabricates counterexamples. *)
+        let eq_groups : (string, Z3.Expr.expr list ref) Hashtbl.t =
+          Hashtbl.create 16 in
+        List.iter (function
+          | BCombinational { body = [BAssign { lhs; rhs }]; _ }
+            when String.length lhs > 3
+                 && String.sub lhs (String.length lhs - 3) 3 = "__D" ->
+              let q = String.sub lhs 0 (String.length lhs - 3) in
+              (match Hashtbl.find_opt inw q with
+               | Some w ->
+                   let st = bv_var q w suffix in
+                   let wz = sz st in
+                   (* per-bit exprs when rhs is ffpack's MSB-first concat of
+                      1-bit cones (or the whole rhs for a 1-bit state) *)
+                   let bit_exprs =
+                     match rhs with
+                     | BConcat es when List.for_all
+                         (fun e -> expr_width e = 1) es
+                         && List.length es = wz ->
+                         Some (Array.of_list (List.rev es))   (* [j] = bit j *)
+                     | _ when wz = 1 -> Some [| rhs |]
+                     | _ -> None in
+                   for j = 0 to wz - 1 do
+                     match bit_const rhs j with
+                     | Some c ->
+                         incr n_cs;
+                         let bit = Z3.BitVector.mk_extract ctx j j st in
+                         let cv = Z3.BitVector.mk_numeral ctx (string_of_int c) 1 in
+                         Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx bit cv ]
+                     | None ->
+                         (* non-const bit: group by NORMALISED D-cone structure.
+                            Normalise (a) const conditions — CE=1'1 muxes hide
+                            identical loads behind per-bit hold slices; (b) the
+                            bit's own hold reference q[j:j] → __SELF__ — bits
+                            whose D differs only in their own hold-slice are
+                            equal by induction (equal INIT ⇒ equal forever). *)
+                         (match bit_exprs with
+                          | Some arr ->
+                              let rec keyf e = match e with
+                                | BSlice { signal = BVar x; msb; lsb }
+                                  when x = q && msb = j && lsb = j ->
+                                    BVar "__SELF__"
+                                | BCond { condition; then_val; else_val } ->
+                                    (match bit_const condition 0 with
+                                     | Some c ->
+                                         keyf (if c <> 0 then then_val else else_val)
+                                     | None ->
+                                         BCond { condition = keyf condition;
+                                                 then_val = keyf then_val;
+                                                 else_val = keyf else_val })
+                                | BBinOp r -> BBinOp { r with lhs = keyf r.lhs;
+                                                              rhs = keyf r.rhs }
+                                | BUnOp r -> BUnOp { r with operand = keyf r.operand }
+                                | BSelect r -> BSelect { array = keyf r.array;
+                                                         index = keyf r.index }
+                                | BSlice r -> BSlice { r with signal = keyf r.signal }
+                                | BConcat es -> BConcat (List.map keyf es)
+                                | BReplicate r -> BReplicate { r with value = keyf r.value }
+                                | BCall r -> BCall { r with args = List.map keyf r.args }
+                                | BVar _ | BConst _ -> e in
+                              let key = string_of_bexpr (keyf arr.(j)) in
+                              let bit = Z3.BitVector.mk_extract ctx j j st in
+                              (match Hashtbl.find_opt eq_groups key with
+                               | Some l -> l := bit :: !l
+                               | None -> Hashtbl.add eq_groups key (ref [bit]))
+                          | None -> ())
+                   done
+               | None -> ())
+          | _ -> ()) bm.processes;
+        Hashtbl.iter (fun _ l ->
+          match !l with
+          | first :: (_ :: _ as rest) ->
+              List.iter (fun b ->
+                incr n_eqr;
+                Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx first b ])
+                rest
+          | _ -> ()) eq_groups in
+      constrain_side bmod1 inputs1 "_d1";
+      constrain_side bmod2 inputs2 "_d2";
+      if !n_cs > 0 then
+        Printf.printf "Constant-state sweep: constrained %d state bit(s)\n" !n_cs;
+      if !n_eqr > 0 then
+        Printf.printf "Equivalent-register sweep: %d state bit(s) tied to group leaders\n" !n_eqr
+    end;
+
+    (* CROSS-SIDE BITBUS STATE MATCHING.  Vivado dedups / const-prunes register
+       bits, leaving a SPARSE per-bit state set (e.g. only `b_q__b1` survives of
+       a 2-bit b_q) which ffpack cannot pack, while the other side packed the
+       full bus `b_q`.  The state names then never match, both float free, and
+       every read of the register fabricates a counterexample.  Tie each
+       per-bit state input `X__b<i>` to bit i of the other side's bus state
+       input `X`.  (The corresponding `X__b<i>__D` next-state cones are paired
+       against bit i of `X__D` in the output compare below.) *)
+    let bitb_re = Str.regexp "^\\(.+\\)__b\\([0-9]+\\)$" in
+    let in1_w = Hashtbl.create (List.length inputs1 * 2 + 1) in
+    List.iter (fun (n, w) -> Hashtbl.replace in1_w n w) inputs1;
+    let n_bb = ref 0 in
+    let match_bit_side my_inputs other_w my_sfx other_sfx =
+      List.iter (fun (name, w) ->
+        if w = 1 && Str.string_match bitb_re name 0 then begin
+          let base = Str.matched_group 1 name in
+          let i = int_of_string (Str.matched_group 2 name) in
+          match Hashtbl.find_opt other_w base with
+          | Some wb when i < wb ->
+              incr n_bb;
+              let bitv = bv_var name 1 my_sfx in
+              let busv = bv_var base wb other_sfx in
+              let bit = Z3.BitVector.mk_extract ctx i i busv in
+              Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx bitv bit ]
+          | _ -> ()
+        end) my_inputs in
+    match_bit_side inputs1 in2_w "_d1" "_d2";
+    match_bit_side inputs2 in1_w "_d2" "_d1";
+    if !n_bb > 0 then
+      Printf.printf "Bitbus state matching: %d per-bit state(s) tied to bus bits\n" !n_bb;
+
+    (* SEMANTIC constant-0 state sweep.  The syntactic sweep above only sees
+       literal constants; synthesis-level constants hide behind real logic —
+       `a_q <= {0,g} - {0,g}` (always 0 through the subtractor LUTs) or
+       `a_q <= d << d` (bits 0,2 unreachable) — which Vivado's optimizer prunes
+       but the other side keeps as live FFs.  Probe each lifted state bit's
+       next-state: if `<q>__D[j] ≠ 0` is UNSAT under all current constraints,
+       the bit loads 0 in every consistent valuation, so with INIT=0 it is
+       constant — pin the state bit.  Capped (Z3_MITER_SEM_CONST_CAP, default
+       1024 probes) so switch-level monsters don't pay thousands of SAT calls;
+       disabled along with the syntactic sweep by Z3_MITER_NO_CONST_STATE. *)
+    if Sys.getenv_opt "Z3_MITER_NO_CONST_STATE" = None then begin
+      let cap = match Sys.getenv_opt "Z3_MITER_SEM_CONST_CAP" with
+        | Some s -> (try int_of_string s with _ -> 1024) | None -> 1024 in
+      let probes = ref 0 and hits = ref 0 in
+      let pinned : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+      let zero1 = Z3.BitVector.mk_numeral ctx "0" 1 in
+      let probe_side inputs outputs sfx =
+        let outw = Hashtbl.create 16 in
+        List.iter (fun (n, w) -> Hashtbl.replace outw n w) outputs;
+        List.iter (fun (q, w) ->
+          match Hashtbl.find_opt outw (q ^ "__D") with
+          | Some wd ->
+              let dvar = bv_var (q ^ "__D") wd sfx in
+              let qvar = bv_var q w sfx in
+              let wmin = min (sz dvar) (sz qvar) in
+              for j = 0 to wmin - 1 do
+                let key = Printf.sprintf "%s%s[%d]" q sfx j in
+                if not (Hashtbl.mem pinned key) && !probes < cap then begin
+                  (* try c = 0 then c = 1 (a const-1 loader with INIT=1 —
+                     dff_init's preset registers — is tied high by synthesis;
+                     same INIT-matches-c assumption as the rest) *)
+                  let try_const cv =
+                    incr probes;
+                    Z3.Solver.push miter_solver;
+                    Z3.Solver.add miter_solver
+                      [ Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx
+                          (Z3.BitVector.mk_extract ctx j j dvar) cv) ];
+                    let r = Z3.Solver.check miter_solver [] in
+                    Z3.Solver.pop miter_solver 1;
+                    if r = Z3.Solver.UNSATISFIABLE then begin
+                      incr hits;
+                      Hashtbl.replace pinned key ();
+                      Z3.Solver.add miter_solver
+                        [ Z3.Boolean.mk_eq ctx
+                            (Z3.BitVector.mk_extract ctx j j qvar) cv ];
+                      true
+                    end else false in
+                  if not (try_const zero1) && !probes < cap then
+                    ignore (try_const (Z3.BitVector.mk_numeral ctx "1" 1))
+                end
+              done
+          | None -> ()) inputs in
+      (* iterate: pinning one bit can make another's D provably 0 *)
+      let last = ref (-1) in
+      while !hits > !last && !probes < cap do
+        last := !hits;
+        probe_side inputs1 outputs1 "_d1";
+        probe_side inputs2 outputs2 "_d2"
+      done;
+      if !hits > 0 then
+        Printf.printf "Semantic const-0 state sweep: %d bit(s) proven constant (%d probes)\n"
+          !hits !probes;
+      (* SEMANTIC same-bus dedup: the structural equivalent-register grouping
+         fails when identical cones route through different intermediate nets
+         (`_n_3` vs `_n_5`, both = wire4 — dff_init's sign-extended load).
+         Probe D[i] ≠ D[j] for bit pairs of the same state bus; UNSAT ⇒ the
+         bits load identically ⇒ (equal INIT) tie q[i] = q[j]. *)
+      let dedup_hits = ref 0 in
+      let dedup_side inputs outputs sfx =
+        let outw = Hashtbl.create 16 in
+        List.iter (fun (n, w) -> Hashtbl.replace outw n w) outputs;
+        List.iter (fun (q, w) ->
+          match Hashtbl.find_opt outw (q ^ "__D") with
+          | Some wd when w > 1 && w <= 32 ->
+              let dvar = bv_var (q ^ "__D") wd sfx in
+              let qvar = bv_var q w sfx in
+              let wmin = min (sz dvar) (sz qvar) in
+              for i = 0 to wmin - 1 do
+                for j = i + 1 to wmin - 1 do
+                  let ki = Printf.sprintf "%s%s[%d]" q sfx i in
+                  let kj = Printf.sprintf "%s%s[%d]" q sfx j in
+                  if not (Hashtbl.mem pinned ki) && not (Hashtbl.mem pinned kj)
+                     && !probes < cap then begin
+                    incr probes;
+                    Z3.Solver.push miter_solver;
+                    Z3.Solver.add miter_solver
+                      [ Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx
+                          (Z3.BitVector.mk_extract ctx i i dvar)
+                          (Z3.BitVector.mk_extract ctx j j dvar)) ];
+                    let r = Z3.Solver.check miter_solver [] in
+                    Z3.Solver.pop miter_solver 1;
+                    if r = Z3.Solver.UNSATISFIABLE then begin
+                      incr dedup_hits;
+                      Z3.Solver.add miter_solver
+                        [ Z3.Boolean.mk_eq ctx
+                            (Z3.BitVector.mk_extract ctx i i qvar)
+                            (Z3.BitVector.mk_extract ctx j j qvar) ]
+                    end
+                  end
+                done
+              done
+          | _ -> ()) inputs in
+      dedup_side inputs1 outputs1 "_d1";
+      dedup_side inputs2 outputs2 "_d2";
+      if !dedup_hits > 0 then
+        Printf.printf "Semantic dedup sweep: %d state-bit pair(s) tied\n" !dedup_hits
+    end;
+
     (* Match undriven internal signals across designs. These are reads of
      * a signal that no process writes (e.g. `reg [7:0] mem [0:255];
      * assign b = mem[a];` — mem is just a source). Without this they
@@ -905,6 +1184,30 @@ let check_miter_equivalence bmod1 bmod2 =
 
     let common_outputs =
       List.filter (fun (n, _) -> List.mem_assoc n outputs2) outputs1 in
+    (* Next-state cones for SPARSE per-bit states (see bitbus matching above):
+       pair `X__b<i>__D` on one side with bit i of `X__D` on the other, so the
+       kept bits' next-state logic is COMPARED (name-equality alone would
+       silently skip them). Each pair yields a "differs" boolean. *)
+    let bitbus_d_pairs =
+      let bitbd_re = Str.regexp "^\\(.+\\)__b\\([0-9]+\\)__D$" in
+      let tab outs = let h = Hashtbl.create 16 in
+        List.iter (fun (n, w) -> Hashtbl.replace h n w) outs; h in
+      let out1_w = tab outputs1 and out2_w = tab outputs2 in
+      let mk my_outs other_w my_sfx other_sfx =
+        List.filter_map (fun (name, w) ->
+          if w = 1 && Str.string_match bitbd_re name 0 then begin
+            let base = Str.matched_group 1 name in
+            let i = int_of_string (Str.matched_group 2 name) in
+            match Hashtbl.find_opt other_w (base ^ "__D") with
+            | Some wb when i < wb ->
+                let e1 = bv_var name 1 my_sfx in
+                let e2 = Z3.BitVector.mk_extract ctx i i
+                           (bv_var (base ^ "__D") wb other_sfx) in
+                Some (Printf.sprintf "%s__D[%d]" base i,
+                      Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx e1 e2))
+            | _ -> None
+          end else None) my_outs in
+      mk outputs1 out2_w "_d1" "_d2" @ mk outputs2 out1_w "_d2" "_d1" in
     (* CONE-LEVEL mode (Z3_MITER_PER_CONE): check each common output (every
        FF's <Q>__D next-state cone + each primary output) on its OWN, with
        push/pop, so a structural state mismatch on a few cones (SVS bit-blasts
@@ -929,6 +1232,14 @@ let check_miter_equivalence bmod1 bmod2 =
          | Z3.Solver.UNSATISFIABLE -> incr neq
          | _ -> incr ndiff; if List.length !diffs < 60 then diffs := name :: !diffs);
         Z3.Solver.pop miter_solver 1) common_outputs;
+      (* sparse-bit next-state cones (bitbus pairs) as extra cones *)
+      List.iter (fun (name, differs) ->
+        Z3.Solver.push miter_solver;
+        Z3.Solver.add miter_solver [ differs ];
+        (match Z3.Solver.check miter_solver [] with
+         | Z3.Solver.UNSATISFIABLE -> incr neq
+         | _ -> incr ndiff; if List.length !diffs < 60 then diffs := name :: !diffs);
+        Z3.Solver.pop miter_solver 1) bitbus_d_pairs;
       Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
       Printf.printf "  PER-CONE: %d EQUIVALENT, %d DIFFER\n" !neq !ndiff;
       Printf.printf "═══════════════════════════════════════════════════════════════\n";
@@ -954,6 +1265,7 @@ let check_miter_equivalence bmod1 bmod2 =
       Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero)
     ) common_outputs in
 
+    let miter_terms = miter_terms @ List.map snd bitbus_d_pairs in
     let miter_output =
       match miter_terms with
       | [] -> Z3.Boolean.mk_false ctx

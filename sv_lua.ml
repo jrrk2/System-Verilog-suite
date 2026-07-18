@@ -438,10 +438,11 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
   let allw : (string, int) Hashtbl.t = Hashtbl.create 64 in
   List.iter (fun (s : bsignal) ->
     let w = Behavioral_boundary.width_of_btype s.stype in
-    if w > 1 then begin
-      Hashtbl.replace allw s.name w;
-      if s.direction = `Input then Hashtbl.replace inw s.name w
-    end) m.signals;
+    (* allw includes WIDTH-1 signals: a single-FF register still packs to a
+       width-1 bus (Vivado pruned a_q to one FF), and its `a_q__b0` readers
+       must resolve to `a_q[0:0]` — excluded from allw they'd tie to 0. *)
+    Hashtbl.replace allw s.name w;
+    if w > 1 && s.direction = `Input then Hashtbl.replace inw s.name w) m.signals;
   if Hashtbl.length allw = 0 then m
   else begin
     let all_digits s = s <> "" && String.for_all (fun c -> c >= '0' && c <= '9') s in
@@ -475,8 +476,26 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
           (match int_of_string_opt suf, Hashtbl.find_opt inw base with
            | Some i, Some w when i >= 0 && i < w -> Some (base, i)
            | _ -> None) in
+    (* bracket bit read `base[i]` where base is any multi-bit signal — Vivado's
+       internal D-buses (`p_0_in[0]`) reach a cell pin as a bracket-string BVar,
+       not the `__b`/`__` bitbus convention; without this rw ties it to 0. *)
+    let split_bracket name =
+      let n = String.length name in
+      if n >= 3 && name.[n-1] = ']' then
+        match String.rindex_opt name '[' with
+        | Some lb when lb > 0 ->
+            let base = String.sub name 0 lb in
+            let inner = String.sub name (lb+1) (n-lb-2) in
+            (match int_of_string_opt inner, Hashtbl.find_opt allw base with
+             | Some i, Some w when i >= 0 && i < w -> Some (base, i)
+             | _ -> None)
+        | _ -> None
+      else None in
     let split_bitbus name =
-      match split_reg name with Some r -> Some r | None -> split_port name in
+      match split_reg name with
+      | Some r -> Some r
+      | None -> (match split_port name with
+                 | Some r -> Some r | None -> split_bracket name) in
     (* Set of nets that HAVE a driver: ports, every process assign target, and
        (conservatively) every net touched by a surviving black-box instance.  A
        read of anything else is an unconnected pin, which Xilinx defaults to 0 —
@@ -569,20 +588,52 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
     let sig_names = Hashtbl.create 256 in
     List.iter (fun (s : bsignal) -> Hashtbl.replace sig_names s.name ())
       m.signals;
+    (* A registered output (packed FF whose bus IS the output port, e.g. a
+       registered `count`) is already driven by its BSequential — do NOT also
+       rebuild it from the per-bit obuf nets, or the port gets two drivers and
+       the miter reads an inconsistent value.  This matters once cross-flow
+       FF-name canonicalisation makes a Vivado FDRE-driven output bus pack. *)
+    let seq_driven : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+    List.iter (function
+      | BSequential { body; _ } ->
+          List.iter (function
+            | BAssign { lhs; _ } -> Hashtbl.replace seq_driven lhs ()
+            | _ -> ()) body
+      | _ -> ()) m.processes;
     let out_drivers = List.filter_map (fun (s : bsignal) ->
+      (* Reconstruct any multi-bit signal — OUTPUT port OR INTERNAL bus (e.g.
+         Vivado's `p_0_in` next-state D-bus) — whose bits were each driven
+         through a per-bit `obuf_<sig>_<i>__O` net by the bus-bit inline fanout.
+         Skip registered outputs (already driven by their BSequential).  Gated on
+         all obuf nets existing, so it only fires where the fanout created them. *)
       match s.direction with
-      | `Output ->
+      | (`Output | `Internal) when not (Hashtbl.mem seq_driven s.name) ->
           let w = Behavioral_boundary.width_of_btype s.stype in
           if w <= 1 then None
           else begin
             let nets = List.init w (fun i ->
               Printf.sprintf "obuf_%s_%d__O" s.name i) in
-            if List.for_all (Hashtbl.mem sig_names) nets
+            (* PARTIAL buses reconstruct too: Vivado leaves a bus bit undriven
+               when nothing reads it (`wire [2:0] ^a` with only [0],[2] driven)
+               — requiring ALL bits made the whole bus tie to 0.  Missing bits
+               get 0 (undriven-and-unread, value irrelevant). *)
+            if List.exists (Hashtbl.mem sig_names) nets
             then Some (BAssign { lhs = s.name;
-                                 rhs = BConcat (List.rev_map (fun n -> BVar n) nets) })
+                                 rhs = BConcat (List.rev_map (fun n ->
+                                   if Hashtbl.mem sig_names n then BVar n
+                                   else BConst { value = Z.zero; width = 1 }) nets) })
             else None
           end
       | _ -> None) m.signals in
+    (* Register the reconstructed buses as DRIVEN before rw rewrites the
+       existing processes — `driven` was built from m.processes alone, so a read
+       of a reconstructed bus (an FDRE's `.D(p_0_in[i])`) would otherwise still
+       be tied to 0 even though `__out_bitbus` is about to drive it.  `rw` reads
+       the mutable `driven` table at apply time, so adding entries here is
+       sufficient. *)
+    List.iter (function
+      | BAssign { lhs; _ } -> Hashtbl.replace driven lhs ()
+      | _ -> ()) out_drivers;
     let processes' = List.map rwp m.processes in
     let processes' =
       if out_drivers = [] then processes'
@@ -595,6 +646,179 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
         { i with port_connections =
                    List.map (fun (p, e) -> (p, rw e)) i.port_connections }) m.instances }
   end
+
+(* Cross-flow FF-name alignment.  Vivado's write_verilog names a bit-blasted
+   register FF `<base>_reg[<i>]` (and a scalar reg `<base>_reg`), while SVS's
+   FPGA_LEC_NAMES uses `<base>__b<i>`.  Rewriting the Vivado form to the SVS form
+   lets Behavioral_ffpack re-pack BOTH sides' per-bit FFs into the same bus
+   register, so ffrip's per-state Q/D cones line up by name in the cross-flow
+   miter (else Vivado stays 4×1-bit `count_reg[i]__Q` vs SVS 1×4-bit `count__Q`).
+   Harmless on the SVS side (no `_reg` names) and on same-flow self-miters. *)
+let canon_ff_name =
+  (* Vivado's FDRE state pin surfaces as `<base>_reg[<i>]__Q` (bit-blasted reg)
+     or `<base>_reg__Q` (scalar reg); ffpack packs a BSequential whose LHS ends
+     in `<bus>__b<idx>`, so map the FF STATE net to that form (dropping the __Q).
+     Non-Q FDRE pins keep their `_reg[i]`→`__b<i>` rewrite for consistency. *)
+  let re_q   = Str.regexp "^\\(.+\\)_reg\\[\\([0-9]+\\)\\]__Q$" in
+  let re_sq  = Str.regexp "^\\(.+\\)_reg__Q$" in
+  let re_bit = Str.regexp "^\\(.+\\)_reg\\[\\([0-9]+\\)\\]\\(__[A-Za-z].*\\)?$" in
+  let re_sc  = Str.regexp "^\\(.+\\)_reg\\(__[A-Za-z].*\\)?$" in
+  fun n ->
+    if Str.string_match re_q n 0 then
+      Str.matched_group 1 n ^ "__b" ^ Str.matched_group 2 n
+    else if Str.string_match re_sq n 0 then
+      Str.matched_group 1 n ^ "__b0"
+    else if Str.string_match re_bit n 0 then
+      Str.matched_group 1 n ^ "__b" ^ Str.matched_group 2 n
+        ^ (try Str.matched_group 3 n with Not_found -> "")
+    else if Str.string_match re_sc n 0 then
+      Str.matched_group 1 n ^ "__b0"
+        ^ (try Str.matched_group 2 n with Not_found -> "")
+    else n
+
+let canonicalize_ff_names (m : bmodule) : bmodule =
+  let open Behavioral_ir in
+  let rec re_e e = match e with
+    | BVar n -> BVar (canon_ff_name n)
+    | BConst _ -> e
+    | BBinOp r -> BBinOp { r with lhs = re_e r.lhs; rhs = re_e r.rhs }
+    | BUnOp r -> BUnOp { r with operand = re_e r.operand }
+    | BSelect r -> BSelect { array = re_e r.array; index = re_e r.index }
+    | BSlice r -> BSlice { r with signal = re_e r.signal }
+    | BConcat es -> BConcat (List.map re_e es)
+    | BReplicate r -> BReplicate { r with value = re_e r.value }
+    | BCond r -> BCond { condition = re_e r.condition;
+                         then_val = re_e r.then_val; else_val = re_e r.else_val }
+    | BCall r -> BCall { r with args = List.map re_e r.args } in
+  let rec re_s s = match s with
+    | BAssign r -> BAssign { lhs = canon_ff_name r.lhs; rhs = re_e r.rhs }
+    | BIf r -> BIf { condition = re_e r.condition;
+                     then_stmts = List.map re_s r.then_stmts;
+                     else_stmts = List.map re_s r.else_stmts }
+    | BCase r -> BCase { selector = re_e r.selector;
+                         cases = List.map (fun (g,b) -> (re_e g, List.map re_s b)) r.cases;
+                         default = List.map re_s r.default }
+    | BWhile r -> BWhile { condition = re_e r.condition; body = List.map re_s r.body }
+    | BFor r -> BFor { init = re_s r.init; condition = re_e r.condition;
+                       update = re_s r.update; body = List.map re_s r.body }
+    | BBlock b -> BBlock (List.map re_s b)
+    | BCallStmt r -> BCallStmt { r with args = List.map re_e r.args }
+    | BReturn eo -> BReturn (Option.map re_e eo) in
+  let re_proc = function
+    | BCombinational r -> BCombinational { r with body = List.map re_s r.body }
+    | BSequential r -> BSequential { r with clock = canon_ff_name r.clock;
+                                            reset = Option.map canon_ff_name r.reset;
+                                            body = List.map re_s r.body } in
+  (* State-name-from-INSTANCE pre-pass.  Vivado can rename an FF's Q NET after
+     the output it aliases (`assign a = a_q` → FDRE \a_q_reg[0] with .Q(\^a)),
+     so the inlined state lands on the net name `^a` — unrecognisable to the
+     name canon.  But the inlined FF process name preserves the INSTANCE
+     (`a_q_reg[0]__seq`), which carries the RTL register identity.  Rewrite the
+     state write onto `<base>__b<i>` (the ffpack-able form), substitute the
+     state read in its own hold branch, and alias the old Q net to the new
+     state so downstream readers stay connected. *)
+  let re_seq = Str.regexp "^\\(.+\\)_reg\\(\\[\\([0-9]+\\)\\]\\)?__seq$" in
+  (* EVICT collisions first: Vivado can reuse a register's BASE name for an
+     unrelated live net (rand_26: `wire [0:0] a_q` is the shared reset-LUT
+     output feeding each \a_q_reg[i]/.R) — packing the canonicalised states
+     into a bus named `a_q` would then collide with it (truncated state, twin
+     writers).  Rename such an INTERNAL signal and every reference to
+     `<base>__vivnet`; a PORT named base is left alone (that is the ordinary
+     registered-output pattern the packer expects). *)
+  let bus_bases : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+  List.iter (function
+    | BSequential { name = pn; _ } when Str.string_match re_seq pn 0 ->
+        Hashtbl.replace bus_bases (Str.matched_group 1 pn) ()
+    | _ -> ()) m.processes;
+  let evict : (string, string) Hashtbl.t = Hashtbl.create 4 in
+  List.iter (fun (s : bsignal) ->
+    if Hashtbl.mem bus_bases s.name && s.direction = `Internal then
+      Hashtbl.replace evict s.name (s.name ^ "__vivnet")) m.signals;
+  let m =
+    if Hashtbl.length evict = 0 then m
+    else begin
+      let ev n = match Hashtbl.find_opt evict n with Some n' -> n' | None -> n in
+      let rec ee e = match e with
+        | BVar n -> BVar (ev n)
+        | BConst _ -> e
+        | BBinOp r -> BBinOp { r with lhs = ee r.lhs; rhs = ee r.rhs }
+        | BUnOp r -> BUnOp { r with operand = ee r.operand }
+        | BSelect r -> BSelect { array = ee r.array; index = ee r.index }
+        | BSlice r -> BSlice { r with signal = ee r.signal }
+        | BConcat es -> BConcat (List.map ee es)
+        | BReplicate r -> BReplicate { r with value = ee r.value }
+        | BCond r -> BCond { condition = ee r.condition;
+                             then_val = ee r.then_val; else_val = ee r.else_val }
+        | BCall r -> BCall { r with args = List.map ee r.args } in
+      let rec es_ s = match s with
+        | BAssign r -> BAssign { lhs = ev r.lhs; rhs = ee r.rhs }
+        | BIf r -> BIf { condition = ee r.condition;
+                         then_stmts = List.map es_ r.then_stmts;
+                         else_stmts = List.map es_ r.else_stmts }
+        | BCase r -> BCase { selector = ee r.selector;
+                             cases = List.map (fun (g,b) -> (ee g, List.map es_ b)) r.cases;
+                             default = List.map es_ r.default }
+        | BWhile r -> BWhile { condition = ee r.condition; body = List.map es_ r.body }
+        | BFor r -> BFor { init = es_ r.init; condition = ee r.condition;
+                           update = es_ r.update; body = List.map es_ r.body }
+        | BBlock b -> BBlock (List.map es_ b)
+        | BCallStmt r -> BCallStmt { r with args = List.map ee r.args }
+        | BReturn eo -> BReturn (Option.map ee eo) in
+      { m with
+        signals = List.map (fun (s:bsignal) -> { s with name = ev s.name }) m.signals;
+        processes = List.map (function
+          | BCombinational r -> BCombinational { r with body = List.map es_ r.body }
+          | BSequential r -> BSequential { r with clock = ev r.clock;
+                                                  reset = Option.map ev r.reset;
+                                                  body = List.map es_ r.body })
+          m.processes;
+        instances = List.map (fun (i:binstance) ->
+          { i with port_connections =
+                     List.map (fun (p,e) -> (p, ee e)) i.port_connections })
+          m.instances }
+    end in
+  let extra_procs = ref [] and extra_sigs = ref [] in
+  let pre_procs = List.map (fun proc ->
+    match proc with
+    | BSequential ({ name = pn; body = [BAssign { lhs; rhs }]; _ } as r)
+      when Str.string_match re_seq pn 0 ->
+        let base = Str.matched_group 1 pn in
+        let idx = (try Str.matched_group 3 pn with Not_found -> "0") in
+        let q_new = base ^ "__b" ^ idx in
+        if canon_ff_name lhs = q_new then proc
+        else begin
+          let rec subst e = match e with
+            | BVar n when n = lhs -> BVar q_new
+            | BVar _ | BConst _ -> e
+            | BBinOp rr -> BBinOp { rr with lhs = subst rr.lhs; rhs = subst rr.rhs }
+            | BUnOp rr -> BUnOp { rr with operand = subst rr.operand }
+            | BSelect rr -> BSelect { array = subst rr.array; index = subst rr.index }
+            | BSlice rr -> BSlice { rr with signal = subst rr.signal }
+            | BConcat es -> BConcat (List.map subst es)
+            | BReplicate rr -> BReplicate { rr with value = subst rr.value }
+            | BCond rr -> BCond { condition = subst rr.condition;
+                                  then_val = subst rr.then_val;
+                                  else_val = subst rr.else_val }
+            | BCall rr -> BCall { rr with args = List.map subst rr.args } in
+          extra_procs := BCombinational {
+            name = q_new ^ "__qalias"; sensitivity = [BAny];
+            body = [BAssign { lhs; rhs = BVar q_new }] } :: !extra_procs;
+          extra_sigs := { name = q_new;
+                          stype = BInt { width = 1; signed = Unsigned };
+                          direction = `Internal; initial_value = None;
+                          attrs = [] } :: !extra_sigs;
+          BSequential { r with body = [BAssign { lhs = q_new; rhs = subst rhs }] }
+        end
+    | _ -> proc) m.processes in
+  let m = { m with signals = !extra_sigs @ m.signals;
+                   processes = pre_procs @ !extra_procs } in
+  { m with
+    signals = List.map (fun (s:bsignal) -> { s with name = canon_ff_name s.name }) m.signals;
+    processes = List.map re_proc m.processes;
+    instances = List.map (fun (i:binstance) ->
+      { i with inst_name = canon_ff_name i.inst_name;
+               port_connections =
+                 List.map (fun (p,e) -> (p, re_e e)) i.port_connections }) m.instances }
 
 let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmodule =
   let p, _n = Behavioral_arch_subst.substitute_program p in
@@ -627,7 +851,8 @@ let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmo
      FDRE-model conditional bodies to a single BAssign (iflift) and re-pack the
      per-bit FFs into one bus FF (ffpack) so state lines up by name.  Then
      resolve the multi-bit-port bitbus. *)
-  let result = Behavioral_ffpack.pack_module (Behavioral_iflift.lift_module result) in
+  let result = Behavioral_ffpack.pack_module
+                 (canonicalize_ff_names (Behavioral_iflift.lift_module result)) in
   resolve_input_bitbus result
 
 (* One module's cross-design verdict, with [trusted] submodules black-boxed
