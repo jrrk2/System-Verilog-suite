@@ -325,6 +325,133 @@ let child_reads child_mod pin : bool =
             Hashtbl.replace child_reads_tbl child_mod t; t in
       Hashtbl.mem tbl pin
 
+(* CHILD-KNOWN output ALIASES: two outputs the child drives from the SAME
+   internal net (`assign rx_clk = userclk2; assign eth_clk = userclk2;`).
+   Vivado rewires the parent's consumers onto ONE of them and dead-ties the
+   other, while the other flow wires them as written — tying the aliased
+   ufos propagates the equivalence so the parent wiring compares close. *)
+let child_out_alias_tbl : (string, (string, string) Hashtbl.t) Hashtbl.t =
+  Hashtbl.create 8
+(* output ≡ INPUT passthrough (`assign rd_data = rd_data_mem`): Vivado
+   dissolves it and rewires the parent's consumers straight to the source —
+   drive the output's ufo from the parent's connection to that input. *)
+let child_out_passthru_tbl : (string, (string, string) Hashtbl.t) Hashtbl.t =
+  Hashtbl.create 8
+let compute_out_aliases (mm : bmodule) : (string, string) Hashtbl.t =
+  let outs = List.filter_map (fun (s : bsignal) ->
+    if s.direction = `Output then Some s.name else None) mm.signals in
+  let inputs = List.filter_map (fun (s : bsignal) ->
+    if s.direction = `Input then Some s.name else None) mm.signals in
+  let ptbl = Hashtbl.create 8 in
+  Hashtbl.replace child_out_passthru_tbl mm.name ptbl;
+  (* identity detection sees through the gate-map's obuf LUT trees: rhs whose
+     support is a SINGLE variable v and which evaluates to 0 under v=0 and 1
+     under v=1 is ≡ v *)
+  let support e =
+    let acc = ref [] in
+    let rec go = function
+      | BVar n -> if not (List.mem n !acc) then acc := n :: !acc
+      | BConst _ -> ()
+      | BBinOp r -> go r.lhs; go r.rhs
+      | BUnOp r -> go r.operand
+      | BSelect r -> go r.array; go r.index
+      | BSlice r -> go r.signal
+      | BConcat es -> List.iter go es
+      | BReplicate r -> go r.value
+      | BCond r -> go r.condition; go r.then_val; go r.else_val
+      | BCall r -> List.iter go r.args in
+    go e; !acc in
+  let rec ev env = function
+    | BConst { value; _ } -> Some (if Z.equal value Z.zero then 0 else 1)
+    | BVar n ->
+        (match List.assoc_opt n env with
+         | Some v -> Some v
+         | None -> (match n with
+                    | "GND" | "<const0>" -> Some 0
+                    | "VCC" | "<const1>" -> Some 1
+                    | _ -> None))
+    | BCond r ->
+        (match ev env r.condition with
+         | Some 0 -> ev env r.else_val
+         | Some _ -> ev env r.then_val
+         | None -> None)
+    | BUnOp { op = BNot; operand; _ } ->
+        (match ev env operand with Some v -> Some (1 - v) | None -> None)
+    | BSlice { signal; _ } -> ev env signal
+    | _ -> None in
+  let ident_of rhs =
+    match rhs with
+    | BVar x -> Some x
+    | _ ->
+        (match support rhs with
+         | [ v ] when ev [ (v, 0) ] rhs = Some 0 && ev [ (v, 1) ] rhs = Some 1 ->
+             Some v
+         | _ -> None) in
+  let drv : (string, string list ref) Hashtbl.t = Hashtbl.create 16 in
+  let note out x =
+    match Hashtbl.find_opt drv x with
+    | Some l -> l := out :: !l
+    | None -> Hashtbl.add drv x (ref [ out ]) in
+  List.iter (function
+    | BCombinational { body; _ } ->
+        List.iter (function
+          | BAssign { lhs; rhs } when List.mem lhs outs ->
+              (match ident_of rhs with
+               | Some x ->
+                   note lhs x;
+                   if List.mem x inputs then Hashtbl.replace ptbl lhs x
+               | None -> ())
+          | _ -> ()) body
+    | _ -> ()) mm.processes;
+  (* gate-mapped children drive output ports through identity obuf LUT
+     INSTANCES (all inputs the same net, INIT an identity table) *)
+  List.iter (fun (i : binstance) ->
+    if is_lut i.module_name then begin
+      let k = lut_k i.module_name in
+      let o = match List.assoc_opt "O" i.port_connections with
+        | Some (BVar n) when List.mem n outs -> Some n
+        | Some (BSlice { signal = BVar n; msb = 0; lsb = 0 })
+          when List.mem n outs -> Some n
+        | _ -> None in
+      let ins = List.init k (fun j ->
+        List.assoc_opt (Printf.sprintf "I%d" j) i.port_connections) in
+      let same_var = match ins with
+        | Some (BVar v) :: rest
+          when List.for_all (function Some (BVar v') -> String.equal v v'
+                                    | _ -> false) rest -> Some v
+        | _ -> None in
+      match o, same_var with
+      | Some out, Some v ->
+          let init = match param_str i "INIT" with
+            | Some s -> parse_init_bits s | None -> [| false |] in
+          let bit b = b < Array.length init && init.(b) in
+          if (not (bit 0)) && bit ((1 lsl k) - 1) then note out v
+      | _ -> ()
+    end) mm.instances;
+  let tbl = Hashtbl.create 8 in
+  Hashtbl.iter (fun _ l ->
+    match List.sort compare !l with
+    | rep :: (_ :: _ as rest) ->
+        List.iter (fun o -> Hashtbl.replace tbl o rep) rest
+    | _ -> ()) drv;
+  tbl
+let out_alias_of child_mod port : string option =
+  let tbl =
+    match Hashtbl.find_opt child_out_alias_tbl child_mod with
+    | Some t -> t
+    | None ->
+        let t = match Hashtbl.find_opt mod_tbl child_mod with
+          | Some mm -> compute_out_aliases mm
+          | None -> Hashtbl.create 1 in
+        Hashtbl.replace child_out_alias_tbl child_mod t; t in
+  Hashtbl.find_opt tbl port
+
+let out_passthru_of child_mod port : string option =
+  ignore (out_alias_of child_mod port);   (* forces the scan *)
+  match Hashtbl.find_opt child_out_passthru_tbl child_mod with
+  | Some t -> Hashtbl.find_opt t port
+  | None -> None
+
 let out_const_of child_mod port bit : int option =
   let tbl =
     match Hashtbl.find_opt child_out_consts child_mod with
@@ -437,11 +564,25 @@ let expand_instance ?canon (i : binstance) : bprocess list * bool =
                    the flow that kept it inside the child. *)
                 let ufon bit = Printf.sprintf "ufo__%s__%s_%d" ck p bit in
                 let free bit = BVar (ufon bit) in
-                (* child-known constant output bit → DRIVE the ufo *)
+                (* child-known constant output bit → DRIVE the ufo;
+                   child-known output ALIAS → tie this port's ufo to the
+                   representative port's ufo *)
                 let known bit = match out_const_of m p bit with
                   | Some 0 -> [ BAssign { lhs = ufon bit; rhs = zero } ]
                   | Some _ -> [ BAssign { lhs = ufon bit; rhs = one } ]
-                  | None -> [] in
+                  | None ->
+                      (match out_passthru_of m p with
+                       | Some inp ->
+                           (* output ≡ child INPUT: drive the ufo from the
+                              parent's connection to that input *)
+                           [ BAssign { lhs = ufon bit; rhs = in_bit i inp bit } ]
+                       | None ->
+                      match out_alias_of m p with
+                       | Some rep when rep <> p ->
+                           [ BAssign { lhs = ufon bit;
+                                       rhs = BVar (Printf.sprintf
+                                               "ufo__%s__%s_%d" ck rep bit) } ]
+                       | _ -> []) in
                 (match port_expr i p with
                  | Some (BVar single) when w > 1 && not (String.contains single ']') ->
                      List.concat (List.init w (fun bit ->
@@ -661,6 +802,8 @@ let expand_program (p : bprogram) : bprogram =
   Hashtbl.reset mod_tbl;
   Hashtbl.reset child_out_consts;
   Hashtbl.reset child_reads_tbl;
+  Hashtbl.reset child_out_alias_tbl;
+  Hashtbl.reset child_out_passthru_tbl;
   List.iter (fun (m : bmodule) -> Hashtbl.replace mod_tbl m.name m) p.modules;
   let p = { p with modules = List.map expand_module p.modules } in
   (* Re-pack bit-blasted `<bus>__b<idx>` register FFs into a single bus-level
