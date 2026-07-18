@@ -4425,15 +4425,49 @@ let convert_module ~pkgs (mdecl : module_decl)
          unqualified_id under the function_declaration whose parent
          isn't a packed dim, port decl, or statement is the name. *)
       let names = ref [] in
-      walk (function
-        | TUPLE3 (STRING t, SymbolIdentifier id, _)
-          when prefix_is "unqualified_id" t -> names := id :: !names
-        | _ -> ()) fdecl;
+      (* skip packed-dim subtrees: `function [ADDR_WIDTH:0] bin2gray(...)`
+         must not pick up ADDR_WIDTH (inside the return-type range) as the
+         function name — the call site then never resolves and the call
+         silently evaluates to 0 (async_fifo gray pointers stuck). *)
+      let rec wnm t =
+        match t with
+        | TUPLE4 (STRING t', _, _, _)
+          when prefix_is "decl_variable_dimension" t'
+            || prefix_is "select_variable_dimension" t' -> ()
+        | TUPLE6 (STRING t', _, _, _, _, _)
+          when prefix_is "decl_variable_dimension" t'
+            || prefix_is "select_variable_dimension" t' -> ()
+        | TUPLE3 (STRING t', SymbolIdentifier id, _)
+          when prefix_is "unqualified_id" t' -> names := id :: !names
+        | SymbolIdentifier id -> names := id :: !names
+        | TUPLE2 (a, b) -> wnm a; wnm b
+        | TUPLE3 (a, b, c) -> wnm a; wnm b; wnm c
+        | TUPLE4 (a, b, c, d) -> List.iter wnm [a; b; c; d]
+        | TUPLE5 (a, b, c, d, e) -> List.iter wnm [a; b; c; d; e]
+        | TUPLE6 (a, b, c, d, e, f) -> List.iter wnm [a; b; c; d; e; f]
+        | TUPLE7 (a, b, c, d, e, f, g) -> List.iter wnm [a; b; c; d; e; f; g]
+        | TUPLE8 (a, b, c, d, e, f, g, h) ->
+            List.iter wnm [a; b; c; d; e; f; g; h]
+        | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+            List.iter wnm [a; b; c; d; e; f; g; h; i]
+        | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+            List.iter wnm [a; b; c; d; e; f; g; h; i; j]
+        | TUPLE11 (a, b, c, d, e, f, g, h, i, j, k) ->
+            List.iter wnm [a; b; c; d; e; f; g; h; i; j; k]
+        | TUPLE12 (a, b, c, d, e, f, g, h, i, j, k, l) ->
+            List.iter wnm [a; b; c; d; e; f; g; h; i; j; k; l]
+        | TLIST xs -> List.iter wnm xs
+        | _ -> ()
+      in
+      wnm fdecl;
       let fname =
         match List.rev !names with
         | [] -> ""
         | first :: _ -> first
       in
+      if Sys.getenv_opt "SVS_FUNC_DEBUG" <> None then
+        Printf.eprintf "[funcname] %s cands=[%s]\n%!" mdecl.m_name
+          (String.concat ";" (List.rev !names));
       if fname = "" then None
       else
         let return_w = width_of ~pkgs ~params fdecl in
