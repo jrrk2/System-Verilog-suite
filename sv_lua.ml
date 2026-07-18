@@ -393,7 +393,22 @@ let cut_blackboxes ?(trusted : string list = []) (m : bmodule) (p : bprogram) : 
         List.iter (fun (pin, expr) ->
           match pin_dir i.module_name pin with
           | Some dir ->
-              let bname = i.inst_name ^ "/" ^ pin in
+              (* Strip gate_map's numeric uniquing suffix (`cpu_mmcm_451`) so
+                 the boundary name pairs with the other flow's RTL instance
+                 name (`cpu_mmcm`) — an unpaired box boundary leaves both
+                 sides' tied inputs as INDEPENDENT frees and every cone fed
+                 by the box (the MMCM's cpu_clk!) spuriously differs. *)
+              let inst_canon =
+                let n = i.inst_name in
+                match String.rindex_opt n '_' with
+                | Some k when k > 0 && k < String.length n - 1
+                    && (let ok = ref true in
+                        String.iteri (fun j c ->
+                          if j > k && not (c >= '0' && c <= '9') then ok := false) n;
+                        !ok) ->
+                    String.sub n 0 k
+                | _ -> n in
+              let bname = inst_canon ^ "/" ^ pin in
               let w = expr_w expr in
               (match dir with
                | `Output ->

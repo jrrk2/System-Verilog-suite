@@ -420,8 +420,12 @@ let expand_instance ?canon (i : binstance) : bprocess list * bool =
       let ports = List.sort (fun (a, _, _) (b, _, _) -> compare a b)
                     (box_ports m) in
       match canon with
-      | Some ck when Hashtbl.mem user_ports m && ports <> [] ->
-          (* USER child → CUT at the canonical boundary (see doc above). *)
+      | Some ck when ports <> [] ->
+          (* Boxed child → CUT at the canonical boundary (see doc above).
+             Applies to USER modules AND irreducible PRIMITIVES: an MMCM has
+             a CLKFBOUT→CLKFBIN feedback loop, so the UF encoding admits
+             multiple fixpoints and the two miter sides settle differently —
+             every clock derived from it (cpu_clk!) then spuriously differs. *)
           let asgs = List.concat_map (fun (p, dir, w) ->
             match dir with
             | `Output ->
@@ -557,7 +561,9 @@ let expand_module (mo : bmodule) : bmodule =
   let canon_of : (string, string) Hashtbl.t = Hashtbl.create 8 in
   let by_mod : (string, string list ref) Hashtbl.t = Hashtbl.create 8 in
   List.iter (fun (i : binstance) ->
-    if Hashtbl.mem user_ports i.module_name then begin
+    if Hashtbl.mem user_ports i.module_name
+       || Hashtbl.mem (Lazy.force Bir_to_edif.xil_json_ports) i.module_name
+    then begin
       let key = norm_clone i.module_name in
       match Hashtbl.find_opt by_mod key with
       | Some l -> l := i.inst_name :: !l
