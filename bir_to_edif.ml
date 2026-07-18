@@ -214,6 +214,29 @@ let write_edif
     ~(path : string) (m : bmodule) : unit =
   let ctx = mk_ctx () in
   populate_widths ctx m;
+  (* Width inference from slice evidence: a bus signal whose DECLARATION was
+     lost through gate_map/flatten still appears with explicit BSlice/BSelect
+     bounds at reader pins.  A whole-bus BVar at another pin (e.g. a blackbox
+     GT output) would otherwise expand to width 1, silently dropping the
+     remaining bits' connections.  Bump widths to cover every sliced bit. *)
+  let port_names : (string, unit) Hashtbl.t = Hashtbl.create 32 in
+  List.iter (fun (s : bsignal) ->
+    if s.direction <> `Internal then Hashtbl.replace port_names s.name ()) m.signals;
+  let bump base w =
+    if not (Hashtbl.mem port_names base) then begin
+      let cur = try Hashtbl.find ctx.widths base with Not_found -> 1 in
+      if w > cur then Hashtbl.replace ctx.widths base w
+    end in
+  let rec infer = function
+    | BSlice { signal = BVar base; msb; lsb } ->
+        bump base (max msb lsb + 1)
+    | BSlice { signal; _ } -> infer signal
+    | BSelect { array = BVar base; index = BConst { value; _ } } ->
+        bump base (Z.to_int value + 1)
+    | BConcat es -> List.iter infer es
+    | _ -> () in
+  List.iter (fun (i : binstance) ->
+    List.iter (fun (_, e) -> infer e) i.port_connections) m.instances;
 
   (* Pre-allocate net ids for top-level ports. *)
   let port_bits : (string, [`Input|`Output|`Internal] * int * int list) Hashtbl.t =
@@ -335,31 +358,60 @@ let write_edif
      into a dead board.  Fail here naming the net + its readers.  SVS_ERC=0
      disables (bit-level buses are approximated at net granularity for now). *)
   if Sys.getenv_opt "SVS_ERC" <> Some "0" then begin
+    (* BIT-LEVEL: resolve every pin connection through the SAME per-bit net-id
+       allocator the emission uses (nets_of_conn), so a bus whose width
+       declaration was lost (pin expands to 1 net while sinks read orphan
+       `__k` singletons) is caught here instead of at Vivado opt_design.
+       ctx.ids is shared with the emission below, so ids agree. *)
     let driven : (string, unit) Hashtbl.t = Hashtbl.create 4096 in
     let readers : (string, string list) Hashtbl.t = Hashtbl.create 4096 in
-    let rec nets acc = function
-      | BVar nm -> nm :: acc
-      | BSlice { signal; _ } -> nets acc signal
-      | BConcat es -> List.fold_left nets acc es
-      | BSelect { array; _ } -> nets acc array
-      | _ -> acc in
-    Hashtbl.iter (fun nm (dir, _, _) ->
-      if dir = `Input then Hashtbl.replace driven nm ()) port_bits;
-    List.iter (fun c -> Hashtbl.replace driven c ())
-      ["<const0>"; "<const1>"; "GND"; "VCC"];
+    List.iter (fun c -> Hashtbl.replace driven c ()) ["n_GND"; "n_VCC"];
+    Hashtbl.iter (fun nm (dir, _, bits) ->
+      if dir = `Input || is_keep_port nm then
+        List.iter (fun id -> Hashtbl.replace driven (net_name_of_id id) ()) bits)
+      port_bits;
+    let conn_nets (i : binstance) (pin, e) =
+      (* mirror the emission's clamp of the connection to the declared width *)
+      let ports = primtype_ports i.module_name in
+      let pin_w = match List.find_opt (fun (p, _, _) -> p = pin) ports with
+        | Some (_, _, w) -> w | None -> 1 in
+      let all = nets_of_conn ctx e in
+      (if List.length all > pin_w then List.filteri (fun k _ -> k < pin_w) all
+       else all),
+      (match List.find_opt (fun (p, _, _) -> p = pin) ports with
+       | Some (_, d, _) -> d | None -> `Input) in
     List.iter (fun (i : binstance) ->
-      let dirs = List.map (fun (n, d, _) -> (n, d)) (primtype_ports i.module_name) in
       List.iter (fun (pin, e) ->
-        let ns = nets [] e in
-        match List.assoc_opt pin dirs with
-        | Some `Output -> List.iter (fun n -> Hashtbl.replace driven n ()) ns
-        | _ -> List.iter (fun n ->
+        let ns, dir = conn_nets i (pin, e) in
+        match dir with
+        | `Output -> List.iter (fun n -> Hashtbl.replace driven n ()) ns
+        | `Input -> List.iter (fun n ->
             let prev = try Hashtbl.find readers n with Not_found -> [] in
-            Hashtbl.replace readers n (i.inst_name :: prev)) ns
+            Hashtbl.replace readers n ((i.inst_name ^ "." ^ pin) :: prev)) ns
       ) i.port_connections) m.instances;
+    (* top-level OUTPUT port bits are readers too: an undriven one reaches
+       silicon as a floating pad / constant-tied status bit *)
+    Hashtbl.iter (fun nm (dir, _, bits) ->
+      if dir = `Output && not (is_keep_port nm) then
+        List.iteri (fun k id ->
+          let n = net_name_of_id id in
+          let prev = try Hashtbl.find readers n with Not_found -> [] in
+          Hashtbl.replace readers n (Printf.sprintf "port:%s[%d]" nm k :: prev))
+          bits) port_bits;
+    (* reverse map for diagnosability: net id -> symbolic base[bit] *)
+    let sym : (string, string) Hashtbl.t = Hashtbl.create 4096 in
+    Hashtbl.iter (fun (k : net_key) id ->
+      Hashtbl.replace sym (net_name_of_id id)
+        (Printf.sprintf "%s[%d]" k.base k.bit)) ctx.ids;
     let undriven =
       Hashtbl.fold (fun n rs acc ->
-        if Hashtbl.mem driven n || is_keep_port n then acc else (n, rs) :: acc)
+        if Hashtbl.mem driven n then acc
+        else
+          let label = match Hashtbl.find_opt sym n with
+            | Some s -> s | None -> n in
+          let base = match String.index_opt label '[' with
+            | Some i -> String.sub label 0 i | None -> label in
+          if is_keep_port base then acc else (label, rs) :: acc)
         readers [] in
     if undriven <> [] then begin
       let total = List.length undriven in

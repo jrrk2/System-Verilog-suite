@@ -305,13 +305,31 @@ let flatten_structural (p : bprogram) ~top : bmodule =
      vanishes and the net dangles (P&R trims the reader). *)
   let amap : (string, bexpr) Hashtbl.t = Hashtbl.create 256 in
   List.iter (fun (nm, rhs) -> if not (Hashtbl.mem amap nm) then Hashtbl.add amap nm rhs) !assigns;
+  (* TOP-port bitbus stitching: when the flatten TOP is itself a GATE-MAPPED
+     module, its internal logic reads input-port bits by the Hardcaml
+     convention `<port>__<i>` — with no parent to map them through
+     port_actual, those names dangle (ERC: tx_rd_data__22 undriven).
+     Resolve them directly to BSlice port[i:i]. *)
+  let top_portw : (string, int) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (s : bsignal) ->
+    match s.direction, s.stype with
+    | (`Input | `Output), BInt { width; _ } -> Hashtbl.replace top_portw s.name width
+    | (`Input | `Output), BBool -> Hashtbl.replace top_portw s.name 1
+    | _ -> ()) top_mod.signals;
   let rec apply ?(depth = 0) e =
     if depth > 64 then e else
     match e with
     | BVar nm ->
         (match Hashtbl.find_opt amap nm with
          | Some rhs -> apply ~depth:(depth + 1) rhs
-         | None -> e)
+         | None ->
+             (match split_dunder_bit nm with
+              | Some (b, bit) ->
+                  (match Hashtbl.find_opt top_portw b with
+                   | Some w when bit < w ->
+                       BSlice { signal = BVar b; msb = bit; lsb = bit }
+                   | _ -> e)
+              | None -> e))
     | BSlice { signal = BVar nm; msb; lsb } when Hashtbl.mem amap nm ->
         let rhs = apply ~depth:(depth + 1) (Hashtbl.find amap nm) in
         if msb = lsb then bit_select rhs msb
