@@ -179,24 +179,30 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
                (GT/MMCM) keep fresh nets. *)
             let is_reg_prim =
               match inst.inst_name with
-              | "FDRE" | "FDCE" | "FDPE" | "FDSE" -> true | _ -> false in
+              | "FDRE" | "FDCE" | "FDPE" | "FDSE"
+              | "FD" | "FD_1" | "FDP" | "FDP_1" | "FDC" | "FDC_1"
+              | "FDE" | "FDE_1" -> true | _ -> false in
             (* Register-name preservation is OPT-IN (FPGA_LEC_NAMES) — it can
                collide a register net with its output port through the identity
                OBUF (self-loop), so the default netlist/bitstream path keeps the
                original anonymous nets.  Z3-LEC runs set the env var. *)
             let lec_names = Option.is_some (Stdlib.Sys.getenv_opt "FPGA_LEC_NAMES") in
-            let named_out =
-              let nm = inst.inst_instance in
-              let base = match String.lsplit2 nm ~on:'[' with Some (b, _) -> b | None -> nm in
-              if lec_names
-                 && is_reg_prim
-                 && String.length nm > 0
-                 && not (String.length nm >= 2 && Char.equal nm.[0] '_'
-                         && Char.equal nm.[1] 'n')
-                 && not (Hashtbl.mem output_bases base)
-                 && List.length inst.inst_outputs = 1
-                 && (match inst.inst_outputs with [ (_, (pw, _)) ] -> pw = w | _ -> false)
-              then Some nm else None in
+            let nm0 = inst.inst_instance in
+            let base0 = match String.lsplit2 nm0 ~on:'[' with Some (b, _) -> b | None -> nm0 in
+            (* A register is nameable for LEC when it's an FDxE with a real RTL
+               name and a single width-matched output. *)
+            let reg_nameable =
+              lec_names
+              && is_reg_prim
+              && String.length nm0 > 0
+              && not (String.length nm0 >= 2 && Char.equal nm0.[0] '_'
+                      && Char.equal nm0.[1] 'n')
+              && List.length inst.inst_outputs = 1
+              && (match inst.inst_outputs with [ (_, (pw, _)) ] -> pw = w | _ -> false) in
+            (* When the register net shares its name with an output PORT, the
+               plain name would collide through the identity OBUF self-loop. *)
+            let collides = Hashtbl.mem output_bases base0 in
+            let named_out = if reg_nameable && not collides then Some nm0 else None in
             let named_net nm =
               internal_signals := { Behavioral_ir.name = nm;
                                     stype = BInt { width = 1; signed = Unsigned };
@@ -209,6 +215,14 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
               | Some nm when w = 1 -> [| named_net nm |]
               | Some nm ->
                   Array.init w ~f:(fun i -> named_net (Printf.sprintf "%s[%d]" nm i))
+              | None when reg_nameable && collides && w = 1 ->
+                  (* Scalar register that IS an output port: anchor it on the
+                     collision-free `<base>__b0` bitbus name so ffrip can pair
+                     it by name.  ffpack repacks and resolve_input_bitbus maps
+                     `<base>__b0` -> base[0], and it never aliases the port
+                     `base` itself.  Without this, scalar registered outputs
+                     kept anonymous `_n<k>` nets and spuriously DIFFERed. *)
+                  [| named_net (nm0 ^ "__b0") |]
               | None -> Array.init w ~f:(fun _ -> add_internal_net ()) in
             Hashtbl.set memo ~key ~data:outs;
             let input_conns = List.map inst.inst_inputs ~f:(fun (p, sig_) ->

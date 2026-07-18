@@ -163,8 +163,19 @@ module Fdpe = struct
   module O = struct
     type 'a t = { q : 'a [@rtlname "Q"] } [@@deriving hardcaml]
   end
-  let create (i : Signal.t I.t) : Signal.t O.t =
-    Instantiation.create_with_interface (module I) (module O) ~name:"FDPE" i
+  let create ?(init : bool = true) ?(instance : string = "") (i : Signal.t I.t)
+    : Signal.t O.t =
+    let parameters =
+      [ Parameter.create ~name:"INIT"
+          ~value:(Parameter.Value.Bit init) ]
+    in
+    let inputs = [ "C", i.c; "CE", i.ce; "PRE", i.pre; "D", i.d ] in
+    let instance = if String.length instance = 0 then None else Some instance in
+    let outs =
+      Instantiation.create ~parameters ?instance () ~name:"FDPE" ~inputs
+        ~outputs:[ "Q", 1 ]
+    in
+    { O.q = Map.find_exn outs "Q" }
 end
 
 (* ---- IO / clock buffers ------------------------------------------- *)

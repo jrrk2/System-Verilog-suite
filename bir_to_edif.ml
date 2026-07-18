@@ -327,6 +327,54 @@ let write_edif
         base @ extra
   in
 
+  (* ─── ELECTRICAL RULE CHECK ───────────────────────────────────────────
+     Every net read by a cell INPUT pin must be DRIVEN by a cell OUTPUT pin,
+     a top-level INPUT port, or a constant.  A floating input means a driver
+     was silently dropped (a gate_map connectivity bug or a lost cell) — the
+     kind of fault Vivado only catches at opt_design, or worse silently trims
+     into a dead board.  Fail here naming the net + its readers.  SVS_ERC=0
+     disables (bit-level buses are approximated at net granularity for now). *)
+  if Sys.getenv_opt "SVS_ERC" <> Some "0" then begin
+    let driven : (string, unit) Hashtbl.t = Hashtbl.create 4096 in
+    let readers : (string, string list) Hashtbl.t = Hashtbl.create 4096 in
+    let rec nets acc = function
+      | BVar nm -> nm :: acc
+      | BSlice { signal; _ } -> nets acc signal
+      | BConcat es -> List.fold_left nets acc es
+      | BSelect { array; _ } -> nets acc array
+      | _ -> acc in
+    Hashtbl.iter (fun nm (dir, _, _) ->
+      if dir = `Input then Hashtbl.replace driven nm ()) port_bits;
+    List.iter (fun c -> Hashtbl.replace driven c ())
+      ["<const0>"; "<const1>"; "GND"; "VCC"];
+    List.iter (fun (i : binstance) ->
+      let dirs = List.map (fun (n, d, _) -> (n, d)) (primtype_ports i.module_name) in
+      List.iter (fun (pin, e) ->
+        let ns = nets [] e in
+        match List.assoc_opt pin dirs with
+        | Some `Output -> List.iter (fun n -> Hashtbl.replace driven n ()) ns
+        | _ -> List.iter (fun n ->
+            let prev = try Hashtbl.find readers n with Not_found -> [] in
+            Hashtbl.replace readers n (i.inst_name :: prev)) ns
+      ) i.port_connections) m.instances;
+    let undriven =
+      Hashtbl.fold (fun n rs acc ->
+        if Hashtbl.mem driven n || is_keep_port n then acc else (n, rs) :: acc)
+        readers [] in
+    if undriven <> [] then begin
+      let total = List.length undriven in
+      let sample = List.filteri (fun i _ -> i < 12) undriven in
+      let body = String.concat "\n  " (List.map (fun (net, rs) ->
+        Printf.sprintf "%S read by [%s] — NO DRIVER" net
+          (String.concat "," (List.filteri (fun i _ -> i < 3) rs))) sample) in
+      failwith (Printf.sprintf
+        "bir_to_edif ERC: %d net(s) feed cell INPUT pins with no driver \
+         (floating — a dropped driver / gate_map bug):\n  %s%s"
+        total body
+        (if total > 12 then Printf.sprintf "\n  ... and %d more" (total - 12) else ""))
+    end
+  end;
+
   let buf = Buffer.create (256 * 1024) in
   let pp fmt = Printf.ksprintf (Buffer.add_string buf) fmt in
   let top_name = m.name in

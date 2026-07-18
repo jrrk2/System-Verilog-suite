@@ -193,9 +193,22 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
          let pad = if io then Xil_prim.obuf s else s in
          real_outs := Signal.output nm pad :: !real_outs));
   (* ---- instantiate one FF per register bit, close feedback ---- *)
+  (* An FF control net (clock / async reset) may be an ON-CHIP net — a black-box
+     output (q_wire, e.g. a BUFG.O clock or a submodule's `mmcm_locked_out`) or a
+     mapped cone (d_sig) — NOT a top-level pad.  port_input would mint a fresh
+     input Signal disconnected from that driver, splitting the net (the FF's PRE
+     lands on a driverless auto-net while the real driver sits on another) — the
+     mmcm_locked boundary break.  Resolve to the on-chip driver first, only
+     falling back to a real input pad. *)
+  let ctrl_signal nm =
+    match Hashtbl.find q_wire nm with
+    | Some s -> s
+    | None -> (match Hashtbl.find d_sig nm with
+               | Some s -> s
+               | None -> port_input nm) in
   List.iter l.regs ~f:(fun r ->
     let clk = port_input r.Bir_to_aig.rb_clock in
-    let rst = Option.map r.Bir_to_aig.rb_reset ~f:port_input in
+    let rst = Option.map r.Bir_to_aig.rb_reset ~f:ctrl_signal in
     (* Lifted SYNCHRONOUS reset/set net (d_sig-mapped, like CE); when present
        each bit becomes FDRE (R, srval bit 0) or FDSE (S, srval bit 1). *)
     let sr =
@@ -236,6 +249,13 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
         in
         let q =
           match rst, sr with
+          | Some clr, _ when init_bit bit ->
+            (* async reset VALUE bit = 1 -> FDPE (async PRESET to 1).  Mapping
+               it to FDCE (clear-to-0) would reset the bit to 0 and lose the
+               reset value — e.g. the PCS pma_reset_pipe <= 4'b1111 stretch,
+               whose FDCE mapping never asserts the PMA reset. *)
+            (Xil_prim.Fdpe.create ~init:true ~instance:qn
+               { c = clk; ce; pre = clr; d }).q
           | Some clr, _ -> (Xil_prim.Fdce.create ~instance:qn { c = clk; ce; clr; d }).q
           | None, Some srn when srval_bit bit ->
             (* sync SET to 1 -> FDSE.S *)

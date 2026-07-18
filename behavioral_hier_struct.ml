@@ -146,11 +146,108 @@ and bit_select (expr : bexpr) (bit : int) : bexpr =
   | BSelect _ -> expr  (* parent already bit-selected; assume scalar *)
   | _         -> expr
 
+(* Width of a structural bexpr.  A bare BVar is a scalar net (1 bit) here —
+   vector nets appear wrapped in BSlice/BConcat in these flattened netlists. *)
+let rec bexpr_width = function
+  | BConst { width; _ } -> width
+  | BSlice { msb; lsb; _ } -> abs (msb - lsb) + 1
+  | BConcat es -> List.fold_left (fun a e -> a + bexpr_width e) 0 es
+  | BReplicate { count; value } -> count * bexpr_width value
+  | _ -> 1
+
+(* Extract bit `i` (LSB = 0) of a structural bexpr as a 1-bit expr, honouring
+   each concat element's true width (bit_select above assumes 1-bit elements,
+   which is wrong for a concat like {const0, ^sv[13:9], ^sv[7:0]}). *)
+let rec bexpr_bit (e : bexpr) (i : int) : bexpr =
+  match e with
+  | BConst { value; _ } ->
+      BConst { value = (if Z.testbit value i then Z.one else Z.zero); width = 1 }
+  | BVar _ -> if i = 0 then e else BSlice { signal = e; msb = i; lsb = i }
+  | BSlice { signal = BVar _ as v; msb; lsb } ->
+      let lo = min msb lsb in BSlice { signal = v; msb = lo + i; lsb = lo + i }
+  | BSlice { signal; msb; lsb } ->
+      let lo = min msb lsb in bexpr_bit signal (lo + i)
+  | BConcat es ->
+      (* MSB-first list; walk from the LSB end subtracting element widths. *)
+      let rec go i = function
+        | [] -> BConst { value = Z.zero; width = 1 }
+        | el :: rest ->
+            let w = bexpr_width el in
+            if i < w then bexpr_bit el i else go (i - w) rest
+      in go i (List.rev es)
+  | _ -> e
+
 (* Flatten a bmodule: return the list of primitive binstances reachable
    from `m`, name-prefixed and port-rewritten so all references resolve
    in the top-level (caller's) scope. *)
-let rec flatten_module ~by_name ~prefix (m : bmodule)
+(* SILENT-LOSSAGE GUARD: the structural flattener keeps only binstances and
+   discards m.processes entirely.  That is correct for a FULLY gate-mapped
+   module (all logic already lives in LUT/FF/CARRY cells), but a module that
+   still carries continuous assigns — constant ties `assign x = <const0>`,
+   net aliases `assign a = b`, or any un-lowered combinational logic — would
+   have that logic VANISH silently, leaving driverless nets that P&R then
+   trims (this dropped pcs_pma_flat.v's 1467 <const0>/<const1> ties in the PCS
+   pass-through and killed downstream wrapper LUTs).  Fail loudly instead. *)
+(* A process the structural flattener can RESOLVE into net connectivity: a
+   combinational block of plain continuous assigns (`assign lhs = rhs`, incl.
+   constant ties and bit-remaps).  Anything else (BIf/BCase comb logic, a
+   clocked BSequential) is un-structural and must have been gate-mapped. *)
+let process_is_resolvable = function
+  | Behavioral_ir.BCombinational { body; _ } ->
+      List.for_all (function Behavioral_ir.BAssign _ -> true | _ -> false) body
+  | Behavioral_ir.BSequential { body; _ } -> body = []
+
+(* Collect a module's continuous assigns as (lhs_net, rhs_expr) pairs, both
+   rewritten into the caller's flat scope (so an output-port LHS resolves to
+   the parent net it drives).  Fails loudly on any UN-resolvable process —
+   silent-lossage guard: that logic would otherwise vanish. *)
+let collect_resolvable_assigns ~prefix ~port_actual (m : bmodule)
+    : (string * bexpr) list =
+  let bad = List.filter (fun p -> not (process_is_resolvable p)) m.processes in
+  if bad <> [] then
+    failwith (Printf.sprintf
+      "flatten_structural: module %S has %d process(es) with un-structural logic \
+       (BIf/BCase/clocked) that the structural flattener cannot resolve and would \
+       SILENTLY DROP — gate_map this module first." m.name (List.length bad));
+  List.concat_map (function
+    | Behavioral_ir.BCombinational { body; _ } ->
+        List.concat_map (function
+          | Behavioral_ir.BAssign { lhs; rhs } ->
+              let lhs' = rewrite_bexpr ~prefix ~port_actual (BVar lhs) in
+              let rhs' = rewrite_bexpr ~prefix ~port_actual rhs in
+              (match lhs' with
+               | BVar nm -> [(nm, rhs')]
+               | BConcat elems ->
+                   (* An output-port whose port_actual is a bit-split concat
+                      {n16,...,n1} (MSB-first): emit one per-bit assign so every
+                      parent net gets its driver.  Without this the whole assign
+                      dropped (silent lossage) and each bit dangled — this is
+                      what left pcspma_status[15:0] undriven. *)
+                   let w = List.fold_left (fun a e -> a + bexpr_width e) 0 elems in
+                   let hi = ref (w - 1) in
+                   List.concat_map (fun el ->
+                     let we = bexpr_width el in
+                     let base_hi = !hi in
+                     hi := !hi - we;
+                     List.filter_map (fun b ->
+                       let bitpos = base_hi - b in           (* net bit,   MSB-first *)
+                       let el_bit = we - 1 - b in            (* elem bit,  LSB = 0   *)
+                       match el with
+                       | BVar nm -> Some (nm, bexpr_bit rhs' bitpos)
+                       | BSlice { signal = BVar nm; msb; lsb } ->
+                           let lo = min msb lsb in
+                           Some (Printf.sprintf "%s[%d]" nm (lo + el_bit),
+                                 bexpr_bit rhs' bitpos)
+                       | _ -> None)
+                       (List.init we (fun b -> b)))
+                     elems
+               | _ -> [])
+          | _ -> []) body
+    | _ -> []) m.processes
+
+let rec flatten_module ~by_name ~prefix ~assigns (m : bmodule)
                       ~(port_actual : string -> bexpr option) : binstance list =
+  assigns := collect_resolvable_assigns ~prefix ~port_actual m @ !assigns;
   List.concat_map (fun (i : binstance) ->
     let new_inst_name = pname prefix i.inst_name in
     match Hashtbl.find_opt by_name i.module_name with
@@ -181,7 +278,7 @@ let rec flatten_module ~by_name ~prefix (m : bmodule)
                i.inst_name i.module_name pn (List.mem_assoc pn inst_port_rewritten));
           r
         in
-        flatten_module ~by_name
+        flatten_module ~by_name ~assigns
           ~prefix:new_inst_name
           ~port_actual:new_port_actual
           child
@@ -199,7 +296,37 @@ let flatten_structural (p : bprogram) ~top : bmodule =
     | Some m -> m
     | None -> failwith ("flatten_structural: no module '" ^ top ^ "' in program")
   in
-  let prims = flatten_module ~by_name ~prefix:"" ~port_actual:(fun _ -> None) top_mod in
+  let assigns = ref [] in
+  let prims0 = flatten_module ~by_name ~assigns ~prefix:"" ~port_actual:(fun _ -> None) top_mod in
+
+  (* Resolve the collected continuous assigns (net aliases / constant ties /
+     bit-remaps to output ports) into cell-pin connectivity: a read of an
+     assigned net becomes the assign's RHS.  Without this the driver assign
+     vanishes and the net dangles (P&R trims the reader). *)
+  let amap : (string, bexpr) Hashtbl.t = Hashtbl.create 256 in
+  List.iter (fun (nm, rhs) -> if not (Hashtbl.mem amap nm) then Hashtbl.add amap nm rhs) !assigns;
+  let rec apply ?(depth = 0) e =
+    if depth > 64 then e else
+    match e with
+    | BVar nm ->
+        (match Hashtbl.find_opt amap nm with
+         | Some rhs -> apply ~depth:(depth + 1) rhs
+         | None -> e)
+    | BSlice { signal = BVar nm; msb; lsb } when Hashtbl.mem amap nm ->
+        let rhs = apply ~depth:(depth + 1) (Hashtbl.find amap nm) in
+        if msb = lsb then bit_select rhs msb
+        else BConcat (List.init (msb - lsb + 1) (fun k -> bit_select rhs (msb - k)))
+    | BSlice { signal; msb; lsb } -> BSlice { signal = apply ~depth signal; msb; lsb }
+    | BConcat es -> BConcat (List.map (apply ~depth) es)
+    | BSelect { array; index } -> BSelect { array = apply ~depth array; index = apply ~depth index }
+    | _ -> e
+  in
+  let prims =
+    if Hashtbl.length amap = 0 then prims0
+    else List.map (fun (i : binstance) ->
+      { i with port_connections =
+                 List.map (fun (pin, e) -> pin, apply e) i.port_connections }) prims0
+  in
 
   (* Collect all signal names referenced by any primitive's port net.    *)
   let referenced = Hashtbl.create 4096 in

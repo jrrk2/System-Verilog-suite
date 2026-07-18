@@ -27,11 +27,26 @@ let signal_of_z ~width value =
    ceil(log2 width) bits is exact for every real shift and removes the
    overflow. *)
 let clog2 n = let rec f n a = if n <= 1 then a else f ((n + 1) / 2) (a + 1) in max 1 (f n 0)
-let log_shift_clamped op s amt =
+(* NOTE the clamp must NOT silently truncate: for W=8 the amount 8 (4'b1000)
+   truncated to clog2(8)=3 bits becomes 0 — a shift-by-8 WRAPPING to shift-by-0
+   (found by the Vivado↔SVS cross-flow miter: `x >> x` with x=8 gave x, not 0).
+   Amounts representable in `needed` bits are handled exactly by log_shift
+   (stages compose; ≥W flushes naturally), so only the DROPPED high bits need
+   handling: if any is set the true amount is ≥ 2^needed ≥ W — mux in the flush
+   value (zeros for sll/srl, sign-replicate for sra). *)
+let log_shift_clamped ?flush op s amt =
   let needed = clog2 (Signal.width s) in
-  let amt' =
-    if Signal.width amt > needed then Signal.select amt (needed - 1) 0 else amt in
-  Signal.log_shift op s amt'
+  if Signal.width amt <= needed then Signal.log_shift op s amt
+  else begin
+    let low = Signal.select amt (needed - 1) 0 in
+    let high = Signal.select amt (Signal.width amt - 1) needed in
+    let overflow = Signal.(high <>:. 0) in
+    let shifted = Signal.log_shift op s low in
+    let fl = match flush with
+      | Some f -> f
+      | None -> Signal.zero (Signal.width s) in
+    Signal.mux2 overflow fl shifted
+  end
 
 (* Context for tracking signals during conversion *)
 type conv_context = {
@@ -332,7 +347,10 @@ let rec expr_to_signal ctx = function
             with _ -> log_shift_clamped Signal.srl s_lhs s_rhs)
        | BAshr ->
            (try Signal.(sra s_lhs (Signal.to_int s_rhs))
-            with _ -> log_shift_clamped Signal.sra s_lhs s_rhs)
+            with _ ->
+              (* overflow flush for arithmetic shift = all sign bits *)
+              let fl = Signal.repeat (Signal.msb s_lhs) (Signal.width s_lhs) in
+              log_shift_clamped ~flush:fl Signal.sra s_lhs s_rhs)
        | BEq -> Signal.(s_lhs ==: s_rhs)
        | BNe -> Signal.(s_lhs <>: s_rhs)
        | BLt -> Signal.(s_lhs <: s_rhs)
@@ -1166,6 +1184,41 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     | BCombinational { body; _ } -> scan_lhs None body)
     bmod.processes;
 
+  (* Per-register ASYNC-RESET VALUE.  iflift renders `if (rst) q<=V; else q<=E`
+     as `q := (rst-cond) ? V : E`, so V (the then-branch) is the reset value.
+     Downstream picks the FF primitive from Reg_spec.reset_to: value 0 -> FDCE
+     (async clear), value 1 -> FDPE (async preset).  Without capturing V a
+     reset-to-NONZERO register (e.g. the PCS pma_reset_pipe <= 4'b1111 reset
+     stretch) defaults reset_to to 0 and mis-maps to FDCE, so the FF clears to
+     0 on reset instead of presetting to 1 — the reset pulse never asserts. *)
+  let rec bexpr_mentions nm = function
+    | Behavioral_ir.BVar v -> v = nm
+    | BConst _ -> false
+    | BBinOp { lhs; rhs; _ } -> bexpr_mentions nm lhs || bexpr_mentions nm rhs
+    | BUnOp { operand; _ } -> bexpr_mentions nm operand
+    | BCond { condition; then_val; else_val } ->
+        bexpr_mentions nm condition || bexpr_mentions nm then_val
+        || bexpr_mentions nm else_val
+    | BSlice { signal; _ } -> bexpr_mentions nm signal
+    | BSelect { array; index } -> bexpr_mentions nm array || bexpr_mentions nm index
+    | BConcat es -> List.exists (bexpr_mentions nm) es
+    | _ -> false in
+  let reset_values : (string, Behavioral_ir.bexpr) Hashtbl.t = Hashtbl.create 16 in
+  let rec scan_rst rst stmts =
+    List.iter (function
+      | Behavioral_ir.BAssign { lhs; rhs = BCond { condition; then_val; _ } }
+        when bexpr_mentions rst condition ->
+          Hashtbl.replace reset_values lhs then_val
+      | BIf { then_stmts; else_stmts; _ } ->
+          scan_rst rst then_stmts; scan_rst rst else_stmts
+      | BBlock ss -> scan_rst rst ss
+      | _ -> ()) stmts in
+  List.iter (function
+    | BSequential { reset = Some rst; reset_async = true; body; _ } ->
+        scan_rst rst body
+    | _ -> ())
+    bmod.processes;
+
   (* Black-box instance OUTPUT wires are pre-created HERE, before the
      register pre-pass, so a register clocked by an internal box output
      (a BUFG/MMCM driving `cpu_clk` used by top-level FFs) binds its
@@ -1323,7 +1376,21 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
          reset_to alone leaves reg_reset empty (so FDRE is selected)
          while still recording the initial value on the Signal. *)
       let apply_init_pre spec =
-        match Hashtbl.find_opt ctx.initial_values s.name with
+        (* Prefer the ASYNC-RESET value (from the reset branch) when present and
+           constant: it drives the FDCE-vs-FDPE choice.  Fall back to the BIR
+           initial (power-on) value for INIT-only registers. *)
+        let reset_const =
+          match Hashtbl.find_opt reset_values s.name with
+          | Some (BConst { value; width }) -> Some (width, value)
+          | _ -> None in
+        let chosen =
+          match reset_const with
+          | Some _ -> reset_const
+          | None ->
+            (match Hashtbl.find_opt ctx.initial_values s.name with
+             | Some (iw, iv) -> Some (iw, iv)
+             | None -> None) in
+        match chosen with
         | None -> spec
         | Some (init_w, init_v) ->
           let const = signal_of_z ~width:(max w init_w) init_v in
@@ -1515,13 +1582,46 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
         List.fold_left (fun acc p -> match p with
           | BSequential { clock; _ } -> clock :: acc
           | _ -> acc) [] bmod.processes in
+      (* FF ASYNC-RESET nets are box outputs just like clocks: e.g. sgmii_soc's
+         `always_ff @(posedge userclk2 or negedge mmcm_locked)` takes the PCS
+         box output `mmcm_locked` as its reset.  Such a net feeds only a reset
+         (no data output), so Hardcaml's data-output-only DCE prunes the box
+         output driving it → the FF reset dangles (ERC: undriven mmcm_locked).
+         Retain them too. *)
+      let reset_names =
+        List.fold_left (fun acc p -> match p with
+          | BSequential { reset = Some r; _ } -> r :: acc
+          | _ -> acc) [] bmod.processes in
+      (* Manually-instantiated flip-flop primitives (Vivado-flattened netlists
+         carry these as explicit FD/FDRE/FDPE/… cells) must pass through gate_map
+         UNCHANGED — like the clock-tree boxes above.  Retain each FF cell's Q
+         output net so Hardcaml's data-output-only DCE can't prune a const-clock
+         FF whose output feeds only other resets (e.g. the PCS RX-recclk
+         reset synchronisers `SYNC_ASYNC_RESET_RECCLK`, INIT=1, .C(<const0>),
+         .PRE(reset)).  Dropping those inverted the RX reset and killed sync. *)
+      let is_ff_prim = function
+        | "FD" | "FD_1" | "FDE" | "FDE_1" | "FDRE" | "FDSE" | "FDCE" | "FDPE"
+        | "FDC" | "FDC_1" | "FDP" | "FDP_1" | "FDRSE" -> true | _ -> false in
+      let ff_out_nets =
+        List.concat_map (fun (i : Behavioral_ir.binstance) ->
+          if is_ff_prim i.module_name then
+            List.filter_map (fun (port, e) ->
+              (* retain Q outputs AND async control-pin nets (R/S/CLR/PRE) of
+                 manually-instantiated FFs — a box output feeding only these
+                 would otherwise be DCE-pruned. *)
+              match port with
+              | "Q" | "R" | "S" | "CLR" | "PRE" ->
+                  (match e with BVar n -> Some n | _ -> None)
+              | _ -> None) i.port_connections
+          else []) bmod.instances in
       let declared name =
         List.exists (fun (s : Behavioral_ir.bsignal) ->
           s.name = name && s.direction = `Output) bmod.signals in
       let seen = Hashtbl.create 16 in
       let extra = List.filter_map (fun name ->
         if Hashtbl.mem seen name || declared name
-           || not (List.mem name clock_names) then None
+           || not (List.mem name clock_names || List.mem name ff_out_nets
+                   || List.mem name reset_names) then None
         else begin
           Hashtbl.add seen name ();
           match List.assoc_opt name ctx.signals with

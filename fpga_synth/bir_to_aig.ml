@@ -318,6 +318,14 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
   let regs = ref [] in
   let insts = ref [] in
   let inst_outs = ref [] in
+  (* Reverse map: a black-box OUTPUT lit -> its generated boundary net name
+     (`i<key>_<port>_o<bit>`).  Those generated names are the canonical
+     boundary I/O (unique per box, so manually-instanced primitives survive
+     AIG conversion).  When an FF's async-reset (or any consumer) net IS such a
+     box output, we rename that consumer to the boundary name so fpga_map
+     bridges it to the on-chip driver (q_wire) instead of minting a fresh input
+     pad — the mmcm_locked boundary break. *)
+  let boundary_of_lit : (int, string) Hashtbl.t = Hashtbl.create (module Int) in
   let carry4_counter = ref 0 in
   (* Decompose a + b + carry_in (low w bits) into ceil(w/4) chained
      CARRY4 instances.  S = a XOR b is still a 1-LUT per bit (LUT2),
@@ -501,7 +509,23 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
             let clk = signal_name register.reg_clock in
             let rst =
               if is_empty register.reg_reset then None
-              else Some (signal_name register.reg_reset)
+              else
+                (* If the async-reset net is a black-box output, use its
+                   generated boundary name so fpga_map resolves it to the box
+                   driver (q_wire) rather than a fresh input pad (which splits
+                   the net — the mmcm_locked break).  Walking it also forces the
+                   box to be lowered.  Otherwise it's a real pad/net: use its
+                   signal name. *)
+                let rlits = walk register.reg_reset in
+                let boundary =
+                  if Array.length rlits = 1 then
+                    (match Hashtbl.find boundary_of_lit rlits.(0) with
+                     | Some nm -> Some nm
+                     | None -> Hashtbl.find boundary_of_lit (rlits.(0) lxor 1))
+                  else None in
+                (match boundary with
+                 | Some nm -> Some nm
+                 | None -> Some (signal_name register.reg_reset))
             in
             (* Extract init value from Hardcaml's [reg_reset_value] when
                it's a constant.  behavioral_to_hardcaml threads the BIR
@@ -625,7 +649,10 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
                 let names =
                   List.init pw ~f:(fun bit -> Printf.sprintf "%s_%s_o%d" base pname bit)
                 in
-                List.iteri names ~f:(fun bit nm -> out_lits.(off + bit) <- aig_input b nm);
+                List.iteri names ~f:(fun bit nm ->
+                  let l = aig_input b nm in
+                  out_lits.(off + bit) <- l;
+                  Hashtbl.set boundary_of_lit ~key:l ~data:nm);
                 pname, names)
             in
             Hashtbl.set memo ~key ~data:out_lits;

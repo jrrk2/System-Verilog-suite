@@ -183,6 +183,32 @@ let ff_body ~ty ~set_val ~ctrl_pin ~init ~inv =
       (if inv = [] then "" else "_inv" ^ String.concat "" inv) in
   empty_mod name signals [proc]
 
+(* Bare D flip-flops with NO clock-enable: FD (Q/C/D), FDP (+async PRE),
+   FDC (+async CLR).  Q' = ctrl ? set_val : D.  The async/sync distinction
+   is irrelevant to a cycle-based next-state miter (modelled the same on
+   both flows, it cancels).  Used by the PCS sync_block / reset_sync. *)
+let bare_ff_body ~ty ~ctrl ~set_val ~init ~inv =
+  let pin name = if List.mem name inv then notb (v name) else v name in
+  let load = BAssign { lhs = "Q"; rhs = pin "D" } in
+  let body = match ctrl with
+    | None -> [ load ]
+    | Some cpin -> [ BIf { condition = pin cpin;
+                           then_stmts = [ BAssign { lhs = "Q";
+                                            rhs = if set_val then c1 else c0 } ];
+                           else_stmts = [ load ] } ] in
+  let q_init = if String.trim init = "1" then Some c1 else Some c0 in
+  let signals =
+    [ sig_ "C" `Input (); sig_ "D" `Input (); sig_ "Q" `Output ?init:q_init () ]
+    @ (match ctrl with Some cpin -> [ sig_ cpin `Input () ] | None -> []) in
+  let proc = BSequential
+    { name = "seq"; clock = "C"; clock_edge = `Pos;
+      reset = None; reset_edge = None; reset_async = false;
+      body; blocking_vars = [] } in
+  let name = Printf.sprintf "%s__%s%s" ty
+      (if String.trim init = "1" then "i1" else "i0")
+      (if inv = [] then "" else "_inv" ^ String.concat "" inv) in
+  empty_mod name signals [proc]
+
 (* ---------------------------------------------------------------------- *)
 (* Buffers / constants : pure wire-through (or a tied value).              *)
 (* ---------------------------------------------------------------------- *)
@@ -384,6 +410,21 @@ let synth (i : binstance) : bmodule option =
         let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
             [("IS_D_INVERTED","D"); ("IS_CE_INVERTED","CE"); ("IS_PRE_INVERTED","PRE")] in
         Some (ff_body ~ty:"FDPE" ~set_val:true ~ctrl_pin:"PRE" ~init ~inv)
+    | "FD" | "FD_1" ->
+        let init = match param_lookup i "INIT" with Some s -> s | None -> "0" in
+        let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
+            [("IS_D_INVERTED","D")] in
+        Some (bare_ff_body ~ty:"FD" ~ctrl:None ~set_val:false ~init ~inv)
+    | "FDP" | "FDP_1" ->
+        let init = match param_lookup i "INIT" with Some s -> s | None -> "1" in
+        let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
+            [("IS_D_INVERTED","D"); ("IS_PRE_INVERTED","PRE")] in
+        Some (bare_ff_body ~ty:"FDP" ~ctrl:(Some "PRE") ~set_val:true ~init ~inv)
+    | "FDC" | "FDC_1" ->
+        let init = match param_lookup i "INIT" with Some s -> s | None -> "0" in
+        let inv = List.filter_map (fun (p, k) -> if inverted i p then Some k else None)
+            [("IS_D_INVERTED","D"); ("IS_CLR_INVERTED","CLR")] in
+        Some (bare_ff_body ~ty:"FDC" ~ctrl:(Some "CLR") ~set_val:false ~init ~inv)
     | "CARRY4" -> Some (carry4_body ())
     | "RAM64M" ->
         let ini key = match param_lookup i key with
