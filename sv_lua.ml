@@ -931,7 +931,10 @@ let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmo
 
 (* One module's cross-design verdict, with [trusted] submodules black-boxed
  * (not flattened) on both sides. *)
-let miter_core ?(trusted : string list = []) (ma, pa) (mb, pb) : string =
+let miter_core ?(trusted : string list = [])
+               ?(input_consts : (string * Z.t) list = [])
+               ?(skip_outputs : string list = [])
+               (ma, pa) (mb, pb) : string =
   let _ = Behavioral_hier.take_unresolved () in   (* clear any stale *)
   let ma' = prep_for_z3 ~trusted ma pa in
   let unres_a = Behavioral_hier.take_unresolved () in
@@ -944,7 +947,8 @@ let miter_core ?(trusted : string list = []) (ma, pa) (mb, pb) : string =
     Printf.sprintf "INCONCLUSIVE — %d unresolved primitive bodies: %s"
       (List.length unres) summary
   end else
-    (try if Z3_miter.check_miter_equivalence ma' mb' then "EQUIVALENT" else "DIFFER"
+    (try if Z3_miter.check_miter_equivalence ~input_consts ~skip_outputs ma' mb'
+         then "EQUIVALENT" else "DIFFER"
      with e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
 
 let lmiter a_h b_h =
@@ -1001,6 +1005,121 @@ let lmiter_hier a_prog_h b_prog_h top =
   let pa = Fpga_prim_expand.expand_program pa_raw in
   Fpga_prim_expand.set_user_ports pb_raw.Behavioral_ir.modules;
   let pb = Fpga_prim_expand.expand_program pb_raw in
+  (* CONTEXTUAL constant port bindings for module [n] on one side: a pin is
+     kept only when EVERY instantiation of n binds it to the same constant
+     (BConst / GND / VCC / const-sentinels / concat thereof).  The caller
+     intersects the two sides and equal bindings become input constraints in
+     the child compare — Vivado const-propagates INTO children, so without
+     the context const-vs-port-passthrough honestly differs. *)
+  let const_binds (p_raw : bprogram) n : (string * Z.t) list =
+    let rec cst = function
+      | Behavioral_ir.BConst { value; width } -> Some (value, width)
+      | BVar ("GND" | "<const0>") -> Some (Z.zero, 1)
+      | BVar ("VCC" | "<const1>") -> Some (Z.one, 1)
+      | BConcat es ->                       (* MSB-first *)
+          List.fold_left (fun acc e ->
+            match acc, cst e with
+            | Some (v, w), Some (ve, we) ->
+                Some (Z.logor (Z.shift_left v we) ve, w + we)
+            | _ -> None) (Some (Z.zero, 0)) es
+      | BReplicate { count; value } ->
+          (match cst value with
+           | Some (v, w) ->
+               let rec rep acc k =
+                 if k = 0 then acc
+                 else rep (Z.logor (Z.shift_left acc w) v) (k - 1) in
+               Some (rep Z.zero count, count * w)
+           | None -> None)
+      | _ -> None in
+    let acc : (string, Z.t option) Hashtbl.t = Hashtbl.create 8 in
+    List.iter (fun (m : bmodule) ->
+      List.iter (fun (i : binstance) ->
+        if i.module_name = n then
+          List.iter (fun (pin, e) ->
+            match cst e with
+            | Some (v, _) ->
+                (match Hashtbl.find_opt acc pin with
+                 | None -> Hashtbl.add acc pin (Some v)
+                 | Some (Some v') when Z.equal v v' -> ()
+                 | Some _ -> Hashtbl.replace acc pin None)
+            | None -> Hashtbl.replace acc pin None)
+            i.port_connections)
+        m.instances) p_raw.modules;
+    (* restrict to the child's INPUT ports *)
+    let inputs = match by_name p_raw n with
+      | Some mm -> List.filter_map (fun (s : bsignal) ->
+          if s.direction = `Input then Some s.name else None) mm.signals
+      | None -> [] in
+    Hashtbl.fold (fun pin v l ->
+      match v with
+      | Some v when List.mem pin inputs -> (pin, v) :: l
+      | _ -> l) acc [] in
+  (* An OUTPUT pin of module [n] is USED on a side when some instantiation
+     connects it to a net that is read elsewhere in the parent (≥2 base-name
+     occurrences across the parent's processes + instance pins + ports).  A
+     pin unread in EVERY instantiation (RTL `.rxuserclk2_out()`, netlist
+     NLW_ tie) is context-dead. *)
+  let used_outputs (p_raw : bprogram) n : (string, unit) Hashtbl.t =
+    let used = Hashtbl.create 8 in
+    let rec bases = function
+      | Behavioral_ir.BVar v -> [ v ]
+      | BSlice { signal; _ } -> bases signal
+      | BSelect { array; index } -> bases array @ bases index
+      | BConcat es -> List.concat_map bases es
+      | BReplicate { value; _ } -> bases value
+      | BBinOp { lhs; rhs; _ } -> bases lhs @ bases rhs
+      | BUnOp { operand; _ } -> bases operand
+      | BCond { condition; then_val; else_val } ->
+          bases condition @ bases then_val @ bases else_val
+      | BCall { args; _ } -> List.concat_map bases args
+      | BConst _ -> [] in
+    List.iter (fun (pm : bmodule) ->
+      let insts_of_n = List.filter (fun (i : binstance) ->
+        i.module_name = n) pm.instances in
+      if insts_of_n <> [] then begin
+        (* occurrence count of every base name in the parent *)
+        let occ = Hashtbl.create 256 in
+        let bump v =
+          Hashtbl.replace occ v
+            (1 + (match Hashtbl.find_opt occ v with Some c -> c | None -> 0)) in
+        let rec stmt s = match s with
+          | Behavioral_ir.BAssign { lhs; rhs } -> bump lhs; List.iter bump (bases rhs)
+          | BIf { condition; then_stmts; else_stmts } ->
+              List.iter bump (bases condition);
+              List.iter stmt then_stmts; List.iter stmt else_stmts
+          | BCase { selector; cases; default } ->
+              List.iter bump (bases selector);
+              List.iter (fun (g, b) -> List.iter bump (bases g); List.iter stmt b) cases;
+              List.iter stmt default
+          | BWhile { condition; body } ->
+              List.iter bump (bases condition); List.iter stmt body
+          | BFor { init; condition; update; body } ->
+              stmt init; List.iter bump (bases condition); stmt update;
+              List.iter stmt body
+          | BBlock b -> List.iter stmt b
+          | BCallStmt { args; _ } -> List.iter (fun a -> List.iter bump (bases a)) args
+          | BReturn (Some e) -> List.iter bump (bases e)
+          | BReturn None -> () in
+        List.iter (function
+          | Behavioral_ir.BCombinational { body; _ } -> List.iter stmt body
+          | BSequential { body; _ } -> List.iter stmt body) pm.processes;
+        List.iter (fun (i : binstance) ->
+          List.iter (fun (_, e) -> List.iter bump (bases e)) i.port_connections)
+          pm.instances;
+        List.iter (fun (s : bsignal) ->
+          if s.direction = `Output then bump s.name) pm.signals;
+        List.iter (fun (i : binstance) ->
+          List.iter (fun (pin, e) ->
+            let bs = bases e in
+            (* pin's own connection counted once above; a second occurrence
+               anywhere means somebody reads the net *)
+            if List.exists (fun b ->
+                 (match Hashtbl.find_opt occ b with Some c -> c | None -> 0) >= 2)
+                 bs
+            then Hashtbl.replace used pin ()) i.port_connections)
+          insts_of_n
+      end) p_raw.modules;
+    used in
   let n_eq = ref 0 in
   let buf = Buffer.create 256 in
   List.iter (fun n ->
@@ -1010,7 +1129,27 @@ let lmiter_hier a_prog_h b_prog_h top =
           (List.filter_map (fun (i : binstance) ->
              if List.mem i.module_name common then Some i.module_name else None)
              (match by_name pa_raw n with Some m -> m.instances | None -> [])) in
-        let verdict = miter_core (ma, pa) (mb, pb) in
+        let ca = const_binds pa_raw n and cb = const_binds pb_raw n in
+        let input_consts =
+          List.filter_map (fun (pin, v) ->
+            match List.assoc_opt pin cb with
+            | Some v' when Z.equal v v' -> Some (pin, v)
+            | _ -> None) ca in
+        let ua = used_outputs pa_raw n and ub = used_outputs pb_raw n in
+        (* dead on EITHER side: a flow that proved the output redundant in
+           context (rx_clk ≡ eth_clk) rewires the parent's consumers and
+           ties the pin off — comparing it against the live side only
+           reproduces that (trusted) context optimisation. *)
+        let skip_outputs =
+          match by_name pa_raw n with
+          | Some mm ->
+              List.filter_map (fun (s : bsignal) ->
+                if s.direction = `Output
+                   && (not (Hashtbl.mem ua s.name)
+                       || not (Hashtbl.mem ub s.name))
+                then Some s.name else None) mm.signals
+          | None -> [] in
+        let verdict = miter_core ~input_consts ~skip_outputs (ma, pa) (mb, pb) in
         if verdict = "EQUIVALENT" then incr n_eq;
         Buffer.add_string buf
           (Printf.sprintf "HIER %-34s %s%s\n" n verdict

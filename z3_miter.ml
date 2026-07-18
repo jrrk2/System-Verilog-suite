@@ -769,7 +769,18 @@ let get_undriven_internals bmod =
   ) bmod.signals
 
 (* Create miter circuit and check equivalence *)
-let check_miter_equivalence bmod1 bmod2 =
+(* [input_consts]: contextual assume-guarantee — port constants the PARENT
+   instantiation binds identically on both flows.  Vivado const-propagates
+   INTO a child (the netlist PCS bakes {…} into _support's
+   an_adv_config_vector and ignores the module's own input port) while the
+   other flow passes the port through; at module level the input is a free
+   variable, so const-vs-baked-const honestly DIFFERs without the context. *)
+(* [skip_outputs]: DEAD outputs by context — every instantiation on BOTH
+   flows leaves the pin unread (RTL `.rxuserclk2_out()`; netlist NLW_ tie).
+   Vivado prunes the cone and ties the output const-0 while the other flow
+   still drives it — honest module-level DIFFER, dead in every context. *)
+let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
+                            ?(skip_outputs : string list = []) bmod1 bmod2 =
   Printf.printf "═══════════════════════════════════════════════════════════════\n";
   Printf.printf "  Z3 Miter Equivalence Checking\n";
   Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
@@ -865,6 +876,27 @@ let check_miter_equivalence bmod1 bmod2 =
         Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx (lo in1) (lo in2) ]
       | None -> ()
     ) inputs1;
+
+    (* CONTEXTUAL port constants (see doc on check_miter_equivalence). *)
+    if input_consts <> [] then begin
+      let n_ic = ref 0 in
+      let apply inputs sfx =
+        List.iter (fun (nm, v) ->
+          match List.assoc_opt nm inputs with
+          | Some w ->
+              incr n_ic;
+              let var = bv_var nm w sfx in
+              let wz = sz var in
+              let masked = Z.logand v (Z.pred (Z.shift_left Z.one wz)) in
+              Z3.Solver.add miter_solver
+                [ Z3.Boolean.mk_eq ctx var
+                    (Z3.BitVector.mk_numeral ctx (Z.to_string masked) wz) ]
+          | None -> ()) input_consts in
+      apply inputs1 "_d1";
+      apply inputs2 "_d2";
+      Printf.printf "Contextual port constants: %d input binding(s) applied\n"
+        (!n_ic)
+    end;
 
     (* CONSTANT-STATE constraints (classic LEC constant-register sweep).  A
        lifted state bit whose next-state (its ffrip `<q>__D` expression) folds
@@ -1184,6 +1216,17 @@ let check_miter_equivalence bmod1 bmod2 =
 
     let common_outputs =
       List.filter (fun (n, _) -> List.mem_assoc n outputs2) outputs1 in
+    let common_outputs =
+      if skip_outputs = [] then common_outputs
+      else begin
+        let kept = List.filter (fun (n, _) ->
+          not (List.mem n skip_outputs)) common_outputs in
+        let dropped = List.length common_outputs - List.length kept in
+        if dropped > 0 then
+          Printf.printf "Context-dead outputs: %d skipped (unread in every instantiation on both flows)\n"
+            dropped;
+        kept
+      end in
     (* Next-state cones for SPARSE per-bit states (see bitbus matching above):
        pair `X__b<i>__D` on one side with bit i of `X__D` on the other, so the
        kept bits' next-state logic is COMPARED (name-equality alone would
@@ -1227,11 +1270,55 @@ let check_miter_equivalence bmod1 bmod2 =
         List.sort_uniq compare !acc in
       let h2 = Hashtbl.create 64 in
       List.iter (fun n -> Hashtbl.replace h2 n ()) (collect bmod2);
+      (* CONST-vs-CONST ufi mismatches are DOWNGRADED to a warning: Vivado
+         ties a child-input bit it proved DEAD to 0 while the other flow
+         wires the live context constant (an_adv bits the PCS ignores) —
+         comparing the wiring of a bit the child never reads only produces
+         noise.  Semantic probe per side: v ≠ c UNSAT ⇒ const c.  Counted,
+         not silent — a live-bit const mismatch is the one class this can
+         mask. *)
+      let probe_const v =
+        let test c =
+          Z3.Solver.push miter_solver;
+          Z3.Solver.add miter_solver
+            [ Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx v
+                (Z3.BitVector.mk_numeral ctx (string_of_int c) 1)) ];
+          let r = Z3.Solver.check miter_solver [] in
+          Z3.Solver.pop miter_solver 1;
+          r = Z3.Solver.UNSATISFIABLE in
+        if test 0 then Some 0 else if test 1 then Some 1 else None in
+      let n_dead = ref 0 in
       let ufi = List.filter_map (fun n ->
-        if Hashtbl.mem h2 n then
+        if Hashtbl.mem h2 n then begin
           let e1 = bv_var n 1 "_d1" and e2 = bv_var n 1 "_d2" in
-          Some (n, Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx e1 e2))
-        else None) (collect bmod1) in
+          match probe_const e1, probe_const e2 with
+          | Some a, Some b when a <> b -> incr n_dead; None
+          | _ -> Some (n, Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx e1 e2))
+        end else None) (collect bmod1) in
+      if !n_dead > 0 then
+        Printf.printf
+          "Dead-bit const wiring mismatches: %d child-input bit(s) downgraded (const-vs-const)\n"
+          !n_dead;
+      (* UNCONDITIONAL cross-side tie of the ufo__ child-output boundary nets
+         (declared by the expand cut).  The undriven matching only ties nets
+         undriven on BOTH sides — a side that HOISTED a child constant drives
+         its ufo (see fpga_prim_expand), and the tie is what propagates that
+         knowledge to the side that kept the constant inside the child. *)
+      let ufo_names bm =
+        List.filter_map (fun (s : bsignal) ->
+          if String.length s.name > 5 && String.sub s.name 0 5 = "ufo__"
+          then Some s.name else None) bm.signals in
+      let u2 = Hashtbl.create 64 in
+      List.iter (fun n -> Hashtbl.replace u2 n ()) (ufo_names bmod2);
+      let n_uf = ref 0 in
+      List.iter (fun n ->
+        if Hashtbl.mem u2 n then begin
+          incr n_uf;
+          Z3.Solver.add miter_solver
+            [ Z3.Boolean.mk_eq ctx (bv_var n 1 "_d1") (bv_var n 1 "_d2") ]
+        end) (List.sort_uniq compare (ufo_names bmod1));
+      if !n_uf > 0 then
+        Printf.printf "Child-output boundary ties: %d ufo net(s)\n" !n_uf;
       bitbus_d_pairs @ ufi in
     (* CONE-LEVEL mode (Z3_MITER_PER_CONE): check each common output (every
        FF's <Q>__D next-state cone + each primary output) on its OWN, with

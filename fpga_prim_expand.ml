@@ -198,6 +198,144 @@ let box_ports ty : (string * [ `Input | `Output ] * int) list =
  * side settle differently) and its inputs become compared nets
  * (`ufi__<canon>__…`, picked up as extra output pairs by the miter) so the
  * parent's wiring INTO the child stays verified (assume-guarantee). *)
+(* CHILD-KNOWN output constants: bits of a child OUTPUT port the child module
+   itself drives with a constant (`assign status_vector[15] = <const0>` /
+   merged concat with const elements).  Each miter side scans its OWN child
+   body and DRIVES the corresponding ufo bit — one side may have hoisted the
+   constant above the boundary (Vivado narrows the port), the other keeps it
+   inside; either side's knowledge propagates through the cross-side ufo tie. *)
+let child_out_consts : (string, (string * int, int) Hashtbl.t) Hashtbl.t =
+  Hashtbl.create 8
+let mod_tbl : (string, bmodule) Hashtbl.t = Hashtbl.create 16
+
+let compute_out_consts (mm : bmodule) : (string * int, int) Hashtbl.t =
+  let tbl = Hashtbl.create 16 in
+  let outs = List.filter_map (fun (s : bsignal) ->
+    if s.direction = `Output then Some s.name else None) mm.signals in
+  let rec ewidth = function
+    | BConst { width; _ } -> Some width
+    | BSlice { msb; lsb; _ } -> Some (abs (msb - lsb) + 1)
+    | BVar ("GND" | "VCC" | "<const0>" | "<const1>") -> Some 1
+    | BReplicate { count; value } ->
+        (match ewidth value with Some w -> Some (count * w) | None -> None)
+    | BConcat es ->
+        List.fold_left (fun a e -> match a, ewidth e with
+          | Some s, Some w -> Some (s + w) | _ -> None) (Some 0) es
+    | _ -> None in
+  let rec bitc e j = match e with
+    | BConst { value; _ } -> Some (if Z.testbit value j then 1 else 0)
+    | BVar ("GND" | "<const0>") -> Some 0
+    | BVar ("VCC" | "<const1>") -> Some 1
+    | BSlice { signal = BVar ("GND" | "<const0>"); _ } -> Some 0
+    | BSlice { signal = BVar ("VCC" | "<const1>"); _ } -> Some 1
+    | BSlice { signal = BConst { value; _ }; msb; lsb } ->
+        let lo = min msb lsb in
+        Some (if Z.testbit value (lo + j) then 1 else 0)
+    | BConcat es ->                        (* MSB-first *)
+        let rec go j = function
+          | [] -> None
+          | el :: rest ->
+              (match ewidth el with
+               | Some w -> if j < w then bitc el j else go (j - w) rest
+               | None -> None) in
+        go j (List.rev es)
+    | _ -> None in
+  let record port rhs =
+    if List.mem port outs then
+      match ewidth rhs with
+      | Some w ->
+          for j = 0 to w - 1 do
+            match bitc rhs j with
+            | Some c -> Hashtbl.replace tbl (port, j) c
+            | None -> ()
+          done
+      | None -> () in
+  let bracket_re = Str.regexp "^\\(.+\\)\\[\\([0-9]+\\)\\]$" in
+  List.iter (function
+    | BCombinational { body; _ } ->
+        List.iter (function
+          | BAssign { lhs; rhs } ->
+              record lhs rhs;
+              if Str.string_match bracket_re lhs 0 then begin
+                let base = Str.matched_group 1 lhs in
+                let bit = int_of_string (Str.matched_group 2 lhs) in
+                if List.mem base outs then
+                  match bitc rhs 0 with
+                  | Some c -> Hashtbl.replace tbl (base, bit) c
+                  | None -> ()
+              end
+          | _ -> ()) body
+    | _ -> ()) mm.processes;
+  tbl
+
+(* Does the child module READ input [pin]?  A side that optimised the pin
+   away (Vivado unifies tx_clk≡rx_clk inside the MAC and ties the pin off)
+   declares it but never references it — comparing the parent's wiring of a
+   pin that side ignores only produces noise, so its ufi is not emitted on
+   that side (no cross-side intersection ⇒ no compare). *)
+let child_reads_tbl : (string, (string, unit) Hashtbl.t) Hashtbl.t =
+  Hashtbl.create 8
+let child_reads child_mod pin : bool =
+  match Hashtbl.find_opt mod_tbl child_mod with
+  | None -> true
+  | Some mm ->
+      let tbl =
+        match Hashtbl.find_opt child_reads_tbl child_mod with
+        | Some t -> t
+        | None ->
+            let t = Hashtbl.create 64 in
+            let rec ee e = match e with
+              | BVar n ->
+                  Hashtbl.replace t n ();
+                  (* bracket-string reads `pin[3]` count as reads of pin *)
+                  (match String.index_opt n '[' with
+                   | Some k -> Hashtbl.replace t (String.sub n 0 k) ()
+                   | None -> ())
+              | BConst _ -> ()
+              | BBinOp r -> ee r.lhs; ee r.rhs
+              | BUnOp r -> ee r.operand
+              | BSelect r -> ee r.array; ee r.index
+              | BSlice r -> ee r.signal
+              | BConcat es -> List.iter ee es
+              | BReplicate r -> ee r.value
+              | BCond r -> ee r.condition; ee r.then_val; ee r.else_val
+              | BCall r -> List.iter ee r.args in
+            let rec es_ s = match s with
+              | BAssign r -> ee r.rhs
+              | BIf r -> ee r.condition;
+                  List.iter es_ r.then_stmts; List.iter es_ r.else_stmts
+              | BCase r -> ee r.selector;
+                  List.iter (fun (g, b) -> ee g; List.iter es_ b) r.cases;
+                  List.iter es_ r.default
+              | BWhile r -> ee r.condition; List.iter es_ r.body
+              | BFor r -> es_ r.init; ee r.condition; es_ r.update;
+                  List.iter es_ r.body
+              | BBlock b -> List.iter es_ b
+              | BCallStmt r -> List.iter ee r.args
+              | BReturn (Some e) -> ee e
+              | BReturn None -> () in
+            List.iter (function
+              | BCombinational { body; _ } -> List.iter es_ body
+              | BSequential { clock; reset; body; _ } ->
+                  Hashtbl.replace t clock ();
+                  (match reset with Some r -> Hashtbl.replace t r () | None -> ());
+                  List.iter es_ body) mm.processes;
+            List.iter (fun (i : binstance) ->
+              List.iter (fun (_, e) -> ee e) i.port_connections) mm.instances;
+            Hashtbl.replace child_reads_tbl child_mod t; t in
+      Hashtbl.mem tbl pin
+
+let out_const_of child_mod port bit : int option =
+  let tbl =
+    match Hashtbl.find_opt child_out_consts child_mod with
+    | Some t -> t
+    | None ->
+        let t = match Hashtbl.find_opt mod_tbl child_mod with
+          | Some mm -> compute_out_consts mm
+          | None -> Hashtbl.create 1 in
+        Hashtbl.replace child_out_consts child_mod t; t in
+  Hashtbl.find_opt tbl (port, bit)
+
 let expand_instance ?canon (i : binstance) : bprocess list * bool =
   let m = i.module_name in
   if is_lut m then begin
@@ -287,15 +425,41 @@ let expand_instance ?canon (i : binstance) : bprocess list * bool =
           let asgs = List.concat_map (fun (p, dir, w) ->
             match dir with
             | `Output ->
-                (* child output bit ← free canonical net *)
-                let free bit = BVar (Printf.sprintf "ufo__%s__%s_%d" ck p bit) in
-                (match out_nets i p with
-                 | [ single ] when w > 1 && not (String.contains single ']') ->
-                     List.init w (fun bit ->
+                (* child output bit ← free canonical net.  A CONST element in
+                   the connection (Vivado hoists child-internal constants
+                   ABOVE the boundary: `.status_vector({const0,const0,bits…})`)
+                   instead DRIVES the ufo net with the constant — the
+                   cross-side ufo tie then propagates the hoisted knowledge to
+                   the flow that kept it inside the child. *)
+                let ufon bit = Printf.sprintf "ufo__%s__%s_%d" ck p bit in
+                let free bit = BVar (ufon bit) in
+                (* child-known constant output bit → DRIVE the ufo *)
+                let known bit = match out_const_of m p bit with
+                  | Some 0 -> [ BAssign { lhs = ufon bit; rhs = zero } ]
+                  | Some _ -> [ BAssign { lhs = ufon bit; rhs = one } ]
+                  | None -> [] in
+                (match port_expr i p with
+                 | Some (BVar single) when w > 1 && not (String.contains single ']') ->
+                     List.concat (List.init w (fun bit ->
                        BAssign { lhs = Printf.sprintf "%s[%d]" single bit;
-                                 rhs = free bit })
-                 | nets -> List.mapi (fun bit n ->
-                     BAssign { lhs = n; rhs = free bit }) nets)
+                                 rhs = free bit } :: known bit))
+                 | Some e ->
+                     List.concat (List.mapi (fun bit b ->
+                       match b with
+                       | BVar ("GND" | "<const0>") ->
+                           [ BAssign { lhs = ufon bit; rhs = zero } ]
+                       | BVar ("VCC" | "<const1>") ->
+                           [ BAssign { lhs = ufon bit; rhs = one } ]
+                       | BConst _ ->
+                           [ BAssign { lhs = ufon bit; rhs = b } ]
+                       | BVar n ->
+                           BAssign { lhs = n; rhs = free bit } :: known bit
+                       | BSlice { signal = BVar s; msb; lsb } when msb = lsb ->
+                           BAssign { lhs = Printf.sprintf "%s[%d]" s msb;
+                                     rhs = free bit } :: known bit
+                       | _ -> known bit) (bits_of e))
+                 | None -> List.concat (List.init (max 1 w) known))
+            | `Input when not (child_reads m p) -> []
             | `Input ->
                 (* child input → compared canonical net (per bit, so widths
                    agree across sides regardless of connection shape).  A
@@ -409,7 +573,30 @@ let expand_module (mo : bmodule) : bmodule =
       expand_instance ?canon:(Hashtbl.find_opt canon_of i.inst_name) i in
     new_procs := procs @ !new_procs;
     if keep then kept := i :: !kept) mo.instances;
+  (* DECLARE the ufo__/ufi__ child-boundary nets the cut emission created —
+     undeclared, the miter's undriven-internal matching never sees the ufo
+     frees, so they stay UNPAIRED across sides and every child-fed cone
+     spuriously differs. *)
+  let bnd_sigs = ref [] and seen = Hashtbl.create 32 in
+  let note n =
+    if (String.length n > 5
+        && (String.sub n 0 5 = "ufo__" || String.sub n 0 5 = "ufi__"))
+       && not (Hashtbl.mem seen n) then begin
+      Hashtbl.replace seen n ();
+      bnd_sigs := { name = n; stype = BInt { width = 1; signed = Unsigned };
+                    direction = `Internal; initial_value = None; attrs = [] }
+                  :: !bnd_sigs
+    end in
+  List.iter (function
+    | BCombinational { body; _ } ->
+        List.iter (function
+          | BAssign { lhs; rhs } ->
+              note lhs;
+              (match rhs with BVar n -> note n | _ -> ())
+          | _ -> ()) body
+    | _ -> ()) !new_procs;
   { mo with instances = List.rev !kept;
+            signals = !bnd_sigs @ mo.signals;
             processes = mo.processes @ List.rev !new_procs }
 
 (* After ffpack collapses `<bus>__b<idx>` bit-FFs into one bus FF `<bus>`, the
@@ -465,6 +652,10 @@ let alias_packed_bits (m : bmodule) : bmodule =
            processes = m.processes @ List.rev !extra_procs }
 
 let expand_program (p : bprogram) : bprogram =
+  Hashtbl.reset mod_tbl;
+  Hashtbl.reset child_out_consts;
+  Hashtbl.reset child_reads_tbl;
+  List.iter (fun (m : bmodule) -> Hashtbl.replace mod_tbl m.name m) p.modules;
   let p = { p with modules = List.map expand_module p.modules } in
   (* Re-pack bit-blasted `<bus>__b<idx>` register FFs into a single bus-level
      BSequential so the miter's ffrip lines up with the behavioural bus reg. *)
