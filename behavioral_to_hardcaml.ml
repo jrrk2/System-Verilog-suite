@@ -484,8 +484,14 @@ let rec expr_to_signal ctx = function
       if lo >= w then
         let nbits = max 1 (hi - lo + 1) in
         Signal.zero nbits
+      else if hi >= w then
+        (* PARTIALLY out of range ([47:32] of a width-42 param constant):
+           Verilog zero-extends — the old clamp silently NARROWED the
+           slice (16 bits became 10), shifting every higher concat
+           element down (arp_ctrl MAC-hi config write corrupted). *)
+        Signal.concat_msb
+          [Signal.zero (hi - w + 1); Signal.select s (w - 1) lo]
       else
-        let hi = min hi (w - 1) in
         Signal.select s hi lo
 
   | BConcat exprs ->
@@ -1202,20 +1208,61 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     | BSlice { signal; _ } -> bexpr_mentions nm signal
     | BSelect { array; index } -> bexpr_mentions nm array || bexpr_mentions nm index
     | BConcat es -> List.exists (bexpr_mentions nm) es
+    (* `!rst_n` reaches iflifted ternaries wrapped as
+       BUnOp(BNot, BCall("or_reduce",[rst_n])) — without descending into
+       BCall args the reset-value capture missed every such register and
+       async-reset-to-NONZERO regs mis-mapped to FDCE (arp_ctrl
+       framing_sel<=1 / core_lsu_be<=8'hFF stuck at 0 on silicon). *)
+    | BCall { args; _ } -> List.exists (bexpr_mentions nm) args
+    | BReplicate { value; _ } -> bexpr_mentions nm value
     | _ -> false in
   let reset_values : (string, Behavioral_ir.bexpr) Hashtbl.t = Hashtbl.create 16 in
-  let rec scan_rst rst stmts =
+  (* registers assigned ONLY in the reset branch never get an iflift
+     ternary — they stay as plain BAssigns inside the `if (!rst_n)` BIf.
+     Harvest that branch directly (polarity-aware) or those regs default
+     to reset_to=0 and mis-map to FDCE (arp_ctrl framing_sel<=1'b1 /
+     core_lsu_be<=8'hFF held 0 forever on silicon). *)
+  let rec strip_wrap = function
+    | Behavioral_ir.BCall { func = ("or_reduce" | "and_reduce"); args = [x] } ->
+        strip_wrap x
+    | BUnOp { op = (BRedOr | BRedAnd); operand; _ } -> strip_wrap operand
+    | e -> e in
+  let rec harvest stmts =
+    List.iter (function
+      | Behavioral_ir.BAssign { lhs; rhs } ->
+          if not (Hashtbl.mem reset_values lhs) then
+            Hashtbl.replace reset_values lhs rhs
+      | BIf { then_stmts; else_stmts; _ } ->
+          harvest then_stmts; harvest else_stmts
+      | BCase { cases; default; _ } ->
+          List.iter (fun (_, s) -> harvest s) cases; harvest default
+      | BBlock ss -> harvest ss
+      | _ -> ()) stmts in
+  let rec scan_rst ~falling rst stmts =
     List.iter (function
       | Behavioral_ir.BAssign { lhs; rhs = BCond { condition; then_val; _ } }
         when bexpr_mentions rst condition ->
           Hashtbl.replace reset_values lhs then_val
-      | BIf { then_stmts; else_stmts; _ } ->
-          scan_rst rst then_stmts; scan_rst rst else_stmts
-      | BBlock ss -> scan_rst rst ss
+      | BIf { condition; then_stmts; else_stmts } ->
+          (match strip_wrap condition with
+           | BUnOp { op = BNot; operand; _ }
+             when strip_wrap operand = Behavioral_ir.BVar rst && falling ->
+               harvest then_stmts; scan_rst ~falling rst else_stmts
+           | BVar v when v = rst && not falling ->
+               harvest then_stmts; scan_rst ~falling rst else_stmts
+           | BVar v when v = rst && falling ->
+               harvest else_stmts; scan_rst ~falling rst then_stmts
+           | BUnOp { op = BNot; operand; _ }
+             when strip_wrap operand = Behavioral_ir.BVar rst && not falling ->
+               harvest else_stmts; scan_rst ~falling rst then_stmts
+           | _ ->
+               scan_rst ~falling rst then_stmts;
+               scan_rst ~falling rst else_stmts)
+      | BBlock ss -> scan_rst ~falling rst ss
       | _ -> ()) stmts in
   List.iter (function
-    | BSequential { reset = Some rst; reset_async = true; body; _ } ->
-        scan_rst rst body
+    | BSequential { reset = Some rst; reset_async = true; reset_edge; body; _ } ->
+        scan_rst ~falling:(reset_edge = Some `Neg) rst body
     | _ -> ())
     bmod.processes;
 

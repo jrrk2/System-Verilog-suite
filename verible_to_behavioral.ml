@@ -711,7 +711,12 @@ let param_value_to_bexpr id v =
           with _ -> BVar id)
      | _ ->
          (match parse_dec v with
-          | Some n -> BConst { value = Z.of_int n; width = 32 }
+          | Some n ->
+              (* wide unbased-decimal params (48-bit FPGA_MAC as
+                 2199028187441): width 32 truncated the value, so
+                 FPGA_MAC[47:32] read as 0 — size to the value *)
+              let w = max 32 (Z.numbits (Z.of_int n)) in
+              BConst { value = Z.of_int n; width = w }
           | None -> BVar id))
 
 (* Best-effort expr → bexpr translator. Walks one level at a time,
@@ -2396,7 +2401,33 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
   | TUPLE8 (STRING tag, _, _, _, selector, _, items, _)
     when prefix_is "case_statement" tag ->
       let sel = recurse_e selector in
-      let case_items = collect_by (has_tag (prefix_is "case_item")) items in
+      (* TOP-LEVEL case items ONLY: collect_by recursed into arm BODIES,
+         so a nested `case (init_step)` leaked its arms into the parent
+         `case (state)` arm list — a leaked narrow arm (2'd1) then matched
+         state==1 BEFORE the real S_IDLE arm and hijacked the FSM
+         (arp_ctrl stuck re-writing MAC-hi forever on silicon). *)
+      let case_items =
+        let acc = ref [] in
+        let rec go t =
+          match t with
+          | TUPLE4 (STRING t', _, _, _) when prefix_is "case_item" t' ->
+              acc := t :: !acc      (* don't descend into the arm body *)
+          | TUPLE2 (a, b) -> go a; go b
+          | TUPLE3 (a, b, c) -> go a; go b; go c
+          | TUPLE4 (a, b, c, d) -> List.iter go [a; b; c; d]
+          | TUPLE5 (a, b, c, d, e) -> List.iter go [a; b; c; d; e]
+          | TUPLE6 (a, b, c, d, e, f) -> List.iter go [a; b; c; d; e; f]
+          | TUPLE7 (a, b, c, d, e, f, g) -> List.iter go [a; b; c; d; e; f; g]
+          | TUPLE8 (a, b, c, d, e, f, g, h) ->
+              List.iter go [a; b; c; d; e; f; g; h]
+          | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+              List.iter go [a; b; c; d; e; f; g; h; i]
+          | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+              List.iter go [a; b; c; d; e; f; g; h; i; j]
+          | TLIST xs -> List.iter go xs
+          | _ -> ()
+        in
+        go items; List.rev !acc in
       let cases, default =
         List.fold_left (fun (cs, def) ci ->
           match ci with
@@ -4517,6 +4548,23 @@ let convert_module ~pkgs (mdecl : module_decl)
                 Some (s.name, BInt { width = w; signed = Unsigned }, `Input)
             ) signals
           ) port_nodes in
+        (* Formal ORDER must match the source: verible's list nesting
+           differs between `input`-keyword and bare-ANSI arg styles, so
+           the blanket List.rev above is right for one and WRONG for the
+           other (rx_addr(b,w) parsed as (w,b): every 2-arg call swapped
+           its arguments — scrambled RX buffer addresses on silicon).
+           Reorder by first appearance in the header walk (wnm collects
+           identifiers in true source order). *)
+        let src_order = List.rev !names in
+        let pos n =
+          let rec go i = function
+            | [] -> max_int
+            | x :: tl -> if x = n then i else go (i + 1) tl
+          in go 0 src_order in
+        let func_params =
+          List.stable_sort
+            (fun (a, _, _) (b, _, _) -> compare (pos a) (pos b))
+            func_params in
         (* Body: walk the function looking for statement nodes, but
            STOP at the outermost matching node — don't descend into
            it.  Otherwise a function with `if(c) x = a; else x = b;`
