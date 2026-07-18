@@ -152,6 +152,16 @@ let reset_arg i name =
   | None -> None
 
 (* ---- classification -------------------------------------------------- *)
+(* distributed-RAM primitives (not block RAM): pin directions by name *)
+let is_dram name =
+  let u = String.uppercase_ascii name in
+  String.length u >= 5 && String.sub u 0 3 = "RAM" && u.[3] <> 'B'
+let dram_dir pin : [ `Input | `Output ] =
+  let u = String.uppercase_ascii pin in
+  let pre s = String.length u >= String.length s
+              && String.sub u 0 (String.length s) = s in
+  if u = "SPO" || u = "DPO" || u = "O" || pre "DO" then `Output else `Input
+
 let is_lut m = String.length m = 4 && String.sub m 0 3 = "LUT"
 let lut_k m = Char.code m.[3] - Char.code '0'
 let passthrough = [ "BUFG"; "BUFH"; "BUFR"; "BUFGCE"; "IBUF"; "OBUF"; "BUFGCTRL" ]
@@ -575,6 +585,20 @@ let expand_instance ?canon ?(sigw : (string, int) Hashtbl.t = Hashtbl.create 0)
          symbol is applied to permuted arguments and the sides never agree. *)
       let ports = List.sort (fun (a, _, _) (b, _, _) -> compare a b)
                     (box_ports m) in
+      (* Distributed-RAM primitives (RAM32M/RAM64M/RAM*X1S/D…) are absent from
+         the Xilinx port oracle — synthesize their port list from THIS
+         instance's pins (directions unambiguous by name: SPO/DPO/O/DO* read
+         outputs, the rest write/address inputs; widths from the connection),
+         so they go through the canonical cut instead of falling back to the
+         prep-time `<inst>/<pin>` cut whose names never pair across flows. *)
+      let ports =
+        if ports <> [] then ports
+        else if is_dram m then
+          List.sort (fun (a, _, _) (b, _, _) -> compare a b)
+            (List.map (fun (pin, e) ->
+               (pin, dram_dir pin, List.length (bits_of_w sigw e)))
+               i.port_connections)
+        else ports in
       match canon with
       | Some ck when ports <> [] ->
           (* Boxed child → CUT at the canonical boundary (see doc above).
@@ -733,6 +757,7 @@ let expand_module (mo : bmodule) : bmodule =
   List.iter (fun (i : binstance) ->
     if Hashtbl.mem user_ports i.module_name
        || Hashtbl.mem (Lazy.force Bir_to_edif.xil_json_ports) i.module_name
+       || is_dram i.module_name
     then begin
       let key = norm_clone i.module_name in
       match Hashtbl.find_opt by_mod key with

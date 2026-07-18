@@ -797,12 +797,29 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
          | None, _ -> skip "no write sites collected"
          | _, None -> skip "no read sites collected"
          | Some (we_expr, w_addr, w_data), Some r_addr ->
+           (* 1W+1R with a read address DISTINCT from the write address needs
+              the DUAL-port variants (write+SPO at A*, async read at
+              DPRA*→DPO).  The X1S single-port form silently READ AT THE
+              WRITE ADDRESS — framing's rx_length_axis (write nextbuf, read
+              core_lsu_addr_dly[7:3]) returned the wrong buffer's length
+              (found by the Vivado↔SVS cross-flow miter). *)
+           let dual = not (w_addr = r_addr) in
            let prim, prim_depth, addr_w =
-             if      mm.depth <=  32 then "RAM32X1S",  32, 5
-             else if mm.depth <=  64 then "RAM64X1S",  64, 6
-             else if mm.depth <= 128 then "RAM128X1S", 128, 7
-             else                         "RAM256X1S", 256, 8
+             if dual then
+               (if      mm.depth <=  32 then "RAM32X1D",  32, 5
+                else if mm.depth <=  64 then "RAM64X1D",  64, 6
+                else                         "RAM128X1D", 128, 7)
+             else
+               (if      mm.depth <=  32 then "RAM32X1S",  32, 5
+                else if mm.depth <=  64 then "RAM64X1S",  64, 6
+                else if mm.depth <= 128 then "RAM128X1S", 128, 7
+                else                         "RAM256X1S", 256, 8)
            in
+           if dual && mm.depth > 128 then
+             skip (Printf.sprintf
+               "FPGA async-read 1W+1R distinct-address depth %d > 128 (no RAM256X1D)"
+               mm.depth)
+           else
            let dw = mm.data_width in
            let orig_clk = match w_proc with BSequential s -> s.clock | _ -> "clk" in
            let read_pin = mname ^ "_dout" in
@@ -818,11 +835,8 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
            let w_addr  = rw_e w_addr in
            let w_data  = rw_e w_data in
            let r_addr  = rw_e r_addr in
-           (* Single-port: same address pin services read and write.
-              When the bit-blast source had distinct read/write addresses
-              they should already collapse here (cpuregs has separate addrs
-              and would fail the 1R check above). *)
-           ignore r_addr;
+           (* single-port: one address pin services read and write;
+              dual-port: DPRA* carries the independent read address *)
            let pad_to_addr_w e =
              (* Pad/truncate the BIR address expression to addr_w bits.
                 bexpr widths are implicit in the suite, so we just feed it
@@ -832,6 +846,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
              else BConcat [ zext_const; e ]
            in
            let a_expr = pad_to_addr_w w_addr in
+           let dp_expr = pad_to_addr_w r_addr in
            (* Per-bit INIT: bit i of init[addr] -> position addr of INIT[i].
               yosys-JSON expects MSB-first binary string, so address 0 is
               at the rightmost (LSB) position. *)
@@ -861,15 +876,22 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                  (* plain binary digits, no `%d'b` prefix — see RAM32M note *)
                  [ ("INIT", init_for_bit b) ]
              ; port_connections =
-                 (* RAM*X1S address is individual 1-bit pins A0..A<addr_w-1>,
-                    not a bus `.A` — the bus form fails strict readers (Vivado
-                    read_edif) and the primitive-port check. *)
+                 (* RAM*X1S/X1D addresses are individual 1-bit pins
+                    A0../DPRA0.., not a bus — the bus form fails strict
+                    readers (Vivado read_edif) and the primitive-port check.
+                    Dual-port reads land on DPO (SPO = write-port view,
+                    unused). *)
                  ("D",    BSlice { signal = w_data; msb = b; lsb = b })
                  :: List.init addr_w (fun i ->
                       (Printf.sprintf "A%d" i, BSlice { signal = a_expr; msb = i; lsb = i }))
+                 @ (if dual then
+                      List.init addr_w (fun i ->
+                        (Printf.sprintf "DPRA%d" i,
+                         BSlice { signal = dp_expr; msb = i; lsb = i }))
+                    else [])
                  @ [ ("WE",   we_expr)
                    ; ("WCLK", BVar orig_clk)
-                   ; ("O",    BVar out_name) ]
+                   ; ((if dual then "DPO" else "O"), BVar out_name) ]
              }) per_bit_outs
            in
            (* Driver concat: read_pin <= {o_(dw-1), ..., o_1, o_0}.       *)
