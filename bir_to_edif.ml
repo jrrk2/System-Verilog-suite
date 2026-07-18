@@ -80,13 +80,15 @@ type net_key = { base : string; bit : int }
 type ctx = {
   ids       : (net_key, int) Hashtbl.t;
   next_id   : int ref;
-  widths    : (string, int) Hashtbl.t;
+  widths    : (string, int) Hashtbl.t;   (* declared ∪ slice-inferred: BVar expansion *)
+  declw     : (string, int) Hashtbl.t;   (* declared only: bitbus_ref strip gate *)
 }
 
 let mk_ctx () = {
   ids     = Hashtbl.create 4096;
   next_id = ref 100;
   widths  = Hashtbl.create 256;
+  declw   = Hashtbl.create 256;
 }
 
 let alloc ctx (k : net_key) : int =
@@ -112,7 +114,8 @@ let populate_widths ctx (m : bmodule) =
       | BInt { width; _ } -> width
       | BBool             -> 1
       | _                 -> 1 in
-    Hashtbl.replace ctx.widths s.name w) m.signals
+    Hashtbl.replace ctx.widths s.name w;
+    Hashtbl.replace ctx.declw s.name w) m.signals
 
 (* Resolve a port_connection bexpr to its list of net names, LSB first.
  * Constants land on n_VCC / n_GND, single-bit refs on alloc'd net ids. *)
@@ -120,6 +123,12 @@ let populate_widths ctx (m : bmodule) =
    vector `<base>` (a declared multi-bit signal), so per-bit input references
    connect to the port bit rather than an orphan scalar net. *)
 let bitbus_ref ctx nm =
+  (* a name that is ITSELF a known multi-bit bus (e.g. Vivado's next-state
+     `wr_addr__0[4:0]`) is a real signal, not a `<base>__<i>` bit memo —
+     stripping it would alias the whole bus onto <base>'s bit ids
+     (multiply-driven nets) *)
+  if (match Hashtbl.find_opt ctx.widths nm with Some w -> w > 1 | None -> false)
+  then None else
   let n = String.length nm in
   let rec find i =
     if i < 1 then None
@@ -128,8 +137,11 @@ let bitbus_ref ctx nm =
   | Some j when j + 1 < n ->
       let suf = String.sub nm (j + 1) (n - j - 1) in
       let base = String.sub nm 0 (j - 1) in
+      (* gate on DECLARED width only: an inference-bumped base must not
+         start hijacking distinct signals that merely share its prefix
+         (Vivado's next-state `wr_addr__0` vs bus `wr_addr`) *)
       if suf <> "" && String.for_all (fun c -> c >= '0' && c <= '9') suf
-         && (match Hashtbl.find_opt ctx.widths base with Some w -> w > 1 | None -> false)
+         && (match Hashtbl.find_opt ctx.declw base with Some w -> w > 1 | None -> false)
       then Some (base, int_of_string suf) else None
   | _ -> None
 
@@ -363,12 +375,15 @@ let write_edif
        declaration was lost (pin expands to 1 net while sinks read orphan
        `__k` singletons) is caught here instead of at Vivado opt_design.
        ctx.ids is shared with the emission below, so ids agree. *)
-    let driven : (string, unit) Hashtbl.t = Hashtbl.create 4096 in
+    let driven : (string, string list) Hashtbl.t = Hashtbl.create 4096 in
     let readers : (string, string list) Hashtbl.t = Hashtbl.create 4096 in
-    List.iter (fun c -> Hashtbl.replace driven c ()) ["n_GND"; "n_VCC"];
+    let add_driver net who =
+      let prev = try Hashtbl.find driven net with Not_found -> [] in
+      Hashtbl.replace driven net (who :: prev) in
+    List.iter (fun c -> add_driver c "tie") ["n_GND"; "n_VCC"];
     Hashtbl.iter (fun nm (dir, _, bits) ->
       if dir = `Input || is_keep_port nm then
-        List.iter (fun id -> Hashtbl.replace driven (net_name_of_id id) ()) bits)
+        List.iter (fun id -> add_driver (net_name_of_id id) ("port:" ^ nm)) bits)
       port_bits;
     let conn_nets (i : binstance) (pin, e) =
       (* mirror the emission's clamp of the connection to the declared width *)
@@ -384,7 +399,11 @@ let write_edif
       List.iter (fun (pin, e) ->
         let ns, dir = conn_nets i (pin, e) in
         match dir with
-        | `Output -> List.iter (fun n -> Hashtbl.replace driven n ()) ns
+        | `Output ->
+            (* mirror the emission's skip of const-folded outputs *)
+            List.iter (fun n ->
+              if n <> "n_GND" && n <> "n_VCC" then
+                add_driver n (i.inst_name ^ "." ^ pin)) ns
         | `Input -> List.iter (fun n ->
             let prev = try Hashtbl.find readers n with Not_found -> [] in
             Hashtbl.replace readers n ((i.inst_name ^ "." ^ pin) :: prev)) ns
@@ -413,6 +432,26 @@ let write_edif
             | Some i -> String.sub label 0 i | None -> label in
           if is_keep_port base then acc else (label, rs) :: acc)
         readers [] in
+    let multi =
+      Hashtbl.fold (fun n ds acc ->
+        match ds with
+        | _ :: _ :: _ ->
+            let label = match Hashtbl.find_opt sym n with
+              | Some s -> s | None -> n in
+            (label, ds) :: acc
+        | _ -> acc) driven [] in
+    if multi <> [] then begin
+      let total = List.length multi in
+      let sample = List.filteri (fun i _ -> i < 8) multi in
+      let body = String.concat "\n  " (List.map (fun (net, ds) ->
+        Printf.sprintf "%S driven by [%s]" net
+          (String.concat "," (List.filteri (fun i _ -> i < 4) ds))) sample) in
+      failwith (Printf.sprintf
+        "bir_to_edif ERC: %d net(s) have MULTIPLE drivers (aliased net ids \
+         / a bitbus collision):\n  %s%s"
+        total body
+        (if total > 8 then Printf.sprintf "\n  ... and %d more" (total - 8) else ""))
+    end;
     if undriven <> [] then begin
       let total = List.length undriven in
       let sample = List.filteri (fun i _ -> i < 12) undriven in
