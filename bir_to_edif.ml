@@ -538,8 +538,10 @@ let write_edif
          (match bitbus_ref ctx nm with
           | Some (b, i) -> Some { base = b; bit = i }
           | None -> Some { base = nm; bit = 0 }))
-    | BSlice { signal = BVar b; msb; lsb } when msb = lsb -> Some { base = b; bit = lsb }
-    | BSelect { array = BVar b; index = BConst { value; _ } } -> Some { base = b; bit = Z.to_int value }
+    | BSlice { signal = BVar b; msb; lsb } when msb = lsb && const_net b = None ->
+        Some { base = b; bit = lsb }
+    | BSelect { array = BVar b; index = BConst { value; _ } } when const_net b = None ->
+        Some { base = b; bit = Z.to_int value }
     | _ -> None in
   let is_ident_obuf (i : binstance) =
     String.equal i.module_name "LUT6"
@@ -557,6 +559,16 @@ let write_edif
   List.iter (fun (s : bsignal) ->
     if s.direction = `Output then Hashtbl.replace out_ports s.name ()) m.signals;
   let ident_names : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+  (* NET-NAME aliasing (applied at add_use time): dropping a buffer must JOIN
+     its output net onto its input net — the old ids-table redirect MOVED the
+     input's driver onto the port net instead, leaving the input net (which may
+     itself be a port or have other readers: rx_clk≡eth_clk) driverless. *)
+  let net_alias : (string, string) Hashtbl.t = Hashtbl.create 64 in
+  let rec resolve_alias ?(d = 0) n =
+    if d > 32 then n else
+    match Hashtbl.find_opt net_alias n with
+    | Some n' when n' <> n -> resolve_alias ~d:(d + 1) n'
+    | _ -> n in
   List.iter (fun (i : binstance) ->
     if is_ident_obuf i then
       match List.assoc_opt "O" i.port_connections, List.assoc_opt "I0" i.port_connections with
@@ -564,11 +576,26 @@ let write_edif
           (match key_of_conn o, key_of_conn i0 with
            | Some ok, Some ik when ok <> ik && Hashtbl.mem out_ports ok.base ->
                Hashtbl.replace ident_names i.inst_name ();
-               Hashtbl.replace ctx.ids ik (alloc ctx ok)
+               Hashtbl.replace net_alias
+                 (net_name_of_id (alloc ctx ok)) (net_name_of_id (alloc ctx ik))
            | _ -> ())
       | _ -> ()) m.instances;
   (* Emit each cell instance with its INIT/property parameters. *)
   let is_skipped_cell = function "GND" | "VCC" -> true | _ -> false in
+  (* GND/VCC CELL instances are skipped (constants ride the shared tie nets) —
+     but their output nets must then BECOME the tie nets, or every reader of a
+     named const net (reset-sync CE/R pins!) is left floating. *)
+  List.iter (fun (i : binstance) ->
+    match i.module_name with
+    | ("GND" | "VCC") as mn ->
+        let tie = if mn = "GND" then "n_GND" else "n_VCC" in
+        let pin = if mn = "GND" then "G" else "P" in
+        (match List.assoc_opt pin i.port_connections with
+         | Some e ->
+             List.iter (fun n -> if n <> tie then Hashtbl.replace net_alias n tie)
+               (nets_of_conn ctx e)
+         | None -> ())
+    | _ -> ()) m.instances;
   let live_cells = List.filter (fun (i : binstance) ->
     not (is_skipped_cell i.module_name)
     && not (Hashtbl.mem ident_names i.inst_name)) m.instances in
@@ -589,9 +616,21 @@ let write_edif
    * `(member led 0)` is led[7] (MSB).  Our bits arrays are LSB-first,
    * so we reverse the member index when emitting. *)
   let net_uses : (string, string list) Hashtbl.t = Hashtbl.create 1024 in
-  let add_use net pref =
+  (* post-bypass connectivity audit: the ident-obuf bypass and const-output
+     skip DROP portrefs after the ERC ran — verify at the FINAL net list that
+     every net read still has a driver (catches a bypass that lost the
+     driver-to-port redirect, e.g. undriven pcspma_status bits). *)
+  let net_has_driver : (string, unit) Hashtbl.t = Hashtbl.create 1024 in
+  let net_readers : (string, string list) Hashtbl.t = Hashtbl.create 1024 in
+  let add_use ?(driver = false) ?(who = "") net pref =
+    let net = resolve_alias net in
     let cur = try Hashtbl.find net_uses net with Not_found -> [] in
-    Hashtbl.replace net_uses net (pref :: cur)
+    Hashtbl.replace net_uses net (pref :: cur);
+    if driver then Hashtbl.replace net_has_driver net ()
+    else begin
+      let r = try Hashtbl.find net_readers net with Not_found -> [] in
+      Hashtbl.replace net_readers net (who :: r)
+    end
   in
   let mem_idx ~w i = w - 1 - i in
 
@@ -629,16 +668,17 @@ let write_edif
               Printf.sprintf "(portref (member %s %d) (instanceref %s))"
                 (edif_safe_id pin) (mem_idx ~w:pin_w bit_i) inst_id
           in
-          add_use net pref
+          add_use ~driver:(pin_dir = `Output)
+            ~who:(i.inst_name ^ "." ^ pin) net pref
         end) nets
     ) i.port_connections) live_cells;
 
   (* Constant tie drivers. *)
-  add_use "n_GND" "(portref G (instanceref n_GND_inst))";
-  add_use "n_VCC" "(portref P (instanceref n_VCC_inst))";
+  add_use ~driver:true "n_GND" "(portref G (instanceref n_GND_inst))";
+  add_use ~driver:true "n_VCC" "(portref P (instanceref n_VCC_inst))";
 
   (* Top-level port references. *)
-  Hashtbl.iter (fun nm (_dir, w, bits) ->
+  Hashtbl.iter (fun nm (dir, w, bits) ->
     List.iteri (fun bit_i id ->
       let net = net_name_of_id id in
       let pref =
@@ -646,7 +686,29 @@ let write_edif
         else Printf.sprintf "(portref (member %s %d))"
                (edif_safe_id nm) (mem_idx ~w bit_i)
       in
-      add_use net pref) bits) port_bits;
+      add_use ~driver:(dir = `Input)
+        ~who:(Printf.sprintf "port:%s[%d]" nm bit_i) net pref) bits) port_bits;
+  if Sys.getenv_opt "SVS_ERC" <> Some "0" then begin
+    let lost =
+      Hashtbl.fold (fun net rs acc ->
+        if Hashtbl.mem net_has_driver net then acc else (net, rs) :: acc)
+        net_readers [] in
+    if lost <> [] then begin
+      let sym : (string, string) Hashtbl.t = Hashtbl.create 4096 in
+      Hashtbl.iter (fun (k : net_key) id ->
+        Hashtbl.replace sym (net_name_of_id id)
+          (Printf.sprintf "%s[%d]" k.base k.bit)) ctx.ids;
+      let body = String.concat "\n  " (List.map (fun (net, rs) ->
+        Printf.sprintf "%S (%s) read by [%s] — DRIVER LOST POST-ERC"
+          (match Hashtbl.find_opt sym net with Some s -> s | None -> net) net
+          (String.concat "," (List.filteri (fun i _ -> i < 3) rs)))
+        (List.filteri (fun i _ -> i < 12) lost)) in
+      failwith (Printf.sprintf
+        "bir_to_edif POST-BYPASS: %d net(s) lost their driver between ERC and \
+         emission (ident-obuf bypass / const-output skip bug):\n  %s"
+        (List.length lost) body)
+    end
+  end;
 
   Hashtbl.iter (fun net uses ->
     pp "          (net %s\n            (joined" net;
