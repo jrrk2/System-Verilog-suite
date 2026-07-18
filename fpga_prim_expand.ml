@@ -463,7 +463,36 @@ let out_const_of child_mod port bit : int option =
         Hashtbl.replace child_out_consts child_mod t; t in
   Hashtbl.find_opt tbl (port, bit)
 
-let expand_instance ?canon (i : binstance) : bprocess list * bool =
+(* WIDTH-AWARE bit extraction for cut-boundary wiring: `bits_of` cannot split
+   a multi-bit BVar ELEMENT inside a concat (no width info), so
+   `.addra({nextbuf, rx_word_addr})` yielded bit0 = the whole 12-bit bus and
+   bits2+ = zero — garbling every ufi compare of the connection.  [sigw] is
+   the PARENT module's declared signal widths. *)
+let rec bits_of_w sigw (e : bexpr) : bexpr list =
+  match e with
+  | BConcat es -> List.rev (List.concat_map (fun x -> List.rev (bits_of_w sigw x)) es)
+  | BConst { value; width } ->
+      List.init width (fun b ->
+        BConst { value = (if Z.testbit value b then Z.one else Z.zero); width = 1 })
+  | BSlice { signal = BVar n; msb; lsb } ->
+      List.init (msb - lsb + 1) (fun b ->
+        BSlice { signal = BVar n; msb = lsb + b; lsb = lsb + b })
+  | BVar n ->
+      (match Hashtbl.find_opt sigw n with
+       | Some w when w > 1 ->
+           List.init w (fun b -> BSlice { signal = BVar n; msb = b; lsb = b })
+       | _ -> [ e ])
+  | other -> [ other ]
+
+let in_bit_w sigw i name idx =
+  match port_expr i name with
+  | None -> zero
+  | Some e ->
+      (match List.nth_opt (bits_of_w sigw e) idx with
+       | Some b -> norm b | None -> zero)
+
+let expand_instance ?canon ?(sigw : (string, int) Hashtbl.t = Hashtbl.create 0)
+    (i : binstance) : bprocess list * bool =
   let m = i.module_name in
   if is_lut m then begin
     let k = lut_k m in
@@ -575,7 +604,7 @@ let expand_instance ?canon (i : binstance) : bprocess list * bool =
                        | Some inp ->
                            (* output ≡ child INPUT: drive the ufo from the
                               parent's connection to that input *)
-                           [ BAssign { lhs = ufon bit; rhs = in_bit i inp bit } ]
+                           [ BAssign { lhs = ufon bit; rhs = in_bit_w sigw i inp bit } ]
                        | None ->
                       match out_alias_of m p with
                        | Some rep when rep <> p ->
@@ -602,7 +631,7 @@ let expand_instance ?canon (i : binstance) : bprocess list * bool =
                        | BSlice { signal = BVar s; msb; lsb } when msb = lsb ->
                            BAssign { lhs = Printf.sprintf "%s[%d]" s msb;
                                      rhs = free bit } :: known bit
-                       | _ -> known bit) (bits_of e))
+                       | _ -> known bit) (bits_of_w sigw e))
                  | None -> List.concat (List.init (max 1 w) known))
             | `Input when not (child_reads m p) -> []
             | `Input ->
@@ -616,7 +645,7 @@ let expand_instance ?canon (i : binstance) : bprocess list * bool =
                   let rhs = match conn with
                     | Some (BVar _ as v) when w > 1 ->
                         BSlice { signal = v; msb = bit; lsb = bit }
-                    | _ -> in_bit i p bit in
+                    | _ -> in_bit_w sigw i p bit in
                   BAssign { lhs = Printf.sprintf "ufi__%s__%s_%d" ck p bit;
                             rhs })) ports in
           if asgs = [] then [], true
@@ -714,10 +743,16 @@ let expand_module (mo : bmodule) : bmodule =
     List.iteri (fun k inst ->
       Hashtbl.replace canon_of inst (Printf.sprintf "%s_%d" mn k))
       (List.sort compare !l)) by_mod;
+  let sigw : (string, int) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (s : bsignal) ->
+    match s.stype with
+    | BInt { width; _ } -> Hashtbl.replace sigw s.name width
+    | BBool -> Hashtbl.replace sigw s.name 1
+    | _ -> ()) mo.signals;
   let new_procs = ref [] and kept = ref [] in
   List.iter (fun i ->
     let procs, keep =
-      expand_instance ?canon:(Hashtbl.find_opt canon_of i.inst_name) i in
+      expand_instance ?canon:(Hashtbl.find_opt canon_of i.inst_name) ~sigw i in
     new_procs := procs @ !new_procs;
     if keep then kept := i :: !kept) mo.instances;
   (* DECLARE the ufo__/ufi__ child-boundary nets the cut emission created —

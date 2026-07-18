@@ -775,12 +775,13 @@ let get_undriven_internals bmod =
    an_adv_config_vector and ignores the module's own input port) while the
    other flow passes the port through; at module level the input is a free
    variable, so const-vs-baked-const honestly DIFFERs without the context. *)
-(* [skip_outputs]: DEAD outputs by context — every instantiation on BOTH
-   flows leaves the pin unread (RTL `.rxuserclk2_out()`; netlist NLW_ tie).
-   Vivado prunes the cone and ties the output const-0 while the other flow
-   still drives it — honest module-level DIFFER, dead in every context. *)
+(* [output_masks]: per-BIT context usage of each output (bit set = read by
+   some parent on BOTH flows).  A flow that proved a bit redundant in
+   context (`.rxuserclk2_out()` unread; pcspma_status[15:2] beyond the LED
+   bits) ties/rewires it — comparing masked-out bits only reproduces that
+   trusted optimisation.  Mask 0 skips the output entirely. *)
 let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
-                            ?(skip_outputs : string list = []) bmod1 bmod2 =
+                            ?(output_masks : (string * Z.t) list = []) bmod1 bmod2 =
   Printf.printf "═══════════════════════════════════════════════════════════════\n";
   Printf.printf "  Z3 Miter Equivalence Checking\n";
   Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
@@ -1217,16 +1218,28 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
     let common_outputs =
       List.filter (fun (n, _) -> List.mem_assoc n outputs2) outputs1 in
     let common_outputs =
-      if skip_outputs = [] then common_outputs
+      if output_masks = [] then common_outputs
       else begin
         let kept = List.filter (fun (n, _) ->
-          not (List.mem n skip_outputs)) common_outputs in
+          match List.assoc_opt n output_masks with
+          | Some m -> not (Z.equal m Z.zero)
+          | None -> true) common_outputs in
         let dropped = List.length common_outputs - List.length kept in
         if dropped > 0 then
           Printf.printf "Context-dead outputs: %d skipped (unread in every instantiation on both flows)\n"
             dropped;
         kept
       end in
+    (* partial masks: bits of an output not read in any context on both
+       flows are excluded from the XOR compare *)
+    let apply_mask name w z =
+      match List.assoc_opt name output_masks with
+      | Some m when not (Z.equal (Z.logand m (Z.pred (Z.shift_left Z.one w)))
+                           (Z.pred (Z.shift_left Z.one w))) ->
+          Z3.BitVector.mk_and ctx z
+            (Z3.BitVector.mk_numeral ctx
+               (Z.to_string (Z.logand m (Z.pred (Z.shift_left Z.one w)))) w)
+      | _ -> z in
     (* Next-state cones for SPARSE per-bit states (see bitbus matching above):
        pair `X__b<i>__D` on one side with bit i of `X__D` on the other, so the
        kept bits' next-state logic is COMPARED (name-equality alone would
@@ -1347,7 +1360,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
         let out2 = bv_var name w2 "_d2" in
         let w = max (sz out1) (sz out2) in
         let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
-        let xor = Z3.BitVector.mk_xor ctx (ext out1) (ext out2) in
+        let xor = apply_mask name w (Z3.BitVector.mk_xor ctx (ext out1) (ext out2)) in
         let zero = Z3.BitVector.mk_numeral ctx "0" w in
         Z3.Solver.push miter_solver;
         Z3.Solver.add miter_solver
@@ -1385,7 +1398,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
       let out2 = bv_var name w2 "_d2" in
       let w = max (sz out1) (sz out2) in
       let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
-      let xor = Z3.BitVector.mk_xor ctx (ext out1) (ext out2) in
+      let xor = apply_mask name w (Z3.BitVector.mk_xor ctx (ext out1) (ext out2)) in
       let zero = Z3.BitVector.mk_numeral ctx "0" w in
       let differs = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero) in
       (* async-reset D-cones count as differing only when BOTH resets are

@@ -744,6 +744,31 @@ let canon_ff_name =
 
 let canonicalize_ff_names (m : bmodule) : bmodule =
   let open Behavioral_ir in
+  (* WIDTH-AWARE canon: the scalar `<base>_reg` -> `<base>__b0` rule must not
+     fire on a MULTI-BIT net that merely ends in `_reg` (Vivado's 8-bit wire
+     `rx_word_addr_reg`) — renaming a bus to a BIT name makes every slice
+     `[k:k]` of it collapse onto bit 0 downstream (split_reg rewrites the
+     __b0 name to bus[0:0]).  Bracketed `<base>_reg[<i>]` forms stay. *)
+  let widths : (string, int) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (s : bsignal) ->
+    match s.stype with
+    | BInt { width; _ } -> Hashtbl.replace widths s.name width
+    | BBool -> Hashtbl.replace widths s.name 1
+    | _ -> ()) m.signals;
+  let canon_ff_name nm =
+    let c = canon_ff_name nm in
+    if String.equal c nm then nm
+    else
+      (* did the SCALAR rule fire? (result ends in __b0 while the source has
+         no bracket index) *)
+      let scalar_rule =
+        not (String.contains nm '[')
+        && String.length c > 4
+        && String.sub c (String.length c - 4) 4 = "__b0" in
+      if scalar_rule
+         && (match Hashtbl.find_opt widths nm with
+             | Some w -> w > 1 | None -> false)
+      then nm else c in
   let rec re_e e = match e with
     | BVar n -> BVar (canon_ff_name n)
     | BConst _ -> e
@@ -852,7 +877,17 @@ let canonicalize_ff_names (m : bmodule) : bmodule =
         let base = Str.matched_group 1 pn in
         let idx = (try Str.matched_group 3 pn with Not_found -> "0") in
         let q_new = base ^ "__b" ^ idx in
-        if canon_ff_name lhs = q_new then proc
+        (* A bracket Q onto a DECLARED BUS (`.Q(rx_word_addr_reg[7])` with an
+           8-bit wire rx_word_addr_reg) must NOT be skipped even though the
+           name canon maps it to q_new: the bus's READERS (LUT cones slicing
+           rx_word_addr_reg[k:k]) need the obuf alias + reconstruction to
+           reach the renamed state, else the bus floats. *)
+        let bus_bracket =
+          Str.string_match canon_bracket_re lhs 0
+          && (let base = Str.matched_group 1 lhs in
+              match Hashtbl.find_opt widths base with
+              | Some w -> w > 1 | None -> false) in
+        if canon_ff_name lhs = q_new && not bus_bracket then proc
         else begin
           let rec subst e = match e with
             | BVar n when n = lhs -> BVar q_new
@@ -948,7 +983,7 @@ let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmo
  * (not flattened) on both sides. *)
 let miter_core ?(trusted : string list = [])
                ?(input_consts : (string * Z.t) list = [])
-               ?(skip_outputs : string list = [])
+               ?(output_masks : (string * Z.t) list = [])
                (ma, pa) (mb, pb) : string =
   let _ = Behavioral_hier.take_unresolved () in   (* clear any stale *)
   let ma' = prep_for_z3 ~trusted ma pa in
@@ -962,7 +997,7 @@ let miter_core ?(trusted : string list = [])
     Printf.sprintf "INCONCLUSIVE — %d unresolved primitive bodies: %s"
       (List.length unres) summary
   end else
-    (try if Z3_miter.check_miter_equivalence ~input_consts ~skip_outputs ma' mb'
+    (try if Z3_miter.check_miter_equivalence ~input_consts ~output_masks ma' mb'
          then "EQUIVALENT" else "DIFFER"
      with e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
 
@@ -1069,69 +1104,108 @@ let lmiter_hier a_prog_h b_prog_h top =
       match v with
       | Some v when List.mem pin inputs -> (pin, v) :: l
       | _ -> l) acc [] in
-  (* An OUTPUT pin of module [n] is USED on a side when some instantiation
-     connects it to a net that is read elsewhere in the parent (≥2 base-name
-     occurrences across the parent's processes + instance pins + ports).  A
-     pin unread in EVERY instantiation (RTL `.rxuserclk2_out()`, netlist
-     NLW_ tie) is context-dead. *)
-  let used_outputs (p_raw : bprogram) n : (string, unit) Hashtbl.t =
-    let used = Hashtbl.create 8 in
-    let rec bases = function
-      | Behavioral_ir.BVar v -> [ v ]
-      | BSlice { signal; _ } -> bases signal
-      | BSelect { array; index } -> bases array @ bases index
-      | BConcat es -> List.concat_map bases es
-      | BReplicate { value; _ } -> bases value
-      | BBinOp { lhs; rhs; _ } -> bases lhs @ bases rhs
-      | BUnOp { operand; _ } -> bases operand
-      | BCond { condition; then_val; else_val } ->
-          bases condition @ bases then_val @ bases else_val
-      | BCall { args; _ } -> List.concat_map bases args
-      | BConst _ -> [] in
+  (* Per-BIT context usage of module [n]'s OUTPUT pins on one side.  A pin
+     bit is USED when some instantiation connects the pin to a net whose
+     corresponding bit is READ elsewhere in the parent (slice-aware: the top
+     reads only pcspma_status[1:0] for the LEDs, so Vivado keeps 2 bits of
+     the child's 16-bit port and ties the rest — comparing the dead bits
+     only reproduces that context optimisation).  Whole-net reads and
+     dynamic selects mark all bits. *)
+  let used_outputs (p_raw : bprogram) n : (string, Z.t) Hashtbl.t =
+    let used : (string, Z.t) Hashtbl.t = Hashtbl.create 8 in
+    let ones w = Z.pred (Z.shift_left Z.one (max 1 w)) in
+    let add_mask pin m =
+      let prev = match Hashtbl.find_opt used pin with
+        | Some v -> v | None -> Z.zero in
+      Hashtbl.replace used pin (Z.logor prev m) in
     List.iter (fun (pm : bmodule) ->
       let insts_of_n = List.filter (fun (i : binstance) ->
         i.module_name = n) pm.instances in
       if insts_of_n <> [] then begin
-        (* occurrence count of every base name in the parent *)
-        let occ = Hashtbl.create 256 in
-        let bump v =
-          Hashtbl.replace occ v
-            (1 + (match Hashtbl.find_opt occ v with Some c -> c | None -> 0)) in
+        (* read-mask per net across the parent, EXCLUDING the pin connections
+           of the instances of n themselves *)
+        let rmask : (string, Z.t) Hashtbl.t = Hashtbl.create 256 in
+        let radd v m =
+          let prev = match Hashtbl.find_opt rmask v with
+            | Some x -> x | None -> Z.zero in
+          Hashtbl.replace rmask v (Z.logor prev m) in
+        let all = Z.pred (Z.shift_left Z.one 256) in
+        let rec re e = match e with
+          | Behavioral_ir.BVar v -> radd v all
+          | BSlice { signal = BVar v; msb; lsb } ->
+              let lo = min msb lsb and hi = max msb lsb in
+              radd v (Z.shift_left (ones (hi - lo + 1)) lo)
+          | BSelect { array = BVar v; index = BConst { value; _ } } ->
+              (try radd v (Z.shift_left Z.one (Z.to_int value)) with _ -> radd v all)
+          | BSlice { signal; _ } -> re signal
+          | BSelect { array; index } -> re array; re index
+          | BConcat es -> List.iter re es
+          | BReplicate { value; _ } -> re value
+          | BBinOp { lhs; rhs; _ } -> re lhs; re rhs
+          | BUnOp { operand; _ } -> re operand
+          | BCond { condition; then_val; else_val } ->
+              re condition; re then_val; re else_val
+          | BCall { args; _ } -> List.iter re args
+          | BConst _ -> () in
         let rec stmt s = match s with
-          | Behavioral_ir.BAssign { lhs; rhs } -> bump lhs; List.iter bump (bases rhs)
+          | Behavioral_ir.BAssign { rhs; _ } -> re rhs
           | BIf { condition; then_stmts; else_stmts } ->
-              List.iter bump (bases condition);
-              List.iter stmt then_stmts; List.iter stmt else_stmts
+              re condition; List.iter stmt then_stmts; List.iter stmt else_stmts
           | BCase { selector; cases; default } ->
-              List.iter bump (bases selector);
-              List.iter (fun (g, b) -> List.iter bump (bases g); List.iter stmt b) cases;
+              re selector;
+              List.iter (fun (g, b) -> re g; List.iter stmt b) cases;
               List.iter stmt default
-          | BWhile { condition; body } ->
-              List.iter bump (bases condition); List.iter stmt body
+          | BWhile { condition; body } -> re condition; List.iter stmt body
           | BFor { init; condition; update; body } ->
-              stmt init; List.iter bump (bases condition); stmt update;
-              List.iter stmt body
+              stmt init; re condition; stmt update; List.iter stmt body
           | BBlock b -> List.iter stmt b
-          | BCallStmt { args; _ } -> List.iter (fun a -> List.iter bump (bases a)) args
-          | BReturn (Some e) -> List.iter bump (bases e)
+          | BCallStmt { args; _ } -> List.iter re args
+          | BReturn (Some e) -> re e
           | BReturn None -> () in
         List.iter (function
           | Behavioral_ir.BCombinational { body; _ } -> List.iter stmt body
           | BSequential { body; _ } -> List.iter stmt body) pm.processes;
         List.iter (fun (i : binstance) ->
-          List.iter (fun (_, e) -> List.iter bump (bases e)) i.port_connections)
-          pm.instances;
+          if not (i.module_name = n) then
+            List.iter (fun (_, e) -> re e) i.port_connections) pm.instances;
+        (* the parent's own output ports are read by ITS parent *)
         List.iter (fun (s : bsignal) ->
-          if s.direction = `Output then bump s.name) pm.signals;
+          if s.direction = `Output then radd s.name all) pm.signals;
+        (* map connection → pin mask: pin bit (bitpos+k) reads iff the
+           connected net's corresponding bit is read *)
+        let netw = Hashtbl.create 64 in
+        List.iter (fun (s : bsignal) ->
+          match s.stype with
+          | BInt { width; _ } -> Hashtbl.replace netw s.name width
+          | BBool -> Hashtbl.replace netw s.name 1
+          | _ -> ()) pm.signals;
+        let width_of v =
+          match Hashtbl.find_opt netw v with Some w -> w | None -> 1 in
+        let net_mask v = match Hashtbl.find_opt rmask v with
+          | Some m -> m | None -> Z.zero in
         List.iter (fun (i : binstance) ->
           List.iter (fun (pin, e) ->
-            let bs = bases e in
-            (* pin's own connection counted once above; a second occurrence
-               anywhere means somebody reads the net *)
-            if List.exists (fun b ->
-                 (match Hashtbl.find_opt occ b with Some c -> c | None -> 0) >= 2)
-                 bs
-            then Hashtbl.replace used pin ()) i.port_connections)
+            let rec conn_mask e bitpos = match e with
+              | Behavioral_ir.BVar v ->
+                  let w = width_of v in
+                  (Z.shift_left (Z.logand (net_mask v) (ones w)) bitpos, w)
+              | BSlice { signal = BVar v; msb; lsb } ->
+                  let lo = min msb lsb and hi = max msb lsb in
+                  let m = Z.logand (Z.shift_right (net_mask v) lo)
+                            (ones (hi - lo + 1)) in
+                  (Z.shift_left m bitpos, hi - lo + 1)
+              | BConcat es ->
+                  let rec go acc pos = function
+                    | [] -> (acc, pos - bitpos)
+                    | el :: rest ->
+                        let m, w = conn_mask el pos in
+                        go (Z.logor acc m) (pos + w) rest in
+                  go Z.zero bitpos (List.rev es)   (* MSB-first → LSB-first *)
+              | BConst { width; _ } -> (Z.zero, width)
+              | _ -> (Z.shift_left Z.one bitpos, 1)  (* conservative: used *)
+            in
+            add_mask pin (fst (conn_mask e 0)))
+            i.port_connections)
           insts_of_n
       end) p_raw.modules;
     used in
@@ -1151,20 +1225,21 @@ let lmiter_hier a_prog_h b_prog_h top =
             | Some v' when Z.equal v v' -> Some (pin, v)
             | _ -> None) ca in
         let ua = used_outputs pa_raw n and ub = used_outputs pb_raw n in
-        (* dead on EITHER side: a flow that proved the output redundant in
-           context (rx_clk ≡ eth_clk) rewires the parent's consumers and
-           ties the pin off — comparing it against the live side only
-           reproduces that (trusted) context optimisation. *)
-        let skip_outputs =
+        (* per-BIT context masks, intersected: a bit dead on EITHER side is
+           masked — a flow that proved it redundant in context (rx_clk ≡
+           eth_clk; pcspma_status[15:2] unread by the LED logic) rewires or
+           ties it, and comparing only reproduces that trusted optimisation. *)
+        let output_masks =
           match by_name pa_raw n with
           | Some mm ->
               List.filter_map (fun (s : bsignal) ->
-                if s.direction = `Output
-                   && (not (Hashtbl.mem ua s.name)
-                       || not (Hashtbl.mem ub s.name))
-                then Some s.name else None) mm.signals
+                if s.direction = `Output then begin
+                  let m v = match Hashtbl.find_opt v s.name with
+                    | Some x -> x | None -> Z.zero in
+                  Some (s.name, Z.logand (m ua) (m ub))
+                end else None) mm.signals
           | None -> [] in
-        let verdict = miter_core ~input_consts ~skip_outputs (ma, pa) (mb, pb) in
+        let verdict = miter_core ~input_consts ~output_masks (ma, pa) (mb, pb) in
         if verdict = "EQUIVALENT" then incr n_eq;
         Buffer.add_string buf
           (Printf.sprintf "HIER %-34s %s%s\n" n verdict
