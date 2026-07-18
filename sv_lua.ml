@@ -593,7 +593,14 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
       | BVar n ->
           (match split_bitbus n with
            | Some (base, i) -> BSlice { signal = BVar base; msb = i; lsb = i }
-           | None -> if Hashtbl.mem driven n then e else c0)
+           | None ->
+               (* ufo__* child-boundary outputs must stay FREE variables —
+                  the miter pairs them by name across sides (assume half of
+                  the child cut).  Zero-tying them made every child-fed cone
+                  vacuously 0=0 "equivalent". *)
+               if Hashtbl.mem driven n then e
+               else if String.length n > 5 && String.sub n 0 5 = "ufo__" then e
+               else c0)
       | BConst _ -> e
       | BBinOp r -> BBinOp { r with lhs = rw r.lhs; rhs = rw r.rhs }
       | BUnOp r -> BUnOp { r with operand = rw r.operand }

@@ -354,18 +354,51 @@ let expand_instance ?canon (i : binstance) : bprocess list * bool =
         else [ comb ("exp_uf_" ^ i.inst_name) asgs ], false
       end
 
+let clone_re1 = Str.regexp "^\\(.+\\)_[0-9]+$"
+
+(* Normalise per-instance module VARIANT names back to a canonical base so
+   child keys pair across the two flows:
+   - Vivado write_verilog clones:  RAMB16_S36_S36_xc7__1, async_fifo_rd__1,
+     dualmem64__parameterized0, rgmii_lfsr_0
+   - SVS elaboration specialisations:  async_fifo_wr__DW72_AW5,
+     gig_ethernet_pcs_pma_0_support__CGL0
+   Rule: cut at the FIRST "__" (both conventions suffix with double
+   underscore; applied unconditionally so it is SYMMETRIC even when one
+   side's base module no longer exists).  The single-underscore digit form
+   (`rgmii_lfsr_0`) is stripped only when the base is a known module —
+   protects names that merely end in digits (eth_mac_1g, ..._pcs_pma_0). *)
+let norm_clone mn =
+  (* SYMMETRIC variant-suffix strip: cut at the FIRST "__" (Vivado clones
+     `__1`/`__parameterized0` AND SVS specialisations `__DW72_AW5`/`__CGL0`
+     both use double underscore) — unconditional, so both sides normalise
+     identically even when a side no longer carries the base module.  The
+     single-underscore digit form (`rgmii_lfsr_0`) stays gated on the base
+     being a known module (protects ..._pcs_pma_0 / eth_mac_1g). *)
+  let rec first_dd i =
+    if i + 1 >= String.length mn then None
+    else if mn.[i] = '_' && mn.[i+1] = '_' then Some i
+    else first_dd (i + 1) in
+  match first_dd 1 with
+  | Some i -> String.sub mn 0 i
+  | None ->
+      if Str.string_match clone_re1 mn 0 then begin
+        let base = Str.matched_group 1 mn in
+        if Hashtbl.mem user_ports base then base else mn
+      end else mn
+
 let expand_module (mo : bmodule) : bmodule =
-  (* Canonical child key = module name + ORDINAL among same-module siblings
-     (sorted by inst_name): identical across the two miter flows even though
-     each flow names the instances differently. *)
+  (* Canonical child key = NORMALISED module name + ORDINAL among same-module
+     siblings (sorted by inst_name): identical across the two miter flows even
+     though each flow names instances (and clones modules) differently. *)
   let canon_of : (string, string) Hashtbl.t = Hashtbl.create 8 in
   let by_mod : (string, string list ref) Hashtbl.t = Hashtbl.create 8 in
   List.iter (fun (i : binstance) ->
-    if Hashtbl.mem user_ports i.module_name then
-      match Hashtbl.find_opt by_mod i.module_name with
+    if Hashtbl.mem user_ports i.module_name then begin
+      let key = norm_clone i.module_name in
+      match Hashtbl.find_opt by_mod key with
       | Some l -> l := i.inst_name :: !l
-      | None -> Hashtbl.add by_mod i.module_name (ref [ i.inst_name ]))
-    mo.instances;
+      | None -> Hashtbl.add by_mod key (ref [ i.inst_name ])
+    end) mo.instances;
   Hashtbl.iter (fun mn l ->
     List.iteri (fun k inst ->
       Hashtbl.replace canon_of inst (Printf.sprintf "%s_%d" mn k))
