@@ -359,6 +359,67 @@ let flatten_structural (p : bprogram) ~top : bmodule =
                  List.map (fun (pin, e) -> pin, apply e) i.port_connections }) prims0
   in
 
+  (* Materialise assigns that drive TOP OUTPUT PORT bits: amap substitution
+     rewrites READERS, but the port itself is not a reader pin — an output
+     like `assign eth_clk_o = eth_clk` would emit with no driver (bit-level
+     ERC: port:eth_clk_o[0] NO DRIVER).  Emit an identity LUT6 obuf per such
+     bit; bir_to_edif's ident-obuf bypass collapses it into a pure net JOIN,
+     so no actual LUT lands in the EDIF (safe for clock ports). *)
+  let out_portw : (string, int) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (s : bsignal) ->
+    match s.direction, s.stype with
+    | `Output, BInt { width; _ } -> Hashtbl.replace out_portw s.name width
+    | `Output, BBool -> Hashtbl.replace out_portw s.name 1
+    | _ -> ()) top_mod.signals;
+  let port_bit_referenced =
+    (* a port bit already touched by some instance pin is left alone —
+       its driver (or an obuf) is already in the netlist *)
+    let tbl : (string * int, unit) Hashtbl.t = Hashtbl.create 64 in
+    let rec scan = function
+      | BVar nm when Hashtbl.mem out_portw nm -> Hashtbl.replace tbl (nm, 0) ()
+      | BSlice { signal = BVar nm; msb; lsb } when Hashtbl.mem out_portw nm ->
+          for b = min msb lsb to max msb lsb do Hashtbl.replace tbl (nm, b) () done
+      | BSlice { signal; _ } -> scan signal
+      | BConcat es -> List.iter scan es
+      | BSelect { array; _ } -> scan array
+      | _ -> () in
+    List.iter (fun (i : binstance) ->
+      List.iter (fun (_, e) -> scan e) i.port_connections) prims;
+    tbl in
+  let mk_portdrv base w bit rhs_bit =
+    Hashtbl.replace port_bit_referenced (base, bit) ();
+    let rhs' = apply rhs_bit in
+    let o = if w = 1 then BVar base
+            else BSlice { signal = BVar base; msb = bit; lsb = bit } in
+    { inst_name = Printf.sprintf "__portdrv_%s_%d" base bit;
+      module_name = "LUT6";
+      param_values = [];
+      param_strs = [("INIT", "64'hFFFFFFFF00000000")];
+      port_connections =
+        [("I0", rhs'); ("I1", rhs'); ("I2", rhs');
+         ("I3", rhs'); ("I4", rhs'); ("I5", rhs'); ("O", o)];
+    } in
+  let synth_obufs =
+    List.concat_map (fun (nm, rhs) ->
+      let base, bit = parse_bit nm in
+      match Hashtbl.find_opt out_portw base with
+      | None -> []
+      | Some w ->
+          (match bit with
+           | Some b ->
+               if b >= w || Hashtbl.mem port_bit_referenced (base, b) then []
+               else [mk_portdrv base w b rhs]
+           | None ->
+               if w = 1 then
+                 (if Hashtbl.mem port_bit_referenced (base, 0) then []
+                  else [mk_portdrv base w 0 rhs])
+               else
+                 List.filter_map (fun b ->
+                   if Hashtbl.mem port_bit_referenced (base, b) then None
+                   else Some (mk_portdrv base w b (bexpr_bit rhs b)))
+                   (List.init w (fun b -> b)))) !assigns in
+  let prims = prims @ synth_obufs in
+
   (* Collect all signal names referenced by any primitive's port net.    *)
   let referenced = Hashtbl.create 4096 in
   let scan_bexpr =
