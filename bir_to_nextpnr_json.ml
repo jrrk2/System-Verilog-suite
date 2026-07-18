@@ -35,6 +35,7 @@ type net_key = { base : string; bit : int }
    string consts in cell connections.  Ids 2 and 3 are reserved for them. *)
 type ctx = {
   next_id     : int ref;
+  ties        : (net_key, bool) Hashtbl.t;  (* GND/VCC CELL output nets -> const *)
   ids         : (net_key, int) Hashtbl.t;
   net_names   : (string, int list) Hashtbl.t;     (* base -> bit ids, in bit-order *)
   widths      : (string, int) Hashtbl.t;          (* signal-name -> declared width *)
@@ -46,6 +47,7 @@ type ctx = {
 
 let mk_ctx () = {
   next_id   = ref 4;          (* 0/1 yosys-reserved; 2/3 = GND/VCC packer nets *)
+  ties      = Hashtbl.create 64;
   ids       = Hashtbl.create 4096;
   net_names = Hashtbl.create 1024;
   widths    = Hashtbl.create 1024;
@@ -96,6 +98,16 @@ let alloc ctx (key : net_key) : int =
     let cur = try Hashtbl.find ctx.net_names key.base with Not_found -> [] in
     Hashtbl.replace ctx.net_names key.base (cur @ [i]);
     i
+
+(* Net-key reference that honours GND/VCC CELL ties: the tie cells are
+   SKIPPED at emission (constants ride const_bit), so a net driven by a
+   GND/VCC INSTANCE (pcs_pma_flat's VCC_2 feeding reset-sync CE pins)
+   must resolve to a constant, not a driverless net id — the EDIF-side
+   twin of this bug left CE pins floating on silicon. *)
+let net_ref const_bit ctx (k : net_key) =
+  match Hashtbl.find_opt ctx.ties k with
+  | Some one -> const_bit ctx one
+  | None -> I (alloc ctx k)
 
 (* Reduce a bexpr-as-net-reference to a single (name, bit_index option). *)
 let rec resolve_bit_ref (e : bexpr) : (string * int option) option =
@@ -157,7 +169,7 @@ let rec bits_of_conn ctx (e : bexpr) : bit list =
       List.map (fun i ->
         match const_of_name base with
         | Some s -> const_bit ctx (s = "1")
-        | None -> I (alloc ctx { base; bit = i })
+        | None -> net_ref const_bit ctx { base; bit = i }
       ) (range lsb msb)
   | BSlice { signal; msb; lsb } ->
       (* Slice of a composite signal (e.g. flatten_struct emits a bus as a
@@ -182,7 +194,7 @@ let rec bits_of_conn ctx (e : bexpr) : bit list =
       (match resolve_bit_ref e with
         | Some (nm, _) when const_of_name nm <> None ->
             [const_bit ctx (const_of_name nm = Some "1")]
-        | Some (nm, Some bit) -> [I (alloc ctx { base = nm; bit })]
+        | Some (nm, Some bit) -> [net_ref const_bit ctx { base = nm; bit }]
         | Some (nm, None    ) ->
             (match bitbus_ref ctx nm with
              | Some (base, bit) ->
@@ -192,14 +204,14 @@ let rec bits_of_conn ctx (e : bexpr) : bit list =
                   * to the actual port bit instead of an orphan scalar net —
                   * the driverless-net bug that made Vivado opt trim the
                   * design. *)
-                 [I (alloc ctx { base; bit })]
+                 [net_ref const_bit ctx { base; bit }]
              | None ->
                  (* Bare `BVar nm` reference — expand to nm's declared
                   * width if known, else fall back to one bit.  Multi-bit
                   * expansion is essential for CARRY4 inputs like .S(_671)
                   * where _671 is a 4-bit wire. *)
                  let w = try Hashtbl.find ctx.widths nm with Not_found -> 1 in
-                 List.init w (fun i -> I (alloc ctx { base = nm; bit = i })))
+                 List.init w (fun i -> net_ref const_bit ctx { base = nm; bit = i }))
         | None ->
             failwith ("bir_to_nextpnr_json: unsupported pin expression: "
                       ^ Behavioral_ir.string_of_bexpr e))
@@ -369,6 +381,27 @@ let yosys_json
     (m : bmodule) : Yojson.Safe.t =
   let ctx = mk_ctx () in
   populate_widths ctx m;
+  (* GND/VCC CELL instances are skipped below — bind their output nets to
+     constants or every reader dangles (nextpnr GT packer rejected the GT
+     config pins; reset-sync CE pins would float). *)
+  List.iter (fun (i : binstance) ->
+    match i.module_name with
+    | ("GND" | "VCC") as mn ->
+        let one = (mn = "VCC") in
+        let pin = if one then "P" else "G" in
+        (match List.assoc_opt pin i.port_connections with
+         | Some e ->
+             let rec keys = function
+               | BVar nm when const_of_name nm = None ->
+                   [{ base = nm; bit = 0 }]
+               | BSlice { signal = BVar b; msb; lsb } when const_of_name b = None ->
+                   List.init (abs (msb - lsb) + 1)
+                     (fun k -> { base = b; bit = min msb lsb + k })
+               | BConcat es -> List.concat_map keys es
+               | _ -> [] in
+             List.iter (fun k -> Hashtbl.replace ctx.ties k one) (keys e)
+         | None -> ())
+    | _ -> ()) m.instances;
   let port_dirs = port_dir_table library_cells in
   let port_widths = port_width_table library_cells in
 
@@ -452,6 +485,27 @@ let yosys_json
     let params =
       List.map (fun (k, s) -> k, `String (verilog_lit_to_binary s)) i.param_strs
       @ List.map (fun (k, n) -> k, `String (int_to_bin32 n)) i.param_values
+    in
+    (* Cells instantiated WITHOUT #() params (Vivado netlists rely on
+       defaults) still need them in the json: nextpnr's DRAM packer keys on
+       INIT_*/IS_WCLK_INVERTED, and their absence left the RAM64M read-port
+       timing arcs unmodelled ("combinatorial loops" abort).  yosys fills
+       these defaults when it parses the netlist; mirror that. *)
+    let params =
+      let zeros n = String.make n '0' in
+      let defaults = match i.module_name with
+        | "RAM64M" | "RAM32M" ->
+            [ "INIT_A", zeros 64; "INIT_B", zeros 64;
+              "INIT_C", zeros 64; "INIT_D", zeros 64;
+              "IS_WCLK_INVERTED", "0" ]
+        | "RAM32X1D" | "RAM32X1S" -> [ "INIT", zeros 32; "IS_WCLK_INVERTED", "0" ]
+        | "RAM64X1D" | "RAM64X1S" -> [ "INIT", zeros 64; "IS_WCLK_INVERTED", "0" ]
+        | "RAM128X1D" | "RAM128X1S" -> [ "INIT", zeros 128; "IS_WCLK_INVERTED", "0" ]
+        | "SRL16E" -> [ "INIT", zeros 16; "IS_CLK_INVERTED", "0" ]
+        | "SRLC32E" -> [ "INIT", zeros 32; "IS_CLK_INVERTED", "0" ]
+        | _ -> [] in
+      params @ List.filter_map (fun (k, v) ->
+        if List.mem_assoc k params then None else Some (k, `String v)) defaults
     in
     i.inst_name,
     `Assoc [
