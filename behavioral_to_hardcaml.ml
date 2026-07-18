@@ -998,12 +998,36 @@ let merge_slice_writes ctx body =
   ) groups [] in
   List.rev !rest @ merged_assigns
 
+(* @slice_write calls live NESTED in case arms / if branches (arp_ctrl's
+   `target_ip[31:24] <= rdata[55:48]` sits three levels deep) — the
+   top-level-only merge left them to stmt_to_always' silent BCallStmt
+   catch-all: the write's ENABLE materialised but its DATA vanished
+   (FDCE with D=1'b0; ARP target-IP compare always failed on silicon).
+   Recurse into every branch: same-branch writes to one register merge
+   into a single read-modify-write BAssign, exactly NBA semantics. *)
+let rec merge_slice_writes_deep ctx body =
+  let body = merge_slice_writes ctx body in
+  List.map (function
+    | BIf r ->
+        BIf { r with then_stmts = merge_slice_writes_deep ctx r.then_stmts;
+                     else_stmts = merge_slice_writes_deep ctx r.else_stmts }
+    | BCase r ->
+        BCase { selector = r.selector;
+                cases = List.map (fun (k, b) ->
+                  (k, merge_slice_writes_deep ctx b)) r.cases;
+                default = merge_slice_writes_deep ctx r.default }
+    | BBlock ss -> BBlock (merge_slice_writes_deep ctx ss)
+    | s -> s) body
+
 (* Convert behavioral process to HardCaml Always block.
    Returns the compiled Always.t so the caller can keep a list
    of all the always-blocks that make up the module. *)
 let process_to_always ctx = function
   | BCombinational { body; _ } ->
       let body = thread_body body in
+      (* shallow only: the merged assign SELF-READS uncovered bits, which
+         is FF-old-value semantics — valid for NBA registers, a
+         combinational LOOP here (axis_gmii_tx gate_map crashed) *)
       let body = merge_slice_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:false ctx) [] body in
       (* stmt_to_always prepends each compiled statement to the
@@ -1028,7 +1052,7 @@ let process_to_always ctx = function
            ctx.reset_falling <- (reset_edge = Some `Neg)
        | _ -> ctx.reset_falling <- false);
       let body = thread_body ~blocking_vars body in
-      let body = merge_slice_writes ctx body in
+      let body = merge_slice_writes_deep ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
       Always.compile (List.rev alw)
 
