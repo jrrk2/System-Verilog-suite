@@ -1968,11 +1968,60 @@ let extract_assign ~pkgs ~params ~arrays tok =
                   }]
               | Some (name, _) ->
                   let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
-                  [BCombinational {
-                    name = "assign_" ^ name;
-                    sensitivity = [BAny];
-                    body = [BAssign { lhs = name; rhs = rhs_e }];
-                  }]
+                  (* Literal bit/range select on the LHS must be PRESERVED:
+                     `assign v[m:l] = x` used to lower to a whole-bus BAssign
+                     (range silently DISCARDED) — partial writes to the same
+                     bus clobbered each other and misaligned (pcs_pma
+                     `status_vector[13:9]/[7:0] = ^status_vector[...]` lost
+                     the sync bit feeding the GT rxresetfsm data_valid).
+                     Emit per-bit `v[k]` bracket-keyed assigns instead. *)
+                  let sel = ref `Whole in
+                  walk (function
+                    | TUPLE4 (STRING dt, _, e, _)
+                      when prefix_is "select_variable_dimension" dt && !sel = `Whole ->
+                        sel := `Single e
+                    | TUPLE6 (STRING dt, _, m, _, l, _)
+                      when prefix_is "select_variable_dimension" dt && !sel = `Whole ->
+                        sel := `Rng (m, l)
+                    | _ -> ()) lhs;
+                  let lit e = match expr_to_bexpr ~pkgs ~params ~arrays e with
+                    | BConst { value; _ } -> Some (Z.to_int value)
+                    | _ -> None in
+                  let mk_bit k rhs =
+                    BCombinational {
+                      name = Printf.sprintf "assign_%s_bit%d" name k;
+                      sensitivity = [BAny];
+                      body = [BAssign { lhs = Printf.sprintf "%s[%d]" name k;
+                                        rhs }];
+                    } in
+                  let whole () =
+                    [BCombinational {
+                      name = "assign_" ^ name;
+                      sensitivity = [BAny];
+                      body = [BAssign { lhs = name; rhs = rhs_e }];
+                    }] in
+                  (match !sel with
+                   | `Single e ->
+                       (match lit e with
+                        | Some k -> [mk_bit k rhs_e]
+                        | None ->
+                            Printf.eprintf
+                              "verible_to_behavioral: WARNING dynamic bit-select \
+                               continuous-assign LHS %s — select dropped\n" name;
+                            whole ())
+                   | `Rng (m, l) ->
+                       (match lit m, lit l with
+                        | Some mv, Some lv ->
+                            let lo = min mv lv and hi = max mv lv in
+                            List.init (hi - lo + 1) (fun b ->
+                              mk_bit (lo + b)
+                                (BSlice { signal = rhs_e; msb = b; lsb = b }))
+                        | _ ->
+                            Printf.eprintf
+                              "verible_to_behavioral: WARNING dynamic range-select \
+                               continuous-assign LHS %s — select dropped\n" name;
+                            whole ())
+                   | `Whole -> whole ())
               | None -> []))
     | _ -> []
   ) assigns

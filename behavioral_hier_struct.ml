@@ -217,6 +217,11 @@ let collect_resolvable_assigns ~prefix ~port_actual (m : bmodule)
               let rhs' = rewrite_bexpr ~prefix ~port_actual rhs in
               (match lhs' with
                | BVar nm -> [(nm, rhs')]
+               | BSlice { signal = BVar nm; msb; lsb } when msb = lsb ->
+                   (* bracket-keyed per-bit assign (`v[k] = x` from a ranged
+                      continuous assign) whose base is a PORT: rewrite gave
+                      bit k of the parent actual — key it per-bit *)
+                   [(Printf.sprintf "%s[%d]" nm msb, rhs')]
                | BConcat elems ->
                    (* An output-port whose port_actual is a bit-split concat
                       {n16,...,n1} (MSB-first): emit one per-bit assign so every
@@ -330,10 +335,18 @@ let flatten_structural (p : bprogram) ~top : bmodule =
                        BSlice { signal = BVar b; msb = bit; lsb = bit }
                    | _ -> e)
               | None -> e))
+    | BSlice { signal = BVar nm; msb; lsb }
+      when msb = lsb && Hashtbl.mem amap (Printf.sprintf "%s[%d]" nm msb) ->
+        (* per-bit bracket-keyed assign resolves this bit read *)
+        apply ~depth:(depth + 1) (Hashtbl.find amap (Printf.sprintf "%s[%d]" nm msb))
     | BSlice { signal = BVar nm; msb; lsb } when Hashtbl.mem amap nm ->
         let rhs = apply ~depth:(depth + 1) (Hashtbl.find amap nm) in
-        if msb = lsb then bit_select rhs msb
-        else BConcat (List.init (msb - lsb + 1) (fun k -> bit_select rhs (msb - k)))
+        (* width-aware bit extraction: rhs may be a concat of MULTI-BIT
+           elements ({const0, ^sv[13:9], ^sv[7:0]}) — bit_select's 1-bit
+           element assumption picked the wrong element and zero-tied the
+           read (the GT rxresetfsm data_valid killer) *)
+        if msb = lsb then bexpr_bit rhs msb
+        else BConcat (List.init (msb - lsb + 1) (fun k -> bexpr_bit rhs (msb - k)))
     | BSlice { signal; msb; lsb } -> BSlice { signal = apply ~depth signal; msb; lsb }
     | BConcat es -> BConcat (List.map (apply ~depth) es)
     | BSelect { array; index } -> BSelect { array = apply ~depth array; index = apply ~depth index }
