@@ -1313,7 +1313,12 @@ let lexpand_fpga_h prog_h ref_h =
 
 let lunroll prog_h =
   let label, p = find_prog prog_h in
-  hadd (Prog (label, Behavioral_unroll.unroll_program p))
+  (* initial-block compile-time evaluation right after generate expansion:
+     array reads then carry literal indices (behavioral_initeval.ml —
+     rgmii_lfsr CRC mask matrices; dropping initial blocks zeroed every
+     CRC output → FCS = ~0 → all TX frames discarded by the peer NIC) *)
+  hadd (Prog (label,
+    Behavioral_initeval.eval_program (Behavioral_unroll.unroll_program p)))
 
 let linline prog_h =
   let label, p = find_prog prog_h in

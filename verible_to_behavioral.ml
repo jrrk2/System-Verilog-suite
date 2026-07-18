@@ -668,6 +668,18 @@ let dummy_bool = BInt { width = 1; signed = Unsigned }
 let param_value_to_bexpr id v =
   let v = String.trim v in
   if v = "" then BVar id
+  else if String.length v >= 2 && v.[0] = '"' && v.[String.length v - 1] = '"'
+  then begin
+    (* STRING parameter value ("GALOIS"): pack as ASCII byte vector, the
+       same encoding TK_StringLiteral uses, so `LFSR_CONFIG == "GALOIS"`
+       folds to a constant compare instead of leaving an unbound BVar
+       (which read as 0 and disabled rgmii_lfsr's CRC mask generation). *)
+    let s = String.sub v 1 (String.length v - 2) in
+    let z = ref Z.zero in
+    String.iter (fun c ->
+      z := Z.logor (Z.shift_left !z 8) (Z.of_int (Char.code c land 0xff))) s;
+    BConst { value = !z; width = 8 * String.length s }
+  end
   else
     let parse_radix base s =
       try Some (int_of_string ("0" ^ base ^ s))
@@ -2238,10 +2250,71 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                         recurse_e rhs];
               }
           | Some (name, Some idx_node), `None when List.mem name arrays ->
-              BCallStmt {
-                func = "@mem_write";
-                args = [BVar name; recurse_e idx_node; recurse_e rhs];
-              }
+              (* `arr[i] = v` — but ALSO `arr[i][j] = v` (array element,
+                 then BIT): the second dimension used to be silently
+                 DROPPED, so rgmii_lfsr's diagonal-mask init
+                 `lfsr_mask_state[i][i] = 1'b1` wrote the whole element
+                 with 1.  Collect the select dims in source order; with
+                 two, lower to a read-modify-write of the element. *)
+              let dims = ref [] in
+              walk (function
+                | TUPLE4 (STRING dt, _, e, _)
+                  when prefix_is "select_variable_dimension" dt ->
+                    dims := `Single e :: !dims
+                | TUPLE6 (STRING dt, _, m, _, l, _)
+                  when prefix_is "select_variable_dimension" dt ->
+                    dims := `Rng (m, l) :: !dims
+                | _ -> ()) lhs;
+              let dims = List.rev !dims in
+              let plain () =
+                BCallStmt {
+                  func = "@mem_write";
+                  args = [BVar name; recurse_e idx_node; recurse_e rhs];
+                } in
+              (match dims with
+               | [_] | [] -> plain ()
+               | [`Single _ | `Rng _; second] ->
+                   let ei = recurse_e idx_node in
+                   let old = BSelect { array = BVar name; index = ei } in
+                   let u64 = BInt { width = 64; signed = Unsigned } in
+                   let bop op lhs rhs = BBinOp { op; lhs; rhs; result_type = u64 } in
+                   let rhs_e = recurse_e rhs in
+                   let ins ~lo ~w_expr =
+                     (* new = (old & ~(mask<<lo)) | ((rhs&mask)<<lo) *)
+                     let mask = match w_expr with
+                       | None -> BConst { value = Z.one; width = 64 }
+                       | Some w ->
+                           bop BSub (bop BShl (BConst { value = Z.one; width = 64 }) w)
+                                    (BConst { value = Z.one; width = 64 }) in
+                     let cleared =
+                       bop BAnd old
+                         (BUnOp { op = BNot; operand = bop BShl mask lo;
+                                  result_type = u64 }) in
+                     let inserted = bop BShl (bop BAnd rhs_e mask) lo in
+                     BCallStmt {
+                       func = "@mem_write";
+                       args = [BVar name; ei; bop BOr cleared inserted];
+                     } in
+                   (match second with
+                    | `Single b -> ins ~lo:(recurse_e b) ~w_expr:None
+                    | `Rng (mn, ln) ->
+                        let m_e = recurse_e mn and l_e = recurse_e ln in
+                        (match m_e, l_e with
+                         | BConst { value = mv; _ }, BConst { value = lv; _ } ->
+                             let lo = Z.min mv lv and hi = Z.max mv lv in
+                             ins ~lo:(BConst { value = lo; width = 64 })
+                                 ~w_expr:(Some (BConst {
+                                   value = Z.add (Z.sub hi lo) Z.one; width = 64 }))
+                         | _ ->
+                             Printf.eprintf
+                               "verible_to_behavioral: WARNING dynamic range on \
+                                2-dim array write %s — inner select dropped\n" name;
+                             plain ()))
+               | _ ->
+                   Printf.eprintf
+                     "verible_to_behavioral: WARNING >2 select dims on array \
+                      write %s — inner selects dropped\n" name;
+                   plain ())
           | Some (name, _), `None -> BAssign { lhs = name; rhs = recurse_e rhs }
           | None, _ -> BBlock []))
   in
@@ -2742,6 +2815,17 @@ let extract_instances ~pkgs ~params tok =
               | _ -> ()) digits;
             take (basestr ^ !ds)
         | TK_UnBasedNumber n -> take n
+        | TK_StringLiteral s ->
+            (* STRING parameter override (.LFSR_CONFIG("GALOIS")): keep it,
+               quote-normalized, so specialization records the value and
+               param_value_to_bexpr packs it as an ASCII constant.  It used
+               to fall through to eval_int -> None -> silently DROPPED,
+               leaving `LFSR_CONFIG == "GALOIS"` comparing an unbound var. *)
+            let s =
+              let n = String.length s in
+              if n >= 2 && s.[0] = '"' && s.[n-1] = '"'
+              then String.sub s 1 (n - 2) else s in
+            take ("\"" ^ s ^ "\"")
         | _ -> ()) valexpr;
       match !found with
       | Some s -> Some s
@@ -3011,7 +3095,24 @@ let extract_body_params ~pkgs ~params tok =
              Hashtbl.replace cur_struct_params id pairs
          | None -> ());
         let cur = List.assoc_opt id acc in
+        let str_default =
+          (* string-typed default (`parameter LFSR_CONFIG = "GALOIS"`):
+             preserve as a QUOTED value so param_value_to_bexpr packs it
+             ASCII at full width — routing it through Z.to_string lost
+             the width (re-parsed at 32 bits, truncating the compare). *)
+          let s = ref None in
+          walk (function
+            | TK_StringLiteral x when !s = None ->
+                let n = String.length x in
+                let x = if n >= 2 && x.[0] = '"' && x.[n-1] = '"'
+                        then String.sub x 1 (n - 2) else x in
+                s := Some x
+            | _ -> ()) v;
+          !s in
         let new_val =
+          match str_default with
+          | Some s -> Some ("\"" ^ s ^ "\"")
+          | None ->
           match eval_int ~pkgs ~params:acc v with
           | Some i -> Some (string_of_int i)
           | None ->
@@ -3793,6 +3894,39 @@ let convert_module ~pkgs (mdecl : module_decl)
       | _ -> None) initial_nodes
   in
   let assign_procs = assign_procs @ mem_init_procs in
+  (* Procedural `initial` blocks (non-$readmemh): keep their statement
+     bodies as reserved-name processes for COMPILE-TIME evaluation by
+     behavioral_initeval (run inside svd.unroll).  rgmii_lfsr computes
+     its CRC mask matrices this way — dropping the block left the masks
+     zero and every CRC output constant-folded to 0 (FCS = ~0). *)
+  let initial_procs =
+    let initial_nodes =
+      collect_by (has_tag (prefix_is "initial_construct")) mdecl.m_body in
+    List.filter_map (fun init ->
+      let saw_readmemh = ref false in
+      walk (function
+        | SymbolIdentifier id when id = "$readmemh" -> saw_readmemh := true
+        | _ -> ()) init;
+      if !saw_readmemh then None
+      else
+        let body_nodes = collect_by (has_tag (fun t ->
+          prefix_is "seq_block" t ||
+          prefix_is "assignment_statement_no_expr" t ||
+          prefix_is "conditional_statement" t ||
+          prefix_is "case_statement" t ||
+          prefix_is "for_loop_statement" t ||
+          prefix_is "loop_statement" t)) init in
+        match body_nodes with
+        | b :: _ ->
+            Some (BCombinational {
+              name = "__initial__";
+              sensitivity = [BAny];
+              body = [stmt_to_bstmt ~pkgs ~params ~arrays:array_names b];
+            })
+        | [] -> None)
+      initial_nodes
+  in
+  let assign_procs = assign_procs @ initial_procs in
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params mdecl.m_body in
   (* Post-pass: merge combinational @mem_write groups targeting the

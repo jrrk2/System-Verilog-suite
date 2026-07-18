@@ -135,6 +135,17 @@ let leaf_text = function
   | TK_HexDigits n -> Some ("'h" ^ n)
   | TK_BinDigits n -> Some ("'b" ^ n)
   | TK_OctDigits n -> Some ("'o" ^ n)
+  (* STRING parameter values (.LFSR_CONFIG("GALOIS")): without this the
+     deep rendering dropped the literal entirely, the override resolved
+     to "" and the specialised clone LOST the parameter — downstream
+     string compares (`LFSR_CONFIG == "GALOIS"`) then read an unbound
+     var as 0 and rgmii_lfsr's CRC mask generation never ran.  Quote-
+     normalised so param_value_to_bexpr packs it as an ASCII constant. *)
+  | TK_StringLiteral s ->
+      let n = String.length s in
+      let s = if n >= 2 && s.[0] = '"' && s.[n-1] = '"'
+              then String.sub s 1 (n - 2) else s in
+      Some ("\"" ^ s ^ "\"")
   | SymbolIdentifier id -> Some id
   | LT_LT -> Some "<<"  | GT_GT -> Some ">>"
   | SLASH -> Some "/"   | STAR  -> Some "*"
@@ -2033,6 +2044,13 @@ let suffix_of_params params =
             String.sub v (i + 2) (String.length v - i - 2)
           with Not_found -> v
         in
+        (* keep the mangled name a plain identifier: string param values
+           arrive quoted ("GALOIS") — drop any non-alphanumeric chars *)
+        let v' = String.to_seq v'
+                 |> Seq.filter (fun c ->
+                      (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+                      || (c >= 'A' && c <= 'Z'))
+                 |> String.of_seq in
         k' ^ v') params)
 
 type specialised = {
