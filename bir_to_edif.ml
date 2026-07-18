@@ -200,6 +200,12 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
  * with width:`N'bBITS`; existing Verilog literals pass through; bare
  * enums (no quotes, no digits-then-tick) pass through as strings.   *)
 let edif_property_value (v : string) : string =
+  (* string params now flow quote-normalised ("LVDS") from the elaborate
+     fix — strip the quotes here or they'd double up in the EDIF *)
+  let v =
+    let n = String.length v in
+    if n >= 2 && v.[0] = '"' && v.[n - 1] = '"'
+    then String.sub v 1 (n - 2) else v in
   let n = String.length v in
   (* Defensive: a based literal that lost its digits ("1'b", "8'h", …)
      would otherwise be emitted verbatim and Vivado would silently read
@@ -602,11 +608,18 @@ let write_edif
   List.iter (fun (i : binstance) ->
     pp "          (instance %s (viewref netlist (cellref %s (libraryref hdi_primitives)))"
       (edif_safe_id i.inst_name) (edif_safe_id i.module_name);
+    let seen_prop : (string, unit) Hashtbl.t = Hashtbl.create 8 in
     List.iter (fun (k, v) ->
-      pp "\n            (property %s (string %s))" k (edif_property_value v)
+      if not (Hashtbl.mem seen_prop k) then begin
+        Hashtbl.add seen_prop k ();
+        pp "\n            (property %s (string %s))" k (edif_property_value v)
+      end
     ) i.param_strs;
     List.iter (fun (k, n) ->
-      pp "\n            (property %s (integer %d))" k n
+      if not (Hashtbl.mem seen_prop k) then begin
+        Hashtbl.add seen_prop k ();
+        pp "\n            (property %s (integer %d))" k n
+      end
     ) i.param_values;
     pp "\n          )\n"
   ) live_cells;
