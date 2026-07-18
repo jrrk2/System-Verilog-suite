@@ -188,8 +188,17 @@ let box_ports ty : (string * [ `Input | `Output ] * int) list =
       | None -> []
 
 (* Expand a single instance -> (processes, keep?) where keep=true leaves the
- * instance in place (unhandled). *)
-let expand_instance (i : binstance) : bprocess list * bool =
+ * instance in place (unhandled).  [canon] is the CANONICAL child key
+ * (module name + sibling ordinal) for USER-module instances — identical on
+ * both miter sides regardless of the flows' own instance names (gate_map
+ * suffixes i_pcs_pma -> i_pcs_pma_257).  A user child is CUT, not
+ * UF-abstracted: its outputs become same-named FREE nets (`ufo__<canon>__…`,
+ * paired across sides by the miter's undriven-internal matching — this also
+ * breaks feedback cycles through the child, where a UF fixed-point lets each
+ * side settle differently) and its inputs become compared nets
+ * (`ufi__<canon>__…`, picked up as extra output pairs by the miter) so the
+ * parent's wiring INTO the child stays verified (assume-guarantee). *)
+let expand_instance ?canon (i : binstance) : bprocess list * bool =
   let m = i.module_name in
   if is_lut m then begin
     let k = lut_k m in
@@ -272,6 +281,38 @@ let expand_instance (i : binstance) : bprocess list * bool =
          symbol is applied to permuted arguments and the sides never agree. *)
       let ports = List.sort (fun (a, _, _) (b, _, _) -> compare a b)
                     (box_ports m) in
+      match canon with
+      | Some ck when Hashtbl.mem user_ports m && ports <> [] ->
+          (* USER child → CUT at the canonical boundary (see doc above). *)
+          let asgs = List.concat_map (fun (p, dir, w) ->
+            match dir with
+            | `Output ->
+                (* child output bit ← free canonical net *)
+                let free bit = BVar (Printf.sprintf "ufo__%s__%s_%d" ck p bit) in
+                (match out_nets i p with
+                 | [ single ] when w > 1 && not (String.contains single ']') ->
+                     List.init w (fun bit ->
+                       BAssign { lhs = Printf.sprintf "%s[%d]" single bit;
+                                 rhs = free bit })
+                 | nets -> List.mapi (fun bit n ->
+                     BAssign { lhs = n; rhs = free bit }) nets)
+            | `Input ->
+                (* child input → compared canonical net (per bit, so widths
+                   agree across sides regardless of connection shape).  A
+                   whole-bus BVar connection must be SLICED by the port width
+                   (bits_of can't split it — no width info), else bit 0 gets
+                   the whole bus and bits 1..w-1 get zero. *)
+                let conn = port_expr i p in
+                List.init (max 1 w) (fun bit ->
+                  let rhs = match conn with
+                    | Some (BVar _ as v) when w > 1 ->
+                        BSlice { signal = v; msb = bit; lsb = bit }
+                    | _ -> in_bit i p bit in
+                  BAssign { lhs = Printf.sprintf "ufi__%s__%s_%d" ck p bit;
+                            rhs })) ports in
+          if asgs = [] then [], true
+          else [ comb ("exp_cut_" ^ i.inst_name) asgs ], false
+      | _ ->
       if ports = [] then [], true
       else begin
         let rec norm_e = function
@@ -314,9 +355,25 @@ let expand_instance (i : binstance) : bprocess list * bool =
       end
 
 let expand_module (mo : bmodule) : bmodule =
+  (* Canonical child key = module name + ORDINAL among same-module siblings
+     (sorted by inst_name): identical across the two miter flows even though
+     each flow names the instances differently. *)
+  let canon_of : (string, string) Hashtbl.t = Hashtbl.create 8 in
+  let by_mod : (string, string list ref) Hashtbl.t = Hashtbl.create 8 in
+  List.iter (fun (i : binstance) ->
+    if Hashtbl.mem user_ports i.module_name then
+      match Hashtbl.find_opt by_mod i.module_name with
+      | Some l -> l := i.inst_name :: !l
+      | None -> Hashtbl.add by_mod i.module_name (ref [ i.inst_name ]))
+    mo.instances;
+  Hashtbl.iter (fun mn l ->
+    List.iteri (fun k inst ->
+      Hashtbl.replace canon_of inst (Printf.sprintf "%s_%d" mn k))
+      (List.sort compare !l)) by_mod;
   let new_procs = ref [] and kept = ref [] in
   List.iter (fun i ->
-    let procs, keep = expand_instance i in
+    let procs, keep =
+      expand_instance ?canon:(Hashtbl.find_opt canon_of i.inst_name) i in
     new_procs := procs @ !new_procs;
     if keep then kept := i :: !kept) mo.instances;
   { mo with instances = List.rev !kept;

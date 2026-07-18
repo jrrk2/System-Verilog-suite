@@ -1208,6 +1208,31 @@ let check_miter_equivalence bmod1 bmod2 =
             | _ -> None
           end else None) my_outs in
       mk outputs1 out2_w "_d1" "_d2" @ mk outputs2 out1_w "_d2" "_d1" in
+    (* Child-boundary INPUT nets (`ufi__<canon>__<port>_<bit>`, emitted by
+       Fpga_prim_expand's user-child cut): compare across sides so the
+       parent's wiring INTO each cut child stays verified — the child's
+       outputs are free paired nets (assume), its inputs are checked
+       (guarantee). *)
+    let bitbus_d_pairs =
+      let collect bm =
+        let acc = ref [] in
+        List.iter (function
+          | BCombinational { body; _ } ->
+              List.iter (function
+                | BAssign { lhs; _ }
+                  when String.length lhs > 5 && String.sub lhs 0 5 = "ufi__" ->
+                    acc := lhs :: !acc
+                | _ -> ()) body
+          | _ -> ()) bm.processes;
+        List.sort_uniq compare !acc in
+      let h2 = Hashtbl.create 64 in
+      List.iter (fun n -> Hashtbl.replace h2 n ()) (collect bmod2);
+      let ufi = List.filter_map (fun n ->
+        if Hashtbl.mem h2 n then
+          let e1 = bv_var n 1 "_d1" and e2 = bv_var n 1 "_d2" in
+          Some (n, Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx e1 e2))
+        else None) (collect bmod1) in
+      bitbus_d_pairs @ ufi in
     (* CONE-LEVEL mode (Z3_MITER_PER_CONE): check each common output (every
        FF's <Q>__D next-state cone + each primary output) on its OWN, with
        push/pop, so a structural state mismatch on a few cones (SVS bit-blasts
