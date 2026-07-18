@@ -469,8 +469,9 @@ let ram_m_lower_dual_port ~prim ~pb ~depth_cap ~addr_w ~m ~(mm : bmem) ~mname ~s
           RAM32M: pb=2 → 6/RAM;  RAM64M: pb=1 → 3/RAM. *)
        let ram_bits = 3 * pb in
        let orig_clk = match w_proc with BSequential s -> s.clock | _ -> "clk" in
-       let rs1_pin = mname ^ "_rs1" in
-       let rs2_pin = mname ^ "_rs2" in
+       (* Lowering-private pins must not collide with source-level read-result nets. *)
+       let rs1_pin = mname ^ "__memlower_rs1" in
+       let rs2_pin = mname ^ "__memlower_rs2" in
        let read_sig nm =
          { name = nm
          ; stype = BInt { width = dw; signed = Unsigned }
