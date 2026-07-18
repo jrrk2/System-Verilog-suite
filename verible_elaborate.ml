@@ -480,6 +480,120 @@ let rec strip_function_decls tok =
  * branches from the body BEFORE the BIR-level extractors walk it,
  * so a popcount__W2 specialisation doesn't carry assigns from the
  * W==1 / W>=3 branches that fight the W==2 branch. *)
+let extract_begin_label = function
+  | TUPLE3 (STRING t, _, lbl) when prefix_is "begin1" t ->
+      let ids = ref [] in
+      walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) lbl;
+      (match List.rev !ids with x :: _ -> Some x | _ -> None)
+  | _ -> None
+
+(* Pull the label from a `generate_block` shape (generate_block1 = begin/end,
+   generate_block2 = label : begin).  None when unlabeled. *)
+let extract_block_label = function
+  | TUPLE4 (STRING t, b, _, _) when prefix_is "generate_block1" t ->
+      extract_begin_label b
+  | TUPLE6 (STRING t, id_node, _, _, _, _) when prefix_is "generate_block2" t ->
+      let ids = ref [] in
+      walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) id_node;
+      (match List.rev !ids with x :: _ -> Some x | _ -> None)
+  | _ -> None
+
+(* ── Generate-block-local declaration namespacing ─────────────────────
+   When a labeled generate-FOR block declares LOCAL nets (`begin:L wire C; …`)
+   the unroller replicates the body per iteration, but every replica keeps the
+   bare name `C` — so all iterations collapse onto ONE net, and a cross-iteration
+   hierarchical reference `L[i-1].C` parses as a bit-select of an undriven net
+   `L` (→ 0).  This rewrites, for iteration `v` of block `L`:
+     • block-local declarations/refs   `C`        → `L__<v>__C`   (this iteration)
+     • hierarchical refs               `L[k].C`   → `L__<k>__C`   (iteration k)
+   so each iteration gets its own net and cross-references thread correctly.
+   Only fires for a LABELED block with ≥1 local declaration (local-free blocks —
+   the overwhelmingly common case — are untouched, so no regression). *)
+let namespace_genblk_locals ~label ~v ~eval_idx tok =
+  let locals : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  let is_decl t = prefix_is "net_variable" t || prefix_is "net_decl_assign" t
+                  || prefix_is "register_variable" t in
+  let rec collect t =
+    (match t with
+     | TUPLE3 (STRING tg, SymbolIdentifier nm, _) when is_decl tg ->
+         Hashtbl.replace locals nm ()
+     | TUPLE4 (STRING tg, SymbolIdentifier nm, _, _) when is_decl tg ->
+         Hashtbl.replace locals nm ()
+     | _ -> ());
+    iter_children collect t
+  and iter_children f = function
+    | TUPLE2 (a,b) -> f a; f b
+    | TUPLE3 (a,b,c) -> f a; f b; f c
+    | TUPLE4 (a,b,c,d) -> f a; f b; f c; f d
+    | TUPLE5 (a,b,c,d,e) -> f a; f b; f c; f d; f e
+    | TUPLE6 (a,b,c,d,e,g) -> f a; f b; f c; f d; f e; f g
+    | TUPLE7 (a,b,c,d,e,g,h) -> List.iter f [a;b;c;d;e;g;h]
+    | TUPLE8 (a,b,c,d,e,g,h,i) -> List.iter f [a;b;c;d;e;g;h;i]
+    | TUPLE9 (a,b,c,d,e,g,h,i,j) -> List.iter f [a;b;c;d;e;g;h;i;j]
+    | TUPLE10 (a,b,c,d,e,g,h,i,j,k) -> List.iter f [a;b;c;d;e;g;h;i;j;k]
+    | TUPLE11 (a,b,c,d,e,g,h,i,j,k,l) -> List.iter f [a;b;c;d;e;g;h;i;j;k;l]
+    | TUPLE12 (a,b,c,d,e,g,h,i,j,k,l,m) -> List.iter f [a;b;c;d;e;g;h;i;j;k;l;m]
+    | TUPLE13 (a,b,c,d,e,g,h,i,j,k,l,m,n) -> List.iter f [a;b;c;d;e;g;h;i;j;k;l;m;n]
+    | TLIST xs -> List.iter f xs
+    | _ -> () in
+  collect tok;
+  if Hashtbl.length locals = 0 then tok
+  else begin
+    let mangle k x = Printf.sprintf "%s__%d__%s" label k x in
+    (* match a hierarchical reference `L[idx].field`; return (idx_tok, field) *)
+    let hier_ref ref3 ext =
+      let base_idx = match ref3 with
+        | TUPLE3 (STRING r3,
+                  TUPLE3 (STRING u, SymbolIdentifier base, _),
+                  TUPLE4 (STRING sd, _, idx, _))
+          when prefix_is "reference3" r3 && prefix_is "unqualified_id" u
+               && prefix_is "select_variable_dimension" sd && base = label ->
+            Some idx
+        | _ -> None in
+      let field = match ext with
+        | TUPLE3 (STRING he, _, TUPLE3 (STRING u, SymbolIdentifier f, _))
+          when prefix_is "hierarchy_extension" he && prefix_is "unqualified_id" u ->
+            Some f
+        | _ -> None in
+      match base_idx, field with
+      | Some idx, Some f when Hashtbl.mem locals f -> Some (idx, f)
+      | _ -> None in
+    (* map over immediate children, rebuilding the node *)
+    let rec map_tok g = function
+      | TUPLE2 (a,b) -> TUPLE2 (g a, g b)
+      | TUPLE3 (a,b,c) -> TUPLE3 (g a, g b, g c)
+      | TUPLE4 (a,b,c,d) -> TUPLE4 (g a, g b, g c, g d)
+      | TUPLE5 (a,b,c,d,e) -> TUPLE5 (g a, g b, g c, g d, g e)
+      | TUPLE6 (a,b,c,d,e,f) -> TUPLE6 (g a, g b, g c, g d, g e, g f)
+      | TUPLE7 (a,b,c,d,e,f,h) -> TUPLE7 (g a, g b, g c, g d, g e, g f, g h)
+      | TUPLE8 (a,b,c,d,e,f,h,i) -> TUPLE8 (g a, g b, g c, g d, g e, g f, g h, g i)
+      | TUPLE9 (a,b,c,d,e,f,h,i,j) -> TUPLE9 (g a, g b, g c, g d, g e, g f, g h, g i, g j)
+      | TUPLE10 (a,b,c,d,e,f,h,i,j,k) -> TUPLE10 (g a, g b, g c, g d, g e, g f, g h, g i, g j, g k)
+      | TUPLE11 (a,b,c,d,e,f,h,i,j,k,l) -> TUPLE11 (g a, g b, g c, g d, g e, g f, g h, g i, g j, g k, g l)
+      | TUPLE12 (a,b,c,d,e,f,h,i,j,k,l,m) -> TUPLE12 (g a, g b, g c, g d, g e, g f, g h, g i, g j, g k, g l, g m)
+      | TUPLE13 (a,b,c,d,e,f,h,i,j,k,l,m,n) -> TUPLE13 (g a, g b, g c, g d, g e, g f, g h, g i, g j, g k, g l, g m, g n)
+      | TLIST xs -> TLIST (List.map g xs)
+      | leaf -> leaf in
+    (* PASS 1: rewrite hierarchical refs L[k].field -> unqualified_id(mangle k field) *)
+    let rec rw_hier t = match t with
+      | TUPLE3 (STRING r2, ref3, ext) when prefix_is "reference2" r2 ->
+          (match hier_ref ref3 ext with
+           | Some (idx, f) ->
+               (match eval_idx idx with
+                | Some k ->
+                    TUPLE3 (STRING "unqualified_id1",
+                            SymbolIdentifier (mangle k f), EMPTY_TOKEN)
+                | None -> map_tok rw_hier t)
+           | None -> map_tok rw_hier t)
+      | _ -> map_tok rw_hier t in
+    (* PASS 2: rename bare block-local decls/refs -> mangle v name *)
+    let rec rw_bare t = match t with
+      | SymbolIdentifier nm when Hashtbl.mem locals nm ->
+          SymbolIdentifier (mangle v nm)
+      | _ -> map_tok rw_bare t in
+    rw_bare (rw_hier tok)
+  end
+
 let rec prune_dead_generates scope tok =
   let take_branch cond_expr_opt branches =
     match cond_expr_opt with
@@ -650,6 +764,12 @@ let rec prune_dead_generates scope tok =
              in
              if still_live then begin
                let inst = subst_genvar name !v body in
+               let inst =
+                 match extract_block_label body with
+                 | Some label ->
+                     namespace_genblk_locals ~label ~v:!v
+                       ~eval_idx:(fun e -> resolve_int_in scope' e) inst
+                 | None -> inst in
                unrolled := prune_dead_generates scope' inst :: !unrolled;
                (* Advance v per step.  Pass scope' (which has the
                   current iteration's genvar value bound) so that
@@ -780,30 +900,6 @@ let rec prune_dead_generates scope tok =
 (* Pull the begin-label (if any) from a `begin_rule` node:
  *   begin1:    TUPLE3("begin1", Begin, label_opt)
  *   label_opt: TUPLE3("label_opt1", COLON, symbol_or_label) | EMPTY *)
-let extract_begin_label = function
-  | TUPLE3 (STRING t, _, lbl) when prefix_is "begin1" t ->
-      let ids = ref [] in
-      walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) lbl;
-      (match List.rev !ids with x :: _ -> Some x | _ -> None)
-  | _ -> None
-
-(* Pull the label from a `generate_block` shape:
- *   generate_block1: TUPLE4(tag, begin_rule, item_list, end_rule)
- *   generate_block2: TUPLE6(tag, label_id, COLON, Begin, item_list, end_rule)
- * Either returns the begin-label name or None when the block is
- * unlabeled. SV-2017 requires synthesis to use this label as a
- * hierarchical-name segment, e.g. `if (...) begin : non_leaf_node`
- * makes the contained `left_child` instance hierarchically known as
- * `non_leaf_node.left_child`. *)
-let extract_block_label = function
-  | TUPLE4 (STRING t, b, _, _) when prefix_is "generate_block1" t ->
-      extract_begin_label b
-  | TUPLE6 (STRING t, id_node, _, _, _, _) when prefix_is "generate_block2" t ->
-      let ids = ref [] in
-      walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) id_node;
-      (match List.rev !ids with x :: _ -> Some x | _ -> None)
-  | _ -> None
-
 (* Walk like walk_live but additionally maintain a stack of enclosing
  * generate-block labels. Calls `f label_stack node` on every visit.
  * The stack is in outer-to-inner order; `String.concat "."` over it

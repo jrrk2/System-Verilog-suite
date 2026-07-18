@@ -2714,6 +2714,19 @@ let extract_instances ~pkgs ~params tok =
                 | _ -> None)
            | _ -> None)
     in
+    (* Same int/string classification as base_overrides above: a plain
+       unbased decimal override (e.g. GTXE2 RX_SIG_VALID_DLY=10) is an
+       INTEGER parameter and must be emitted as EDIF (integer 10).  Left in
+       param_strs it reaches bir_to_edif.edif_property_value, whose all-0/1
+       heuristic re-reads "10" as the binary literal 2'b10 (=2) and silently
+       corrupts the transceiver config.  Based literals ("'h3202", "'b0")
+       keep their apostrophe here so int_of_string_opt rejects them -> they
+       stay source-style strings for the INIT path. *)
+    let base_param_ints, base_param_strs =
+      List.fold_left (fun (iv, sv) (name, s) ->
+        match int_of_string_opt s with
+        | Some i -> ((name, i) :: iv, sv)
+        | None   -> (iv, (name, s) :: sv)) ([], []) base_param_strs in
     List.filter_map (fun in_ ->
       let inst_name = ref None in
       let port_conns = ref [] in
@@ -2806,7 +2819,7 @@ let extract_instances ~pkgs ~params tok =
                  source-string param_strs -- the silicon-validated fix-18
                  extraction) take priority; origin's string-only extraction is
                  appended (List.assoc takes the first match, dups benign). *)
-              param_values = base_pvals;
+              param_values = base_pvals @ base_param_ints;
               param_strs = base_pstrs @ base_param_strs;
               port_connections = List.rev !port_conns;
             }
@@ -4357,6 +4370,195 @@ let convert_module ~pkgs (mdecl : module_decl)
         }
     ) function_decls
   in
+  (* ── Nonzero-lsb packed-range normalisation ──────────────────────────
+     Vivado post-synth netlists declare sliced-bus remnants like
+     `wire [3:3] \^b ;` — width 1, base offset 3 — drive them WHOLE
+     (`.O(\^b )`) and read them indexed (`\^b [3]`).  BInt keeps only the
+     width, so the read would select bit 3 of a 1-bit net → constant 0
+     (found by the Vivado↔SVS cross-flow miter: rand_1's `b` cone).
+     Record each declared name's nonzero base offset and rebase indexed
+     reads onto bit 0.  Gated on the table being non-empty — ordinary
+     [N:0] designs are untouched. *)
+  let range_offsets : (string, int) Hashtbl.t = Hashtbl.create 8 in
+  let decl_nodes = collect_by (has_tag (fun t ->
+    prefix_is "net_declaration" t || prefix_is "data_declaration" t))
+    mdecl.m_body in
+  List.iter (fun dn ->
+    match extract_range ~pkgs ~params dn with
+    | Some (m, l) when min m l <> 0 ->
+        let off = min m l in
+        let names = ref [] in
+        walk (function
+          | TUPLE3 (STRING t, SymbolIdentifier nm, _)
+            when prefix_is "net_variable" t
+                 || prefix_is "register_variable" t -> names := nm :: !names
+          | TUPLE4 (STRING t, SymbolIdentifier nm, _, _)
+            when prefix_is "net_decl_assign" t -> names := nm :: !names
+          | _ -> ()) dn;
+        List.iter (fun nm -> Hashtbl.replace range_offsets nm off) !names
+    | _ -> ()) decl_nodes;
+  let signals, processes, instances =
+    if Hashtbl.length range_offsets = 0 then signals, processes, instances
+    else begin
+      let off_of x = Hashtbl.find_opt range_offsets x in
+      let rec rb e = match e with
+        | BSlice { signal = BVar x; msb; lsb } when off_of x <> None ->
+            let o = Option.get (off_of x) in
+            BSlice { signal = BVar x; msb = msb - o; lsb = lsb - o }
+        | BSelect { array = BVar x; index = BConst { value; width } }
+          when off_of x <> None ->
+            let o = Option.get (off_of x) in
+            BSelect { array = BVar x;
+                      index = BConst { value = Z.sub value (Z.of_int o); width } }
+        | BVar _ | BConst _ -> e
+        | BBinOp r -> BBinOp { r with lhs = rb r.lhs; rhs = rb r.rhs }
+        | BUnOp r -> BUnOp { r with operand = rb r.operand }
+        | BSelect r -> BSelect { array = rb r.array; index = rb r.index }
+        | BSlice r -> BSlice { r with signal = rb r.signal }
+        | BConcat es -> BConcat (List.map rb es)
+        | BReplicate r -> BReplicate { r with value = rb r.value }
+        | BCond r -> BCond { condition = rb r.condition;
+                             then_val = rb r.then_val; else_val = rb r.else_val }
+        | BCall r -> BCall { r with args = List.map rb r.args } in
+      let rec rbs s = match s with
+        | BAssign r -> BAssign { r with rhs = rb r.rhs }
+        | BIf r -> BIf { condition = rb r.condition;
+                         then_stmts = List.map rbs r.then_stmts;
+                         else_stmts = List.map rbs r.else_stmts }
+        | BCase r -> BCase { selector = rb r.selector;
+                             cases = List.map (fun (g, b) -> (rb g, List.map rbs b)) r.cases;
+                             default = List.map rbs r.default }
+        | BWhile r -> BWhile { condition = rb r.condition; body = List.map rbs r.body }
+        | BFor r -> BFor { init = rbs r.init; condition = rb r.condition;
+                           update = rbs r.update; body = List.map rbs r.body }
+        | BBlock b -> BBlock (List.map rbs b)
+        | BCallStmt r -> BCallStmt { r with args = List.map rb r.args }
+        | BReturn eo -> BReturn (Option.map rb eo) in
+      (signals,
+       List.map (function
+         | BCombinational r -> BCombinational { r with body = List.map rbs r.body }
+         | BSequential r -> BSequential { r with body = List.map rbs r.body })
+         processes,
+       List.map (fun (i : binstance) ->
+         { i with port_connections =
+                    List.map (fun (p, e) -> (p, rb e)) i.port_connections })
+         instances)
+    end in
+  (* ── Declared-`signed` recovery + sign-extension normalisation ───────
+     `input signed wire4; reg [1:0] r; … r <= wire4;` must SIGN-extend
+     (r = {wire4,wire4}); every decl site above hardcodes Unsigned, so the
+     qualifier was lost and downstream encoders zero-extended (found by the
+     Vivado↔SVS cross-flow miter on yosys dff_init).  Recover `signed` from
+     the decl CST (any port/net/data decl node containing a Signed token),
+     mark the signals, and normalise assignments whose RHS is a signed
+     expression narrower than the LHS by MATERIALISING the extension at BIR
+     level ({{n{x[msb]}},x} via Behavioral_const.sign_extend) — encoder-
+     agnostic, so the Z3 miter AND the gate_map netlist are both fixed.
+     Signed div/mod and signed comparisons are NOT yet handled (audit P1g). *)
+  let signed_names : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+  let sdecl_nodes = collect_by (has_tag (fun t ->
+    prefix_is "module_port_declaration" t || prefix_is "port_declaration" t
+    || prefix_is "net_declaration" t || prefix_is "data_declaration" t
+    || prefix_is "tf_port_declaration" t)) mdecl.m_body in
+  List.iter (fun dn ->
+    let has_signed = ref false in
+    walk (function Signed -> has_signed := true | _ -> ()) dn;
+    if !has_signed then begin
+      let rec collect t = match t with
+        | TUPLE6 (STRING t', _, _, _, _, _)
+          when prefix_is "decl_variable_dimension" t'
+            || prefix_is "select_variable_dimension" t' -> ()
+        | TUPLE4 (STRING t', _, _, _)
+          when prefix_is "decl_variable_dimension" t'
+            || prefix_is "select_variable_dimension" t' -> ()
+        | TUPLE4 (STRING t', SymbolIdentifier id, _, _)
+          when prefix_is "net_decl_assign" t' ->
+            Hashtbl.replace signed_names id ()
+        | SymbolIdentifier id -> Hashtbl.replace signed_names id ()
+        | TUPLE2 (a,b) -> collect a; collect b
+        | TUPLE3 (a,b,c) -> collect a; collect b; collect c
+        | TUPLE4 (a,b,c,d) -> collect a; collect b; collect c; collect d
+        | TUPLE5 (a,b,c,d,e) -> List.iter collect [a;b;c;d;e]
+        | TUPLE6 (a,b,c,d,e,f) -> List.iter collect [a;b;c;d;e;f]
+        | TUPLE7 (a,b,c,d,e,f,g) -> List.iter collect [a;b;c;d;e;f;g]
+        | TUPLE8 (a,b,c,d,e,f,g,h) -> List.iter collect [a;b;c;d;e;f;g;h]
+        | TLIST xs -> List.iter collect xs
+        | _ -> ()
+      in
+      collect dn
+    end) sdecl_nodes;
+  let signals, processes =
+    if Hashtbl.length signed_names = 0 then signals, processes
+    else begin
+      let signals = List.map (fun (s : bsignal) ->
+        if Hashtbl.mem signed_names s.name then
+          match s.stype with
+          | BInt { width; _ } -> { s with stype = BInt { width; signed = Signed } }
+          | _ -> s
+        else s) signals in
+      let widths : (string, int) Hashtbl.t = Hashtbl.create 32 in
+      List.iter (fun (s : bsignal) ->
+        match s.stype with
+        | BInt { width; _ } -> Hashtbl.replace widths s.name width
+        | _ -> ()) signals;
+      let is_signed_sig n =
+        Hashtbl.mem signed_names n && Hashtbl.mem widths n in
+      (* LRM signedness of an expression: signed var; arith/bitwise op of
+         all-signed operands; ?: of signed branches.  Part-selects, concats,
+         replications and comparisons are UNSIGNED. *)
+      let rec expr_signed = function
+        | BVar n -> is_signed_sig n
+        | BBinOp { op = (BAdd|BSub|BMul|BAnd|BOr|BXor); lhs; rhs; _ } ->
+            expr_signed lhs && expr_signed rhs
+        | BUnOp { op = (BNot|BNeg); operand; _ } -> expr_signed operand
+        | BCond { then_val; else_val; _ } ->
+            expr_signed then_val && expr_signed else_val
+        | BCall { func = "@signed"; _ } -> true
+        | _ -> false in
+      (* Push the assignment-context width INTO the expression (extending
+         the RESULT of a narrower binop is not the same as extending its
+         operands first — carries), sign-extending at the leaves. *)
+      let rec widen to_w e = match e with
+        | BBinOp ({ op = (BAdd|BSub|BMul|BAnd|BOr|BXor); _ } as r) ->
+            BBinOp { r with lhs = widen to_w r.lhs; rhs = widen to_w r.rhs;
+                     result_type = BInt { width = to_w; signed = Signed } }
+        | BUnOp ({ op = (BNot|BNeg); _ } as r) ->
+            BUnOp { r with operand = widen to_w r.operand;
+                    result_type = BInt { width = to_w; signed = Signed } }
+        | BCond r -> BCond { r with then_val = widen to_w r.then_val;
+                                    else_val = widen to_w r.else_val }
+        | _ ->
+            (match Behavioral_const.width_of_expr_with widths e with
+             | Some w when w < to_w && w > 0 ->
+                 Behavioral_const.sign_extend ~from_w:w ~to_w e
+             | _ -> e) in
+      let fix_assign lhs rhs =
+        match Hashtbl.find_opt widths lhs with
+        | Some lw when expr_signed rhs ->
+            (match Behavioral_const.width_of_expr_with widths rhs with
+             | Some rw when rw < lw && rw > 0 -> Some (widen lw rhs)
+             | _ -> None)
+        | _ -> None in
+      let rec fs s = match s with
+        | BAssign r ->
+            (match fix_assign r.lhs r.rhs with
+             | Some rhs' -> BAssign { r with rhs = rhs' }
+             | None -> s)
+        | BIf r -> BIf { r with then_stmts = List.map fs r.then_stmts;
+                                else_stmts = List.map fs r.else_stmts }
+        | BCase r -> BCase { r with cases = List.map (fun (g,b) ->
+                                      (g, List.map fs b)) r.cases;
+                                    default = List.map fs r.default }
+        | BWhile r -> BWhile { r with body = List.map fs r.body }
+        | BFor r -> BFor { r with body = List.map fs r.body }
+        | BBlock b -> BBlock (List.map fs b)
+        | _ -> s in
+      let processes = List.map (function
+        | BCombinational r -> BCombinational { r with body = List.map fs r.body }
+        | BSequential r -> BSequential { r with body = List.map fs r.body })
+        processes in
+      signals, processes
+    end in
   {
     name = mdecl.m_name;
     params = [];
