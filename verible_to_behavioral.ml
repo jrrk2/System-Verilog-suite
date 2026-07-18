@@ -2428,20 +2428,87 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
           | _ -> ()
         in
         go items; List.rev !acc in
-      let cases, default =
-        List.fold_left (fun (cs, def) ci ->
+      (* casez/casex WILDCARD labels (15'b100_0001_0???_0000): the plain
+         path lowered `?` as 0, turning the pattern into an exact compare
+         that (almost) never matches — framing_top's whole register-read
+         mux returned the default 0 on silicon.  Detect wildcard digits
+         and lower the ENTIRE case to a priority if-chain of masked
+         compares ((sel & mask) == value), preserving arm order. *)
+      let wildcard_of key =
+        let found = ref None in
+        walk (function
+          | TUPLE3 (STRING t', base, digits)
+            when prefix_is "bin_based_number" t' && !found = None ->
+              let btxt = (match base with TK_BinBase s -> s | _ -> "") in
+              let dtxt = ref "" in
+              walk (function
+                | TK_BinDigits n -> dtxt := !dtxt ^ n
+                | _ -> ()) digits;
+              let ds = String.concat "" (String.split_on_char '_' !dtxt) in
+              if ds <> ""
+                 && String.exists (fun c ->
+                      c = '?' || c = 'z' || c = 'Z' || c = 'x' || c = 'X') ds
+              then begin
+                let w = match String.index_opt btxt '\'' with
+                  | Some i ->
+                      (try int_of_string (String.sub btxt 0 i)
+                       with _ -> String.length ds)
+                  | None -> String.length ds in
+                let v = ref Z.zero and m = ref Z.zero in
+                String.iter (fun c ->
+                  v := Z.shift_left !v 1; m := Z.shift_left !m 1;
+                  match c with
+                  | '0' -> m := Z.logor !m Z.one
+                  | '1' -> v := Z.logor !v Z.one; m := Z.logor !m Z.one
+                  | _ -> ()) ds;
+                found := Some (!v, !m, w)
+              end
+          | _ -> ()) key;
+        !found in
+      let arms =    (* (cond-info, body) in source order; None key = default *)
+        List.filter_map (fun ci ->
           match ci with
           | TUPLE4 (STRING t, key, _colon, body) when prefix_is "case_item" t ->
-              if prefix_is "case_item2" t then
-                (* `default:` arm. *)
-                (cs, [recurse_s body])
-              else
-                let k = recurse_e key in
-                let b = [recurse_s body] in
-                (cs @ [(k, b)], def)
-          | _ -> (cs, def)
-        ) ([], []) case_items in
-      BCase { selector = sel; cases; default }
+              if prefix_is "case_item2" t then Some (None, [recurse_s body])
+              else Some (Some (key, wildcard_of key), [recurse_s body])
+          | _ -> None) case_items in
+      let has_wild =
+        List.exists (function Some (_, Some _), _ -> true | _ -> false)
+          (List.map (fun (k, b) -> (k, b)) arms) in
+      if has_wild then begin
+        let bool_t = BBool in
+        let cond_of key = function
+          | Some (v, m, w) ->
+              BBinOp { op = BEq;
+                       lhs = BBinOp { op = BAnd; lhs = sel;
+                                      rhs = BConst { value = m; width = w };
+                                      result_type = BInt { width = w; signed = Unsigned } };
+                       rhs = BConst { value = v; width = w };
+                       result_type = bool_t }
+          | None ->
+              BBinOp { op = BEq; lhs = sel; rhs = recurse_e key;
+                       result_type = bool_t } in
+        let default_body =
+          match List.find_opt (fun (k, _) -> k = None) arms with
+          | Some (_, b) -> b | None -> [] in
+        let chain =
+          List.fold_right (fun (k, b) acc ->
+            match k with
+            | None -> acc                    (* default handled below *)
+            | Some (key, wc) ->
+                [BIf { condition = cond_of key wc;
+                       then_stmts = b; else_stmts = acc }])
+            arms default_body in
+        (match chain with [s] -> s | ss -> BBlock ss)
+      end else begin
+        let cases, default =
+          List.fold_left (fun (cs, def) (k, b) ->
+            match k with
+            | None -> (cs, b)
+            | Some (key, _) -> (cs @ [(recurse_e key, b)], def))
+            ([], []) arms in
+        BCase { selector = sel; cases; default }
+      end
   (* `seq_block1(begin1, TLIST [stmts], end)`. Verible's parser builds
    * the statement list with `TLIST ($2 :: lst)`, prepending each new
    * statement — so the TLIST is in *reverse* source order. We must
