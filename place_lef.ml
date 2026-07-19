@@ -421,20 +421,46 @@ let () =
      by default so the silicon-validated pinned placement is unchanged. *)
   let carry_spread =
     match Sys.getenv_opt "TOPO_CARRY_SPREAD" with Some v -> v <> "0" && v <> "" | None -> false in
+  (* Density CAP (TOPO_CARRY_MAX_PER_COL): fill columns in X order up to this many
+     carry slices, then move to the next.  First-fit in column order keeps carries
+     in a CONTIGUOUS band (short register-to-register datapaths -> timing) while
+     the cap keeps each column below the D-output (DMUX) switchbox-congestion
+     threshold that a ~full column hits.  Maximal spread (least-used column)
+     cleared congestion but SCATTERED carries over ~70 columns -> the 125 MHz eth
+     datapath fell to ~27 MHz.  Default cap gives a handful of contiguous columns. *)
+  let carry_max_per_col =
+    match Sys.getenv_opt "TOPO_CARRY_MAX_PER_COL" with
+    | Some v -> (try int_of_string v with _ -> 32)
+    | None -> 32 in
+  let sorted_cols =
+    lazy (List.sort compare (Hashtbl.fold (fun c _ acc -> c :: acc) slice_by_col [])) in
+  let col_used c =
+    Array.fold_left (fun a s -> if s.used then a + 1 else a) 0 (Hashtbl.find slice_by_col c) in
   let find_col_run len =
     if not carry_spread then begin
       let res = ref None in
       Hashtbl.iter (fun _c arr -> if !res = None then res := run_in_col arr len) slice_by_col;
       !res
     end else begin
-      let best = ref None and best_used = ref max_int in
-      Hashtbl.iter (fun _c arr ->
-          let uc = Array.fold_left (fun a s -> if s.used then a + 1 else a) 0 arr in
-          if uc < !best_used then
-            match run_in_col arr len with
-            | Some run -> best := Some run; best_used := uc
-            | None -> ()) slice_by_col;
-      !best
+      (* first column (by X) still under the density cap with a free run *)
+      let res = ref None in
+      List.iter (fun c ->
+          if !res = None && col_used c < carry_max_per_col then
+            match run_in_col (Hashtbl.find slice_by_col c) len with
+            | Some run -> res := Some run
+            | None -> ()) (Lazy.force sorted_cols);
+      (* every capped column full -> fall back to the least-used column *)
+      if !res = None then begin
+        let best = ref None and best_used = ref max_int in
+        Hashtbl.iter (fun _c arr ->
+            let uc = Array.fold_left (fun a s -> if s.used then a + 1 else a) 0 arr in
+            if uc < !best_used then
+              match run_in_col arr len with
+              | Some run -> best := Some run; best_used := uc
+              | None -> ()) slice_by_col;
+        res := !best
+      end;
+      !res
     end in
   List.iter (fun chain ->
       match find_col_run (List.length chain) with

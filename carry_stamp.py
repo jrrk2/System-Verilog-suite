@@ -119,6 +119,12 @@ def free_neighbour_lut_global(site):
         ns = f"SLICE_X{x+dx}Y{y+dy}"
         if _known_sites and ns not in _known_sites:
             continue
+        # A CARRY4 slice's 6LUT slots are reserved for its OWN S/DI buffers; do
+        # not borrow one for a neighbour's DIgnd const (dense contiguous packing
+        # -> the borrowed slot collides with that carry's S-buffer -> SLOT
+        # COLLISION).  carry_sites is populated below, before this is called.
+        if ns in carry_sites:
+            continue
         for sl in SLOT:
             bel = f"{ns}/{sl}6LUT"
             if bel not in occupied:
@@ -131,10 +137,13 @@ n_slut = 0
 n_ff = 0
 n_di = 0
 occupied = {}     # bel -> cellname, to catch slot collisions
+carry_sites = set()   # SLICE sites hosting a CARRY4 (their slots are reserved)
 for cn, c in cells.items():
     b = c.get("attributes", {}).get("BEL")
     if b:
         occupied[b] = cn
+        if b.endswith("/CARRY4"):
+            carry_sites.add(b.split("/")[0])
 
 def claim(bel, who):
     if bel in occupied and occupied[bel] != who:
@@ -429,6 +438,8 @@ def free_neighbour_lut(site):
     for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1)):
         ns = f"SLICE_X{x+dx}Y{y+dy}"
         if ns not in known_sites:
+            continue
+        if ns in carry_sites:   # reserve carry slices' slots for their own buffers
             continue
         for sl in SLOT:
             bel = f"{ns}/{sl}6LUT"
