@@ -1496,6 +1496,18 @@ let xil_unisims_dir =
   with Not_found ->
     "/opt/Xilinx/Vivado/2020.1/data/vhdl/src/unisims/primitive"
 
+(* Search directories for per-primitive `.vhd` entity interfaces.  The simple
+   primitives (SRL16E, RAM64M, MMCME2_ADV, BUFG, …) live in `primitive/`, but
+   the hard analog macros (GTXE2_CHANNEL/COMMON, PCIE, …) live in the sibling
+   `secureip/` directory.  Search BOTH so a GT's VHDL entity — the authoritative
+   source of its port directions and bus widths — actually resolves; otherwise
+   the net-usage heuristic guesses every GT pin as input, the genuine outputs
+   (CPLLLOCK, RXOUTCLK, …) orphan driverless, and nextpnr reports false
+   combinatorial loops.  Honours XIL_UNISIMS_VHD_DIR (its sibling secureip too). *)
+let xil_unisims_dirs =
+  let sib sub = Filename.concat (Filename.dirname xil_unisims_dir) sub in
+  [ xil_unisims_dir; sib "secureip" ]
+
 let xil_primitive_cache :
     (string, Behavioral_ir.library_port list) Hashtbl.t =
   Hashtbl.create 256
@@ -1572,9 +1584,11 @@ let lookup_xil_primitive_ports names :
     not (Hashtbl.mem xil_primitive_cache n
          || Hashtbl.mem xil_primitive_missing n)) dedup in
   let to_parse = List.filter_map (fun n ->
-    let p = Filename.concat xil_unisims_dir (n ^ ".vhd") in
-    if Sys.file_exists p then Some (n, p)
-    else
+    match List.find_map (fun d ->
+            let p = Filename.concat d (n ^ ".vhd") in
+            if Sys.file_exists p then Some p else None) xil_unisims_dirs with
+    | Some p -> Some (n, p)
+    | None ->
       (* No Vivado unisim .vhd on this machine — serve from the persistent JSON
          cache so the tool still resolves the interface. *)
       (match Hashtbl.find_opt (Lazy.force json_cache) n with
@@ -1619,9 +1633,11 @@ let lookup_xil_primitive_impl names :
     not (Hashtbl.mem xil_primitive_impl_cache n
          || Hashtbl.mem xil_primitive_missing n)) dedup in
   let to_parse = List.filter_map (fun n ->
-    let p = Filename.concat xil_unisims_dir (n ^ ".vhd") in
-    if Sys.file_exists p then Some (n, p)
-    else
+    match List.find_map (fun d ->
+            let p = Filename.concat d (n ^ ".vhd") in
+            if Sys.file_exists p then Some p else None) xil_unisims_dirs with
+    | Some p -> Some (n, p)
+    | None ->
       (* No Vivado unisim .vhd on this machine — serve from the persistent JSON
          cache so the tool still resolves the interface. *)
       (match Hashtbl.find_opt (Lazy.force json_cache) n with

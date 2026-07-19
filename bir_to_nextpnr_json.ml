@@ -382,9 +382,185 @@ let dir_str : [< `Input | `Output | `Inout | `Internal ] -> string = function
   | `Inout    -> "inout"
   | `Internal -> "input"  (* unreachable for cells/ports; keeps types unified *)
 
+(* Collapse the identity-LUT6 buffer chain SVS's of_circuit inserts between a GT
+   SERIAL output pin (GTXE2_CHANNEL.GTXTXP/GTXTXN — an OPAD driver) and its
+   top-level output port.  That chain (INIT=64'hFFFFFFFF00000000, all six inputs
+   tied) is a nextpnr OUTMUX workaround: correct for FABRIC output ports, but on
+   a GT serial port nextpnr then auto-inserts an OBUF and binds it to the GT
+   serial OPAD -> "No Bel OPAD/.../OUTBUF".  Rewrite the GT pin to drive the port
+   net directly and drop the chain buffers, so constrain_gt binds GTXTXP->OPAD
+   with no fabric buffer.  Only chains that TERMINATE at a GT serial pin are
+   collapsed — the ~4000 legitimate fabric OUTMUX buffers are untouched — and the
+   test is STRUCTURAL (no sgmii_ port-name heuristic).  This is the upstream
+   equivalent of the removed build-script strip_gt_pins identity-chain pass and
+   mirrors bir_to_edif's ident-obuf bypass. *)
+let collapse_gt_serial (m : bmodule) : bmodule =
+  let key_of : bexpr -> (string * int) option = function
+    | BVar nm -> Some (nm, 0)
+    | BSlice { signal = BVar b; msb; lsb } when msb = lsb -> Some (b, lsb)
+    | BSelect { array = BVar b; index = BConst { value; _ } } -> Some (b, Z.to_int value)
+    | _ -> None in
+  let is_ident (i : binstance) =
+    String.equal i.module_name "LUT6"
+    && List.mem ("INIT", "64'hFFFFFFFF00000000") i.param_strs
+    && (match List.assoc_opt "I0" i.port_connections with
+        | Some i0 ->
+            List.for_all (fun p ->
+              match List.assoc_opt p i.port_connections with
+              | Some e -> e = i0 | None -> false) ["I1"; "I2"; "I3"; "I4"; "I5"]
+        | None -> false) in
+  let out_ports : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (s : bsignal) ->
+    if s.direction = `Output then Hashtbl.replace out_ports s.name ()) m.signals;
+  (* ident buffer indexed by its INPUT net key -> (inst_name, its output conn) *)
+  let by_in : (string * int, string * bexpr) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (i : binstance) ->
+    if is_ident i then
+      match List.assoc_opt "I0" i.port_connections,
+            List.assoc_opt "O" i.port_connections with
+      | Some i0, Some o ->
+          (match key_of i0 with Some k -> Hashtbl.replace by_in k (i.inst_name, o)
+                              | None -> ())
+      | _ -> ()) m.instances;
+  let drop : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  let rewrite : (string * string, bexpr) Hashtbl.t = Hashtbl.create 8 in
+  List.iter (fun (i : binstance) ->
+    if String.equal i.module_name "GTXE2_CHANNEL" then
+      List.iter (fun pin ->
+        match List.assoc_opt pin i.port_connections with
+        | Some conn ->
+            (* walk the ident chain forward from the GT pin to a terminal port *)
+            let rec walk k chain seen =
+              match Hashtbl.find_opt by_in k with
+              | Some (inst, out) when not (List.mem inst seen) ->
+                  (match key_of out with
+                   | Some ok when Hashtbl.mem out_ports (fst ok) ->
+                       Some (out, inst :: chain)
+                   | Some ok -> walk ok (inst :: chain) (inst :: seen)
+                   | None -> None)
+              | _ -> None in
+            (match key_of conn with
+             | Some k ->
+                 (match walk k [] [] with
+                  | Some (port_conn, chain) ->
+                      Hashtbl.replace rewrite (i.inst_name, pin) port_conn;
+                      List.iter (fun n -> Hashtbl.replace drop n ()) chain
+                  | None -> ())
+             | None -> ())
+        | None -> ()) ["GTXTXP"; "GTXTXN"]) m.instances;
+  if Hashtbl.length rewrite = 0 then m
+  else
+    let instances =
+      List.filter_map (fun (i : binstance) ->
+        if Hashtbl.mem drop i.inst_name then None
+        else if String.equal i.module_name "GTXE2_CHANNEL" then
+          Some { i with port_connections =
+            List.map (fun (pin, conn) ->
+              match Hashtbl.find_opt rewrite (i.inst_name, pin) with
+              | Some pc -> (pin, pc) | None -> (pin, conn)) i.port_connections }
+        else Some i) m.instances in
+    { m with instances }
+
+(* Bypass an identity-LUT6 buffer (INIT=64'hFFFFFFFF00000000, all six inputs
+   tied) sitting DIRECTLY on a clock-buffer output.  SVS's of_circuit inserts
+   these as an OUTMUX workaround, but on a CLOCK net it is disastrous: the
+   BUFG/BUFH/BUFR output (a real clock-network source) is re-driven onto a
+   FABRIC LUT, so its fanout (here rx_clk: 245 CK/WCLK pins) lands on general
+   routing and router2 cannot reach the far CLKINV inputs ("failed to find a
+   route using dedicated resources" -> SKIP_FAILED_ARCS).  Drop the buffer and
+   alias its readers back onto the clock-buffer net so the clock stays on the
+   dedicated network.  Reader-side (net alias), vs collapse_gt_serial's
+   driver-side rewrite; mirrors bir_to_edif's ident-obuf bypass. *)
+let bypass_clock_ident_buffers (m : bmodule) : bmodule =
+  let is_clock_buf t = List.mem t
+    ["BUFG"; "BUFGCTRL"; "BUFGCE"; "BUFH"; "BUFHCE"; "BUFR"; "BUFIO"; "BUFMR"] in
+  let key_of : bexpr -> (string * int) option = function
+    | BVar nm -> Some (nm, 0)
+    | BSlice { signal = BVar b; msb; lsb } when msb = lsb -> Some (b, lsb)
+    | BSelect { array = BVar b; index = BConst { value; _ } } -> Some (b, Z.to_int value)
+    | _ -> None in
+  let is_ident (i : binstance) =
+    String.equal i.module_name "LUT6"
+    && List.mem ("INIT", "64'hFFFFFFFF00000000") i.param_strs
+    && (match List.assoc_opt "I0" i.port_connections with
+        | Some i0 ->
+            List.for_all (fun p ->
+              match List.assoc_opt p i.port_connections with
+              | Some e -> e = i0 | None -> false) ["I1"; "I2"; "I3"; "I4"; "I5"]
+        | None -> false) in
+  (* top-level output port names: an identity buffer that drives a clock-forward
+     OUTPUT PORT is the legitimate OUTMUX case -- keep it (dropping it would leave
+     the port undriven / on fabric anyway). *)
+  let out_ports : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (s : bsignal) ->
+    if s.direction = `Output then Hashtbl.replace out_ports s.name ()) m.signals;
+  (* clock_src: net key -> the ROOT clock-buffer output expr that (transitively,
+     through identity buffers) drives it.  Seed with every clock-buffer O pin. *)
+  let clock_src : (string * int, bexpr) Hashtbl.t = Hashtbl.create 32 in
+  List.iter (fun (i : binstance) ->
+    if is_clock_buf i.module_name then
+      match List.assoc_opt "O" i.port_connections with
+      | Some o -> (match key_of o with Some k -> Hashtbl.replace clock_src k o | None -> ())
+      | None -> ()) m.instances;
+  let drop : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  let alias : (string * int, bexpr) Hashtbl.t = Hashtbl.create 16 in
+  (* Iterate to a fixpoint: the recovered clock is forwarded through a CHAIN of
+     these buffers (rx_clk -> eth_clk -> ...), so bypassing one exposes the next.
+     Each dropped buffer aliases its output to the chain's ROOT clock net. *)
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter (fun (i : binstance) ->
+      if is_ident i && not (Hashtbl.mem drop i.inst_name) then
+        match List.assoc_opt "I0" i.port_connections,
+              List.assoc_opt "O" i.port_connections with
+        | Some i0, Some o ->
+            (match key_of i0, key_of o with
+             | Some ik, Some ok
+               when Hashtbl.mem clock_src ik && not (Hashtbl.mem out_ports (fst ok)) ->
+                 let root = Hashtbl.find clock_src ik in
+                 Hashtbl.replace drop i.inst_name ();
+                 Hashtbl.replace alias ok root;
+                 Hashtbl.replace clock_src ok root;
+                 changed := true
+             | _ -> ())
+        | _ -> ()) m.instances
+  done;
+  if Hashtbl.length alias = 0 then m
+  else begin
+    let repl e = match key_of e with
+      | Some k -> (match Hashtbl.find_opt alias k with Some r -> Some r | None -> None)
+      | None -> None in
+    let rec rw e =
+      match repl e with
+      | Some r -> r
+      | None ->
+        (match e with
+         | BVar _ | BConst _ -> e
+         | BSlice { signal; msb; lsb } -> BSlice { signal = rw signal; msb; lsb }
+         | BSelect { array; index } -> BSelect { array = rw array; index = rw index }
+         | BConcat es -> BConcat (List.map rw es)
+         | BReplicate { count; value } -> BReplicate { count; value = rw value }
+         | BBinOp { op; lhs; rhs; result_type } ->
+             BBinOp { op; lhs = rw lhs; rhs = rw rhs; result_type }
+         | BUnOp { op; operand; result_type } ->
+             BUnOp { op; operand = rw operand; result_type }
+         | BCond { condition; then_val; else_val } ->
+             BCond { condition = rw condition; then_val = rw then_val; else_val = rw else_val }
+         | BCall { func; args } -> BCall { func; args = List.map rw args }) in
+    let instances =
+      List.filter_map (fun (i : binstance) ->
+        if Hashtbl.mem drop i.inst_name then None
+        else Some { i with port_connections =
+          List.map (fun (p, e) -> (p, rw e)) i.port_connections }) m.instances in
+    { m with instances }
+  end
+
 let yosys_json
     ~(library_cells : (string * library_port list) list)
     (m : bmodule) : Yojson.Safe.t =
+  let m = collapse_gt_serial m in
+  let m = bypass_clock_ident_buffers m in
   let ctx = mk_ctx () in
   populate_widths ctx m;
   (* GND/VCC CELL instances are skipped below — bind their output nets to
@@ -411,6 +587,31 @@ let yosys_json
   let port_dirs = port_dir_table library_cells in
   let port_widths = port_width_table library_cells in
 
+  (* nextpnr-xilinx auto-inserts GND/VCC tie cells, so we drop ours below. *)
+  let is_skipped_cell = function "GND" | "VCC" -> true | _ -> false in
+  (* No silent input-default.  The netlist is flattened here (post
+     flatten_struct), so every instance is a primitive.  A pin with no resolved
+     direction — absent from the Xilinx baseline, library_cells, AND the unisim
+     VHD interface — must NOT be guessed as input: that is exactly what emitted
+     every GTXE2 OUTPUT (CPLLLOCK, RXOUTCLK, …) as an input, orphaning its net
+     and producing false nextpnr combinatorial loops.  Fail loudly, naming the
+     primitive.port pairs, so the fix (add its VHD interface — primitive/ or
+     secureip/) is unambiguous. *)
+  let unresolved =
+    List.concat_map (fun (i : binstance) ->
+      if is_skipped_cell i.module_name then []
+      else List.filter_map (fun (pin, _) ->
+        if Hashtbl.mem port_dirs (i.module_name, pin) then None
+        else Some (i.module_name ^ "." ^ pin)) i.port_connections) m.instances
+    |> List.sort_uniq compare in
+  if unresolved <> [] then
+    failwith (Printf.sprintf
+      "bir_to_nextpnr_json %s: unresolved primitive port directions — no Xilinx \
+       baseline, library_cell, or unisim VHD interface entry for: %s. Guessing \
+       these as inputs orphans real outputs and yields false nextpnr \
+       combinatorial loops; supply the primitive's VHD interface."
+      m.name (String.concat ", " unresolved));
+
   (* Pre-allocate net ids for top-level ports so they are stable.
      For vector ports, we allocate one id per bit. *)
   (* `__keep_<net>` outputs are synthetic retention handles added by
@@ -430,10 +631,10 @@ let yosys_json
     end
   ) m.signals;
 
-  (* nextpnr-xilinx auto-inserts GND/VCC tie cells, so we drop ours to
-     avoid multi-driver conflicts.  The constants are already represented
-     as the "0"/"1" string tokens in any consumer's connections. *)
-  let is_skipped_cell = function "GND" | "VCC" -> true | _ -> false in
+  (* nextpnr-xilinx auto-inserts GND/VCC tie cells, so we drop ours (above,
+     is_skipped_cell) to avoid multi-driver conflicts.  The constants are
+     already represented as the "0"/"1" string tokens in any consumer's
+     connections. *)
   let cells = List.filter_map (fun (i : binstance) ->
     if is_skipped_cell i.module_name then None else Some (
     (* port direction lookup: per-cell port_name -> input/output *)
@@ -448,11 +649,18 @@ let yosys_json
      * chain, even ones whose top O bits have no consumers in the RTL. *)
     let pad_bits_to_width pin bits =
       let actual = List.length bits in
-      let declared =
-        try Hashtbl.find port_widths (i.module_name, pin)
-        with Not_found -> actual
+      let found, declared =
+        try true, Hashtbl.find port_widths (i.module_name, pin)
+        with Not_found -> false, actual
       in
-      if actual >= declared then bits
+      if found && actual > declared && dir_of_pin pin <> `Output then
+        (* Clamp an over-wide INPUT connection down to the pin's declared
+           width: a 32-bit const param bound to a narrow config pin (GTXE2
+           LOOPBACK is [2:0]; C_GT_LOOPBACK arrives 32-bit const-0) leaves
+           LOOPBACK[3..] with no wire on the bel -> nextpnr router error
+           "No wire found for port LOOPBACK3".  Match bir_to_edif's clamp. *)
+        List.filteri (fun k _ -> k < declared) bits
+      else if actual >= declared then bits
       else
         let pad_count = declared - actual in
         let pads = List.init pad_count (fun _ ->
@@ -488,8 +696,20 @@ let yosys_json
     let int_to_bin32 (n : int) =
       String.init 32 (fun i ->
         if (n lsr (31 - i)) land 1 = 1 then '1' else '0') in
+    (* A double-quoted value is a STRING-enum parameter (MMCM COMPENSATION,
+       BANDWIDTH, GT *_CFG strings, …): emit it BARE, the way yosys' write_json
+       does, so nextpnr's `str_or_default` compares the raw token.  Keeping the
+       Verilog quotes makes the value literally `"ZHOLD"` (7 chars) which never
+       equals nextpnr's `ZHOLD` -> "unsupported COMPENSATION type '"ZHOLD"'".
+       Non-quoted values still go through verilog_lit_to_binary (sized literals
+       -> bit strings; plain reals/ints pass through). *)
+    let param_str_value s =
+      let s = String.trim s in
+      let n = String.length s in
+      if n >= 2 && s.[0] = '"' && s.[n - 1] = '"' then String.sub s 1 (n - 2)
+      else verilog_lit_to_binary s in
     let params =
-      List.map (fun (k, s) -> k, `String (verilog_lit_to_binary s)) i.param_strs
+      List.map (fun (k, s) -> k, `String (param_str_value s)) i.param_strs
       @ List.map (fun (k, n) -> k, `String (int_to_bin32 n)) i.param_values
     in
     (* Cells instantiated WITHOUT #() params (Vivado netlists rely on

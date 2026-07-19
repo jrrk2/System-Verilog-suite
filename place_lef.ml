@@ -399,23 +399,43 @@ let () =
   List.iter (fun c -> if is_root c then begin
       let rec walk c acc = match next_of c with Some n -> walk n (n :: acc) | None -> List.rev acc in
       chains := (c :: walk c []) :: !chains end) carry_cells;
-  let find_col_run len =
-    let res = ref None in
-    Hashtbl.iter (fun _c arr ->
-        if !res = None then begin
-          let n = Array.length arr in
-          let i = ref 0 in
-          while !res = None && !i + len <= n do
-            let ok = ref true and consec = ref true in
-            for k = 0 to len - 1 do
-              if arr.(!i + k).used then ok := false;
-              if k > 0 && arr.(!i + k).sy <> arr.(!i + k - 1).sy + 1 then consec := false
-            done;
-            if !ok && !consec then res := Some (Array.sub arr !i len);
-            incr i
-          done
-        end) slice_by_col;
+  (* find the first free consecutive vertical run of `len` slices in column arr *)
+  let run_in_col arr len =
+    let n = Array.length arr and res = ref None and i = ref 0 in
+    while !res = None && !i + len <= n do
+      let ok = ref true and consec = ref true in
+      for k = 0 to len - 1 do
+        if arr.(!i + k).used then ok := false;
+        if k > 0 && arr.(!i + k).sy <> arr.(!i + k - 1).sy + 1 then consec := false
+      done;
+      if !ok && !consec then res := Some (Array.sub arr !i len);
+      incr i
+    done;
     !res in
+  (* TOPO_CARRY_SPREAD: load-balance carry chains across columns instead of
+     first-fit (which fills each column to ~95% before moving on -> all 285
+     carries land in 3 columns whose D-output (DMUX) switchbox routing then
+     saturates: 128 overused DMUX wires, unroutable).  Pick the column with a
+     free run that currently holds the FEWEST used slices, so carries (and the
+     carry_stamp LUTs that fill their slices) stay sparse per column.  Gated off
+     by default so the silicon-validated pinned placement is unchanged. *)
+  let carry_spread =
+    match Sys.getenv_opt "TOPO_CARRY_SPREAD" with Some v -> v <> "0" && v <> "" | None -> false in
+  let find_col_run len =
+    if not carry_spread then begin
+      let res = ref None in
+      Hashtbl.iter (fun _c arr -> if !res = None then res := run_in_col arr len) slice_by_col;
+      !res
+    end else begin
+      let best = ref None and best_used = ref max_int in
+      Hashtbl.iter (fun _c arr ->
+          let uc = Array.fold_left (fun a s -> if s.used then a + 1 else a) 0 arr in
+          if uc < !best_used then
+            match run_in_col arr len with
+            | Some run -> best := Some run; best_used := uc
+            | None -> ()) slice_by_col;
+      !best
+    end in
   List.iter (fun chain ->
       match find_col_run (List.length chain) with
       | Some run -> List.iteri (fun k c -> bind (Hashtbl.find name2id c.Pack_to_lef.pc_name) run.(k)) chain

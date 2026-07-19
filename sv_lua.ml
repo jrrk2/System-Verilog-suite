@@ -1365,7 +1365,23 @@ let lflatten_z3 prog_h top =
 let lflatten_struct prog_h top =
   let _, p = find_prog prog_h in
   let m = Behavioral_hier_struct.flatten_structural p ~top in
-  hadd (Netlist (top, m, p.library_cells))
+  (* library_cells is captured at parse time; later passes that SYNTHESISE new
+     primitive instances — memlower turns an async-read memory into RAM32X1D,
+     srl_infer emits SRL16E/SRLC32E — introduce cell TYPES absent from it.  Top
+     it up from the same authoritative VHD-interface lookup (primitive/ +
+     secureip/) so every primitive in the flat netlist has known port
+     directions/widths; otherwise the structural emitters must guess an input
+     for every pin (orphaning outputs -> false nextpnr combinatorial loops) —
+     which they now refuse to do, bombing instead.  Memoised: already-resolved
+     types (LUT/FF/CARRY4/GT/…) cost nothing. *)
+  let covered = List.map fst p.library_cells in
+  let missing =
+    List.fold_left (fun acc (i : Behavioral_ir.binstance) ->
+      let mn = i.module_name in
+      if mn = "GND" || mn = "VCC" || List.mem mn covered || List.mem mn acc
+      then acc else mn :: acc) [] m.instances |> List.rev in
+  let lc = p.library_cells @ Vhdl_to_behavioral.lookup_xil_primitive_ports missing in
+  hadd (Netlist (top, m, lc))
 
 (* Read a nextpnr-xilinx routed JSON (post-pack/place/route) and reconstruct
    a UNISIM-primitive Netlist handle (un-packing SLICE_LUTX/SLICE_FFX/... via

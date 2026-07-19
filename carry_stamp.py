@@ -169,17 +169,29 @@ for cn, c in list(cells.items()):
         is_gnd = is_gnd_bit(sb)
         is_vcc = is_vcc_bit(sb)
         if d is not None and d[1].startswith("LUT"):
-            # LUT-driven: stamp that S-LUT into the slot
-            claim(slot6, d[0])
-            cells[d[0]].setdefault("attributes", {})["BEL"] = slot6
-            ic = cells[d[0]].get("connections", {})
-            for pp in ("I0", "I1", "I2", "I3", "I4", "I5"):
-                v = ic.get(pp, [])
-                if v and is_int(v[0]):
-                    slot_in[k] = v[0]
-                    break
-            n_slut += 1
-            continue
+            # LUT-driven: stamp that S-LUT into THIS carry's slot -- but only if
+            # the driving LUT is not already committed to a DIFFERENT slot.  A
+            # net feeding S of several carries (e.g. a place_lef $feedthrough
+            # relay, or a shared compare term) has one driver LUT; CARRY4.S[k] is
+            # a DEDICATED same-slice connection (only this slice's slot-LUT O6
+            # reaches it), so a single LUT cannot serve two carries.  When the
+            # LUT is already placed elsewhere, fall through to insert a per-slice
+            # identity buffer here (fed by the net through general routing) --
+            # otherwise the second carry's S input is sourced from a remote slice
+            # and nextpnr cannot route it (X..Y1/A6LUT_O6 -> X..Y9/A6LUT_O6).
+            cur_bel = cells[d[0]].get("attributes", {}).get("BEL")
+            if cur_bel in (None, slot6) and occupied.get(slot6) in (None, d[0]):
+                claim(slot6, d[0])
+                cells[d[0]].setdefault("attributes", {})["BEL"] = slot6
+                ic = cells[d[0]].get("connections", {})
+                for pp in ("I0", "I1", "I2", "I3", "I4", "I5"):
+                    v = ic.get(pp, [])
+                    if v and is_int(v[0]):
+                        slot_in[k] = v[0]
+                        break
+                n_slut += 1
+                continue
+            # else: shared S driver already placed -> buffer locally (below).
         maxbit += 1
         onet = maxbit
         bufname = f"{cn}$Srt${k}"
