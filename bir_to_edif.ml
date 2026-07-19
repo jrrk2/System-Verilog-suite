@@ -337,35 +337,36 @@ let write_edif
           List.map (fun (p : library_port) ->
             p.port_name, p.port_direction, p.port_width) ports
       | [] -> [] in
-    match Hashtbl.find_opt (Lazy.force xil_json_ports) t with
-    | Some l when l <> [] ->
-        (* Authoritative Vivado interface — use EXACTLY (correct widths and
-           directions).  Do NOT bump from connected widths: a single malformed
-           connection (e.g. a gate-map LUT6.I0 with 31 bits) must not widen the
-           declared scalar pin; the per-pin clamp downstream truncates it. *)
-        l
-    | _ ->
-        (* Fallback for primitives absent from the JSON: library_cells / VHDL /
-           hardcoded, bumped to the connected width and unioned with any
-           connected port they omit, so the interface is complete enough to
-           link. *)
-        let base0 = match from_lib, from_hard with
-          | Some l, _ -> l
-          | None, Some l -> l
-          | None, None -> from_vhdl () in
+    (* Authoritative declared interface: the Vivado xil_primitive_ports JSON,
+       else the primitive's VHD entity (via library_cells).  Both give the EXACT
+       bus widths -- use them without bumping to the connected width: a 32-bit
+       const bound to a narrow GT pin (C_GT_LOOPBACK -> LOOPBACK[2:0]) must NOT
+       widen the pin to LOOPBACK[31:0] (Vivado then rejects the invalid pins and
+       black-boxes the whole GTXE2_CHANNEL -> undriven CPLL_RESET LUTs).  The
+       downstream per-pin clamp truncates the over-wide connection instead. *)
+    let authoritative =
+      match Hashtbl.find_opt (Lazy.force xil_json_ports) t with
+      | Some l when l <> [] -> Some l
+      | _ -> from_lib in
+    let union_extra known =
+      match Hashtbl.find_opt connected_ports t with
+      | None -> []
+      | Some h ->
+          Hashtbl.fold (fun pn w acc ->
+            if List.mem pn known then acc else (pn, `Input, w) :: acc) h [] in
+    match authoritative with
+    | Some l -> l @ union_extra (List.map (fun (n, _, _) -> n) l)
+    | None ->
+        (* Truly unknown primitive: hardcoded table / VHDL-direct, bumped to the
+           connected width and unioned with any connected port they omit, so the
+           interface is complete enough to link. *)
+        let base0 = match from_hard with Some l -> l | None -> from_vhdl () in
         let conn_w pn =
           match Hashtbl.find_opt connected_ports t with
           | Some h -> (try Hashtbl.find h pn with Not_found -> 0)
           | None -> 0 in
         let base = List.map (fun (n, d, w) -> (n, d, max w (conn_w n))) base0 in
-        let known = List.map (fun (n, _, _) -> n) base in
-        let extra =
-          match Hashtbl.find_opt connected_ports t with
-          | None -> []
-          | Some h ->
-              Hashtbl.fold (fun pn w acc ->
-                if List.mem pn known then acc else (pn, `Input, w) :: acc) h [] in
-        base @ extra
+        base @ union_extra (List.map (fun (n, _, _) -> n) base)
   in
 
   (* ─── ELECTRICAL RULE CHECK ───────────────────────────────────────────

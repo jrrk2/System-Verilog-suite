@@ -1569,6 +1569,13 @@ let lwrite_mod_edif mod_h path =
  * oracle with LUT INIT parameters preserved correctly. *)
 let lwrite_netlist_edif net_h path =
   let _, m, lc = find_netlist net_h in
+  (* Apply the same structural collapses the nextpnr emitter does, so the EDIF
+     is legal for Vivado: drop the GT-serial identity-LUT chain (GTXTXP/GTXTXN
+     must drive a dedicated GT pad, not a fabric buffer/OBUF -> Vivado Place
+     30-713) and bypass the clock identity buffers (a fabric LUT driving 100s of
+     register clock pins -> Place 30-568 / global-signal congestion). *)
+  let m = Bir_to_nextpnr_json.collapse_gt_serial m in
+  let m = Bir_to_nextpnr_json.bypass_clock_ident_buffers m in
   Bir_to_edif.write_edif ~library_cells:lc ~path m;
   path
 
