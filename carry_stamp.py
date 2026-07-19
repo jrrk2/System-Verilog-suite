@@ -16,6 +16,13 @@ Usage: carry_stamp.py <ft_json> <bels> <out_json>
 import json, sys, os
 
 ft_json, bels_path, out_json = sys.argv[1], sys.argv[2], sys.argv[3]
+# CARRY_STAMP_AVOID_CI: don't use the DEDICATED incoming carry (CI = the
+# previous CARRY4.CO) as the don't-care local input for a const-forced S/DI LUT.
+# Reading it forces that CO onto general routing, where it collides with the
+# previous slice's sum O[k] on the single position-k output mux (DMUX
+# over-commit -> 128 unroutable nets).  Off by default so the silicon-validated
+# pinned placement/golden is bit-identical; the from-source flow sets it.
+AVOID_CI = os.environ.get("CARRY_STAMP_AVOID_CI") not in (None, "", "0")
 j = json.load(open(ft_json))
 mod = max(j["modules"].values(), key=lambda m: len(m.get("cells", {})))
 cells = mod["cells"]
@@ -147,15 +154,28 @@ for cn, c in list(cells.items()):
     # a real routable net already present at this slice, for const-0 LUT inputs
     # (a LUT1 INIT=0 fed by a LOCAL net outputs 0 with NO global GND routing)
     def slice_local_net():
+        best = None
         for sb2 in S:
             if is_int(sb2) and sb2 not in gnd_bits:
                 d2 = drv.get(sb2)
                 if d2 and d2[1].startswith("FD"):
-                    return sb2
-        for pn in ("CYINIT", "CI"):
-            v = c["connections"].get(pn, [])
+                    return sb2                    # FF-driven S bit: ideal
+                if AVOID_CI and best is None:
+                    best = sb2                    # any other real S input (sum/LUT-driven)
+        if AVOID_CI:
+            # Prefer a net already routed into this slice (an S input); never CI.
+            if best is not None:
+                return best
+            v = c["connections"].get("CYINIT", [])
             if v and is_int(v[0]) and v[0] not in gnd_bits:
-                return v[0]
+                d = drv.get(v[0])
+                if not d or d[1] != "CARRY4":     # skip a carry-driven CYINIT too
+                    return v[0]
+        else:
+            for pn in ("CYINIT", "CI"):
+                v = c["connections"].get(pn, [])
+                if v and is_int(v[0]) and v[0] not in gnd_bits:
+                    return v[0]
         # const-only carry: no local routable net -> global non-clock net
         # (const-LUT output is INIT-forced, input value is a don't-care).
         return GLOBAL_FALLBACK_NET
