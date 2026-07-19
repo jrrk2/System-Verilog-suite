@@ -123,12 +123,12 @@ let populate_widths ctx (m : bmodule) =
    vector `<base>` (a declared multi-bit signal), so per-bit input references
    connect to the port bit rather than an orphan scalar net. *)
 let bitbus_ref ctx nm =
-  (* a name that is ITSELF a known multi-bit bus (e.g. Vivado's next-state
-     `wr_addr__0[4:0]`) is a real signal, not a `<base>__<i>` bit memo —
-     stripping it would alias the whole bus onto <base>'s bit ids
-     (multiply-driven nets) *)
-  if (match Hashtbl.find_opt ctx.widths nm with Some w -> w > 1 | None -> false)
-  then None else
+  (* a name that is ITSELF a declared signal (Vivado's next-state twin
+     `wr_addr__0`, a distinct wire, EVEN when width 1) is a real net, not a
+     `<base>__<i>` bit memo — stripping it aliases it onto <base>'s bit ids
+     (multiply-driven).  Only UNDECLARED synthetic `__<i>` names get stripped;
+     declared names expand by their own width downstream. *)
+  if Hashtbl.mem ctx.widths nm then None else
   let n = String.length nm in
   let rec find i =
     if i < 1 then None
