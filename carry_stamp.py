@@ -59,6 +59,24 @@ for cn, c in cells.items():
                 if isinstance(b, int):
                     drv[b] = (cn, c["type"], p)
 
+# Global fallback net for const-LUT inputs: a const generator (INIT 00/11)
+# ignores its input value, so any net routable on GENERAL interconnect works.
+# Needed for const-ONLY carries (all S/DI/CI const) that have no local FD net
+# -- without it those const LUTs can't be stamped and nextpnr falls back to an
+# unplaceable global $PACKER_{GND,VCC}_NET$LUT feedthrough in the dense corner.
+# Pick the highest-fanout NON-CLOCK net (clock nets ride dedicated routing and
+# won't reach a LUT data pin).
+import collections as _cx
+_fan = _cx.Counter(); _clk = set()
+for _cn, _c in cells.items():
+    for _p, _bl in _c.get("connections", {}).items():
+        for _b in _bl:
+            if isinstance(_b, int):
+                _fan[_b] += 1
+                if _p in ("CLK", "C", "WCLK"):
+                    _clk.add(_b)
+GLOBAL_FALLBACK_NET = next((b for b, _ in _fan.most_common() if b not in _clk), None)
+
 # max net id (for fresh routethru nets)
 maxbit = 1
 for c in cells.values():
@@ -138,7 +156,9 @@ for cn, c in list(cells.items()):
             v = c["connections"].get(pn, [])
             if v and is_int(v[0]) and v[0] not in gnd_bits:
                 return v[0]
-        return None
+        # const-only carry: no local routable net -> global non-clock net
+        # (const-LUT output is INIT-forced, input value is a don't-care).
+        return GLOBAL_FALLBACK_NET
     # per-slot: the net feeding this slot's 6LUT occupant (for 5LUT input sharing)
     slot_in = [None, None, None, None]
     # --- S inputs ---
