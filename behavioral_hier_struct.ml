@@ -442,12 +442,40 @@ let flatten_structural (p : bprogram) ~top : bmodule =
   in
   let port_signals = List.filter (fun (s : bsignal) ->
     s.direction = `Input || s.direction = `Output) top_mod.signals in
+  (* Width oracle for flattened internal nets.  A flattened net is
+     `<inst_prefix>__<child_signal_name>`; forcing every one to width 1
+     LOST declared vector widths (a `wire [5:0] .../rd_addr` fed a bare
+     BVar to RAM64M.ADDRA, so the nextpnr-json emitter padded 5 orphan
+     `__pad_` bits -> undriven read-address -> nextpnr's topo walk never
+     retired the RAM read output -> FALSE "combinatorial loop").  Recover
+     the width by matching the `__<signal>` suffix against every module's
+     declared signals (child names carry Vivado's full escaped path, so
+     the boundary match is precise; longest match wins). *)
+  let wide : (string, int) Hashtbl.t = Hashtbl.create 4096 in
+  List.iter (fun (m : bmodule) ->
+    List.iter (fun (s : bsignal) ->
+      match s.stype with
+      | BInt { width; _ } when width > 1 ->
+          let prev = try Hashtbl.find wide s.name with Not_found -> 0 in
+          if width > prev then Hashtbl.replace wide s.name width
+      | _ -> ()) m.signals) p.modules;
+  let width_of_net nm =
+    let n = String.length nm in
+    let best = ref 1 in
+    Hashtbl.iter (fun sig_name w ->
+      let sn = String.length sig_name in
+      let matches =
+        nm = sig_name
+        || (n > sn + 2 && String.sub nm (n - sn) sn = sig_name
+            && nm.[n - sn - 1] = '_' && nm.[n - sn - 2] = '_') in
+      if matches && w > !best then best := w) wide;
+    !best in
   let extra_signals =
     Hashtbl.fold (fun nm () acc ->
       let base, _ = parse_bit nm in
       if List.mem base port_names || List.mem nm port_names then acc
       else { name = nm;
-             stype = BInt { width = 1; signed = Unsigned };
+             stype = BInt { width = width_of_net nm; signed = Unsigned };
              direction = `Internal;
              initial_value = None;
              attrs = [];

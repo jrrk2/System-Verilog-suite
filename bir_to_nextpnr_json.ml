@@ -134,6 +134,12 @@ let rec resolve_bit_ref (e : bexpr) : (string * int option) option =
    a per-bit input reference `framing_rdata__40` allocates its own scalar net,
    disconnected from the port bit `framing_rdata[40]` -> driverless net. *)
 let bitbus_ref ctx nm =
+  (* A name that is ITSELF a declared signal (Vivado's next-state twin
+     `wr_addr__0`, a distinct `wire [4:4]`) must NOT be memo-stripped to
+     `{wr_addr,0}` — that aliased it onto bit 0 of the bus and produced a
+     multiply-driven net (wr_addr_reg[0].Q vs wr_addr[4]_i_1.O).  Same
+     class as the EDIF declared/inferred split. *)
+  if Hashtbl.mem ctx.widths nm then None else
   let n = String.length nm in
   let rec find i =
     if i < 1 then None
