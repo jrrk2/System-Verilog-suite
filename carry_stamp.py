@@ -32,14 +32,22 @@ for cn, bel in bels.items():
 
 SLOT = ["A", "B", "C", "D"]
 
-# GND-driven net bits (outputs of GND primitives)
+# GND/VCC-driven net bits (outputs of GND/VCC primitives).  With
+# NEXTPNR_JSON_CONST_STRINGS=1 constants ALSO appear as the string bits "0"
+# and "1" directly on cell pins; helpers below treat both forms uniformly.
 gnd_bits = set()
+vcc_bits = set()
 for cn, c in cells.items():
-    if c["type"] == "GND":
+    if c["type"] in ("GND", "VCC"):
+        tgt = gnd_bits if c["type"] == "GND" else vcc_bits
         for nets in c.get("connections", {}).values():
             for b in nets:
                 if isinstance(b, int):
-                    gnd_bits.add(b)
+                    tgt.add(b)
+def is_gnd_bit(b):
+    return b == "0" or (isinstance(b, int) and b in gnd_bits)
+def is_vcc_bit(b):
+    return b == "1" or (isinstance(b, int) and b in vcc_bits)
 
 # driver of each integer net bit -> (cellname, type, port)
 drv = {}
@@ -138,7 +146,8 @@ for cn, c in list(cells.items()):
     for k, sb in enumerate(S):
         slot6 = f"{site}/{SLOT[k]}6LUT"
         d = drv.get(sb) if is_int(sb) else None
-        is_gnd = (not is_int(sb)) or (sb in gnd_bits)
+        is_gnd = is_gnd_bit(sb)
+        is_vcc = is_vcc_bit(sb)
         if d is not None and d[1].startswith("LUT"):
             # LUT-driven: stamp that S-LUT into the slot
             claim(slot6, d[0])
@@ -154,15 +163,19 @@ for cn, c in list(cells.items()):
         maxbit += 1
         onet = maxbit
         bufname = f"{cn}$Srt${k}"
-        if is_gnd:
-            # S=GND: const-0 generator -- LUT1 INIT=0 fed by a LOCAL net
-            # (needs no global GND connection at all)
+        if is_gnd or is_vcc:
+            # S=GND/VCC: const generator -- LUT1 fed by a LOCAL net, INIT 00
+            # (const-0) or 11 (const-1); needs no global GND/VCC routing.
+            # Without the VCC case, S="1" was mis-stamped as const-0 (wrong
+            # carry propagate) AND nextpnr still fed the VCC net through an
+            # unplaceable $PACKER_VCC_NET$LUT.
             src = slice_local_net()
             if src is None:
                 continue
             buf = {"type": "LUT1", "port_directions": {"I0": "input", "O": "output"},
                    "connections": {"I0": [src], "O": [onet]},
-                   "parameters": {"INIT": "00"}, "attributes": {"BEL": slot6}}
+                   "parameters": {"INIT": "11" if is_vcc else "00"},
+                   "attributes": {"BEL": slot6}}
         else:
             # FF / external -> identity buffer (INIT=2) passing the driver to S
             src = sb
@@ -182,19 +195,24 @@ for cn, c in list(cells.items()):
     #     feed it the SAME net as the 6LUT occupant (slot_in[k]).
     newDI = list(DI)
     pending_gnd_di = []
+    pending_vcc_di = []
     for k, db in enumerate(DI):
-        if not is_int(db):
+        is_gnd = is_gnd_bit(db)
+        is_vcc = is_vcc_bit(db)
+        # string-const "0"/"1" (CONST_STRINGS) used to be skipped here, so a
+        # VCC-tied DI reached nextpnr as the global VCC net -> unplaceable
+        # $PACKER_VCC_NET$LUT feedthrough.  Handle it as a local const 5LUT.
+        if not is_int(db) and not is_gnd and not is_vcc:
             continue
-        d = drv.get(db)
-        is_gnd = db in gnd_bits
-        if (d is not None and not is_gnd
+        d = drv.get(db) if is_int(db) else None
+        if (d is not None and not is_gnd and not is_vcc
                 and d[1] in ("LUT1", "LUT2", "LUT3", "LUT4", "LUT5")):
             continue  # LUT1-5-driven DI: nextpnr adopts the driver into the 5LUT
         # (LUT6-driven DI is NOT adoptable -- a LUT6 has no O5 -- so buffer it)
         slot5 = f"{site}/{SLOT[k]}5LUT"
         if slot5 in occupied:
             continue
-        if not is_gnd:
+        if not is_gnd and not is_vcc:
             # fracture legality: the 5LUT shares A1-A5 with the slot's 6LUT;
             # adding a NEW input net requires occupant inputs + 1 <= 5
             occ6 = occupied.get(f"{site}/{SLOT[k]}6LUT")
@@ -208,8 +226,8 @@ for cn, c in list(cells.items()):
                     continue  # would be an illegal fracture; leave for nextpnr
         maxbit += 1
         onet = maxbit
-        if is_gnd:
-            # const-0 generator: INIT=0 fed by the slot's 6LUT input net.
+        if is_gnd or is_vcc:
+            # const-0/1 generator: INIT fed by the slot's 6LUT input net.
             # SAME net as the occupant's first pin -> shared A1, no conflict.
             # ILLEGAL when the occupant uses >=6 inputs (Vivado 18-608: "A6
             # cannot be used because of A5LUT usage") -- the fractured LUT's
@@ -227,13 +245,14 @@ for cn, c in list(cells.items()):
                         ins6.add(v2[0])
                 occ_n = len(ins6)
             if occ_n >= 6 or slot_in[k] is None:
-                pending_gnd_di.append(k)
+                (pending_vcc_di if is_vcc else pending_gnd_di).append(k)
                 continue
-            tag = "DIgnd"
+            tag = "DIvcc" if is_vcc else "DIgnd"
             buf = {"type": "LUT1",
                    "port_directions": {"I0": "input", "O": "output"},
                    "connections": {"I0": [slot_in[k]], "O": [onet]},
-                   "parameters": {"INIT": "00"}, "attributes": {"BEL": slot5}}
+                   "parameters": {"INIT": "11" if is_vcc else "00"},
+                   "attributes": {"BEL": slot5}}
         else:
             # FF/LUT6-driven DI passthrough.  PIN-ALIGN with the 6LUT occupant:
             # nextpnr pin-maps each fractured LUT's I0->A1, I1->A2... per cell,
@@ -291,6 +310,22 @@ for cn, c in list(cells.items()):
                 "parameters": {"INIT": "00"}, "attributes": {"BEL": rbel}}
             occupied[rbel] = gname
             for k in pending_gnd_di:
+                newDI[k] = onet
+                n_di += 1
+    if pending_vcc_di:
+        # per-carry const-1 in a NEIGHBOUR slice; DI enters via the AX bypass
+        src = slice_local_net()
+        rbel = free_neighbour_lut_global(site) if src is not None else None
+        if rbel is not None:
+            maxbit += 1
+            onet = maxbit
+            vname = f"{cn}$DIvccx"
+            new_cells[vname] = {"type": "LUT1",
+                "port_directions": {"I0": "input", "O": "output"},
+                "connections": {"I0": [src], "O": [onet]},
+                "parameters": {"INIT": "11"}, "attributes": {"BEL": rbel}}
+            occupied[rbel] = vname
+            for k in pending_vcc_di:
                 newDI[k] = onet
                 n_di += 1
     if DI:
