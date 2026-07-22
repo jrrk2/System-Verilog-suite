@@ -104,11 +104,22 @@ let iface_hdr_ports : (string, (string * [ `Input | `Output ]) list) Hashtbl.t =
 let module_iface_ports : (string, (string * string) list) Hashtbl.t =
   Hashtbl.create 32
 
-(* Interface INSTANCES declared inside each module: (inst_name, iface).  Captured
- * from the struct-typed local decls (an interface instance `if2 u(clk)` — or even
- * a port-less `hs_if h()` that never surfaces as a binstance).  The elaboration
- * pass scalarizes each into member nets and wires its header ports. *)
-let module_iface_insts : (string, (string * string) list) Hashtbl.t =
+(* Interface INSTANCES declared inside each module: (inst_name, iface, param
+ * overrides).  Captured from the struct-typed local decls (an interface instance
+ * `if2 u(clk)` — or even a port-less `hs_if h()` that never surfaces as a
+ * binstance).  The overrides (`axi_if #(.ID_WIDTH(4)) lsu_if()`) let the
+ * elaboration pass size each bundle's member nets per-instance, not by the
+ * interface's default params. *)
+let module_iface_insts : (string, (string * string * (string * string) list) list) Hashtbl.t =
+  Hashtbl.create 32
+
+(* Interface declarations (name -> module_decl), kept so per-instance member
+ * widths can be recomputed with the instance's parameter overrides. *)
+let iface_decls : (string, Verible_elaborate.module_decl) Hashtbl.t =
+  Hashtbl.create 16
+
+(* Per-(iface, canonical-params) specialised member widths, memoised. *)
+let iface_spec_members : (string, (string * int) list) Hashtbl.t =
   Hashtbl.create 32
 
 (* SIGNAL name -> width, for `$bits(<signal>)` ONLY.  Kept SEPARATE from
@@ -4536,8 +4547,35 @@ let convert_module ~pkgs (mdecl : module_decl)
   in
   cur_signal_struct := signal_struct_decls;
   (* Record the interface instances among these struct-typed locals for the
-   * interface-elaboration pass (type is a registered interface). *)
-  (let ifis = List.filter (fun (_, tn) -> Hashtbl.mem iface_reg tn) signal_struct_decls in
+   * interface-elaboration pass (type is a registered interface), together with
+   * each instance's parameter overrides so its bundle members can be sized
+   * per-instance (`axi_if #(.ID_WIDTH(4)) lsu_if()`). *)
+  (let iface_bases = collect_by
+     (has_tag (prefix_is "instantiation_base")) mdecl.m_body in
+   let ifis = List.concat_map (fun base ->
+     let tn = ref None in
+     walk (function
+       | SymbolIdentifier id when !tn = None && Hashtbl.mem iface_reg id -> tn := Some id
+       | _ -> ()) base;
+     match !tn with
+     | None -> []
+     | Some tn ->
+         let ov = Verible_elaborate.extract_overrides base in
+         let vars = collect_by (has_tag (fun t ->
+           (let l = String.length "register_variable" in
+            String.length t >= l && String.sub t 0 l = "register_variable")
+           || prefix_is "non_anonymous_gate_instance" t
+           || prefix_is "gate_instance_or_register_variable" t)) base in
+         List.filter_map (fun v ->
+           let nm = ref None in
+           walk (function
+             | TUPLE3 (STRING t, SymbolIdentifier id, _)
+               when prefix_is "unqualified_id" t && !nm = None -> nm := Some id
+             | SymbolIdentifier id when !nm = None -> nm := Some id
+             | _ -> ()) v;
+           match !nm with
+           | Some n when n <> tn -> Some (n, tn, ov)
+           | _ -> None) vars) iface_bases in
    if ifis <> [] then Hashtbl.replace module_iface_insts mdecl.m_name ifis);
   (* Reset per-module width cache; populated below as soon as the
    * port + internal signals are extracted, before any expr_to_bexpr
@@ -6138,24 +6176,10 @@ let discover_init_dirs files =
  * to the member scalars.  Runs BEFORE name_positional_ports and fully resolves
  * any interface-touching instance's connections (so no `$posN` is left for it).
  * A module with no interface instances and no interface-port child is untouched. *)
-let elaborate_interfaces (bmods : bmodule list) : bmodule list =
+let elaborate_interfaces ~pkgs (bmods : bmodule list) : bmodule list =
   let is_iface_mod n = Hashtbl.mem iface_reg n in
   let is_pos k = String.length k > 4 && String.sub k 0 4 = "$pos" in
   let pos_idx k = int_of_string_opt (String.sub k 4 (String.length k - 4)) in
-  (* MSB-first bit layout of an interface: [(member, msb, lsb)] *)
-  let iface_layout iface =
-    match Hashtbl.find_opt iface_reg iface with
-    | None -> []
-    | Some members ->
-        let tw = List.fold_left (fun a (_, w) -> a + w) 0 members in
-        let _, layout = List.fold_left (fun (pos, acc) (m, w) ->
-          (pos + w, (m, tw - pos - 1, tw - pos - w) :: acc)) (0, []) members in
-        List.rev layout
-  in
-  (* Source-order port SLOTS for a module, in the SAME order name_positional_ports
-   * uses (the module's Input|Output signals), but with each interface port's
-   * scalarized members (p$clk, p$data, …) collapsed to ONE slot (base, Some iface)
-   * at the position of its first member. *)
   (* Strip a specialise_design suffix (`axi_master_passthru__MIW4_IIW4` ->
    * `axi_master_passthru`): module_iface_ports/_insts are keyed by the BASE name
    * (from mdecl.m_name at convert time) but bmodules carry the specialised name. *)
@@ -6167,11 +6191,61 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
       else find (i + 1) in
     find 0
   in
+  (* MSB-first bit layout of an explicit member list: [(member, msb, lsb)] *)
+  let layout_of members =
+    let tw = List.fold_left (fun a (_, w) -> a + w) 0 members in
+    let _, layout = List.fold_left (fun (pos, acc) (m, w) ->
+      (pos + w, (m, tw - pos - 1, tw - pos - w) :: acc)) (0, []) members in
+    List.rev layout
+  in
+  (* Member widths for an interface instance under its parameter overrides,
+   * memoised.  `axi_if #(.ID_WIDTH(4)) lsu_if()` gets 4-bit id members even though
+   * axi_if's default ID_WIDTH is 6 — re-convert the interface decl with the
+   * instance's params (safe: post main convert-loop, interface has no children). *)
+  let spec_members iface params =
+    let key = iface ^ "#" ^ String.concat ","
+        (List.map (fun (k, v) -> k ^ "=" ^ v) (List.sort compare params)) in
+    match Hashtbl.find_opt iface_spec_members key with
+    | Some m -> m
+    | None ->
+        let dflt () = Option.value ~default:[] (Hashtbl.find_opt iface_reg iface) in
+        let m =
+          if params = [] then dflt ()
+          else match Hashtbl.find_opt iface_decls iface with
+            | None -> dflt ()
+            | Some mdecl ->
+                (try
+                   let im = convert_module ~pkgs mdecl params in
+                   let sw = function
+                     | BInt { width; _ } -> width | BBool -> 1
+                     | BArray { element = BInt { width; _ }; size } -> width * size
+                     | _ -> 0 in
+                   let ms = List.filter_map (fun (s : bsignal) ->
+                     let w = sw s.stype in if w > 0 then Some (s.name, w) else None)
+                     im.signals in
+                   if ms = [] then dflt () else ms
+                 with _ -> dflt ()) in
+        Hashtbl.replace iface_spec_members key m; m
+  in
+  (* per-parent: inst_name -> (iface, member-widths under the instance's params) *)
+  let members_tbl_of (m : bmodule) =
+    let tbl = Hashtbl.create 8 in
+    List.iter (fun (nm, iface, params) ->
+      Hashtbl.replace tbl nm (iface, spec_members iface params))
+      (Option.value ~default:[] (Hashtbl.find_opt module_iface_insts (base_name m.name)));
+    (* interface instances that surfaced only as a binstance: default params *)
+    List.iter (fun (i : binstance) ->
+      if is_iface_mod i.module_name && not (Hashtbl.mem tbl i.inst_name) then
+        Hashtbl.replace tbl i.inst_name
+          (i.module_name, Option.value ~default:[]
+             (Hashtbl.find_opt iface_reg i.module_name))) m.instances;
+    tbl
+  in
+  (* Source-order port SLOTS for a module (interface port collapsed to one slot). *)
   let slots_of (mm : bmodule) =
     let ifps = Option.value ~default:[]
         (Hashtbl.find_opt module_iface_ports (base_name mm.name)) in
     let member_base name =
-      (* if `name` is `base$mem` with base a known interface port, return (base,iface) *)
       match String.index_opt name '$' with
       | Some i ->
           let base = String.sub name 0 i in
@@ -6179,8 +6253,7 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
            | Some iface -> Some (base, iface) | None -> None)
       | None -> None in
     let seen = Hashtbl.create 8 in
-    (* m.signals is in REVERSE source order; reverse it back so positional slot
-     * indices match forward-source ports (the order instance actuals use). *)
+    (* m.signals is REVERSE source order; reverse it back to forward source order. *)
     List.rev (List.filter_map (fun (s : bsignal) ->
       match s.direction with
       | `Input | `Output ->
@@ -6191,18 +6264,52 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
            | None -> Some (s.name, None))
       | _ -> None) mm.signals)
   in
-  let by_name = Hashtbl.create 64 in
-  List.iter (fun (mm : bmodule) -> Hashtbl.replace by_name mm.name mm) bmods;
+  let mk_by_name mods =
+    let h = Hashtbl.create 64 in
+    List.iter (fun (mm : bmodule) -> Hashtbl.replace h mm.name mm) mods; h in
+  let by_name = mk_by_name bmods in
+  (* PASS 1 — the connected bundle's member widths are authoritative; record the
+   * width each child interface-PORT member must take so its port net matches the
+   * bundle net it's wired to (a passthru's `m$awid` must be 4b when wired to a
+   * 4-bit-ID bundle, though axi_if's default ID makes it 6b). *)
+  let key2 a b = a ^ "\000" ^ b in
+  let child_port_w : (string, int) Hashtbl.t = Hashtbl.create 128 in
+  List.iter (fun (m : bmodule) ->
+    let im = members_tbl_of m in
+    if Hashtbl.length im > 0 then
+      List.iter (fun (i : binstance) ->
+        if not (is_iface_mod i.module_name) then
+          match Hashtbl.find_opt by_name i.module_name with
+          | None -> ()
+          | Some child ->
+              let slots = slots_of child in
+              let n = List.length slots in
+              List.iter (fun (k, be) ->
+                let slot =
+                  if is_pos k then
+                    (match pos_idx k with Some idx when idx < n -> Some (List.nth slots idx) | _ -> None)
+                  else List.find_opt (fun (nm, _) -> nm = k) slots in
+                match slot, be with
+                | Some (name, Some _), BVar u when Hashtbl.mem im u ->
+                    let (_, members) = Hashtbl.find im u in
+                    List.iter (fun (mem, w) ->
+                      Hashtbl.replace child_port_w (key2 i.module_name (name ^ "$" ^ mem)) w)
+                      members
+                | _ -> ()) i.port_connections) m.instances) bmods;
+  (* PASS 2 — resize child interface-port member signals to the connected width. *)
+  let bmods = List.map (fun (m : bmodule) ->
+    { m with signals = List.map (fun (s : bsignal) ->
+        match Hashtbl.find_opt child_port_w (key2 m.name s.name) with
+        | Some w -> { s with stype = BInt { width = w; signed = Unsigned } }
+        | None -> s) m.signals }) bmods in
+  let by_name = mk_by_name bmods in
+  (* PASS 3 — scalarize interface instances, wire header ports, fan out. *)
   List.map (fun (m : bmodule) ->
+    let members_tbl = members_tbl_of m in
     let inst_iface = Hashtbl.create 8 in
-    (* interface instances declared in this module (incl. port-less bundles that
-     * never became a binstance) *)
-    List.iter (fun (nm, iface) -> Hashtbl.replace inst_iface nm iface)
-      (Option.value ~default:[] (Hashtbl.find_opt module_iface_insts (base_name m.name)));
-    (* also any that DID surface as a binstance (safety net) *)
-    List.iter (fun (i : binstance) ->
-      if is_iface_mod i.module_name then
-        Hashtbl.replace inst_iface i.inst_name i.module_name) m.instances;
+    Hashtbl.iter (fun u (iface, _) -> Hashtbl.replace inst_iface u iface) members_tbl;
+    let members_of u =
+      match Hashtbl.find_opt members_tbl u with Some (_, ms) -> ms | None -> [] in
     let child_iface_slots (i : binstance) =
       match Hashtbl.find_opt by_name i.module_name with
       | Some mm -> List.exists (fun (_, io) -> io <> None) (slots_of mm)
@@ -6216,18 +6323,15 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
       let rec re e =
         match e with
         | BVar u when Hashtbl.mem inst_iface u ->
-            let iface = Hashtbl.find inst_iface u in
-            BConcat (List.map (fun (mem, _) -> BVar (u ^ "$" ^ mem))
-                       (Hashtbl.find iface_reg iface))
+            BConcat (List.map (fun (mem, _) -> BVar (u ^ "$" ^ mem)) (members_of u))
         | BSlice { signal = BVar u; msb; lsb } when Hashtbl.mem inst_iface u ->
-            let iface = Hashtbl.find inst_iface u in
             let parts = List.filter_map (fun (mem, fm, fl) ->
               let imsb = min fm msb and ilsb = max fl lsb in
               if imsb < ilsb then None
               else if imsb = fm && ilsb = fl then Some (BVar (u ^ "$" ^ mem))
               else Some (BSlice { signal = BVar (u ^ "$" ^ mem);
                                   msb = imsb - fl; lsb = ilsb - fl }))
-              (iface_layout iface) in
+              (layout_of (members_of u)) in
             (match parts with [] -> e | [x] -> x | xs -> BConcat xs)
         | BSlice { signal; msb; lsb } -> BSlice { signal = re signal; msb; lsb }
         | BBinOp r -> BBinOp { r with lhs = re r.lhs; rhs = re r.rhs }
@@ -6260,12 +6364,12 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
         | BCombinational r -> BCombinational { r with body = List.map re_stmt r.body }
         | BSequential r -> BSequential { r with body = List.map re_stmt r.body }
       in
-      (* Member nets for every interface instance. *)
-      let new_sigs = Hashtbl.fold (fun u iface acc ->
+      (* Member nets for every interface instance (per-instance widths). *)
+      let new_sigs = Hashtbl.fold (fun u (_, members) acc ->
         List.map (fun (mem, w) ->
           { name = u ^ "$" ^ mem; stype = BInt { width = w; signed = Unsigned };
             direction = `Internal; initial_value = None; attrs = [] })
-          (Hashtbl.find iface_reg iface) @ acc) inst_iface [] in
+          members @ acc) members_tbl [] in
       (* Header-port connections of each interface instance -> assigns. *)
       let hdr_procs = ref [] in
       List.iter (fun (i : binstance) ->
@@ -6330,14 +6434,14 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
                     else List.find_opt (fun (nm, _) -> nm = k) slots in
                   match slot with
                   | Some (name, None) -> [(name, re be)]
-                  | Some (name, Some iface) ->
+                  | Some (name, Some _iface) ->
                       (match be with
                        | BVar u when Hashtbl.mem inst_iface u ->
                            List.filter_map (fun (mem, _) ->
                              let formal = name ^ "$" ^ mem in
                              if List.mem formal formals_scalar
                              then Some (formal, BVar (u ^ "$" ^ mem)) else None)
-                             (Hashtbl.find iface_reg iface)
+                             (members_of u)
                        | _ -> [(name, re be)])
                   | None -> [(k, re be)]) i.port_connections in
                 Some { i with port_connections = conns }
@@ -6441,6 +6545,7 @@ let convert_files_inner ~top files : bprogram =
           if w > 0 then Some (s.name, w) else None) im.signals in
         if members <> [] then begin
           Hashtbl.replace iface_reg mdecl.m_name members;
+          Hashtbl.replace iface_decls mdecl.m_name mdecl;
           let total = List.fold_left (fun a (_, w) -> a + w) 0 members in
           Hashtbl.replace type_widths mdecl.m_name total;
           (* Header ports of the interface itself (`interface if2(input clk)`)
@@ -6579,7 +6684,7 @@ let convert_files_inner ~top files : bprogram =
   in
   (* Elaborate interface instances (bundle nets + header wiring + interface-port
    * connection fan-out) before positional resolution. *)
-  let bmods = elaborate_interfaces bmods in
+  let bmods = elaborate_interfaces ~pkgs bmods in
   (* Positional → named port connections, before prep_for_z3's
    * destructive flatten/ffrip/share. *)
   let bmods = name_positional_ports bmods in
