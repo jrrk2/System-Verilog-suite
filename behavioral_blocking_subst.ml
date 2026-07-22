@@ -155,9 +155,134 @@ let process_seq_body stmts =
     ) rewritten
   end
 
+(* Names assigned anywhere in a statement (any branch depth). *)
+let rec assigned_names acc = function
+  | BAssign { lhs; _ } -> if List.mem lhs acc then acc else lhs :: acc
+  | BIf { then_stmts; else_stmts; _ } ->
+      List.fold_left assigned_names
+        (List.fold_left assigned_names acc then_stmts) else_stmts
+  | BCase { cases; default; _ } ->
+      let acc = List.fold_left
+        (fun a (_, ss) -> List.fold_left assigned_names a ss) acc cases in
+      List.fold_left assigned_names acc default
+  | BBlock ss -> List.fold_left assigned_names acc ss
+  | BCallStmt { args = BVar n :: _; _ } ->
+      if List.mem n acc then acc else n :: acc
+  | _ -> acc
+
+(* Does a statement contain a SELF-REFERENCING blocking assignment at ANY
+   depth — `x = f(x)`, the iflift encoding of a no-else `if` that keeps the
+   prior value?  Those are exactly the assignments that, left un-threaded,
+   become a combinational loop. *)
+let rec has_self_ref_stmt = function
+  | BAssign { lhs; rhs } -> count_in_expr lhs rhs > 0
+  | BIf { then_stmts; else_stmts; _ } ->
+      List.exists has_self_ref_stmt then_stmts
+      || List.exists has_self_ref_stmt else_stmts
+  | BCase { cases; default; _ } ->
+      List.exists (fun (_, ss) -> List.exists has_self_ref_stmt ss) cases
+      || List.exists has_self_ref_stmt default
+  | BBlock ss -> List.exists has_self_ref_stmt ss
+  | _ -> false
+
+(* Blocking→non-blocking conversion for a COMBINATIONAL block.  In always_comb,
+ * `=` is blocking, so each read sees the most recent in-block write.  iflift
+ * turns a no-else `if (c) x = v;` into the self-reference `x = c ? v : x`
+ * (the else "keeps prior"); a `default; conditional-override` idiom — e.g.
+ * dmi_jtag's shift registers
+ *     dr_d = dr_q;                              (* default *)
+ *     if (clear) dr_d = 0;
+ *     else begin if (cap) if(sel) dr_d = …;     (* → dr_d = c ? … : dr_d *)
+ *                if (shift) if(sel) dr_d = … end
+ * then reads `dr_d`, and the Hardcaml lowering sees a combinational loop.
+ * Thread the value-so-far (an env from names to their current expression)
+ * through the block AND into every BIf/BCase branch, substituting each read;
+ * the self-references resolve to the entering default and the loop dissolves.
+ * Branch results are merged back (`cond ? then : else`) so post-branch reads
+ * stay correct.  ONLY blocks that actually contain a self-reference are
+ * rewritten — everything else is returned byte-for-byte untouched, so this
+ * never perturbs blocks that already lower correctly. *)
+let thread_comb_body orig_stmts =
+  let rec flatten = function
+    | BBlock ss :: rest -> flatten (ss @ rest)
+    | s :: rest -> s :: flatten rest
+    | [] -> [] in
+  let stmts = flatten orig_stmts in
+  if not (List.exists has_self_ref_stmt stmts) then orig_stmts
+  else begin
+    let env : (string, bexpr) Hashtbl.t = Hashtbl.create 16 in
+    let subst e = map_expr (fun n -> Hashtbl.find_opt env n) e in
+    let snapshot () = Hashtbl.fold (fun k v a -> (k, v) :: a) env [] in
+    let restore snap =
+      Hashtbl.reset env; List.iter (fun (k, v) -> Hashtbl.replace env k v) snap in
+    let merge cond' snap_then snap_else names =
+      List.iter (fun k ->
+        let pv = match Hashtbl.find_opt env k with Some v -> v | None -> BVar k in
+        let tv = match List.assoc_opt k snap_then with Some v -> v | None -> pv in
+        let ev = match List.assoc_opt k snap_else with Some v -> v | None -> pv in
+        let m = if tv = ev then tv
+                else BCond { condition = cond'; then_val = tv; else_val = ev } in
+        Hashtbl.replace env k m) names in
+    let rec thread_stmt s =
+      match s with
+      | BAssign { lhs; rhs } ->
+          let rhs' = subst rhs in
+          Hashtbl.replace env lhs rhs';
+          BAssign { lhs; rhs = rhs' }
+      | BIf { condition; then_stmts; else_stmts } ->
+          let cond' = subst condition in
+          let names = assigned_names (assigned_names [] (BBlock then_stmts))
+                        (BBlock else_stmts) in
+          let snap = snapshot () in
+          let te = List.map thread_stmt then_stmts in
+          let snap_then = snapshot () in
+          restore snap;
+          let ee = List.map thread_stmt else_stmts in
+          let snap_else = snapshot () in
+          restore snap;
+          merge cond' snap_then snap_else names;
+          BIf { condition = cond'; then_stmts = te; else_stmts = ee }
+      | BCase { selector; cases; default } ->
+          let sel' = subst selector in
+          let names =
+            List.fold_left (fun a (_, ss) ->
+              List.fold_left assigned_names a ss)
+              (List.fold_left assigned_names [] default) cases in
+          let snap = snapshot () in
+          let cases' = List.map (fun (k, ss) ->
+            let k' = subst k in
+            let ss' = List.map thread_stmt ss in
+            let sn = snapshot () in restore snap; (k', ss', sn)) cases in
+          let default' = List.map thread_stmt default in
+          let snap_def = snapshot () in
+          restore snap;
+          (* Merge arms fold: sel==k0 ? env_k0 : … : default. *)
+          List.iter (fun nm ->
+            let pv = match Hashtbl.find_opt env nm with Some v -> v | None -> BVar nm in
+            let vdef = match List.assoc_opt nm snap_def with Some v -> v | None -> pv in
+            let m = List.fold_right (fun (k', _, sn) acc ->
+              let va = match List.assoc_opt nm sn with Some v -> v | None -> pv in
+              if va = acc then acc
+              else BCond { condition = BBinOp { op = BEq; lhs = sel'; rhs = k';
+                                                result_type = BBool };
+                           then_val = va; else_val = acc }) cases' vdef in
+            Hashtbl.replace env nm m) names;
+          BCase { selector = sel';
+                  cases = List.map (fun (k', ss', _) -> (k', ss')) cases';
+                  default = default' }
+      | BBlock ss -> BBlock (List.map thread_stmt ss)
+      | BCallStmt { func; args } ->
+          BCallStmt { func; args = List.map subst args }
+      | BReturn (Some e) -> BReturn (Some (subst e))
+      | other -> other in
+    List.map thread_stmt stmts
+  end
+
 let process_module (m : bmodule) : bmodule =
   let new_processes = List.map (function
     | BSequential s -> BSequential { s with body = process_seq_body s.body }
+    | BCombinational s ->
+        BCombinational { s with body = thread_comb_body s.body }
     | other -> other
   ) m.processes in
   { m with processes = new_processes }

@@ -536,11 +536,17 @@ let rec scrub_slice_writes = function
    - a `cond ? rhs : prior` mux for a bit range a single site writes
    Returns [None] if the sites overlap (last-wins semantics would need
    per-bit muxing — not implemented yet).                            *)
-let merge_target_sites ~width target sites =
+let merge_target_sites ~width ~base target sites =
   (* MSB-first (descending hi) so we walk the bit range from top to
      bottom in concat order. *)
   let sorted = List.sort (fun a b -> compare b.hi a.hi) sites in
-  let prior hi lo = BSlice { signal = BVar target; msb = hi; lsb = lo } in
+  (* [base] is the retention value for bits/branches nobody writes:
+     - sequential target: `BVar target` (the register Q feedback) — correct;
+     - combinational target: the DEFAULT assignment (`data_d = data_q`) that
+       precedes the slice writes.  Using `BVar target` for a comb signal makes
+       the RMW self-referential → a combinational loop (dm_mem's memory-word
+       assembly, dm_csrs' data_d/progbuf_d). *)
+  let prior hi lo = BSlice { signal = base; msb = hi; lsb = lo } in
   let overlap = ref false in
   let rec walk cur = function
     | [] ->
@@ -573,7 +579,7 @@ let merge_target_sites ~width target sites =
    from the body and append one merged final-assign at the end (so
    it lands AFTER any existing writes to the same signal — matches
    non-blocking last-wins semantics).                              *)
-let merge_slice_writes_body widths body =
+let merge_slice_writes_body ~is_comb widths body =
   let sites = List.fold_left (collect_slice_sites None) [] body in
   if sites = [] then body
   else
@@ -581,10 +587,41 @@ let merge_slice_writes_body widths body =
     List.iter (fun s ->
       let cur = try Hashtbl.find by_target s.target with Not_found -> [] in
       Hashtbl.replace by_target s.target (s :: cur)) sites;
+    (* For a COMB target, the retention base is the RHS of a full (non-slice)
+       assignment to it (the `data_d = data_q` default); for a SEQ target it is
+       the register itself.  Falls back to `BVar target` if no full assign is
+       found (a comb signal written only by slices — then it genuinely latches
+       and BVar is the least-wrong choice). *)
+    let base_of target w =
+      if not is_comb then BVar target   (* register Q feedback — correct *)
+      else begin
+        let found = ref None in
+        let rec scan = function
+          | BAssign { lhs; rhs } when lhs = target && !found = None ->
+              found := Some rhs
+          | BIf { then_stmts; else_stmts; _ } ->
+              List.iter scan then_stmts; List.iter scan else_stmts
+          | BCase { cases; default; _ } ->
+              List.iter (fun (_, ss) -> List.iter scan ss) cases;
+              List.iter scan default
+          | BBlock ss -> List.iter scan ss
+          | BWhile { body; _ } | BFor { body; _ } -> List.iter scan body
+          | _ -> () in
+        List.iter scan body;
+        match !found with
+        | Some rhs -> rhs
+        (* No default assign for a COMB target: reading `BVar target` for the
+           retention is a self-referential combinational loop (dm_mem's
+           abstract_cmd ROM, built by static per-halfword part-selects with no
+           default).  Use 0 — a comb signal with no default is undefined in HW,
+           so 0 is a safe non-looping choice; fully-covered targets have no
+           gaps and never use it. *)
+        | None -> BConst { value = Z.zero; width = w }
+      end in
     let merges = Hashtbl.fold (fun target ts acc ->
       match Hashtbl.find_opt widths.scalar target with
       | Some w ->
-          (match merge_target_sites ~width:w target ts with
+          (match merge_target_sites ~width:w ~base:(base_of target w) target ts with
            | Some bassign -> (target, bassign) :: acc
            | None -> acc)
       | None -> acc) by_target [] in
@@ -620,9 +657,9 @@ let merge_slice_writes_module (m : bmodule) =
   let widths = build_widths m.signals in
   let walk_proc = function
     | BSequential s ->
-        BSequential { s with body = merge_slice_writes_body widths s.body }
+        BSequential { s with body = merge_slice_writes_body ~is_comb:false widths s.body }
     | BCombinational c ->
-        BCombinational { c with body = merge_slice_writes_body widths c.body }
+        BCombinational { c with body = merge_slice_writes_body ~is_comb:true widths c.body }
   in
   { m with processes = List.map walk_proc m.processes }
 

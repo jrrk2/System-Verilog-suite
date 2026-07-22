@@ -2598,7 +2598,12 @@ any_port: port_named { ($1) }
 
 port_named: DOT member_name LPAREN expression RPAREN { TUPLE6(STRING("port_named1"),DOT,$2,LPAREN,$4,RPAREN) }
 	|	DOT member_name LPAREN RPAREN { TUPLE5(STRING("port_named2"),DOT,$2,LPAREN,RPAREN) }
-	|	DOT member_name { TUPLE3(STRING("port_named3"),DOT,$2) }
+	|	DOT member_name { (* SV-2017 `.name` implicit port connection shorthand:
+	                       * `.clk_sys` ≡ `.clk_sys(clk_sys)`.  Emit the canonical
+	                       * explicit (port_named1) shape, reusing the identifier as
+	                       * the connected net, so every downstream consumer handles
+	                       * it uniformly (no TUPLE3 special case). *)
+	                      TUPLE6(STRING("port_named1"),DOT,$2,LPAREN,$2,RPAREN) }
 	|	DOT_STAR { (DOT_STAR) }
 
 member_name: GenericIdentifier { ($1) }

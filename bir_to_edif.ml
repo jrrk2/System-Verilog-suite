@@ -375,7 +375,12 @@ let write_edif
      was silently dropped (a gate_map connectivity bug or a lost cell) — the
      kind of fault Vivado only catches at opt_design, or worse silently trims
      into a dead board.  Fail here naming the net + its readers.  SVS_ERC=0
-     disables (bit-level buses are approximated at net granularity for now). *)
+     disables (bit-level buses are approximated at net granularity for now).
+     ERC_AUTOFIX=1 instead ties each undriven input net to n_GND (logged) so a
+     debug bitstream still builds past Vivado opt_design — the floaters become
+     deterministic 0s rather than opt_design errors, letting you test the rest
+     of the design on silicon while the real dropped-driver bug is chased. *)
+  let autofix_gnd : (string, unit) Hashtbl.t = Hashtbl.create 64 in
   if Sys.getenv_opt "SVS_ERC" <> Some "0" then begin
     (* BIT-LEVEL: resolve every pin connection through the SAME per-bit net-id
        allocator the emission uses (nets_of_conn), so a bus whose width
@@ -402,9 +407,17 @@ let write_edif
        else all),
       (match List.find_opt (fun (p, _, _) -> p = pin) ports with
        | Some (_, d, _) -> d | None -> `Input) in
+    let all_conns : (string, string list) Hashtbl.t = Hashtbl.create 4096 in
+    let diag_on = Sys.getenv_opt "ERC_DIAG" <> None in
     List.iter (fun (i : binstance) ->
       List.iter (fun (pin, e) ->
         let ns, dir = conn_nets i (pin, e) in
+        (if diag_on then
+           let d = match dir with `Output -> "O" | `Input -> "I" in
+           List.iter (fun n ->
+             let tag = Printf.sprintf "%s.%s[%s:%s]" i.module_name pin d
+                 (Behavioral_ir.string_of_bexpr e) in
+             Hashtbl.replace all_conns n (tag :: (try Hashtbl.find all_conns n with Not_found -> []))) ns);
         match dir with
         | `Output ->
             (* mirror the emission's skip of const-folded outputs *)
@@ -460,11 +473,48 @@ let write_edif
         (if total > 8 then Printf.sprintf "\n  ... and %d more" (total - 8) else ""))
     end;
     if undriven <> [] then begin
+      (* DIAGNOSTIC: for each undriven net's base, show the driven/read status of
+         every allocated bit of that base — reveals whether the floater is a
+         bit-aliasing (base driven at other bits) or a base-naming split. *)
+      (match Sys.getenv_opt "ERC_DIAG" with
+       | None -> ()
+       | Some path ->
+         let oc = open_out path in
+         (* reverse net-name -> id map for reporting neighbour bits by base *)
+         let name_of : (string, net_key) Hashtbl.t = Hashtbl.create 4096 in
+         Hashtbl.iter (fun (k : net_key) id -> Hashtbl.replace name_of (net_name_of_id id) k) ctx.ids;
+         Hashtbl.iter (fun n rs ->
+           if not (Hashtbl.mem driven n) then begin
+             let label = match Hashtbl.find_opt sym n with Some s -> s | None -> n in
+             Printf.fprintf oc "UNDRIVEN %s (id %s)\n" label n;
+             Printf.fprintf oc "  readers: %s\n"
+               (String.concat ", " (List.filteri (fun i _ -> i < 4) rs));
+             let conns = try Hashtbl.find all_conns n with Not_found -> [] in
+             Printf.fprintf oc "  ALL conns on this id: %s\n"
+               (String.concat " | " conns);
+             ignore name_of
+           end) readers;
+         close_out oc;
+         Printf.eprintf "[ERC_DIAG] wrote %s\n" path);
       let total = List.length undriven in
       let sample = List.filteri (fun i _ -> i < 12) undriven in
       let body = String.concat "\n  " (List.map (fun (net, rs) ->
         Printf.sprintf "%S read by [%s] — NO DRIVER" net
           (String.concat "," (List.filteri (fun i _ -> i < 3) rs))) sample) in
+      if Sys.getenv_opt "ERC_AUTOFIX" <> None then begin
+        (* record the raw per-bit net ids so emission can alias them to n_GND *)
+        Hashtbl.iter (fun n _rs ->
+          if not (Hashtbl.mem driven n) then begin
+            let label = match Hashtbl.find_opt sym n with Some s -> s | None -> n in
+            let base = match String.index_opt label '[' with
+              | Some i -> String.sub label 0 i | None -> label in
+            if not (is_keep_port base) then Hashtbl.replace autofix_gnd n ()
+          end) readers;
+        Printf.eprintf
+          "[ERC_AUTOFIX] %d undriven input net(s) tied to n_GND (debug build):\n  %s%s\n"
+          (Hashtbl.length autofix_gnd) body
+          (if total > 12 then Printf.sprintf "\n  ... and %d more" (total - 12) else "")
+      end else
       failwith (Printf.sprintf
         "bir_to_edif ERC: %d net(s) feed cell INPUT pins with no driver \
          (floating — a dropped driver / gate_map bug):\n  %s%s"
@@ -603,6 +653,12 @@ let write_edif
                (nets_of_conn ctx e)
          | None -> ())
     | _ -> ()) m.instances;
+  (* ERC_AUTOFIX: redirect every undriven input net onto the grounded tie net.
+     Applied AFTER the GND/VCC and ident-obuf aliases so a real driver alias
+     always wins; a purely-floating net has none, so it lands on n_GND. *)
+  Hashtbl.iter (fun n () ->
+    if not (Hashtbl.mem net_alias n) then Hashtbl.replace net_alias n "n_GND")
+    autofix_gnd;
   let live_cells = List.filter (fun (i : binstance) ->
     not (is_skipped_cell i.module_name)
     && not (Hashtbl.mem ident_names i.inst_name)) m.instances in
@@ -737,6 +793,306 @@ let write_edif
     (edif_safe_id top_name) (edif_safe_id top_name);
   pp ")\n";
 
+  let oc = open_out path in
+  Fun.protect ~finally:(fun () -> close_out oc)
+    (fun () -> output_string oc (Buffer.contents buf))
+
+(* ─── Hierarchical EDIF: emit one `work` cell per module, submodule instances
+ * as `work` cellrefs, primitives as `hdi_primitives` — NO flatten_struct.
+ * Each module's net connectivity comes straight from gate_map (miter-proven),
+ * so this avoids the flatten artifacts (bit-bus aliasing / dropped drivers). *)
+let write_edif_hier
+    ~(library_cells : (string * library_port list) list)
+    ~(path : string) (p : bprogram) ~(top : string) : unit =
+  let user_modules : (string, bmodule) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (m : bmodule) -> Hashtbl.replace user_modules m.name m) p.modules;
+  let sig_width (s : bsignal) = match s.stype with
+    | BInt { width; _ } -> width | BBool -> 1
+    | BArray { element = BInt { width; _ }; size } -> width * size
+    | _ -> 1 in
+  let user_ports : (string, (string * [`Input|`Output] * int) list) Hashtbl.t =
+    Hashtbl.create 64 in
+  List.iter (fun (m : bmodule) ->
+    Hashtbl.replace user_ports m.name
+      (List.filter_map (fun (s : bsignal) -> match s.direction with
+         | `Input  -> Some (s.name, `Input, sig_width s)
+         | `Output -> Some (s.name, `Output, sig_width s)
+         | _ -> None) m.signals)) p.modules;
+  let xil_primitive_ports : (string * (string * [`Input|`Output] * int) list) list = [
+    "LUT1",[ "O",`Output,1;"I0",`Input,1 ];
+    "LUT2",[ "O",`Output,1;"I0",`Input,1;"I1",`Input,1 ];
+    "LUT3",[ "O",`Output,1;"I0",`Input,1;"I1",`Input,1;"I2",`Input,1 ];
+    "LUT4",[ "O",`Output,1;"I0",`Input,1;"I1",`Input,1;"I2",`Input,1;"I3",`Input,1 ];
+    "LUT5",[ "O",`Output,1;"I0",`Input,1;"I1",`Input,1;"I2",`Input,1;"I3",`Input,1;"I4",`Input,1 ];
+    "LUT6",[ "O",`Output,1;"I0",`Input,1;"I1",`Input,1;"I2",`Input,1;"I3",`Input,1;"I4",`Input,1;"I5",`Input,1 ];
+    "FDRE",[ "Q",`Output,1;"C",`Input,1;"CE",`Input,1;"D",`Input,1;"R",`Input,1 ];
+    "FDSE",[ "Q",`Output,1;"C",`Input,1;"CE",`Input,1;"D",`Input,1;"S",`Input,1 ];
+    "FDCE",[ "Q",`Output,1;"C",`Input,1;"CE",`Input,1;"D",`Input,1;"CLR",`Input,1 ];
+    "FDPE",[ "Q",`Output,1;"C",`Input,1;"CE",`Input,1;"D",`Input,1;"PRE",`Input,1 ];
+    "CARRY4",[ "CO",`Output,4;"O",`Output,4;"CI",`Input,1;"CYINIT",`Input,1;"DI",`Input,4;"S",`Input,4 ];
+    "BUFG",[ "O",`Output,1;"I",`Input,1 ]; "IBUF",[ "O",`Output,1;"I",`Input,1 ];
+    "OBUF",[ "O",`Output,1;"I",`Input,1 ]; "INV",[ "O",`Output,1;"I",`Input,1 ];
+    "IBUFDS",[ "O",`Output,1;"I",`Input,1;"IB",`Input,1 ];
+    "MUXF7",[ "O",`Output,1;"I0",`Input,1;"I1",`Input,1;"S",`Input,1 ];
+    "MUXF8",[ "O",`Output,1;"I0",`Input,1;"I1",`Input,1;"S",`Input,1 ];
+  ] in
+  let is_user t = Hashtbl.mem user_modules t in
+  let is_skipped_cell = function "GND" | "VCC" -> true | _ -> false in
+  let is_keep_port nm = String.length nm >= 7 && String.sub nm 0 7 = "__keep_" in
+  (* declared port interface of any cell type (user module or primitive). *)
+  let prim_ports t : (string * [`Input|`Output] * int) list =
+    if is_user t then (try Hashtbl.find user_ports t with Not_found -> [])
+    else
+      let auth =
+        match Hashtbl.find_opt (Lazy.force xil_json_ports) t with
+        | Some l when l <> [] -> Some l
+        | _ ->
+          (match List.assoc_opt t library_cells with
+           | Some ports when ports <> [] ->
+               Some (List.map (fun (pp : library_port) ->
+                 pp.port_name, pp.port_direction, pp.port_width) ports)
+           | _ -> None) in
+      (match auth with
+       | Some l -> l
+       | None ->
+         (match List.assoc_opt t xil_primitive_ports with
+          | Some l -> l
+          | None ->
+            (match (try Vhdl_to_behavioral.lookup_xil_primitive_ports [t] with _ -> []) with
+             | (_, ports) :: _ ->
+                 List.map (fun (pp : library_port) ->
+                   pp.port_name, pp.port_direction, pp.port_width) ports
+             | [] -> []))) in
+  (* Union of ports (and max connection width) each user cell type is
+     instantiated with across ALL parents — a cell must declare every port any
+     parent connects (gate_map may drop a child input the parent still wires,
+     e.g. rgmii_lfsr.state_in). *)
+  let type_conn : (string, (string, int) Hashtbl.t) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (m : bmodule) ->
+    let ctx = mk_ctx () in populate_widths ctx m;
+    let bump base w = let cur = try Hashtbl.find ctx.widths base with Not_found -> 1 in
+      if w > cur then Hashtbl.replace ctx.widths base w in
+    let rec infer = function
+      | BSlice { signal = BVar base; msb; lsb } -> bump base (max msb lsb + 1)
+      | BSlice { signal; _ } -> infer signal
+      | BSelect { array = BVar base; index = BConst { value; _ } } -> bump base (Z.to_int value + 1)
+      | BConcat es -> List.iter infer es | _ -> () in
+    List.iter (fun (i : binstance) -> List.iter (fun (_, e) -> infer e) i.port_connections) m.instances;
+    List.iter (fun (i : binstance) ->
+      if is_user i.module_name then begin
+        let h = match Hashtbl.find_opt type_conn i.module_name with
+          | Some h -> h | None -> let h = Hashtbl.create 16 in Hashtbl.add type_conn i.module_name h; h in
+        List.iter (fun (pin, e) ->
+          let w = max 1 (List.length (nets_of_conn ctx e)) in
+          Hashtbl.replace h pin (max (try Hashtbl.find h pin with Not_found -> 0) w)) i.port_connections
+      end) m.instances) p.modules;
+  (* Base signal names a module DRIVES internally: any process-assigned LHS,
+     any @mem_write/@slice_write target, and any net wired to a child instance's
+     OUTPUT pin.  Used to infer the direction of connected-but-undeclared ports
+     (below): if the lower-level module is proven to drive the port, it is an
+     OUTPUT (a driver), not a defaulted input — otherwise a mis-/under-declared
+     driven port reads as a floating net in the parent ERC. *)
+  let driven_of (m : bmodule) : (string, unit) Hashtbl.t =
+    let d = Hashtbl.create 64 in
+    let mark n = Hashtbl.replace d n () in
+    let rec base = function
+      | BVar n -> Some n
+      | BSelect { array; _ } -> base array
+      | BSlice { signal; _ } -> base signal
+      | _ -> None in
+    let rec st = function
+      | BAssign { lhs; _ } -> mark lhs
+      | BCallStmt { func = ("@mem_write" | "@slice_write" | "@part_sel_write_up");
+                    args = (BVar a) :: _ } -> mark a
+      | BIf r -> List.iter st r.then_stmts; List.iter st r.else_stmts
+      | BCase r -> List.iter (fun (_, b) -> List.iter st b) r.cases; List.iter st r.default
+      | BBlock b -> List.iter st b
+      | BWhile r -> List.iter st r.body
+      | BFor r -> st r.init; st r.update; List.iter st r.body
+      | _ -> () in
+    List.iter (function
+      | BCombinational c -> List.iter st c.body
+      | BSequential s -> List.iter st s.body) m.processes;
+    List.iter (fun (i : binstance) ->
+      let ports = prim_ports i.module_name in
+      List.iter (fun (pin, e) ->
+        match List.find_opt (fun (p, _, _) -> p = pin) ports with
+        | Some (_, `Output, _) -> (match base e with Some n -> mark n | None -> ())
+        | _ -> ()) i.port_connections) m.instances;
+    d in
+  (* Fold the connected-port union into user_ports so BOTH the child's interface
+     and the parent's connection emission size each pin identically (array member
+     refs, not scalar).  Declared I/O keep their signal widths; an undeclared
+     connected pin becomes an OUTPUT if the module drives it internally, else an
+     input, at the connection width. *)
+  List.iter (fun (m : bmodule) ->
+    let existing = try Hashtbl.find user_ports m.name with Not_found -> [] in
+    let names = List.map (fun (n, _, _) -> n) existing in
+    let extra = match Hashtbl.find_opt type_conn m.name with
+      | Some h ->
+          let drv = driven_of m in
+          Hashtbl.fold (fun pin w acc ->
+            if List.mem pin names then acc
+            else (pin, (if Hashtbl.mem drv pin then `Output else `Input), w) :: acc) h []
+      | None -> [] in
+    Hashtbl.replace user_ports m.name (existing @ extra)) p.modules;
+  let buf = Buffer.create (1024 * 1024) in
+  let pp fmt = Printf.ksprintf (Buffer.add_string buf) fmt in
+  let now = Unix.gmtime (Unix.time ()) in
+  pp "(edif %s\n" (edif_safe_id top);
+  pp "  (edifversion 2 0 0)\n  (edifLevel 0)\n  (keywordmap (keywordlevel 0))\n";
+  pp "  (status (written (timeStamp %d %d %d %d %d %d)\n      (program \"bir_to_edif_hier\")))\n"
+    (now.tm_year + 1900) (now.tm_mon + 1) now.tm_mday now.tm_hour now.tm_min now.tm_sec;
+
+  (* all PRIMITIVE cell types used anywhere (instances whose module is not a user cell). *)
+  let used_prim : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (m : bmodule) ->
+    List.iter (fun (i : binstance) ->
+      if not (is_user i.module_name) then Hashtbl.replace used_prim i.module_name ())
+      m.instances) p.modules;
+  pp "  (Library hdi_primitives\n    (edifLevel 0)\n    (technology (numberDefinition))\n";
+  pp "    (cell GND (celltype GENERIC) (view netlist (viewtype NETLIST) (interface (port G (direction OUTPUT)))))\n";
+  pp "    (cell VCC (celltype GENERIC) (view netlist (viewtype NETLIST) (interface (port P (direction OUTPUT)))))\n";
+  Hashtbl.iter (fun ty () ->
+    if is_skipped_cell ty then () else begin
+      pp "    (cell %s (celltype GENERIC)\n      (view netlist (viewtype NETLIST)\n        (interface\n" (edif_safe_id ty);
+      List.iter (fun (pname, dir, w) ->
+        let d = match dir with `Input -> "INPUT" | `Output -> "OUTPUT" in
+        if w = 1 then pp "          (port %s (direction %s))\n" (edif_safe_id pname) d
+        else pp "          (port (array (rename %s \"%s[%d:0]\") %d) (direction %s))\n"
+               (edif_safe_id pname) pname (w - 1) w d) (prim_ports ty);
+      pp "        )))\n"
+    end) used_prim;
+  pp "  )\n";
+
+  (* ── one work cell per module ── *)
+  let emit_cell (m : bmodule) =
+    let ctx = mk_ctx () in
+    populate_widths ctx m;
+    let port_names : (string, unit) Hashtbl.t = Hashtbl.create 32 in
+    List.iter (fun (s : bsignal) ->
+      if s.direction <> `Internal then Hashtbl.replace port_names s.name ()) m.signals;
+    let bump base w =
+      if not (Hashtbl.mem port_names base) then begin
+        let cur = try Hashtbl.find ctx.widths base with Not_found -> 1 in
+        if w > cur then Hashtbl.replace ctx.widths base w end in
+    let rec infer = function
+      | BSlice { signal = BVar base; msb; lsb } -> bump base (max msb lsb + 1)
+      | BSlice { signal; _ } -> infer signal
+      | BSelect { array = BVar base; index = BConst { value; _ } } -> bump base (Z.to_int value + 1)
+      | BConcat es -> List.iter infer es | _ -> () in
+    List.iter (fun (i : binstance) -> List.iter (fun (_, e) -> infer e) i.port_connections) m.instances;
+    (* Interface = the reconciled user_ports (declared outputs + connected-port
+       union), so the child's ports and the parent's connections use IDENTICAL
+       widths (member refs on both sides). *)
+    let port_bits : (string, [`Input|`Output|`Internal] * int * int list) Hashtbl.t = Hashtbl.create 32 in
+    List.iter (fun (pn, dir, w) ->
+      if not (is_keep_port pn) && not (Hashtbl.mem port_bits pn) then
+        Hashtbl.add port_bits pn ((dir :> [`Input|`Output|`Internal]), w,
+          List.init w (fun i -> alloc ctx { base = pn; bit = i })))
+      (try Hashtbl.find user_ports m.name with Not_found -> []);
+    (* interface *)
+    pp "    (cell %s (celltype GENERIC)\n      (view netlist (viewtype NETLIST)\n        (interface\n" (edif_safe_id m.name);
+    Hashtbl.iter (fun nm (dir, w, _) ->
+      let d = match dir with `Input -> "INPUT" | `Output -> "OUTPUT" | _ -> "INPUT" in
+      if w = 1 then pp "          (port %s (direction %s))\n" (edif_safe_id nm) d
+      else pp "          (port (array (rename %s \"%s[%d:0]\") %d) (direction %s))\n"
+             (edif_safe_id nm) nm (w - 1) w d) port_bits;
+    pp "        )\n        (contents\n";
+    pp "          (instance n_GND_inst (viewref netlist (cellref GND (libraryref hdi_primitives))))\n";
+    pp "          (instance n_VCC_inst (viewref netlist (cellref VCC (libraryref hdi_primitives))))\n";
+    let live_cells = List.filter (fun (i : binstance) -> not (is_skipped_cell i.module_name)) m.instances in
+    List.iter (fun (i : binstance) ->
+      let lib = if is_user i.module_name then "work" else "hdi_primitives" in
+      pp "          (instance %s (viewref netlist (cellref %s (libraryref %s)))"
+        (edif_safe_id i.inst_name) (edif_safe_id i.module_name) lib;
+      let seen : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+      List.iter (fun (k, v) -> if not (Hashtbl.mem seen k) then begin
+        Hashtbl.add seen k (); pp "\n            (property %s (string %s))" k (edif_property_value v) end) i.param_strs;
+      List.iter (fun (k, n) -> if not (Hashtbl.mem seen k) then begin
+        Hashtbl.add seen k (); pp "\n            (property %s (integer %d))" k n end) i.param_values;
+      pp "\n          )\n") live_cells;
+    (* nets *)
+    let net_uses : (string, string list) Hashtbl.t = Hashtbl.create 1024 in
+    let net_has_driver : (string, unit) Hashtbl.t = Hashtbl.create 1024 in
+    let net_readers : (string, string list) Hashtbl.t = Hashtbl.create 1024 in
+    let add_use ?(driver = false) ?(who = "") net pref =
+      Hashtbl.replace net_uses net (pref :: (try Hashtbl.find net_uses net with Not_found -> []));
+      if driver then Hashtbl.replace net_has_driver net ()
+      else Hashtbl.replace net_readers net (who :: (try Hashtbl.find net_readers net with Not_found -> [])) in
+    let mem_idx ~w i = w - 1 - i in
+    List.iter (fun (i : binstance) ->
+      let inst_id = edif_safe_id i.inst_name in
+      let ports = prim_ports i.module_name in
+      List.iter (fun (pin, expr) ->
+        let pin_w = match List.find_opt (fun (pn, _, _) -> pn = pin) ports with Some (_, _, w) -> w | None -> 1 in
+        let pin_dir = match List.find_opt (fun (pn, _, _) -> pn = pin) ports with Some (_, d, _) -> d | None -> `Input in
+        let nets = let all = nets_of_conn ctx expr in
+          if List.length all > pin_w then List.filteri (fun k _ -> k < pin_w) all else all in
+        List.iteri (fun bit_i net ->
+          if pin_dir = `Output && (net = "n_GND" || net = "n_VCC") then ()
+          else begin
+            let pref = if pin_w = 1 then Printf.sprintf "(portref %s (instanceref %s))" (edif_safe_id pin) inst_id
+                       else Printf.sprintf "(portref (member %s %d) (instanceref %s))" (edif_safe_id pin) (mem_idx ~w:pin_w bit_i) inst_id in
+            add_use ~driver:(pin_dir = `Output) ~who:(i.inst_name ^ "." ^ pin) net pref
+          end) nets) i.port_connections) live_cells;
+    add_use ~driver:true "n_GND" "(portref G (instanceref n_GND_inst))";
+    add_use ~driver:true "n_VCC" "(portref P (instanceref n_VCC_inst))";
+    Hashtbl.iter (fun nm (dir, w, bits) ->
+      List.iteri (fun bit_i id ->
+        let net = net_name_of_id id in
+        let pref = if w = 1 then Printf.sprintf "(portref %s)" (edif_safe_id nm)
+                   else Printf.sprintf "(portref (member %s %d))" (edif_safe_id nm) (mem_idx ~w bit_i) in
+        (* a module INPUT drives internal nets; an OUTPUT reads them *)
+        add_use ~driver:(dir = `Input) ~who:(Printf.sprintf "port:%s[%d]" nm bit_i) net pref) bits) port_bits;
+    if Sys.getenv_opt "SVS_ERC" <> Some "0" then begin
+      let lost = Hashtbl.fold (fun net rs acc -> if Hashtbl.mem net_has_driver net then acc else (net, rs) :: acc) net_readers [] in
+      if lost <> [] then
+        Printf.eprintf "[edif_hier] %s: %d net(s) read with no driver (e.g. %s)\n" m.name
+          (List.length lost)
+          (match lost with (n, _) :: _ -> n | [] -> "");
+      (* HIER_ERC_DIAG=<module>: dump every undriven net's symbolic name +
+         readers so we can see if the emitter dropped a real driver or the
+         name is a port/const the crude ERC misclassifies. *)
+      (match Sys.getenv_opt "HIER_ERC_DIAG" with
+       | Some target when target = m.name ->
+         let sym : (string, string) Hashtbl.t = Hashtbl.create 4096 in
+         Hashtbl.iter (fun (k : net_key) id ->
+           Hashtbl.replace sym (net_name_of_id id) (Printf.sprintf "%s[%d]" k.base k.bit)) ctx.ids;
+         List.iter (fun (net, rs) ->
+           Printf.eprintf "[HDIAG] %s (%s) <- read by %s\n"
+             (match Hashtbl.find_opt sym net with Some s -> s | None -> net) net
+             (String.concat ", " (List.filteri (fun i _ -> i < 3) rs))) lost
+       | _ -> ())
+    end;
+    Hashtbl.iter (fun net uses ->
+      pp "          (net %s\n            (joined" net;
+      List.iter (fun u -> pp "\n              %s" u) uses;
+      pp ")\n          )\n") net_uses;
+    pp "        )\n      )\n    )\n"
+  in
+  pp "  (Library work\n    (edifLevel 0)\n    (technology (numberDefinition))\n";
+  (* Vivado read_edif is single-pass (definition-before-use): a cell must be
+     emitted before any cell that instantiates it.  Post-order DFS = leaves
+     first, each module after its user-submodules. *)
+  let ordered =
+    let visited = Hashtbl.create 128 and order = ref [] in
+    let rec dfs n =
+      if not (Hashtbl.mem visited n) then begin
+        Hashtbl.add visited n ();
+        (match Hashtbl.find_opt user_modules n with
+         | Some (m : bmodule) ->
+             List.iter (fun (i : binstance) ->
+               if is_user i.module_name then dfs i.module_name) m.instances;
+             order := m :: !order
+         | None -> ())
+      end in
+    List.iter (fun (m : bmodule) -> dfs m.name) p.modules;
+    List.rev !order in
+  List.iter emit_cell ordered;
+  pp "  )\n";
+  pp "  (Design %s (cellref %s (libraryref work)))\n" (edif_safe_id top) (edif_safe_id top);
+  pp ")\n";
   let oc = open_out path in
   Fun.protect ~finally:(fun () -> close_out oc)
     (fun () -> output_string oc (Buffer.contents buf))

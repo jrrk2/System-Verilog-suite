@@ -633,6 +633,119 @@ let ram_m_lower_dual_port ~prim ~pb ~depth_cap ~addr_w ~m ~(mm : bmem) ~mname ~s
          m.name mname (2 * n_per_copy) prim n_per_copy mm.depth dw;
        `Lowered (m', None))
 
+(* ──────────── true-dual-port (TDP) lowering ──────────── *)
+
+(* Indices of the processes that WRITE mem (@mem_write of mname).  A genuine
+   Xilinx TDP RAM (prim_generic_ram_2p) is written by two independent clocked
+   processes — one per port — each of which also reads mem into its own
+   registered rdata.  Each such process maps 1:1 onto a RAMB36E1 port. *)
+let mem_writer_indices m_name processes =
+  let rec writes = function
+    | [] -> false
+    | BCallStmt { func = "@mem_write"; args = (BVar n) :: _ } :: _ when n = m_name -> true
+    | BIf { then_stmts; else_stmts; _ } :: tl ->
+        writes then_stmts || writes else_stmts || writes tl
+    | BCase { cases; default; _ } :: tl ->
+        List.exists (fun (_, ss) -> writes ss) cases || writes default || writes tl
+    | BBlock ss :: tl -> writes ss || writes tl
+    | (BWhile { body; _ } | BFor { body; _ }) :: tl -> writes body || writes tl
+    | _ :: tl -> writes tl
+  in
+  List.filter (fun i ->
+    match List.nth processes i with BSequential s -> writes s.body | _ -> false)
+    (List.init (List.length processes) (fun i -> i))
+
+(* Build one Fpga_bram_resolve.ram_port from a single clocked process that
+   both masked-byte-writes and registers a read of mem, all at that port's
+   address.  [read_pin] is the net build_byte_lane_ram will drive with this
+   port's read data; the process's mem-reads are rewritten to it.  Returns
+   (port, registered-read-target option) or None if the process doesn't match
+   the byte-masked read/write shape. *)
+let build_tdp_port m_name ~read_pin ~dw (p : bprocess) =
+  let body, clk = match p with
+    | BSequential s -> s.body, s.clock
+    | BCombinational c -> c.body, "clk" in
+  let rw_e = rewrite_reads_e m_name read_pin in
+  let w_sites = collect_write_sites m_name body in
+  let r_sites = collect_read_sites  m_name body in
+  match fold_read_sites r_sites with
+  | None -> None
+  | Some r_addr0 ->
+    let r_addr = rw_e r_addr0 in
+    (* Fold a constant integer expression (unroll leaves `i*8` as an
+       un-simplified BMul of BConsts rather than a folded BConst). *)
+    let rec ceval = function
+      | BConst { value; _ } -> Some (Z.to_int value)
+      | BBinOp { op = BMul; lhs; rhs; _ } ->
+        (match ceval lhs, ceval rhs with Some a, Some b -> Some (a * b) | _ -> None)
+      | BBinOp { op = BAdd; lhs; rhs; _ } ->
+        (match ceval lhs, ceval rhs with Some a, Some b -> Some (a + b) | _ -> None)
+      | BBinOp { op = BShl; lhs; rhs; _ } ->
+        (match ceval lhs, ceval rhs with Some a, Some b -> Some (a lsl b) | _ -> None)
+      | _ -> None
+    in
+    (* Recognise one byte-lane write's data as byte `k` of a common base.  Two
+       shapes reach here: a clean [base[8k+7:8k]] slice (constant `[7:0]` style
+       source), or the indexed part-select `base[i*8 +: 8]` which unroll+lower
+       leave as [(base >> i*8) & 8'hFF].  Both mean "byte k <= base's byte k". *)
+    let byte_of_data data =
+      match data with
+      | BSlice { signal; msb; lsb } when msb - lsb = 7 && lsb mod 8 = 0 ->
+        Some (lsb / 8, signal)
+      | BBinOp { op = BAnd; lhs = BBinOp { op = BShr; lhs = base; rhs = sh; _ }; rhs = mask; _ }
+      | BBinOp { op = BAnd; lhs = mask; rhs = BBinOp { op = BShr; lhs = base; rhs = sh; _ }; _ } ->
+        (match ceval sh, ceval mask with
+         | Some s, Some m when s mod 8 = 0 && m = 0xFF -> Some (s / 8, base)
+         | _ -> None)
+      | _ -> None
+    in
+    (* every write site must be byte k of a COMMON base at a COMMON address
+       (the sb/sh/sw byte-mask pattern). *)
+    let byte_info =
+      match w_sites with
+      | [] -> None
+      | (_, a0, _) :: _ ->
+        let parsed = List.map (fun (pred, a, data) ->
+          match byte_of_data data with
+          | Some (k, base) when a = a0 ->
+            Some (k, (match pred with Some pr -> pr | None -> one_lit 1), base)
+          | _ -> None) w_sites in
+        if List.for_all Option.is_some parsed then begin
+          let bytes = List.map Option.get parsed in
+          let base = let _, _, s = List.hd bytes in s in
+          if List.for_all (fun (_, _, s) -> s = base) bytes then Some (a0, bytes, base)
+          else None
+        end else None
+    in
+    let read_reg =
+      let rec find_uncond = function
+        | [] -> None
+        | BAssign { lhs; rhs = BSelect { array = BVar n; _ } } :: _ when n = m_name -> Some lhs
+        | BBlock b :: rest -> (match find_uncond b with Some r -> Some r | None -> find_uncond rest)
+        | _ :: rest -> find_uncond rest
+      in find_uncond body
+    in
+    let port =
+      match byte_info with
+      | Some (a0, bytes, base) ->
+        let w_addr = rw_e a0 and base = rw_e base in
+        let nbytes = dw / 8 in
+        let strobe b = match List.find_opt (fun (bl, _, _) -> bl = b) bytes with
+          | Some (_, pr, _) -> rw_e pr | None -> zero_lit 1 in
+        let wstrb = BConcat (List.rev (List.init nbytes strobe)) in
+        let we_any = List.fold_left (fun acc (_, pr, _) -> bool_or acc (rw_e pr)) (zero_lit 1) bytes in
+        Fpga_bram_resolve.(
+          { p_clk = BVar clk
+          ; p_addr = BCond { condition = we_any; then_val = w_addr; else_val = r_addr }
+          ; p_we = we_any; p_wdata = base; p_wstrb = Some wstrb })
+      | None ->
+        (* read-only port: no writes, address = read address. *)
+        Fpga_bram_resolve.(
+          { p_clk = BVar clk; p_addr = r_addr
+          ; p_we = zero_lit 1; p_wdata = zero_lit dw; p_wstrb = None })
+    in
+    Some (port, read_reg)
+
 (* ──────────── per-memory lowering ──────────── *)
 
 (* Try to lower a single bmem. Returns either:
@@ -877,19 +990,26 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                  (* plain binary digits, no `%d'b` prefix — see RAM32M note *)
                  [ ("INIT", init_for_bit b) ]
              ; port_connections =
-                 (* RAM*X1S/X1D addresses are individual 1-bit pins
-                    A0../DPRA0.., not a bus — the bus form fails strict
-                    readers (Vivado read_edif) and the primitive-port check.
-                    Dual-port reads land on DPO (SPO = write-port view,
-                    unused). *)
+                 (* RAM32X1S/D and RAM64X1S/D expose their addresses as
+                    individual 1-bit pins A0../DPRA0.. (that IS the Xilinx
+                    primitive interface); the bus form fails strict readers
+                    (Vivado read_edif) and the primitive-port check.  RAM128X1D
+                    is the exception: its actual primitive interface is a 7-bit
+                    BUS A[6:0]/DPRA[6:0], so scalar pins there would not match
+                    the unisim VHDL interface (the port-direction resolver then
+                    drops the cell).  Emit per-primitive.  Dual-port reads land
+                    on DPO (SPO = write-port view, unused). *)
                  ("D",    BSlice { signal = w_data; msb = b; lsb = b })
-                 :: List.init addr_w (fun i ->
-                      (Printf.sprintf "A%d" i, BSlice { signal = a_expr; msb = i; lsb = i }))
-                 @ (if dual then
-                      List.init addr_w (fun i ->
-                        (Printf.sprintf "DPRA%d" i,
-                         BSlice { signal = dp_expr; msb = i; lsb = i }))
-                    else [])
+                 :: (if prim = "RAM128X1D" then
+                       ("A", a_expr) :: (if dual then [ ("DPRA", dp_expr) ] else [])
+                     else
+                       List.init addr_w (fun i ->
+                         (Printf.sprintf "A%d" i, BSlice { signal = a_expr; msb = i; lsb = i }))
+                       @ (if dual then
+                            List.init addr_w (fun i ->
+                              (Printf.sprintf "DPRA%d" i,
+                               BSlice { signal = dp_expr; msb = i; lsb = i }))
+                          else []))
                  @ [ ("WE",   we_expr)
                    ; ("WCLK", BVar orig_clk)
                    ; ((if dual then "DPO" else "O"), BVar out_name) ]
@@ -962,6 +1082,91 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
        accept the timing change.\n"
       m.name mname;
     `Skipped
+  end
+  else if fpga && mm.read_is_sync
+          && List.length (mem_writer_indices mname m.processes) = 2 then begin
+    (* ── FPGA true-dual-port (TDP) path ──────────────────────────────
+       prim_generic_ram_2p: two independent clocked processes, each doing a
+       masked byte-write and a registered read at that port's address.  Map
+       each process onto one RAMB36E1 port (A/B), both able to read AND write
+       simultaneously — the native Xilinx TDP mode.  Kept separate from the
+       single-writer path below so that path (picosoc/eth) is untouched. *)
+    let dw = mm.data_width in
+    if mm.depth > Fpga_bram_resolve.prim_capacity Fpga_bram_resolve.RAMB36E1 / 8 then
+      skip (Printf.sprintf
+        "TDP byte-write depth %d > %d (deep x1-tiling TODO)" mm.depth
+        (Fpga_bram_resolve.prim_capacity Fpga_bram_resolve.RAMB36E1 / 8))
+    else begin
+      let widx = mem_writer_indices mname m.processes in
+      let ia = List.nth widx 0 and ib = List.nth widx 1 in
+      let pa_proc = List.nth m.processes ia and pb_proc = List.nth m.processes ib in
+      let read_pin_a = mname ^ "_rdata_a" and read_pin_b = mname ^ "_rdata_b" in
+      match build_tdp_port mname ~read_pin:read_pin_a ~dw pa_proc,
+            build_tdp_port mname ~read_pin:read_pin_b ~dw pb_proc with
+      | Some (port_a, rreg_a), Some (port_b, rreg_b) ->
+        let insts, new_sigs, drv_stmts, _rdata_names =
+          Fpga_bram_resolve.build_byte_lane_ram ~name:mname ~depth:mm.depth ~width:dw
+            ?init:(if mm.init_values <> [] then Some (Array.of_list mm.init_values) else None)
+            ~ports:[ port_a; port_b ] ()
+        in
+        (* rdata net names are read_pin_a / read_pin_b by construction. *)
+        let absorb rreg pin =
+          match rreg with Some rd -> [ BAssign { lhs = rd; rhs = BVar pin } ] | None -> [] in
+        let driver =
+          BCombinational
+            { name = mname ^ "_drv"; sensitivity = [ BAny ]
+            ; body = drv_stmts @ absorb rreg_a read_pin_a @ absorb rreg_b read_pin_b }
+        in
+        let rewrite_port_body pin rreg body =
+          let body = List.map (rewrite_reads_s mname pin) (strip_mem_writes mname body) in
+          match rreg with
+          | Some rd ->
+            let rec drop bb =
+              List.filter_map (function
+                | BAssign { lhs; rhs = BVar n } when lhs = rd && n = pin -> None
+                | BBlock b -> Some (BBlock (drop b))
+                | s -> Some s) bb
+            in drop body
+          | None -> body
+        in
+        let processes' =
+          List.mapi (fun i p ->
+            match p with
+            | BSequential s when i = ia ->
+              BSequential { s with body = rewrite_port_body read_pin_a rreg_a s.body }
+            | BSequential s when i = ib ->
+              BSequential { s with body = rewrite_port_body read_pin_b rreg_b s.body }
+            | BSequential s ->
+              BSequential { s with body = List.map (rewrite_reads_s mname read_pin_a) s.body }
+            | BCombinational c ->
+              BCombinational { c with body = List.map (rewrite_reads_s mname read_pin_a) c.body })
+            m.processes
+        in
+        let instances' =
+          List.map (fun (i : binstance) ->
+            { i with port_connections =
+                List.map (fun (pn, e) -> (pn, rewrite_reads_e mname read_pin_a e))
+                  i.port_connections })
+            m.instances
+        in
+        let funcs' =
+          List.map (fun (f : bfunc) ->
+            { f with body = List.map (rewrite_reads_s mname read_pin_a) f.body })
+            m.funcs
+        in
+        let signals' =
+          List.filter (fun (s : bsignal) -> s.name <> mname) m.signals @ new_sigs in
+        let m' =
+          { m with signals = signals'; processes = processes' @ [ driver ]
+          ; instances = insts @ instances'; funcs = funcs'
+          ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
+        in
+        Printf.eprintf
+          "[memlower] %s.%s: TDP -> %d RAMB tile(s) (2 ports, depth=%d width=%d)\n"
+          m.name mname (List.length insts) mm.depth dw;
+        `Lowered (m', None)
+      | _ -> skip "TDP: a port process did not match the byte-masked read/write shape"
+    end
   end
   else if
     mm.n_write_ports < 1

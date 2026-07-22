@@ -61,16 +61,21 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
       range 0
   | BConcat es ->
       List.concat_map (nets_of_conn ctx) (List.rev es)
-  | BSlice { signal; msb; lsb } ->
-      let base = match signal with
-        | BVar nm -> nm
-        | _ -> failwith ("bir_to_verilog_netlist: slice of non-BVar: "
-                         ^ Behavioral_ir.string_of_bexpr signal) in
+  | BSlice { signal = BVar base; msb; lsb } ->
       let rec range lo hi = if lo > hi then [] else lo :: range (lo + 1) hi in
       List.map (fun i ->
         match const_net base with
         | Some n -> n
         | None   -> net_name_of_id (alloc ctx { base; bit = i }))
+        (range lsb msb)
+  | BSlice { signal; msb; lsb } ->
+      (* Slice of a composite (flatten_struct emits a bus as a BConcat of nets,
+         then slices it): expand the inner signal LSB-first and take [lsb..msb];
+         out-of-range bits read x -> tie GND. *)
+      let full = Array.of_list (nets_of_conn ctx signal) in
+      let n = Array.length full in
+      let rec range lo hi = if lo > hi then [] else lo :: range (lo + 1) hi in
+      List.map (fun i -> if i >= 0 && i < n then full.(i) else "n_GND")
         (range lsb msb)
   | BVar nm ->
       (match const_net nm with

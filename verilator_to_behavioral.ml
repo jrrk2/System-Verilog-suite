@@ -80,6 +80,15 @@ let rec get_width_from_dtype = function
       get_width_from_dtype (Some base)
   | Some (RefType { refdtype_ref; _ }) -> get_width_from_dtype refdtype_ref
   | Some (EnumType { base; _ }) -> get_width_from_dtype base
+  | Some (StructType { members; _ }) ->
+      (* Packed struct: total width = sum of member widths.  Without this a
+         struct-typed port/signal (dm::dmi_req_t, dmi_resp_t) collapsed to 1 bit
+         in the Verilator frontend, so the cross-flow miter saw a 1-bit vs
+         41/34-bit interface for dmi_cdc and spuriously DIFFERed. *)
+      List.fold_left (fun acc m -> acc + get_width_from_dtype (Some m)) 0 members
+  (* a struct member wraps its real dtype in dtype_ref — deref it (else each
+     member counts as 1 and dmi_req_t summed to 3 not 41). *)
+  | Some (MemberType { dtype_ref; _ }) -> get_width_from_dtype dtype_ref
   | _ -> 1
 
 (* For an unpacked-array type, return its depth; otherwise None. *)
@@ -467,6 +476,14 @@ let rec expr_to_bexpr = function
 
 (* Convert Verilator statement to behavioral IR statement *)
 let rec stmt_to_bstmt = function
+  | AssignW { lhs; rhs } ->
+      (* Newer Verilator (>=5.048) wraps each continuous `assign` in an ALWAYS
+         whose body is an ASSIGNW (not a top-level CONTASSIGN).  Inside a
+         process body an ASSIGNW is just a blocking combinational write — route
+         it through the same LHS handling as Assign, else the whole comb block
+         comes out empty and every driven net silently reads as undriven (the
+         prim_fifo_async_simple wready_o/src_req/pending_d drop-off). *)
+      stmt_to_bstmt (Assign { lhs; rhs; is_blocking = true })
   | Assign { lhs; rhs; _ } ->
       (* Three LHS shapes we care about:
        *   VarRef name             — `name = rhs`     (BAssign)
@@ -1239,6 +1256,27 @@ let convert_verilator_json_to_behavioral json_file =
     if !debug then Printf.printf "Reading Verilator JSON: %s\n" json_file;
 
     let json = Yojson.Safe.from_file json_file in
+    (* Version guard by JSON shape (robust even for a pre-generated file, where
+       the `verilator` on PATH may not be the one that produced it).  The
+       NBA-scheduler fields on the NETLIST root (evalNbap/nbaEventp/…) are only
+       emitted by Verilator's newer non-blocking scheduler — absent in the
+       <5.048 builds that also mis-emit packed-struct ports (the dtype
+       self-reference collapse).  Their absence => the JSON is from a too-old
+       verilator; fail loudly rather than miter garbage.  VERILATOR_MIN_OK=0
+       bypasses. *)
+    if Sys.getenv_opt "VERILATOR_MIN_OK" <> Some "0" then begin
+      let root_keys = match json with
+        | `Assoc kvs -> List.map fst kvs
+        | _ -> [] in
+      let markers = ["evalNbap"; "nbaEventp"; "nbaEventTriggerp";
+                     "delaySchedulerp"; "stlFirstIterationp"] in
+      if not (List.exists (fun m -> List.mem m root_keys) markers) then
+        failwith (Printf.sprintf
+          "Verilator JSON %s lacks the NBA-scheduler fields (%s): produced by a \
+           too-old verilator (< 5.048) that mis-emits packed-struct ports. \
+           Regenerate with a newer verilator (set VERILATOR_MIN_OK=0 to override)."
+          json_file (String.concat "/" markers))
+    end;
     let ast = Sv_parse.parse json in
 
     if !debug then Printf.printf "Successfully parsed Verilator JSON\n";

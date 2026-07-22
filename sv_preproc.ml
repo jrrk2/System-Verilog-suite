@@ -42,9 +42,32 @@ let preprocess_string_ref :
  * insisting on `\`ifndef GUARD` everywhere.  Cleared by reset(). *)
 let included_files : (string, unit) Hashtbl.t = Hashtbl.create 16
 
+(* Seed project-wide defines from the SVS_DEFINE env var so a multi-file
+ * synthesis can pass `+define+` equivalents (FPGA_XILINX, VC707, …) that
+ * the per-file reset() would otherwise wipe.  Format: entries separated by
+ * ';', each "NAME=BODY" (substituted) or bare "NAME" (membership only, empty
+ * expansion — enough for `\`ifdef).  Applied on every reset() so the tokens
+ * are visible in EVERY file, matching a tool-level +define+.  In-file
+ * `\`define / `\`undef still work normally on top of these. *)
+let seed_defines_from_env () =
+  match Sys.getenv_opt "SVS_DEFINE" with
+  | None | Some "" -> ()
+  | Some s ->
+      List.iter (fun entry ->
+        let entry = String.trim entry in
+        if entry <> "" then
+          match String.index_opt entry '=' with
+          | Some i ->
+              let name = String.trim (String.sub entry 0 i) in
+              let body = String.sub entry (i+1) (String.length entry - i - 1) in
+              if name <> "" then Hashtbl.replace defines name (Plain body)
+          | None -> Hashtbl.replace defines entry (Plain ""))
+        (String.split_on_char ';' s)
+
 let reset () =
   Hashtbl.clear defines;
-  Hashtbl.clear included_files
+  Hashtbl.clear included_files;
+  seed_defines_from_env ()
 
 let is_id_start c =
   (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_'
@@ -120,6 +143,12 @@ let substitute formals actuals body =
          | Some v -> Buffer.add_string out v
          | None   -> Buffer.add_string out id);
         p := p'
+      end else if c = '`' && !p + 1 < n && body.[!p + 1] = '`' then begin
+        (* `` is the SV token-paste operator: it concatenates the adjacent
+         * tokens (e.g. `assert_static_in_package_``__name` → one identifier).
+         * Emit nothing so the surrounding text joins, after the formals on
+         * either side have been substituted. *)
+        p := !p + 2
       end else begin
         Buffer.add_char out c;
         incr p
@@ -196,8 +225,18 @@ let rec expand_string ?(fuel = 16) s =
 (* Process one directive line (already trimmed, starts with `).
  * Returns text to emit on this line (typically empty). Mutates the
  * ifdef stack and the macro table. *)
+(* Each ifdef-stack level carries (branch_active, any_matched):
+ *   branch_active — is the CURRENT branch of this if-chain emitting;
+ *   any_matched   — has ANY branch of this chain been taken yet.
+ * Tracking any_matched is essential for multi-way `ifdef/`elsif/`elsif/`else
+ * chains: without it, a trailing `else re-activates once the current (last
+ * `elsif) branch is false even though an EARLIER `elsif already matched —
+ * e.g. prim_assert.sv (`ifdef VERILATOR / `elsif SYNTHESIS / `elsif YOSYS /
+ * `else) would emit BOTH the SYNTHESIS branch and the `else branch. *)
 let process_directive ifdef_stk line =
-  let active () = List.for_all (fun b -> b) !ifdef_stk in
+  let branch_active (a, _) = a in
+  let active () = List.for_all branch_active !ifdef_stk in
+  let outer_of tl = List.for_all branch_active tl in
   let n = String.length line in
   let (kw, p) = read_ident line 1 in
   let rest = if p < n then String.sub line p (n - p) else "" in
@@ -205,25 +244,25 @@ let process_directive ifdef_stk line =
   match kw with
   | "ifdef" ->
       let cond = active () && Hashtbl.mem defines rest in
-      ifdef_stk := cond :: !ifdef_stk;
+      ifdef_stk := (cond, cond) :: !ifdef_stk;
       ""
   | "ifndef" ->
       let cond = active () && not (Hashtbl.mem defines rest) in
-      ifdef_stk := cond :: !ifdef_stk;
+      ifdef_stk := (cond, cond) :: !ifdef_stk;
       ""
   | "else" ->
       (match !ifdef_stk with
-       | top :: tl ->
-           let outer = List.for_all (fun b -> b) tl in
-           ifdef_stk := (outer && not top) :: tl
+       | (_, matched) :: tl ->
+           let outer = outer_of tl in
+           ifdef_stk := ((outer && not matched), true) :: tl
        | [] -> ());
       ""
   | "elsif" ->
       (match !ifdef_stk with
-       | _top :: tl ->
-           let outer = List.for_all (fun b -> b) tl in
-           let cond = outer && Hashtbl.mem defines rest in
-           ifdef_stk := cond :: tl
+       | (_, matched) :: tl ->
+           let outer = outer_of tl in
+           let cond = outer && (not matched) && Hashtbl.mem defines rest in
+           ifdef_stk := (cond, matched || cond) :: tl
        | [] -> ());
       ""
   | "endif" ->
@@ -404,6 +443,31 @@ let lines_of_string s =
  * the macro table on entry; pass `~keep_defines:true` to preserve
  * the table built from a previous call (handy when feeding several
  * fragments through with a shared preamble). *)
+(* Strip SystemVerilog attribute instances (open-paren-star ... star-close-paren,
+ * e.g. xprop_off, keep="true").  They are synthesis-irrelevant metadata but can
+ * appear in almost any position — before an always_comb statement, on a module
+ * item, on a port — where the grammar has no production for them, so dropping
+ * them in the preprocessor is far simpler than teaching every rule to accept an
+ * optional attribute.  A '(' immediately followed by '*' is never a valid SV
+ * expression, and attributes do not nest, so a flat scan to the next star-paren
+ * is safe.  Runs after line comments are already stripped. *)
+let strip_attributes s =
+  let n = String.length s in
+  let buf = Buffer.create n in
+  let i = ref 0 in
+  while !i < n do
+    if !i + 1 < n && s.[!i] = '(' && s.[!i + 1] = '*' then begin
+      let j = ref (!i + 2) in
+      let closed = ref false in
+      while not !closed && !j + 1 < n do
+        if s.[!j] = '*' && s.[!j + 1] = ')' then closed := true else incr j
+      done;
+      if !closed then (Buffer.add_char buf ' '; i := !j + 2)
+      else (Buffer.add_char buf s.[!i]; incr i)  (* unterminated: leave as-is *)
+    end else (Buffer.add_char buf s.[!i]; incr i)
+  done;
+  Buffer.contents buf
+
 let preprocess_string ?(keep_defines = false) text =
   if not keep_defines then reset ();
   let raw = fold_continuations (lines_of_string text) in
@@ -416,12 +480,12 @@ let preprocess_string ?(keep_defines = false) text =
       if txt <> "" then Buffer.add_string out txt;
       Buffer.add_char out '\n'
     end else begin
-      let active = List.for_all (fun b -> b) !ifdef_stk in
+      let active = List.for_all (fun (a, _) -> a) !ifdef_stk in
       if active then Buffer.add_string out (expand_string line);
       Buffer.add_char out '\n'
     end
   ) raw;
-  Buffer.contents out
+  strip_attributes (Buffer.contents out)
 
 let () = preprocess_string_ref := preprocess_string
 
@@ -459,8 +523,14 @@ let preprocess_file ?(incdirs=[]) filename =
   really_input ic buf 0 n;
   close_in ic;
   let parent_dir = Filename.dirname filename in
+  (* SVS_INCDIR: colon-separated project include search path, appended after
+   * any caller-supplied incdirs (tool-level +incdir+ equivalent). *)
+  let env_incdirs =
+    match Sys.getenv_opt "SVS_INCDIR" with
+    | None | Some "" -> []
+    | Some s -> List.filter (fun d -> d <> "") (String.split_on_char ':' s) in
   let saved = !include_dirs in
-  include_dirs := parent_dir :: (saved @ incdirs);
+  include_dirs := parent_dir :: (saved @ incdirs @ env_incdirs);
   let result = preprocess_string (Bytes.unsafe_to_string buf) in
   include_dirs := saved;
   result

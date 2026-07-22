@@ -180,6 +180,41 @@ let post_load (p : bprogram) =
   |> Behavioral_const.expand_fills_program
   |> Behavioral_const.strip_signed_program
 
+(* Guard against a stale Verilator.  Versions < 5.048 mis-emit packed-struct
+ * ports in --json-only (the self-reference dtype collapse that flattened
+ * dmi_req_i/dmi_resp_o to a single bit), producing a silently-wrong IR.  A
+ * too-old `verilator` on PATH (e.g. a lingering /usr/local 5.024 alongside a
+ * newer $HOME build) is a real point of confusion — fail loudly instead of
+ * miter-ing against garbage.  Set VERILATOR_MIN_OK=0 to bypass. *)
+let verilator_min = (5, 48)
+let check_verilator_version () =
+  if Sys.getenv_opt "VERILATOR_MIN_OK" = Some "0" then ()
+  else begin
+    let line =
+      try
+        let ic = Unix.open_process_in "verilator --version 2>/dev/null" in
+        let l = (try input_line ic with End_of_file -> "") in
+        ignore (Unix.close_process_in ic); l
+      with _ -> "" in
+    (* "Verilator 5.050 2026-07-01 rev v5.050" -> (5, 50) *)
+    let ver =
+      try Scanf.sscanf line "Verilator %d.%d" (fun a b -> Some (a, b))
+      with _ -> None in
+    match ver with
+    | Some (maj, min) ->
+        let (rmaj, rmin) = verilator_min in
+        if (maj, min) < (rmaj, rmin) then
+          failwith (Printf.sprintf
+            "verilator on PATH is %d.%03d but the struct-port JSON fix needs \
+             >= %d.%03d; upgrade or fix PATH (or set VERILATOR_MIN_OK=0 to override). \
+             Got: %S" maj min rmaj rmin line)
+    | None ->
+        failwith (Printf.sprintf
+          "could not determine verilator version (need >= %d.%03d); is verilator \
+           on PATH?  Got: %S (set VERILATOR_MIN_OK=0 to override)"
+          (fst verilator_min) (snd verilator_min) line)
+  end
+
 let load_frontend ~frontend ~top ~files : bprogram =
   match frontend with
   | "verible" ->
@@ -198,6 +233,7 @@ let load_frontend ~frontend ~top ~files : bprogram =
       (try Sys.remove tmp with _ -> ());
       post_load p
   | "verilator" ->
+      check_verilator_version ();
       (match files with
        | [j] ->
            (match Verilator_to_behavioral.convert_verilator_json_to_behavioral j with
@@ -1133,10 +1169,13 @@ let lmiter_hier a_prog_h b_prog_h top =
         let rec re e = match e with
           | Behavioral_ir.BVar v -> radd v all
           | BSlice { signal = BVar v; msb; lsb } ->
-              let lo = min msb lsb and hi = max msb lsb in
+              let lo = max 0 (min msb lsb) and hi = max msb lsb in
               radd v (Z.shift_left (ones (hi - lo + 1)) lo)
           | BSelect { array = BVar v; index = BConst { value; _ } } ->
-              (try radd v (Z.shift_left Z.one (Z.to_int value)) with _ -> radd v all)
+              (try
+                 let b = Z.to_int value in
+                 if b >= 0 then radd v (Z.shift_left Z.one b) else radd v all
+               with _ -> radd v all)
           | BSlice { signal; _ } -> re signal
           | BSelect { array; index } -> re array; re index
           | BConcat es -> List.iter re es
@@ -1185,12 +1224,12 @@ let lmiter_hier a_prog_h b_prog_h top =
           | Some m -> m | None -> Z.zero in
         List.iter (fun (i : binstance) ->
           List.iter (fun (pin, e) ->
-            let rec conn_mask e bitpos = match e with
+            let rec conn_mask e bitpos = let bitpos = max 0 bitpos in match e with
               | Behavioral_ir.BVar v ->
                   let w = width_of v in
                   (Z.shift_left (Z.logand (net_mask v) (ones w)) bitpos, w)
               | BSlice { signal = BVar v; msb; lsb } ->
-                  let lo = min msb lsb and hi = max msb lsb in
+                  let lo = max 0 (min msb lsb) and hi = max msb lsb in
                   let m = Z.logand (Z.shift_right (net_mask v) lo)
                             (ones (hi - lo + 1)) in
                   (Z.shift_left m bitpos, hi - lo + 1)
@@ -1395,8 +1434,29 @@ let lread_nextpnr_json path =
 
 (* Gate-map one module: behavioural BIR → AIG → LUT-cover → Hardcaml
  * Circuit.t of LUT/FDRE/CARRY4/IBUF/OBUF/BUFG cells. *)
+(* (b) Persistent snapshot of every module's ORIGINAL declared port directions,
+   keyed by module name, first-seen-wins.  ibex_svs.lua gate_maps + splices each
+   module in turn; by the time a parent is gate-mapped, a child already spliced
+   may have had a dead input port pruned (of_circuit dead-input elim), so
+   building port_dir from the CURRENT (pruned) program misses it.  We record
+   each module's interface the first time it appears (before its own splice
+   prunes anything), then fall back to this snapshot when the live program lacks
+   a port — belt-and-braces with fix (a) in hardcaml_to_behavioral. *)
+let orig_port_dirs :
+  (string, (string * [ `Input | `Output ]) list) Hashtbl.t = Hashtbl.create 128
+
 let lgate_map mod_h k_lut io_flag =
   let _, m, prog = find_mod mod_h in
+  (* snapshot originals (first-seen) before any pruning of these modules *)
+  List.iter (fun (mm : Behavioral_ir.bmodule) ->
+    if not (Hashtbl.mem orig_port_dirs mm.Behavioral_ir.name) then
+      Hashtbl.replace orig_port_dirs mm.Behavioral_ir.name
+        (List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+           match s.Behavioral_ir.direction with
+           | `Input -> Some (s.Behavioral_ir.name, `Input)
+           | `Output -> Some (s.Behavioral_ir.name, `Output)
+           | _ -> None) mm.Behavioral_ir.signals))
+    prog.Behavioral_ir.modules;
   (* Record the module's declared INPUT-port widths so of_circuit can pad
      regrouped input ports back to full width (a wide input whose high bits'
      fanout was pruned would otherwise narrow, dropping data). *)
@@ -1426,6 +1486,12 @@ let lgate_map mod_h k_lut io_flag =
       | `Input  -> Hashtbl.replace pd_tbl (mm.Behavioral_ir.name, s.name) `Input
       | `Output -> Hashtbl.replace pd_tbl (mm.Behavioral_ir.name, s.name) `Output
       | _ -> ()) mm.Behavioral_ir.signals) prog.Behavioral_ir.modules;
+  (* (b) fill any (module, port) the CURRENT program lacks (a spliced child had
+     the port pruned) from the first-seen original-interface snapshot. *)
+  Hashtbl.iter (fun name ports ->
+    List.iter (fun (p, d) ->
+      if not (Hashtbl.mem pd_tbl (name, p)) then Hashtbl.replace pd_tbl (name, p) d)
+      ports) orig_port_dirs;
   let covered = Hashtbl.create 64 in
   List.iter (fun (cn, _) -> Hashtbl.replace covered cn ()) prog.Behavioral_ir.library_cells;
   let inst_types =
@@ -1579,6 +1645,14 @@ let lwrite_netlist_edif net_h path =
   Bir_to_edif.write_edif ~library_cells:lc ~path m;
   path
 
+(* Hierarchical EDIF straight from a gate-mapped PROGRAM — one work cell per
+ * module, submodule instances as work cellrefs — WITHOUT flatten_struct.  Keeps
+ * module boundaries (avoids the flatten bit-bus artifacts) for Vivado read_edif. *)
+let lwrite_hier_edif prog_h top path =
+  let _, p = find_prog prog_h in
+  Bir_to_edif.write_edif_hier ~library_cells:p.Behavioral_ir.library_cells ~path p ~top;
+  path
+
 (* Direct Netlist → gate-level structural Verilog.  Same internal graph
  * as write_netlist_edif / write_nextpnr_json — a third independent view
  * so xsim can functionally simulate the flattened netlist (against
@@ -1711,6 +1785,79 @@ let lwrite_nextpnr_json net_h path =
     ~library_cells:lc
     ~path m;
   path
+
+(* Strip the SVS parameter-specialization suffix (`base__P1_D32_…`) from every
+ * module whose BASE (text before the first `__`) is unique in the program, and
+ * rewrite all instance module_name references to match.  This reconciles SVS's
+ * per-parameterization module names with a Vivado post-synth netlist's clean
+ * base names (`ibex_cs_registers`, `ibex_alu`, …) so miter_hier pairs them by
+ * name.  Modules whose base collides (multiple specializations, e.g. several
+ * ibex_counter/ibex_csr) are left untouched — merging them would be unsound. *)
+let lcanon_module_names prog_h =
+  let _, p = find_prog prog_h in
+  let base n =
+    let len = String.length n in
+    let rec find i =
+      if i + 1 >= len then n
+      else if n.[i] = '_' && n.[i + 1] = '_' then String.sub n 0 i
+      else find (i + 1)
+    in find 0 in
+  (* Interface signature = sorted "port:width" over I/O ports.  Two modules
+     that are the SAME primitive at the SAME parameterisation have identical
+     signatures across BOTH flows (Vivado `prim_flop_2sync__parameterized0`
+     Width=1 and SVS `prim_flop_2sync__W1_R0` Width=1 both -> clk_i:1,d_i:1,
+     q_o:1,rst_ni:1) even though their suffix schemes differ.  Used to
+     disambiguate a base shared by several variants — the reason the DMI CDC
+     FIFO / 2-sync flops never paired, so the miter FF-ripped them on one side
+     and abstracted them on the other (the 152-vs-14 dmi_cdc mismatch). *)
+  let iface_sig (m : bmodule) =
+    m.signals
+    |> List.filter_map (fun (s : bsignal) ->
+        match s.direction with
+        | `Input | `Output ->
+            let w = match s.stype with
+              | BInt { width; _ } -> width | BBool -> 1 | _ -> 0 in
+            Some (Printf.sprintf "%s:%d" s.name w)
+        | _ -> None)
+    |> List.sort compare |> String.concat "," in
+  (* Per-base set of distinct interface signatures.  A base whose variants all
+     share ONE interface is the same primitive at a param that does not change
+     ports (BSCANE2__J3 / BSCANE2__J4 differ only in JTAG_CHAIN) -> collapse to
+     the plain base so it pairs with the other flow's plainly-named instance.
+     A base with SEVERAL interfaces is genuinely different sizes (the CDC FIFO
+     __W34_E1 vs __W41_E1) -> disambiguate by interface. *)
+  let base_ifaces : (string, (string, unit) Hashtbl.t) Hashtbl.t =
+    Hashtbl.create 128 in
+  List.iter (fun (m : bmodule) ->
+    let b = base m.name in
+    let s = match Hashtbl.find_opt base_ifaces b with
+      | Some s -> s | None -> let s = Hashtbl.create 4 in Hashtbl.replace base_ifaces b s; s in
+    Hashtbl.replace s (iface_sig m) ())
+    p.modules;
+  let sig_tag m =
+    let s = iface_sig m in
+    let h = ref 5381 in
+    String.iter (fun c -> h := (!h * 33 + Char.code c) land 0xffffff) s;
+    Printf.sprintf "%06x" !h in
+  let ren : (string, string) Hashtbl.t = Hashtbl.create 128 in
+  List.iter (fun (m : bmodule) ->
+    let b = base m.name in
+    let multi = (try Hashtbl.length (Hashtbl.find base_ifaces b) with Not_found -> 1) > 1 in
+    (* single-interface base -> plain base (unchanged for uniquely-named tops
+       like dm_top/top_vc707); multi-interface base -> base + iface tag, applied
+       even to the plainly-named variant so BOTH flows agree. *)
+    let canon = if multi then b ^ "__i" ^ sig_tag m else b in
+    if canon <> m.name then Hashtbl.replace ren m.name canon)
+    p.modules;
+  let map n = try Hashtbl.find ren n with Not_found -> n in
+  let modules' = List.map (fun (m : bmodule) ->
+    { m with name = map m.name
+    ; instances = List.map (fun (i : binstance) ->
+        { i with module_name = map i.module_name }) m.instances })
+    p.modules in
+  Printf.eprintf "[canon] renamed %d module(s) to their base names\n"
+    (Hashtbl.length ren);
+  hadd (Prog (fst (find_prog prog_h) ^ ":canon", { p with modules = modules' }))
 
 (* Comma-separated list of module names in a prog. *)
 let lmodule_names prog_h =
@@ -2148,6 +2295,8 @@ module MakeLib
                            (wrap2 lflatten_struct);
         "module_names",   V.efunc (V.string **->> V.string)
                            (wrap1 lmodule_names);
+        "canon_module_names", V.efunc (V.string **->> V.string)
+                           (wrap1 lcanon_module_names);
         "splice",         V.efunc (V.string **-> V.string **-> V.string
                                    **->> V.string)
                            (wrap3 lsplice);
@@ -2188,6 +2337,8 @@ module MakeLib
                                (wrap2 lwrite_mod_edif);
         "write_netlist_edif", V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_netlist_edif);
+        "write_hier_edif",    V.efunc (V.string **-> V.string **-> V.string **->> V.string)
+                               (wrap3 lwrite_hier_edif);
         "write_netlist_verilog", V.efunc (V.string **-> V.string **->> V.string)
                                   (wrap2 lwrite_netlist_verilog);
         "expand_primitives_for_z3", V.efunc (V.string **->> V.string)

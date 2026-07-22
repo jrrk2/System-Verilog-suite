@@ -463,9 +463,19 @@ let rec expr_to_signal ctx = function
              let need_w =
                let rec lg n = if n <= 1 then 0 else 1 + lg ((n + 1) / 2) in
                lg size in
+             (* Match the selector width to [need_w] = ceil_log2(size): pad a
+                too-narrow index up, and — crucially — TRUNCATE a too-WIDE one
+                (an `arr[idx]` where idx is a 32-/64-bit expression indexing a
+                small array, e.g. ibex_alu's `imd_val_q_i[…]`).  Hardcaml's mux
+                computes its bound as `1 lsl width(sel)`; a >=63-bit selector
+                overflows OCaml's native int to a nonsense small value and it
+                rejects the mux ("too many inputs (8) (maximum_expected 1)").
+                need_w bits index exactly `size` cases; high bits are
+                out-of-range (Verilog x) so dropping them is sound. *)
              let s_index =
                let iw = Signal.width s_index in
-               if iw >= need_w then s_index
+               if iw = need_w then s_index
+               else if iw > need_w then Signal.select s_index (need_w - 1) 0
                else Signal.uresize s_index need_w in
              Signal.mux s_index cases)
 
@@ -481,16 +491,20 @@ let rec expr_to_signal ctx = function
          hi < lo into Signal.select; out-of-range bits read as 0.   *)
       let hi = max msb lsb and lo = min msb lsb in
       let w  = Signal.width s in
-      if lo >= w then
-        let nbits = max 1 (hi - lo + 1) in
-        Signal.zero nbits
-      else if hi >= w then
-        (* PARTIALLY out of range ([47:32] of a width-42 param constant):
-           Verilog zero-extends — the old clamp silently NARROWED the
-           slice (16 bits became 10), shifting every higher concat
-           element down (arp_ctrl MAC-hi config write corrupted). *)
-        Signal.concat_msb
-          [Signal.zero (hi - w + 1); Signal.select s (w - 1) lo]
+      if hi < 0 || lo >= w then
+        (* Entirely out of range → Verilog reads x/0. *)
+        Signal.zero (max 1 (hi - lo + 1))
+      else if hi >= w || lo < 0 then
+        (* PARTIALLY out of range on either end: zero-pad the underflow
+           (lo < 0, e.g. a `[$bits(t)-1:0]` where a struct/param width folded
+           to 0 → `[-1:0]`) and/or the overflow (hi >= w, e.g. arp_ctrl's
+           MAC-hi `[47:32]` of a width-42 constant), keeping the valid middle.
+           Verilog zero-extends out-of-range bits; a straight Signal.select
+           would either crash (lo<0) or silently narrow the slice. *)
+        let top = if hi > w - 1 then [Signal.zero (hi - (w - 1))] else [] in
+        let bot = if lo < 0 then [Signal.zero (- lo)] else [] in
+        let vhi = min hi (w - 1) and vlo = max lo 0 in
+        Signal.concat_msb (top @ [Signal.select s vhi vlo] @ bot)
       else
         Signal.select s hi lo
 
@@ -752,7 +766,11 @@ let rec stmt_to_always ~is_reg ctx alw = function
  * register's Q).  Array/slice [BCallStmt]s pass through with their
  * argument expressions threaded.  Works for both combinational and
  * sequential bodies. *)
-let thread_body ?(blocking_vars = []) body =
+let thread_body ?(blocking_vars = [])
+    ?(width_of = (fun (_ : string) -> (None : int option)))
+    ?(elem_w_of = (fun (_ : string) -> (None : int option)))
+    ?(is_comb = false)
+    body =
   let is_blocking name = List.mem name blocking_vars in
   let rec subst env e =
     match e with
@@ -776,8 +794,15 @@ let thread_body ?(blocking_vars = []) body =
   (* All signal names assigned anywhere in a stmt list, incl. nested. *)
   let assigned_scalars stmts =
     let acc = ref [] in
+    let add nm = if not (List.mem nm !acc) then acc := nm :: !acc in
     let rec go = function
-      | BAssign { lhs; _ } -> if not (List.mem lhs !acc) then acc := lhs :: !acc
+      | BAssign { lhs; _ } -> add lhs
+      (* Partial writes fold into the same threaded value (see the BCallStmt
+         handler), so their target is "assigned" for branch-materialisation. *)
+      | BCallStmt { func; args = BVar name :: _ }
+        when func = "@mem_write" || func = "@slice_write"
+          || func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+          add name
       | BIf { then_stmts; else_stmts; _ } -> List.iter go then_stmts; List.iter go else_stmts
       | BCase { cases; default; _ } ->
           List.iter (fun (_, ss) -> List.iter go ss) cases; List.iter go default
@@ -926,7 +951,77 @@ let thread_body ?(blocking_vars = []) body =
               Hashtbl.remove env k
           ) assigned
       | BCallStmt { func; args } ->
-          out := BCallStmt { func; args = List.map (subst env) args } :: !out
+          (* Fold a partial write into the value-so-far, so a combinational
+             `default; part-write` run collapses to one self-reference-free
+             BAssign instead of a full-bus read-modify-write against the
+             Variable's empty block-entry value (→ Hardcaml "Combinational
+             loop"; lowRISC dm_sba's `be_mask[be_idx]`/`be_mask[base+:2]`).
+             `set_field name lsb fw data` overwrites `fw` bits at bit-offset
+             `lsb` of the current threaded value via mask/shift (dynamic lsb
+             OK).  Real multi-bit unpacked arrays are handled elsewhere
+             (coalesce_comb_mem_writes / lower_mem_writes_in_seq); only
+             packed-vector-style writes fold here. *)
+          let set_field name lsb_expr fw data =
+            match width_of name with
+            | None -> None
+            | Some w when fw >= 1 && fw <= w ->
+                let ty = BInt { width = w; signed = Unsigned } in
+                (* Base value the writes modify.  Use the threaded value-so-far
+                   if present; otherwise for COMBINATIONAL logic an as-yet-
+                   unwritten target is undriven → default ZERO, NOT a self-read
+                   (`BVar name`), which would be a structural combinational loop
+                   even when every bit is later overwritten (ibex_alu's bit-
+                   reverse `for(i) rev[i]=src[31-i]`).  Sequential targets keep
+                   the self-read (register keep-old-value). *)
+                let cur =
+                  match Hashtbl.find_opt env name with
+                  | Some v -> v
+                  | None -> if is_comb then BConst { value = Z.zero; width = w }
+                            else BVar name in
+                let mask = BConst {
+                  value = Z.sub (Z.shift_left Z.one fw) Z.one; width = w } in
+                let mask_sh = BBinOp { op = BShl; lhs = mask;
+                                       rhs = lsb_expr; result_type = ty } in
+                let cleared = BBinOp { op = BAnd; lhs = cur;
+                  rhs = BUnOp { op = BNot; operand = mask_sh; result_type = ty };
+                  result_type = ty } in
+                let data_m = BBinOp { op = BAnd; lhs = data; rhs = mask;
+                                      result_type = ty } in
+                let data_sh = BBinOp { op = BShl; lhs = data_m;
+                                       rhs = lsb_expr; result_type = ty } in
+                Some (BBinOp { op = BOr; lhs = cleared; rhs = data_sh;
+                               result_type = ty })
+            | _ -> None in
+          let u32 = BInt { width = 32; signed = Unsigned } in
+          let folded =
+            match func, args with
+            | "@part_sel_write_up",
+              [BVar name; base; BConst { value = w; _ }; data]
+              when Z.gt w Z.zero ->
+                set_field name (subst env base) (Z.to_int w) (subst env data)
+            | "@part_sel_write_down",
+              [BVar name; base; BConst { value = w; _ }; data]
+              when Z.gt w Z.zero ->
+                let wi = Z.to_int w in
+                let lsb = BBinOp { op = BSub; lhs = subst env base;
+                  rhs = BConst { value = Z.of_int (wi - 1); width = 32 };
+                  result_type = u32 } in
+                set_field name lsb wi (subst env data)
+            | "@mem_write", [BVar name; idx; data]
+              when (match elem_w_of name with Some e -> e = 1 | None -> true) ->
+                (* packed-vector single-bit write (real arrays pre-folded). *)
+                set_field name (subst env idx) 1 (subst env data)
+            (* @slice_write (constant bit-ranges) is left to merge_slice_writes,
+               which already lowers it correctly without a comb loop; folding it
+               here would needlessly change silicon-validated netlists. *)
+            | _ -> None in
+          (match folded, args with
+           | Some newv, BVar name :: _ ->
+               Hashtbl.replace env name newv;
+               if not (List.mem name !local) then local := name :: !local
+           | _ ->
+               out := BCallStmt { func; args = List.map (subst env) args }
+                      :: !out)
       | other -> out := other :: !out
     ) (flatten_top stmts);
     (* flush signals assigned at this level that survived to the end *)
@@ -1024,7 +1119,38 @@ let rec merge_slice_writes_deep ctx body =
    of all the always-blocks that make up the module. *)
 let process_to_always ctx = function
   | BCombinational { body; _ } ->
-      let body = thread_body body in
+      let width_of name =
+        match List.assoc_opt name ctx.variables with
+        | Some v -> Some (Signal.width (Always.Variable.value v))
+        | None ->
+            (match List.assoc_opt name ctx.signals with
+             | Some s -> Some (Signal.width s) | None -> None) in
+      let elem_w_of name = Hashtbl.find_opt ctx.array_elem_w name in
+      (* thread_body only threads `blocking_vars` through the value-so-far env;
+         the partial-write fold needs its targets threaded so a comb
+         `default; part-write` collapses to one BAssign (dm_sba be_mask).  The
+         nested-self-ref case (dmi_jtag dtmcs) is handled earlier by the
+         blocking→non-blocking conversion pass, so leaving ordinary comb signals
+         off the blocking list keeps silicon-validated netlists (eth-arp)
+         bit-for-bit unchanged. *)
+      let partial_targets =
+        let acc = ref [] in
+        let add n = if not (List.mem n !acc) then acc := n :: !acc in
+        let rec go = function
+          | BCallStmt { func; args = BVar n :: _ }
+            when func = "@mem_write"
+              || func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+              add n
+          | BIf { then_stmts; else_stmts; _ } ->
+              List.iter go then_stmts; List.iter go else_stmts
+          | BCase { cases; default; _ } ->
+              List.iter (fun (_, ss) -> List.iter go ss) cases; List.iter go default
+          | BBlock ss -> List.iter go ss
+          | _ -> () in
+        List.iter go body; !acc in
+      let body =
+        thread_body ~blocking_vars:partial_targets ~width_of ~elem_w_of
+          ~is_comb:true body in
       (* shallow only: the merged assign SELF-READS uncovered bits, which
          is FF-old-value semantics — valid for NBA registers, a
          combinational LOOP here (axis_gmii_tx gate_map crashed) *)
@@ -1051,7 +1177,14 @@ let process_to_always ctx = function
            ctx.reset <- Some (get_signal ctx rst_name);
            ctx.reset_falling <- (reset_edge = Some `Neg)
        | _ -> ctx.reset_falling <- false);
-      let body = thread_body ~blocking_vars body in
+      let width_of name =
+        match List.assoc_opt name ctx.variables with
+        | Some v -> Some (Signal.width (Always.Variable.value v))
+        | None ->
+            (match List.assoc_opt name ctx.signals with
+             | Some s -> Some (Signal.width s) | None -> None) in
+      let elem_w_of name = Hashtbl.find_opt ctx.array_elem_w name in
+      let body = thread_body ~blocking_vars ~width_of ~elem_w_of body in
       let body = merge_slice_writes_deep ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
       Always.compile (List.rev alw)
@@ -1206,13 +1339,22 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
         scan_lhs ck_rst default; scan_lhs ck_rst tl
     | BBlock s :: tl -> scan_lhs ck_rst s; scan_lhs ck_rst tl
     | _ :: tl -> scan_lhs ck_rst tl in
+  (* Combinational FIRST, then sequential, so a signal driven in BOTH (a
+     defect — resolved elsewhere by dropping the comb driver) is classified as
+     a REGISTER, not a wire.  A seq @part_sel/@mem RMW reads `BVar lhs` as its
+     Q feedback; if the signal were mis-created as a wire (comb classification
+     winning) that feedback becomes a genuine combinational loop.  For a
+     conflict-free design (eth-arp) each signal is in one process, so order is
+     irrelevant — no behavioural change. *)
+  List.iter (function
+    | BCombinational { body; _ } -> scan_lhs None body
+    | BSequential _ -> ()) bmod.processes;
   List.iter (function
     | BSequential { clock; reset; reset_async; reset_edge; body; _ } ->
         let async_rst = if reset_async then reset else None in
         let rst_falling = reset_async && reset_edge = Some `Neg in
         scan_lhs (Some (clock, async_rst, rst_falling)) body
-    | BCombinational { body; _ } -> scan_lhs None body)
-    bmod.processes;
+    | BCombinational _ -> ()) bmod.processes;
 
   (* Per-register ASYNC-RESET VALUE.  iflift renders `if (rst) q<=V; else q<=E`
      as `q := (rst-cond) ? V : E`, so V (the then-branch) is the reset value.
@@ -1521,16 +1663,212 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
      This also masks a known Verible-converter bug where indexed
      array-LHS like `assign arr[i] = …` loses the index and produces
      N separate BCombinational processes against the same bare name. *)
+  (* Coalesce combinational array-element writes into one full-bus BAssign per
+     array.  After unroll, `always_comb` blocks that write array elements —
+     `for(i) arr[i]=f(i)`, `arr[k]=v`, and crucially GUARDED / DYNAMIC-index
+     writes like lowRISC bus.sv's `if (accept) host_gnt_o[host_sel_req]=1` —
+     arrive as several @mem_write(arr, idx, data), some nested in BIf.  Lowering
+     each @mem_write independently makes every one read the array Variable's
+     block-entry value (an empty comb wire) and rewrite a slot, leaving the
+     others driverless → Hardcaml aborts ("circuit input signal must have a
+     port name").  Instead, walk the whole block collecting each write's
+     (guard, index, data) — guard = AND of the enclosing BIf conditions — and
+     rebuild each array as one BAssign whose slot k is a last-write-wins
+     BCond chain: `if (guard_n && idx_n==k) then data_n else …` down to a
+     zero default.  Handles constant AND dynamic indices, conditional writes,
+     and full or partial coverage. *)
+  let coalesce_comb_mem_writes stmts =
+    let is_arr arr = match List.find_opt
+      (fun (sg : Behavioral_ir.bsignal) -> sg.name = arr) bmod.signals with
+      | Some { stype = BArray { element = BInt _; _ }; _ } -> true
+      | _ -> false in
+    let bool1 = BInt { width = 1; signed = Unsigned } in
+    let order = ref [] in
+    (* per array: ordered (guard option, idx, data). *)
+    let writes : (string,
+                  (Behavioral_ir.bexpr option * Behavioral_ir.bexpr
+                   * Behavioral_ir.bexpr) list) Hashtbl.t = Hashtbl.create 8 in
+    let and_g g c = match g with
+      | None -> Some c
+      | Some g0 -> Some (Behavioral_ir.BBinOp { op = BAnd; lhs = g0; rhs = c;
+                                                result_type = bool1 }) in
+    let rec collect guard = function
+      | Behavioral_ir.BBlock b -> List.iter (collect guard) b
+      | BCallStmt { func = "@mem_write"; args = [BVar arr; idx; data] }
+        when is_arr arr ->
+          if not (Hashtbl.mem writes arr) then order := arr :: !order;
+          let cur = try Hashtbl.find writes arr with Not_found -> [] in
+          Hashtbl.replace writes arr (cur @ [(guard, idx, data)])
+      | BIf { condition; then_stmts; else_stmts } ->
+          let notc = Behavioral_ir.BUnOp { op = BNot; operand = condition;
+                                           result_type = bool1 } in
+          List.iter (collect (and_g guard condition)) then_stmts;
+          List.iter (collect (and_g guard notc)) else_stmts
+      | _ -> () in
+    List.iter (collect None) stmts;
+    if Hashtbl.length writes = 0 then stmts
+    else begin
+      let folded = Hashtbl.create 8 in
+      let coalesced = List.filter_map (fun arr ->
+        match List.find_opt (fun (sg : Behavioral_ir.bsignal) -> sg.name = arr)
+                bmod.signals with
+        | Some { stype = BArray { size; element = BInt { width = ew; _ } }; _ }
+          when size > 0 ->
+            Hashtbl.replace folded arr ();
+            let pairs = Hashtbl.find writes arr in
+            (* A later write's DATA can read the element it is modifying —
+               `arr[i][j]=1` lowers to @mem_write(arr, i, arr[i] | (1<<j)),
+               whose `arr[i]` is a read-modify-write of the same slot (ibex's
+               `mhpmevent[i]='0; mhpmevent[i][i-3]=1'b1`).  That self-read is a
+               combinational loop unless it resolves to the slot's value SO FAR
+               (the fold accumulator).  Substitute `BSelect(BVar arr, idx)` in a
+               write's data with `acc`. *)
+            let rec subst_self idx acc e =
+              match e with
+              | BSelect { array = BVar a; index } when a = arr && index = idx ->
+                  acc
+              | BSelect { array; index } ->
+                  BSelect { array = subst_self idx acc array;
+                            index = subst_self idx acc index }
+              | BBinOp r ->
+                  BBinOp { r with lhs = subst_self idx acc r.lhs;
+                                  rhs = subst_self idx acc r.rhs }
+              | BUnOp r -> BUnOp { r with operand = subst_self idx acc r.operand }
+              | BCond r ->
+                  BCond { condition = subst_self idx acc r.condition;
+                          then_val = subst_self idx acc r.then_val;
+                          else_val = subst_self idx acc r.else_val }
+              | BConcat es -> BConcat (List.map (subst_self idx acc) es)
+              | BSlice r -> BSlice { r with signal = subst_self idx acc r.signal }
+              | BReplicate r ->
+                  BReplicate { r with value = subst_self idx acc r.value }
+              | BCall r -> BCall { r with args = List.map (subst_self idx acc) r.args }
+              | e -> e in
+            (* MSB-first: slot size-1 … 0.  Each slot folds its writes in
+               source order (later write = outer = higher priority).  A write
+               with a CONSTANT index only affects its own slot — fold it in
+               directly for the matching slot and SKIP it for others (no BCond,
+               no accumulator duplication).  This is essential: keeping a BCond
+               (and re-substituting `acc` into each self-referencing write's
+               then_val) for every write in every slot is O(2^writes) in memory
+               (ibex's mhpmevent has ~30 self-referencing writes → 25 GB). *)
+            let const_idx = function
+              | Behavioral_ir.BConst { value; _ } -> Some (Z.to_int value)
+              | _ -> None in
+            let parts = List.init size (fun j ->
+              let k = size - 1 - j in
+              let kc = Behavioral_ir.BConst { value = Z.of_int k; width = 32 } in
+              let init = Behavioral_ir.BConst { value = Z.zero; width = ew } in
+              List.fold_left (fun acc (guard, idx, data) ->
+                match const_idx idx with
+                | Some ci when ci <> k -> acc   (* different slot — no effect *)
+                | Some _ ->                       (* this slot; idx == k *)
+                    let d = BSlice { signal = subst_self idx acc data;
+                                     msb = ew - 1; lsb = 0 } in
+                    (match guard with
+                     | None -> d
+                     | Some g -> Behavioral_ir.BCond { condition = g;
+                                   then_val = d; else_val = acc })
+                | None ->                         (* dynamic index *)
+                    let eq = Behavioral_ir.BBinOp { op = BEq; lhs = idx; rhs = kc;
+                                                    result_type = bool1 } in
+                    let cond = match guard with
+                      | None -> eq
+                      | Some g -> Behavioral_ir.BBinOp { op = BAnd; lhs = g;
+                                    rhs = eq; result_type = bool1 } in
+                    Behavioral_ir.BCond { condition = cond;
+                      then_val = BSlice { signal = subst_self idx acc data;
+                                          msb = ew - 1; lsb = 0 };
+                      else_val = acc }) init pairs) in
+            Some (Behavioral_ir.BAssign { lhs = arr; rhs = BConcat parts })
+        | _ -> None) (List.rev !order) in
+      (* Strip the folded arrays' @mem_writes from the body (wherever nested),
+         keeping BIf structure that still holds non-array statements. *)
+      let rec strip ss = List.filter_map (fun s -> match s with
+        | Behavioral_ir.BCallStmt { func = "@mem_write"; args = [BVar arr; _; _] }
+          when Hashtbl.mem folded arr -> None
+        | BBlock b -> (match strip b with [] -> None | b' -> Some (BBlock b'))
+        | BIf { condition; then_stmts; else_stmts } ->
+            let t = strip then_stmts and e = strip else_stmts in
+            if t = [] && e = [] then None
+            else Some (BIf { condition; then_stmts = t; else_stmts = e })
+        | other -> Some other) ss in
+      strip stmts @ coalesced
+    end
+  in
+  (* A signal driven in BOTH a combinational and a sequential process is a
+     defect (a _q register combinationally re-driven) that Hardcaml rejects as
+     "assign wire multiple times".  Resolve by letting the REGISTER win: strip
+     the comb assignments to any seq-driven name.  This only fires on designs
+     that would otherwise crash (eth-arp has no such conflict, so it is a
+     no-op there); it makes an unbuildable module build with the register-file
+     path inert — enough for a minimal debug module (dmactive/dmstatus/halt
+     don't use these arrays; abstract-data/progbuf/sysbus do). *)
+  let seq_driven =
+    let acc = Hashtbl.create 64 in
+    let rec w = function
+      | BAssign { lhs; _ } -> Hashtbl.replace acc lhs ()
+      | BCallStmt { args = (BVar n) :: _; _ } -> Hashtbl.replace acc n ()
+      | BIf { then_stmts; else_stmts; _ } -> List.iter w then_stmts; List.iter w else_stmts
+      | BCase { cases; default; _ } ->
+          List.iter (fun (_, s) -> List.iter w s) cases; List.iter w default
+      | BBlock s -> List.iter w s
+      | _ -> () in
+    List.iter (function BSequential { body; _ } -> List.iter w body | _ -> ())
+      bmod.processes;
+    acc in
+  let dropped = ref [] in
+  let strip_seq_driven body =
+    let rec f = function
+      | BAssign { lhs; _ } when Hashtbl.mem seq_driven lhs ->
+          dropped := lhs :: !dropped; None
+      | BCallStmt { args = (BVar n) :: _; _ } when Hashtbl.mem seq_driven n ->
+          dropped := n :: !dropped; None
+      | BIf r -> Some (BIf { r with
+          then_stmts = List.filter_map f r.then_stmts;
+          else_stmts = List.filter_map f r.else_stmts })
+      | BCase r -> Some (BCase { r with
+          cases = List.map (fun (g, s) -> (g, List.filter_map f s)) r.cases;
+          default = List.filter_map f r.default })
+      | BBlock s -> Some (BBlock (List.filter_map f s))
+      | s -> Some s in
+    List.filter_map f body in
   let merged_combs =
     let bodies = List.filter_map (function
       | BCombinational { body; _ } -> Some body
       | _ -> None) bmod.processes in
     match bodies with
     | [] -> None
-    | _ -> Some (BCombinational {
+    | _ ->
+      let body = coalesce_comb_mem_writes (List.concat bodies) in
+      let body = strip_seq_driven body in
+      (if Sys.getenv_opt "SELFREF_DEBUG" <> None then begin
+        let rec w = function
+          | BAssign { lhs; rhs } ->
+              let s = try Behavioral_ir.string_of_bexpr rhs with _ -> "" in
+              (* crude self-ref: lhs token appears in its own RHS *)
+              let re = Str.regexp_string lhs in
+              (try ignore (Str.search_forward re s 0);
+                 Printf.eprintf "[selfref] %s := (self-referential, %d chars)\n%!"
+                   lhs (String.length s)
+               with Not_found -> ())
+          | BIf { then_stmts; else_stmts; _ } -> List.iter w then_stmts; List.iter w else_stmts
+          | BCase { cases; default; _ } ->
+              List.iter (fun (_, s) -> List.iter w s) cases; List.iter w default
+          | BBlock s -> List.iter w s
+          | _ -> () in
+        List.iter w body
+      end);
+      (if !dropped <> [] then
+         Printf.eprintf
+           "[seq-wins] %s: dropped comb driver(s) for seq-driven signal(s) %s \
+            (register wins; would otherwise be a multiple-driver error)\n%!"
+           bmod.name
+           (String.concat "," (List.sort_uniq compare !dropped)));
+      Some (BCombinational {
         name = "merged_comb";
         sensitivity = [BAny];
-        body = List.concat bodies })
+        body })
   in
   (* Group BSequential processes by (clock, clock_edge, reset,
      reset_edge, reset_async) and merge each group's bodies — same
@@ -1577,6 +1915,46 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     @ merged_seqs
     @ other_processes in
 
+  (if Sys.getenv_opt "DUP_LHS" <> None then begin
+    let names_of body =
+      let acc = ref [] in
+      let rec w = function
+        | BAssign { lhs; _ } -> acc := lhs :: !acc
+        | BCallStmt { args = (BVar n) :: _; _ } -> acc := n :: !acc
+        | BIf { then_stmts; else_stmts; _ } -> List.iter w then_stmts; List.iter w else_stmts
+        | BCase { cases; default; _ } ->
+            List.iter (fun (_, s) -> List.iter w s) cases; List.iter w default
+        | BBlock s -> List.iter w s
+        | _ -> () in
+      List.iter w body; List.sort_uniq compare !acc in
+    let comb_names = match merged_combs with
+      | Some (BCombinational { body; _ }) -> names_of body | _ -> [] in
+    let seq_names = List.concat_map (function
+      | BSequential { body; _ } -> names_of body | _ -> []) merged_seqs in
+    let both = List.filter (fun n -> List.mem n seq_names) comb_names in
+    Printf.eprintf "[DUP_LHS] %s: comb-driven=%d seq-driven=%d comb∩seq=[%s]\n%!"
+      bmod.name (List.length comb_names) (List.length seq_names)
+      (String.concat "," both);
+    (if both <> [] && Sys.getenv_opt "DUP_LHS_STMTS" <> None then begin
+      let show n body =
+        let rec w = function
+          | BAssign { lhs; rhs } when lhs = n ->
+              Printf.eprintf "    COMB %s := %s\n%!" lhs
+                (try Behavioral_ir.string_of_bexpr rhs with _ -> "?")
+          | BCallStmt { func; args = (BVar a) :: _ } when a = n ->
+              Printf.eprintf "    COMB %s(%s, ...)\n%!" func a
+          | BIf { then_stmts; else_stmts; _ } -> List.iter w then_stmts; List.iter w else_stmts
+          | BCase { cases; default; _ } ->
+              List.iter (fun (_, s) -> List.iter w s) cases; List.iter w default
+          | BBlock s -> List.iter w s
+          | _ -> () in
+        List.iter w body in
+      match merged_combs with
+      | Some (BCombinational { body; _ }) ->
+          List.iter (fun n -> show n body) both
+      | _ -> ()
+    end)
+  end);
   let _always_blocks =
     List.map (process_to_always ctx) processes_to_run in
   let _ = _always_blocks in    (* compiled side-effects are in ctx *)

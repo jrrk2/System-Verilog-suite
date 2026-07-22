@@ -245,9 +245,20 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
                     Behavioral_ir.BVar outs.(off + pw - 1 - i)) in
                   (p, BConcat (Array.to_list per_bit)))
             in
-            let params =
-              List.map inst.inst_generics ~f:(fun pp ->
-                Parameter_name.to_string pp.Parameter.name, param_value pp)
+            (* Keep INTEGER generics as integers (param_values) — routing them
+               through [param_value] stringifies to "32'bN", which bir_to_edif
+               then emits as (string "32'b..."), and Vivado's BSCANE2 JTAG_CHAIN
+               (an integer 1..4 selecting USER1..4) silently falls back to its
+               default → the DMI (USER4) / dtmcs (USER3) taps stop responding to
+               openocd.  Only non-int generics (INIT bit-vectors, reals) become
+               param_strs. *)
+            let param_ints, param_str_list =
+              List.fold inst.inst_generics ~init:([], [])
+                ~f:(fun (iv, sv) pp ->
+                  let name = Parameter_name.to_string pp.Parameter.name in
+                  match pp.Parameter.value with
+                  | Parameter.Value.Int v -> ((name, v) :: iv, sv)
+                  | _ -> (iv, (name, param_value pp) :: sv))
             in
             let cname =
               Printf.sprintf "%s_%d" inst.inst_instance
@@ -255,7 +266,8 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
             instances := {
               Behavioral_ir.inst_name = cname;
               module_name = inst.inst_name;
-              param_values = []; param_strs = params;
+              param_values = List.rev param_ints;
+              param_strs = List.rev param_str_list;
               port_connections = input_conns @ output_conns;
             } :: !instances;
             outs
@@ -332,15 +344,18 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
    * `<base>__<i>` form; bir_to_nextpnr_json's bare-BVar fallback
    * expands `BVar base` against widths, so consumers that reference
    * the whole bus directly still work. *)
-  let declared_w =
+  let declared_list =
     match Hashtbl.find declared_input_widths (Circuit.name circ) with
-    | Some l -> (fun base -> Option.value (List.Assoc.find l base ~equal:String.equal) ~default:0)
-    | None -> (fun _ -> 0) in
+    | Some l -> l | None -> [] in
+  let declared_w base =
+    Option.value (List.Assoc.find declared_list base ~equal:String.equal) ~default:0 in
+  let emitted_inputs = ref [] in
   List.iter (regroup ~dir:`Input input_sigs)
     ~f:(fun (base, w, by_idx) ->
       (* pad to the declared width so high input bits pruned from the mapped
          circuit are still declared on the port and reconnect via bitbus_ref. *)
       let w' = Int.max w (declared_w base) in
+      emitted_inputs := base :: !emitted_inputs;
       port_signals := { Behavioral_ir.name = base;
                         stype = BInt { width = w'; signed = Unsigned };
                         direction = `Input;
@@ -351,6 +366,29 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
           if w' = 1 then base
           else Printf.sprintf "%s__%d" base i in
         Hashtbl.set memo ~key:(T.uid s) ~data:[| bit_name |]));
+  (* (a) Preserve DECLARED input ports that of_circuit optimised out of the
+     mapped circuit ENTIRELY (dead-input elimination, not just high-bit
+     pruning).  Silently dropping a declared port changes the module
+     interface: a parent's port-direction lookup then misses it, the net
+     heuristic misclassifies the reader pin as an OUTPUT, and the
+     inter-instance net splits into orphan driver + orphan reader (dm_mem's
+     clear_resumeack_i, dm_sba's dmactive_i).  Re-declare each fully-dropped
+     input as an unused port at its declared width so the interface is
+     stable across gate_map.
+     NOTE: this also re-declares a genuinely-dead TOP-level input (e.g. ARP
+     top's unused uart_rx), so a flat/nextpnr-JSON flow may gain an unused port
+     — functionally inert (an unread input), verified separately.  Disable with
+     NO_PRESERVE_DECLARED_INPUTS if a flow needs the exact pruned interface. *)
+  if Stdlib.(Sys.getenv_opt "NO_PRESERVE_DECLARED_INPUTS" = None) then
+  List.iter declared_list ~f:(fun (base, w) ->
+    if w > 0 && not (List.mem !emitted_inputs base ~equal:String.equal) then begin
+      emitted_inputs := base :: !emitted_inputs;
+      port_signals := { Behavioral_ir.name = base;
+                        stype = BInt { width = w; signed = Unsigned };
+                        direction = `Input;
+                        initial_value = None;
+                        attrs = [] } :: !port_signals
+    end);
 
   (* Outputs: emit ONE multi-bit Output bsignal per regrouped bus.
    * Drive each bit with an identity LUT acting as a structural

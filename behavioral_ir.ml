@@ -398,3 +398,16 @@ let width_of_type = function
 let is_signed = function
   | BInt { signed = Signed; _ } -> true
   | _ -> false
+
+(* ========================================================================= *)
+(* Struct-scalarize layouts (shared across passes)                           *)
+(*                                                                           *)
+(* When STRUCT_SCALARIZE splits an internal struct signal S into per-field   *)
+(* signals S$field, it records the field layout here so downstream consumers *)
+(* (notably the cross-flow Z3 miter) can tie SVS's scalarized `S$field`      *)
+(* FF-states to a reference flow's whole `S` register, since                 *)
+(*   S == { S$f1, S$f2, ..., S$fn }   (BConcat is MSB-first, i.e. f1 = high) *)
+(* Each entry is (field, msb, lsb, width) within S, in MSB-first order.      *)
+(* ========================================================================= *)
+let scalarize_layouts : (string, (string * int * int * int) list) Hashtbl.t =
+  Hashtbl.create 256

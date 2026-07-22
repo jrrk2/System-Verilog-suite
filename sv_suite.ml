@@ -622,6 +622,28 @@ let () =
   | "random"     :: rest -> cmd_random rest
   | "list-mods"  :: rest -> cmd_list_mods rest
   | "ff-stats"   :: rest -> cmd_ff_stats rest
+  | "preprocess" :: f :: _ ->
+      (* Debug: dump the SVS-preprocessed text of one file (honours
+       * SVS_DEFINE / SVS_INCDIR like the frontend). *)
+      print_string (Sv_preproc.preprocess_file f)
+  | "parseraw" :: f :: _ ->
+      (* Debug: lex+parse an ALREADY-preprocessed file (no preprocessing),
+       * so a .pp dump can be bisected to localise a grammar failure. *)
+      let ic = open_in f in
+      let n = in_channel_length ic in
+      let s = really_input_string ic n in
+      close_in ic;
+      let lexbuf = Lexing.from_string s in
+      Lexing.set_filename lexbuf f;
+      (try
+        let dl = Source_text_verible_lex.deflate Source_text_verible_lex.token in
+        let _ = Source_text_verible.ml_start dl lexbuf in
+        print_string "PARSE_OK\n"
+      with e ->
+        let p = Lexing.lexeme_start_p lexbuf in
+        Printf.printf "PARSE_FAIL line %d col %d token %S: %s\n"
+          p.pos_lnum (p.pos_cnum - p.pos_bol) (Lexing.lexeme lexbuf)
+          (Printexc.to_string e))
   | "script"     :: rest -> cmd_script rest
   | "verify-arch":: rest -> cmd_verify_arch rest
   | "emit-arch"  :: rest -> cmd_emit_arch rest

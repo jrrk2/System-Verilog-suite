@@ -775,6 +775,36 @@ let rec prune_dead_generates scope tok =
              in
              if still_live then begin
                let inst = subst_genvar name !v body in
+               (* Evaluate GENERATE-SCOPED localparams (now constant after the
+                  genvar substitution) and substitute their references — e.g.
+                  lowRISC gpio's `for(i) begin localparam int e = (i+1)*8<=W ?
+                  (i+1)*8 : W; assign x[e-1:i*8] = … end`.  Without this `e`
+                  is unbound and the slice bounds collapse (→ a comb loop).
+                  Substituting the name everywhere also mangles the decl's own
+                  name to a number, which the downstream param extractor then
+                  harmlessly skips (no SymbolIdentifier name). *)
+               let inst =
+                 let pdecls =
+                   collect_by (has_tag (prefix_is "any_param_declaration")) inst in
+                 List.fold_left (fun inst pn ->
+                   let pname =
+                     match collect_by
+                             (has_tag (prefix_is "param_type_followed_by_id")) pn with
+                     | s :: _ ->
+                         let ids = ref [] in
+                         walk (function SymbolIdentifier id -> ids := id :: !ids
+                                      | _ -> ()) s;
+                         (match List.rev !ids with last :: _ -> Some last | [] -> None)
+                     | [] -> None in
+                   let rhs = match collect_by
+                               (has_tag (prefix_is "trailing_assign")) pn with
+                     | a :: _ -> Some a | [] -> None in
+                   match pname, rhs with
+                   | Some pnm, Some r ->
+                       (match !evaluator_for_walk scope' (!resolver_for_walk r) with
+                        | Some pv -> subst_genvar pnm pv inst
+                        | None -> inst)
+                   | _ -> inst) inst pdecls in
                let inst =
                  match extract_block_label body with
                  | Some label ->
@@ -1534,12 +1564,37 @@ let resolve_param_default ~functions ~lookup_int ~pkgs ~tok : sv_value =
            (match lookup_int [] s with
             | Some n -> SVInt n | None -> SVUnknown))
 
+(* Type name -> bit width (summed packed struct / enum / typedef), populated by
+ * collect_type_widths at the top of specialise_design; consulted by resolve_value
+ * and Eval so `.Width($bits(dcsr_t))` folds to a real width during specialization
+ * (else it was captured as the type-name string -> width 1 -> undriven bits). *)
+let type_widths : (string, int) Hashtbl.t = Hashtbl.create 128
+
 (* Resolve an override expression to a printable string, folding
  * `pkg::name` references through the package table when possible.
  * Returns the deep stringification by default so the constant
  * evaluator sees the full expression text — falling back to the
  * single-leaf value_of only for trivially-wrapped scalars. *)
 let rec resolve_value (pkgs : package_decl list) tok =
+  (* `$bits(<type>)` overrides (e.g. `.Width($bits(dcsr_t))`) fold to the
+   * registered type width; deep-stringification would otherwise mangle the
+   * type name into the specialization suffix and leave the width unresolved. *)
+  let bits_width () =
+    match collect_by (function
+      | TUPLE3 (STRING t, SystemTFIdentifier ("$bits" | "bits"), _)
+        when prefix_is "system_tf_call" t -> true
+      | _ -> false) tok with
+    | (TUPLE3 (_, _, call_base)) :: _ ->
+        let last = ref None in
+        walk (function
+          | SymbolIdentifier id when Hashtbl.mem type_widths id -> last := Some id
+          | _ -> ()) call_base;
+        Option.map (Hashtbl.find type_widths) !last
+    | _ -> None
+  in
+  match bits_width () with
+  | Some w -> string_of_int w
+  | None ->
   let try_qualified t =
     match t with
     | TUPLE4 (STRING tag,
@@ -1674,6 +1729,21 @@ module Eval = struct
           while !j < n && is_id s.[!j] do incr j done;
           push (TDollar (String.sub s (!i + 1) (!j - !i - 1)));
           i := !j
+      | '"' ->
+          (* String literal → a STABLE large hash, so `==`/`!=` on strings
+             evaluate correctly without threading a full string value type
+             through the integer evaluator.  lowRISC's `localparam int UseDsp
+             = CounterWidth < 49 ? "yes" : "no";` then `if (UseDsp == "yes")`
+             folds to hash("yes") on both sides → 1.  The high bit is forced
+             set so a string hash never collides with a small integer literal
+             (equal strings → equal hash; different strings collide only with
+             negligible probability, and string-vs-int compares are nonsense
+             SV that never appears in a real generate condition). *)
+          let j = ref (!i + 1) in
+          while !j < n && s.[!j] <> '"' do incr j done;
+          let str = String.sub s (!i + 1) (!j - !i - 1) in
+          push (TNum (0x40000000 lor (Hashtbl.hash str land 0x3fffffff)));
+          i := if !j < n then !j + 1 else !j
       | '\'' ->
           (* `'0`, `'1`, `'x`, `'z` — bare unsized fill literals.  Also
              unsized based literals `'h..`, `'b..`, `'o..`, `'d..` (these
@@ -1887,6 +1957,25 @@ module Eval = struct
               | _ -> (None, rest))
          | _ -> (List.assoc_opt (base ^ "." ^ field) scope, rest))
     | TId id :: rest -> (List.assoc_opt id scope, rest)
+    | TDollar "bits" :: TLP :: rest ->
+        (* $bits(<type>) / $bits(pkg::<type>): the LAST identifier before `)`
+           is the type name — look up its width.  Falls through to the numeric
+           parse (arg's value) only when no identifier resolves as a type. *)
+        let rec upto acc = function
+          | TRP :: r -> (List.rev acc, r) | x :: r -> upto (x :: acc) r | [] -> (List.rev acc, []) in
+        let inside, r = upto [] rest in
+        let last_ty = List.fold_left (fun acc t -> match t with
+          | TId s when Hashtbl.mem type_widths s -> Some (Hashtbl.find type_widths s)
+          | _ -> acc) None inside in
+        (if Sys.getenv_opt "TYPEW_DEBUG" <> None then
+           Printf.eprintf "[bits] $bits(...) inside_ids=[%s] -> %s\n%!"
+             (String.concat "," (List.filter_map (function TId s -> Some s | _ -> None) inside))
+             (match last_ty with Some w -> string_of_int w | None -> "None"));
+        (match last_ty with
+         | Some _ -> (last_ty, r)
+         | None ->
+             (* not a known type: keep the old behaviour ($bits(expr) -> arg) *)
+             let arg, _ = parse_expr scope rest in (arg, r))
     | TDollar fname :: TLP :: rest ->
         let arg, t = parse_expr scope rest in
         let rec drop_to_rp = function
@@ -1956,6 +2045,84 @@ module Eval = struct
     in
     try fst (parse_expr scope (tokenize s)) with _ -> None
 end
+
+(* Width of the first packed dimension [msb:lsb] under [tok], via string eval. *)
+let elab_range_width tok =
+  match collect_by (has_tag (prefix_is "decl_variable_dimension")) tok with
+  | (TUPLE6 (_, _, msb, _, lsb, _)) :: _ ->
+      (match Eval.eval_string [] (deep_string_of_token msb),
+             Eval.eval_string [] (deep_string_of_token lsb) with
+       | Some m, Some l -> Some (abs (m - l) + 1)
+       | _ -> None)
+  | _ -> None
+
+(* Populate [type_widths] from every `typedef` in [body]: a packed struct sums
+ * its members' packed-dim widths (field with no dim = 1 bit); any other typedef
+ * takes its own packed-dim width.  First definition wins. *)
+let collect_type_widths body =
+  let nodes = collect_by (has_tag (prefix_is "type_declaration")) body in
+  (* returns (name, width, is_struct) *)
+  let width_of_node n = match n with
+    | TUPLE6 (_, _, data_type, SymbolIdentifier nm, _, _) ->
+        let members = collect_by (has_tag (prefix_is "struct_union_member")) data_type in
+        let w =
+          if members <> [] then
+            List.fold_left (fun acc m ->
+              match elab_range_width m with
+              | Some w -> acc + w
+              | None ->
+                  (* member with no packed dim: an enum/typedef-typed field
+                     (`dtm_op_e op`) whose width is that of its TYPE, not 1. *)
+                  let tw = ref None in
+                  walk (function
+                    | SymbolIdentifier id when !tw = None ->
+                        (match Hashtbl.find_opt type_widths id with
+                         | Some w -> tw := Some w | None -> ())
+                    | _ -> ()) m;
+                  acc + (match !tw with Some w -> w | None -> 1)) 0 members
+          else (match elab_range_width data_type with Some w -> w | None -> 1) in
+        Some (nm, w, members <> [])
+    | _ -> None in
+  (* Pass 1: register enums/scalars + provisional struct widths (first-wins). *)
+  List.iter (fun n -> match width_of_node n with
+    | Some (nm, w, _) when w > 0 && not (Hashtbl.mem type_widths nm) ->
+        Hashtbl.replace type_widths nm w
+    | _ -> ()) nodes;
+  (* Pass 2: recompute STRUCT widths now every enum/typedef is registered.  A
+     struct summed before its enum field's type was known UNDERCOUNTS (dmi_req_t
+     = 40 vs 41, `dtm_op_e op` = 1 not 2) — which sized the DMI CDC FIFO one bit
+     short and dropped an op bit crossing the tck→clk domain.  Update only on an
+     improvement so a correct width is never clobbered. *)
+  List.iter (fun n -> match width_of_node n with
+    | Some (nm, w, true) when w > 0 ->
+        (match Hashtbl.find_opt type_widths nm with
+         | Some old when old >= w -> ()
+         | _ -> Hashtbl.replace type_widths nm w)
+    | _ -> ()) nodes;
+  if Sys.getenv_opt "TYPEW_DEBUG" <> None then
+    List.iter (fun n -> match width_of_node n with
+      | Some (nm, w, m) -> Printf.eprintf "[typew] %s = %d (struct=%b)\n%!" nm w m
+      | None -> ()) nodes
+
+(* Map struct/enum-typed SIGNAL / PORT names to their type width, so
+ * `$bits(<signal>)` folds (e.g. dm_csrs's `.Width($bits(dmi_resp_o))` where
+ * `dm::dmi_resp_t dmi_resp_o` is 34-bit).  Must run AFTER all typedefs are
+ * registered (package structs included).  The declared name is the LAST
+ * identifier of a data/port declaration whose type is a known struct. *)
+let collect_signal_widths body =
+  List.iter (fun n ->
+    let tw = ref None and last = ref None in
+    walk (function
+      | SymbolIdentifier id ->
+          last := Some id;
+          if !tw = None && Hashtbl.mem type_widths id then tw := Hashtbl.find_opt type_widths id
+      | _ -> ()) n;
+    match !tw, !last with
+    | Some w, Some nm when w > 0 && not (Hashtbl.mem type_widths nm) ->
+        Hashtbl.replace type_widths nm w
+    | _ -> ())
+    (collect_by (has_tag (fun s ->
+       prefix_is "data_declaration" s || prefix_is "port_declaration_noattr" s)) body)
 
 (* Pull module-port parameter DEFAULTS (everything in the
  * `#(parameter ...)` header), as (name, rhs_token) pairs. The grammar
@@ -2087,6 +2254,13 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
     @ List.concat_map (fun p -> extract_functions p.pkg_body) pkgs
   in
   Hashtbl.clear struct_table;
+  (* Register type widths so `$bits(<type>)` folds during specialization. *)
+  Hashtbl.clear type_widths;
+  List.iter (fun m -> collect_type_widths m.m_body) mods;
+  List.iter (fun p -> collect_type_widths p.pkg_body) pkgs;
+  (* second pass: struct-typed signal/port names (needs all typedefs first) *)
+  List.iter (fun m -> collect_signal_widths m.m_body) mods;
+  List.iter (fun p -> collect_signal_widths p.pkg_body) pkgs;
   let debug = Sys.getenv_opt "ELAB_DEBUG" <> None in
   walk_live_debug := debug;
   if debug then
@@ -2185,7 +2359,18 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
         fixed_point sc' remaining'
       else sc'
     in
-    fixed_point scope lps
+    let scope = fixed_point scope lps in
+    (* Package-scoped constants (enum members + localparams) as a low-priority
+     * base, so a generate condition that references a bare imported enum —
+     * ibex_alu's `if (RV32B != RV32BNone)` with `import ibex_pkg::*` — resolves
+     * and the dead RV32B branch is PRUNED (otherwise walk_live can't decide and
+     * keeps the bitmanip logic, whose shuffle_mode self-writes then loop).
+     * Module params/localparams above keep priority. *)
+    let pkg_consts =
+      List.concat_map (fun (p : package_decl) ->
+        List.filter_map (fun (n, v) ->
+          Option.map (fun i -> (n, i)) (int_of_pvalue v)) p.pkg_params) pkgs in
+    scope @ List.filter (fun (n, _) -> not (List.mem_assoc n scope)) pkg_consts
   in
   let resolve_overrides_with scope ovs =
     List.map (fun (name, tok) ->

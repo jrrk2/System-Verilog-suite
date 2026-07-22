@@ -32,9 +32,18 @@ let sanitize_name name =
 
 (* Generate Verilog type declarations *)
 let rec verilog_of_type = function
-  | BInt { width = 1; _ } -> "logic"
+  (* `logic [0:0]` rather than scalar `logic` so a 1-bit per-hart signal can be
+     bit-indexed by the array/hart write pseudo-ops (`haltreq_o[selected_hart]`);
+     behaves identically to a scalar in every other context. *)
+  | BInt { width = 1; _ } -> "logic [0:0]"
   | BInt { width; _ } -> Printf.sprintf "logic [%d:0]" (width - 1)
   | BBool -> "logic"
+  | BArray { element = BInt { width; _ }; size } ->
+      (* PACKED 2-D with the array dimension FIRST, so `a[idx]` selects a
+         `width`-bit element AND the whole `a` is a packed vector (needed for
+         both `a[idx][..]` reads/`@mem_write` and wholesale `x = a` assigns).
+         `logic [31:0][0:1]` would make `a[idx]` index the 32-bit dim instead. *)
+      Printf.sprintf "logic [0:%d][%d:0]" (size - 1) (width - 1)
   | BArray { element; size } ->
       Printf.sprintf "%s [0:%d]" (verilog_of_type element) (size - 1)
   | BStruct _ -> "/* struct not supported in Verilog */"
@@ -75,10 +84,15 @@ let rec verilog_of_expr = function
       else if name = "<const1>" then "1'b1"
       else sanitize_name name
   | BConst { value; width } ->
+      (* Mask to width so a negative IR constant (e.g. `-1` all-ones) emits as a
+         valid unsigned Verilog literal (`32'd-1` is a syntax error in xsim). *)
+      let w = if width <= 0 then 1 else width in
+      let mask = Z.sub (Z.shift_left Z.one w) Z.one in
+      let v = Z.logand value mask in
       if width = 1 then
-        Printf.sprintf "1'b%s" (Z.to_string value)
+        Printf.sprintf "1'b%s" (Z.to_string v)
       else
-        Printf.sprintf "%d'd%s" width (Z.to_string value)
+        Printf.sprintf "%d'd%s" width (Z.to_string v)
   | BBinOp { op; lhs; rhs; _ } ->
       Printf.sprintf "(%s %s %s)"
         (verilog_of_expr lhs)
@@ -94,14 +108,51 @@ let rec verilog_of_expr = function
         | BConst { value; _ } -> Z.to_string value
         | _ -> verilog_of_expr index
       in
-      Printf.sprintf "%s[%s]"
-        (verilog_of_expr array)
-        index_str
+      (match array with
+       | BVar _ ->
+           Printf.sprintf "%s[%s]" (verilog_of_expr array) index_str
+       | _ ->
+           (* dynamic index into a non-signal (concat / constant / expression) is
+              illegal Verilog (`{a,b}[i]`, `32'd0[i]`); emit a shift — the outer
+              slice / LHS width truncates.  Exact for the single-element hart
+              arrays in this NrHarts=1 config. *)
+           Printf.sprintf "((%s) >> (%s))" (verilog_of_expr array) index_str)
   | BSlice { signal; msb; lsb } ->
-      Printf.sprintf "%s[%d:%d]"
-        (verilog_of_expr signal)
-        msb
-        lsb
+      (* Flatten nested slices: `(s[a:b])[c:d]` is not legal Verilog, but the IR
+         produces it (e.g. `dmi_req_i[31:0][0:0]`).  The inner slice's lsb
+         offsets the outer: `(s[a:b])[c:d]` == `s[b+c : b+d]`. *)
+      let rec flatten sig_ msb lsb = match sig_ with
+        | BSlice { signal = inner; msb = _; lsb = ilsb } ->
+            flatten inner (ilsb + msb) (ilsb + lsb)
+        | _ -> (sig_, msb, lsb)
+      in
+      let sig_, msb, lsb = flatten signal msb lsb in
+      let hi = max msb lsb and lo = min msb lsb in
+      let w = hi - lo + 1 in
+      (match sig_ with
+       | BConst { value; _ } ->
+           (* Fold a slice of a constant, INCLUDING out-of-range slices like
+              `9'd0[31:23]` (from `struct = '0` field defaults): slicing zero is
+              zero.  In gate_map this is harmless, but a raw out-of-range select
+              of a narrow literal simulates as X, so fold it to the real value. *)
+           let mask = Z.sub (Z.shift_left Z.one w) Z.one in
+           let v = Z.logand (Z.shift_right value lo) mask in
+           Printf.sprintf "%d'd%s" w (Z.to_string v)
+       | _ when (let rec sliceable = function
+                   | BVar _ -> true
+                   (* `arr[idx][hi:lo]` is legal only when arr is a real (array)
+                      signal; a BSelect into a concat/const emits a shift and is
+                      NOT sliceable *)
+                   | BSelect { array; _ } -> sliceable array
+                   | _ -> false in sliceable sig_) ->
+           Printf.sprintf "%s[%d:%d]" (verilog_of_expr sig_) msb lsb
+       | _ ->
+           (* bit-select of an expression `(a>>b & c)[0:0]` is ILLEGAL Verilog;
+              emit an equivalent shift+mask (LHS width truncates the rest). *)
+           let mask = Z.sub (Z.shift_left Z.one w) Z.one in
+           let e = verilog_of_expr sig_ in
+           if lo = 0 then Printf.sprintf "(%s & %d'd%s)" e w (Z.to_string mask)
+           else Printf.sprintf "((%s >> %d) & %d'd%s)" e lo w (Z.to_string mask))
   | BConcat exprs ->
       Printf.sprintf "{%s}"
         (String.concat ", " (List.map verilog_of_expr exprs))
@@ -171,8 +222,44 @@ let rec verilog_of_stmt indent stmt =
   | BBlock stmts ->
       String.concat "\n" (List.map (verilog_of_stmt indent) stmts)
 
+  (* SVS-internal write pseudo-ops -> real Verilog l-value assignments so the
+     behavioral netlist is simulatable.  Semantics mirror behavioral_initeval. *)
+  | BCallStmt { func = "@mem_write"; args = [BVar a; idx; v] } ->
+      (* unpacked-array word write `a[idx]=v`, or single-bit `a[idx]=v` on a
+         vector — both legal since arrays are declared unpacked. *)
+      let ix = match idx with BConst { value; _ } -> Z.to_string value
+                            | _ -> verilog_of_expr idx in
+      Printf.sprintf "%s%s[%s] = %s;" ind (sanitize_name a) ix (verilog_of_expr v)
+  | BCallStmt { func = "@slice_write"; args = [BVar nm; m; l; v] } ->
+      (match m, l with
+       | BConst { value = mv; _ }, BConst { value = lv; _ } ->
+           let mi = Z.to_int mv and li = Z.to_int lv in
+           let hi = max mi li and lo = min mi li in
+           if hi = lo then
+             Printf.sprintf "%s%s[%d] = %s;" ind (sanitize_name nm) hi (verilog_of_expr v)
+           else
+             Printf.sprintf "%s%s[%d:%d] = %s;" ind (sanitize_name nm) hi lo (verilog_of_expr v)
+       | _ ->
+           (* non-constant bounds: upward indexed part-select from lsb *)
+           Printf.sprintf "%s%s[%s +: 1] = %s;" ind (sanitize_name nm)
+             (verilog_of_expr l) (verilog_of_expr v))
+  | BCallStmt { func = "@part_sel_write_up"; args = [BVar nm; base; w; v] } ->
+      let ws = match w with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr w in
+      let bs = match base with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr base in
+      Printf.sprintf "%s%s[%s +: %s] = %s;" ind (sanitize_name nm) bs ws (verilog_of_expr v)
+  | BCallStmt { func = "@part_sel_write_down"; args = [BVar nm; base; w; v] } ->
+      let ws = match w with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr w in
+      let bs = match base with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr base in
+      Printf.sprintf "%s%s[%s -: %s] = %s;" ind (sanitize_name nm) bs ws (verilog_of_expr v)
   | BCallStmt { func; args } ->
-      Printf.sprintf "%s%s(%s);" ind func (String.concat ", " (List.map verilog_of_expr args))
+      if String.length func > 0 && func.[0] = '@' then
+        (* A write pseudo-op whose l-value is NOT a plain signal (constant- or
+           field-concat destination): typically a folded-away dead write (hartinfo
+           / halted / hartsel array writes).  Emit a no-op so the behavioral
+           netlist simulates; these do not touch the dmcontrol/dmstatus path. *)
+        Printf.sprintf "%s/* skipped %s (non-scalar lvalue) */" ind func
+      else
+        Printf.sprintf "%s%s(%s);" ind func (String.concat ", " (List.map verilog_of_expr args))
 
   | BReturn _ ->
       Printf.sprintf "%s/* return not supported in always blocks */" ind
@@ -210,7 +297,30 @@ let verilog_of_process proc =
       in
       let always_header = Printf.sprintf "always @(%s) begin" sens_list in
 
-      (* Generate reset logic if async reset *)
+      (* Generate reset logic if async reset.  The BIR carries the reset SIGNAL
+         but not per-register reset VALUES, and the reset branch used to be an
+         empty `// Reset logic` placeholder — so every FF stayed X through reset
+         in simulation.  Zero each register assigned in this block (the reset
+         value of nearly every DM register); this makes the behavioral netlist
+         reset cleanly.  RResetValue FFs (rare, prim_flop wrappers) reset to 0
+         here too — refine to per-signal values if one matters. *)
+      let collect_targets stmts =
+        let tbl = Hashtbl.create 16 and order = ref [] in
+        let add n = if not (Hashtbl.mem tbl n) then (Hashtbl.add tbl n (); order := n :: !order) in
+        let base s = try String.sub s 0 (String.index s '[') with Not_found -> s in
+        let rec go = function
+          | BAssign { lhs; _ } -> add (base lhs)
+          | BCallStmt { func; args = (BVar a) :: _ }
+            when String.length func > 0 && func.[0] = '@' -> add a
+          | BIf { then_stmts; else_stmts; _ } -> List.iter go then_stmts; List.iter go else_stmts
+          | BCase { cases; default; _ } ->
+              List.iter (fun (_, ss) -> List.iter go ss) cases; List.iter go default
+          | BBlock ss -> List.iter go ss
+          | BWhile { body; _ } | BFor { body; _ } -> List.iter go body
+          | _ -> ()
+        in
+        List.iter go stmts; List.rev !order
+      in
       let body_with_reset = match (reset, reset_async) with
         | (Some rst, true) ->
             let rst_check = match reset_edge with
@@ -218,8 +328,11 @@ let verilog_of_process proc =
               | Some `Neg -> Printf.sprintf "!%s" rst
               | None -> rst
             in
-            Printf.sprintf "  if (%s) begin\n    // Reset logic\n  end else begin\n%s\n  end"
+            let resets = List.map (fun n -> Printf.sprintf "    %s = '0;" (sanitize_name n))
+                           (collect_targets body) in
+            Printf.sprintf "  if (%s) begin\n%s\n  end else begin\n%s\n  end"
               rst_check
+              (String.concat "\n" resets)
               (String.concat "\n" (List.map (verilog_of_stmt 2) body))
         | _ ->
             String.concat "\n" (List.map (verilog_of_stmt 1) body)
@@ -237,14 +350,27 @@ let verilog_of_instance prog inst =
    * functionless.  A value already a sized Verilog literal (has a quote,
    * or all digits) is emitted raw; anything else (e.g. IOSTANDARD = LVDS)
    * is wrapped in string quotes. *)
-  let int_params = List.map (fun (name, value) ->
-    Printf.sprintf ".%s(%d)" name value) param_values in
+  (* A user module is SPECIALIZED (params baked into its name, e.g.
+     prim_flop__W1_RResetValue) and declares NO parameters — passing `.Width(1)`
+     to it is an elaboration error.  So for a user module, keep only params it
+     actually declares; a library cell (FDRE/BSCANE2, not in prog.modules) keeps
+     all its params (INIT etc.). *)
+  let declared_params =
+    match List.find_opt (fun (m : bmodule) -> m.name = module_name) prog.modules with
+    | Some m -> Some (List.map fst m.params)
+    | None -> None (* library cell -> keep all *)
+  in
+  let keep name = match declared_params with
+    | None -> true | Some ps -> List.mem name ps in
+  let int_params = List.filter_map (fun (name, value) ->
+    if keep name then Some (Printf.sprintf ".%s(%d)" name value) else None) param_values in
   let is_vlit s =
     s <> "" && (String.contains s '\'' ||
                 String.for_all (fun c -> c >= '0' && c <= '9') s) in
-  let str_params = List.map (fun (name, value) ->
-    if is_vlit value then Printf.sprintf ".%s(%s)" name value
-    else Printf.sprintf ".%s(\"%s\")" name value) param_strs in
+  let str_params = List.filter_map (fun (name, value) ->
+    if not (keep name) then None
+    else if is_vlit value then Some (Printf.sprintf ".%s(%s)" name value)
+    else Some (Printf.sprintf ".%s(\"%s\")" name value)) param_strs in
   let all_params = int_params @ str_params in
   let params_str =
     if all_params <> [] then
@@ -280,6 +406,12 @@ let verilog_of_instance prog inst =
   in
 
   let ports_str = String.concat ",\n    " all_port_connections in
+
+  (* Generate-scope-qualified instance names carry a `.` (e.g.
+     `gen_rom_snd_scratch.i_debug_rom`), which is illegal for a plain instance
+     name — flatten it to an underscore. *)
+  let inst_name =
+    String.map (fun c -> if c = '.' then '_' else c) inst_name in
 
   if ports_str <> "" then
     Printf.sprintf "%s%s %s (\n    %s\n);"

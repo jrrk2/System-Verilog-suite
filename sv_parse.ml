@@ -295,6 +295,15 @@ let rec parse_json attr json =
       let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       let is_generate = json |> member "generate" |> to_bool_option |> Option.value ~default:false in
       Begin { name; stmts; is_generate }
+
+  (* v5.048+ emits GENBLOCK for elaborated generate scopes (was folded into
+     BEGIN in 5.024).  Contents live in `itemsp` (not `stmtsp`); genforp is the
+     unrolled generate-for header.  Treat as a generate Begin so the enclosed
+     instances/assigns are walked. *)
+  | "GENBLOCK" ->
+      let items = json |> member "itemsp" |> to_list_safe |> List.map (parse' attr name) in
+      let genfor = json |> member "genforp" |> to_list_safe |> List.map (parse' attr name) in
+      Begin { name; stmts = genfor @ items; is_generate = true }
       
   | "ASSIGN" ->
       let lhs = json |> member "lhsp" |> to_list_safe |> List.hd |> parse' attr name in
@@ -345,6 +354,28 @@ let rec parse_json attr json =
       let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       let incs = json |> member "incsp" |> to_list_safe |> List.map (parse' attr name) in
       For' { condition; stmts; incs }
+
+  (* v5.048 unified loop node: the loop CONDITION is a LOOPTEST node embedded in
+     `stmtsp`, the rest of `stmtsp` is the body, `contsp` are the increments.
+     Map to the same For' the WHILE path uses so svd.unroll can process it. *)
+  | "LOOP" ->
+      let items = json |> member "stmtsp" |> to_list_safe in
+      let is_looptest x =
+        (try (x |> member "type" |> to_string) = "LOOPTEST" with _ -> false) in
+      let condition = match List.find_opt is_looptest items with
+        | Some lt -> lt |> member "condp" |> to_list_safe |> List.hd |> parse' attr name
+        | None -> Const' { name = "1'h1"; dtype = "" } in
+      let stmts = items |> List.filter (fun x -> not (is_looptest x))
+                        |> List.map (parse' attr name) in
+      let incs = json |> member "contsp" |> to_list_safe |> List.map (parse' attr name) in
+      For' { condition; stmts; incs }
+  | "LOOPTEST" ->
+      (* only reached standalone (LOOP consumes it above) — yield its condition *)
+      json |> member "condp" |> to_list_safe |> List.hd |> parse' attr name
+
+  (* Verilator's constant-pool optimisation artifacts — no design logic, skip. *)
+  | "CONSTPOOL" | "SCOPE" ->
+      Begin { name; stmts = []; is_generate = false }
 
   | "VARREF" ->
       let dtype = json |> member "dtypep" |> to_string in

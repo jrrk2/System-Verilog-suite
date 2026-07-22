@@ -536,6 +536,7 @@ let rec encode_stmt suffix ctx_sigs solver = function
        with Z3.Error msg ->
         Printf.eprintf "Error encoding assignment: %s := <rhs>\n" lhs;
         Printf.eprintf "  LHS width: %d\n" width;
+        Printf.eprintf "  RHS: %s\n" (Behavioral_ir.string_of_bexpr rhs);
         Printf.eprintf "  Z3 error: %s\n" msg;
         raise (Z3.Error msg)
       )
@@ -1215,6 +1216,71 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
      * and `Q__D_d1 ?= Q__D_d2` falls out of the output XOR. *)
     ignore ctx2;
 
+    (* ---- Struct-scalarize state ties (STRUCT_SCALARIZE default-on) -------
+       One flow (SVS) splits an internal struct register S into per-field
+       FFs S$f1..S$fn; the reference flow (Verilator) keeps the whole S.
+       FF-rip then names the states differently (S$f vs S) so they never
+       pair by name — the DR/dtmcs datapath would silently drop out of the
+       comparison (an unsound "EQUIVALENT" over a subset).  Re-tie them via
+       the layout Behavioral_ir.scalarize_layouts recorded at split time:
+         current-state:  S(whole) == { S$f1, ..., S$fn }   (MSB-first)
+         next-state:     S__D     ?= { S$f1__D, ..., S$fn__D }  (extra cone)
+       so the scalarized datapath is PROVEN, not skipped.  Works in either
+       flow-order (whole may be design 1 or 2). *)
+    let scalarize_d_pairs = ref [] in
+    if Hashtbl.length scalarize_layouts > 0 then begin
+      let lookup lst n = List.assoc_opt n lst in
+      let mk_concat_msb sfx fvars =            (* fvars MSB-first *)
+        match List.map (fun (fn, fw) -> bv_var fn fw sfx) fvars with
+        | [] -> None
+        | x :: xs -> Some (List.fold_left (fun acc z ->
+                             Z3.BitVector.mk_concat ctx acc z) x xs) in
+      let n_scal = ref 0 in
+      Hashtbl.iter (fun base layout ->
+        if layout <> [] then begin
+          let fvars = List.map (fun (f, _, _, w) -> (base ^ "$" ^ f, w)) layout in
+          let tot = List.fold_left (fun a (_, w) -> a + w) 0 fvars in
+          (* whole_in/field_in = the two designs' input lists; try both
+             orientations so we don't assume which flow scalarized. *)
+          let try_orient whole_sfx field_sfx whole_in field_in whole_out field_out =
+            match lookup whole_in base with
+            | Some ww when ww = tot
+                         && List.for_all (fun (fn,_) ->
+                              lookup field_in fn <> None) fvars ->
+              (* current-state tie: whole Q == concat(field Qs) *)
+              (match mk_concat_msb field_sfx fvars with
+               | Some concat_q ->
+                 let whole_q = bv_var base tot whole_sfx in
+                 Z3.Solver.add miter_solver
+                   [ Z3.Boolean.mk_eq ctx whole_q concat_q ];
+                 incr n_scal
+               | None -> ());
+              (* next-state cone: whole__D ?= concat(field__D) *)
+              let wd = base ^ "__D" in
+              let fds = List.map (fun (fn, fw) -> (fn ^ "__D", fw)) fvars in
+              (match lookup whole_out wd with
+               | Some wwd when wwd = tot
+                            && List.for_all (fun (fn,_) ->
+                                 lookup field_out fn <> None) fds ->
+                 (match mk_concat_msb field_sfx fds with
+                  | Some concat_d ->
+                    let whole_d = bv_var wd tot whole_sfx in
+                    let differs = Z3.Boolean.mk_not ctx
+                        (Z3.Boolean.mk_eq ctx whole_d concat_d) in
+                    scalarize_d_pairs := (wd, differs) :: !scalarize_d_pairs
+                  | None -> ())
+               | _ -> ());
+              true
+            | _ -> false in
+          ignore (try_orient "_d1" "_d2" inputs1 inputs2 outputs1 outputs2
+                  || try_orient "_d2" "_d1" inputs2 inputs1 outputs2 outputs1)
+        end) scalarize_layouts;
+      if !n_scal > 0 then
+        Printf.printf
+          "Struct-scalarize state ties: %d register(s) tied (whole ↔ fields), %d next-state cone(s)\n"
+          !n_scal (List.length !scalarize_d_pairs)
+    end;
+
     let common_outputs =
       List.filter (fun (n, _) -> List.mem_assoc n outputs2) outputs1 in
     let common_outputs =
@@ -1378,6 +1444,14 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
          | Z3.Solver.UNSATISFIABLE -> incr neq
          | _ -> incr ndiff; if List.length !diffs < 60 then diffs := name :: !diffs);
         Z3.Solver.pop miter_solver 1) bitbus_d_pairs;
+      (* scalarized whole↔fields next-state cones *)
+      List.iter (fun (name, differs) ->
+        Z3.Solver.push miter_solver;
+        Z3.Solver.add miter_solver [ differs ];
+        (match Z3.Solver.check miter_solver [] with
+         | Z3.Solver.UNSATISFIABLE -> incr neq
+         | _ -> incr ndiff; if List.length !diffs < 60 then diffs := name :: !diffs);
+        Z3.Solver.pop miter_solver 1) !scalarize_d_pairs;
       Printf.printf "\n═══════════════════════════════════════════════════════════════\n";
       Printf.printf "  PER-CONE: %d EQUIVALENT, %d DIFFER\n" !neq !ndiff;
       Printf.printf "═══════════════════════════════════════════════════════════════\n";
@@ -1420,7 +1494,8 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
       | g -> Z3.Boolean.mk_and ctx (differs :: g)
     ) common_outputs in
 
-    let miter_terms = miter_terms @ List.map snd bitbus_d_pairs in
+    let miter_terms = miter_terms @ List.map snd bitbus_d_pairs
+                                  @ List.map snd !scalarize_d_pairs in
     let miter_output =
       match miter_terms with
       | [] -> Z3.Boolean.mk_false ctx

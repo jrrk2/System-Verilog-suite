@@ -57,6 +57,74 @@ let width_of_sized_literal tok =
 let cur_struct_params : (string, (string * int) list) Hashtbl.t =
   Hashtbl.create 4
 
+(* Type name -> bit width, summed from every packed struct / enum / typedef
+ * (module bodies + package bodies).  Populated during conversion (a pre-pass
+ * over all modules/packages, refined per-module with full params) and queried
+ * by the `$bits(<type>)` evaluator.  Without this, `.Width($bits(dcsr_t))`
+ * folded to 0 -> the specialized ibex_csr got a 1-bit rd_data_o while the
+ * parent wired a 26-bit concat, leaving 25 bits/26 undriven (EDIF ERC). *)
+let type_widths : (string, int) Hashtbl.t = Hashtbl.create 128
+
+(* SystemVerilog interfaces are elaborated as PACKED STRUCTS: an interface's
+ * signals become the struct's fields, so member access (`p.data`) reuses the
+ * existing struct-slice machinery and a whole-interface port connection carries
+ * every member.  Populated once from the interface declarations before the user
+ * modules are converted (see register_interfaces / convert_files_inner).
+ *   iface_reg : interface name -> [(member, width)]  (declaration order = MSB..LSB)
+ * The total width is also registered in [type_widths] so extract_port_decl treats
+ * an interface port like any struct-typed port. *)
+let iface_reg : (string, (string * int) list) Hashtbl.t = Hashtbl.create 16
+
+(* Modport member directions: "iface$modport" -> [(member, `Input|`Output)].
+ * An interface PORT `if2.wr p` exposes only the modport's members and with the
+ * modport's per-member direction — clk is an INPUT of drv, data an OUTPUT — so
+ * the scalarized port members (p$clk, p$data) get the right formal directions
+ * and the Vivado-flattened miter matches.  Populated in convert_files_inner. *)
+let iface_modports : (string, (string * [ `Input | `Output ]) list) Hashtbl.t =
+  Hashtbl.create 16
+
+(* Interface ports of the module currently being converted:
+ * (port_name, iface_name, modport_name).  extract_port_decl records each one;
+ * convert_module replays it after scalarize_module to promote the scalarized
+ * members (p$clk, p$data, …) to formals with their modport directions.
+ * Reset per module. *)
+let cur_iface_ports : (string * string * string) list ref = ref []
+
+(* Interface header ports: iface name -> [(port, `Input|`Output)] — the ports on
+ * the interface DECLARATION itself (e.g. `interface if2(input logic clk)` → clk).
+ * Used to wire an interface INSTANCE's own connections (`if2 u(clk)` → u.clk=clk)
+ * during interface-instance elaboration.  Populated in convert_files_inner. *)
+let iface_hdr_ports : (string, (string * [ `Input | `Output ]) list) Hashtbl.t =
+  Hashtbl.create 16
+
+(* Interface ports of each module: (port_name, iface).  The elaboration pass uses
+ * this to rebuild source-order port SLOTS from the FINAL scalarized signal order,
+ * collapsing each interface port's per-member formals (p$clk, p$data) back into a
+ * single slot so positional connections resolve as they do for scalar ports. *)
+let module_iface_ports : (string, (string * string) list) Hashtbl.t =
+  Hashtbl.create 32
+
+(* Interface INSTANCES declared inside each module: (inst_name, iface).  Captured
+ * from the struct-typed local decls (an interface instance `if2 u(clk)` — or even
+ * a port-less `hs_if h()` that never surfaces as a binstance).  The elaboration
+ * pass scalarizes each into member nets and wires its header ports. *)
+let module_iface_insts : (string, (string * string) list) Hashtbl.t =
+  Hashtbl.create 32
+
+(* SIGNAL name -> width, for `$bits(<signal>)` ONLY.  Kept SEPARATE from
+ * type_widths so registering signal widths does NOT pollute the phantom-instance
+ * drop guard (which treats type_widths membership as "this is a type name") or
+ * any other type_widths consumer.  Cleared+repopulated per module. *)
+let signal_widths : (string, int) Hashtbl.t = Hashtbl.create 128
+
+(* Enum member name -> the enum's declared base width (`enum logic [1:0]` -> 2).
+ * A member used in a WIDTH-sensitive context (a concat) must carry the enum
+ * width, not the default 32: dmi_jtag's `{address_q, data_q, DMINoError}` (op
+ * status = 2-bit enum) rendered DMINoError as 32'0 -> 71-bit concat truncated to
+ * 41 -> the DMI op-status field corrupted -> openocd sees perpetual "busy" ->
+ * "DMI operation didn't complete".  Populated by extract_enum_items. *)
+let enum_member_widths : (string, int) Hashtbl.t = Hashtbl.create 128
+
 let rec eval_int ~pkgs ~params tok =
   let lookup name =
     match List.assoc_opt name params with
@@ -101,6 +169,20 @@ let rec eval_int ~pkgs ~params tok =
         | _ -> ()) digits;
       (try Some (int_of_string ("0o" ^ !s)) with _ -> None)
   | SymbolIdentifier id -> lookup id
+  (* `pkg::name` — a package-scoped constant (e.g. dm::Idle, an enum member
+   * now in the package's params via convert_files_inner's augmentation).
+   * Resolve against the NAMED package first, then fall back to the all-package
+   * lookup for bare uniqueness. *)
+  | TUPLE4 (STRING tag,
+            TUPLE3 (STRING tg1, SymbolIdentifier pkg, _),
+            _,
+            TUPLE3 (STRING tg2, SymbolIdentifier name, _))
+    when prefix_is "qualified_id" tag
+      && prefix_is "unqualified_id" tg1
+      && prefix_is "unqualified_id" tg2 ->
+      (match resolve_pkg_ref pkgs ~pkg ~name with
+       | Some v -> int_of_pvalue v
+       | None -> lookup name)
   | TUPLE4 (STRING "add_expr2", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a + b)
@@ -229,15 +311,47 @@ let rec eval_int ~pkgs ~params tok =
           match acc with
           | None -> None
           | Some acc_val ->
-              (match eval_int ~pkgs ~params part,
-                     width_of_sized_literal part with
-               | Some v, Some w ->
-                   let mask = (1 lsl w) - 1 in
-                   Some ((acc_val lsl w) lor (v land mask))
-               | _ -> None)
+              (match eval_int ~pkgs ~params part with
+               | None -> None
+               | Some v ->
+                 (match width_of_sized_literal part with
+                  | Some w ->
+                      let mask = (1 lsl w) - 1 in
+                      Some ((acc_val lsl w) lor (v land mask))
+                  | None ->
+                      (* Non-literal part (package ref / derived param, e.g.
+                         `dm::DataCount` in `{4'h0, dm::DataCount}`): its width
+                         isn't a sized literal we can read.  When the MSBs
+                         accumulated so far are 0 the shift distance is
+                         irrelevant, so fold it as a zero-extension.  This lets
+                         DataEnd/ProgBufEnd (`Data0 + {4'h0, DataCount} - 1`)
+                         resolve instead of leaving the [Data0:DataEnd] address
+                         range bound unfolded -> mis-decoding dmcontrol writes.
+                         If the MSBs are non-zero we can't place it -> None. *)
+                      if acc_val = 0 then Some v else None))
         ) (Some 0) parts
       in
       folded
+  (* Replication `{N{expr}}` — expr_primary_braces2(LBRACE, count, LBRACE,
+     body, RBRACE, RBRACE).  Fold to N copies of expr's bits.  dm_csrs'
+     `parameter SelectableHarts = {NrHarts{1'b1}}` needs this or it ties to 0,
+     which corrupts the per-hart selection/alignment logic. *)
+  | TUPLE7 (STRING tag, _, count, _, body, _, _)
+    when prefix_is "expr_primary_braces2" tag ->
+      (match eval_int ~pkgs ~params count with
+       | Some n when n > 0 && n <= 62 ->
+           let inner = match body with TLIST (x :: _) -> x | x -> x in
+           (match eval_int ~pkgs ~params inner with
+            | Some v ->
+                let w = match width_of_sized_literal inner with
+                  | Some w when w > 0 -> w | _ -> 1 in
+                let mask = if w >= 62 then -1 else (1 lsl w) - 1 in
+                let vv = v land mask in
+                let rec rep i acc =
+                  if i >= n then acc else rep (i + 1) ((acc lsl w) lor vv) in
+                Some (rep 0 0)
+            | None -> None)
+       | _ -> None)
   (* `system_tf_call1(SystemTFIdentifier "$name", call_base)` — emitted
    * for elaboration system tasks whitelisted in
    * Source_text_verible_lex.mll's `systask` hashtable ($clog2, $bits,
@@ -247,16 +361,35 @@ let rec eval_int ~pkgs ~params tok =
    * reference_or_call_base1 fallback below. *)
   | TUPLE3 (STRING "system_tf_call1", SystemTFIdentifier name, call_base) ->
       let inner_arg () =
-        let cands = collect_by (function
-          | TUPLE4 (STRING t, _, _, _)
-            when prefix_is "add_expr" t || prefix_is "mul_expr" t -> true
-          | TK_DecNumber _ -> true
-          | TUPLE3 (STRING t, _, _)
-            when prefix_is "reference_or_call_base" t
-              || prefix_is "unqualified_id" t
-              || prefix_is "reference2" t -> true
-          | _ -> false) call_base in
-        match cands with first :: _ -> Some first | [] -> None
+        (* A package-qualified arg like `dm::ProgBufSize` is a `qualified_id`
+           whose FIRST inner `unqualified_id` is the PACKAGE name (`dm`).
+           Collecting unqualified_id sub-nodes then taking the first wrongly
+           picks `dm` (not a param → eval_int None → $clog2 collapses to 0,
+           giving `addr[-1:0]`).  So, unless the arg is an arithmetic
+           expression (handled recursively), prefer a whole qualified_id. *)
+        let has_arith =
+          collect_by (function
+            | TUPLE4 (STRING t, _, _, _)
+              when prefix_is "add_expr" t || prefix_is "mul_expr" t -> true
+            | _ -> false) call_base <> [] in
+        let quals =
+          if has_arith then []
+          else collect_by (function
+            | TUPLE4 (STRING t, _, _, _) when prefix_is "qualified_id" t -> true
+            | _ -> false) call_base in
+        match quals with
+        | q :: _ -> Some q
+        | [] ->
+          let cands = collect_by (function
+            | TUPLE4 (STRING t, _, _, _)
+              when prefix_is "add_expr" t || prefix_is "mul_expr" t -> true
+            | TK_DecNumber _ -> true
+            | TUPLE3 (STRING t, _, _)
+              when prefix_is "reference_or_call_base" t
+                || prefix_is "unqualified_id" t
+                || prefix_is "reference2" t -> true
+            | _ -> false) call_base in
+          match cands with first :: _ -> Some first | [] -> None
       in
       (match name with
        | "$clog2" ->
@@ -274,7 +407,15 @@ let rec eval_int ~pkgs ~params tok =
            (match inner_arg () with
             | Some e -> eval_int ~pkgs ~params e
             | None -> None)
-       | "$bits" -> Some 0
+       | "$bits" ->
+           (* $bits(<type>) or $bits(pkg::<type>): the LAST identifier is the
+              type name; look it up in the type-width registry.  Falls back to
+              Some 0 (previous behaviour) for $bits of an unknown type. *)
+           let last = ref None in
+           walk (function SymbolIdentifier id -> last := Some id | _ -> ()) call_base;
+           (match !last with
+            | Some id -> (match Hashtbl.find_opt type_widths id with Some w -> Some w | None -> (match Hashtbl.find_opt signal_widths id with Some w -> Some w | None -> Some 0))
+            | None -> Some 0)
        | _ -> None)
   (* Function-like call wrapper: `reference_or_call_base1(reference,
    * call_base)`. The lexer treats most `$name` tokens as
@@ -327,12 +468,25 @@ let rec eval_int ~pkgs ~params tok =
            (match inner_arg () with
             | Some e -> eval_int ~pkgs ~params e
             | None -> None)
-       (* `$bits(T)` — width of a type or expression.  Without full
-        * type-parameter elaboration we don't carry per-type bit-counts;
-        * fall back to Some 0 (the empty-config default, same strategy
-        * as $clog2 above).  Real fix lands with task #141 PStruct. *)
-       | Some "$bits" -> Some 0
+       (* `$bits(T)` / `$bits(pkg::T)` — the LAST identifier is the type name;
+        * look it up in the type-width registry (summed struct/enum/typedef
+        * widths).  Falls back to Some 0 for an unknown type. *)
+       | Some "$bits" ->
+           let last = ref None in
+           walk (function SymbolIdentifier id -> last := Some id | _ -> ()) call_base;
+           (match !last with
+            | Some id -> (match Hashtbl.find_opt type_widths id with Some w -> Some w | None -> (match Hashtbl.find_opt signal_widths id with Some w -> Some w | None -> Some 0))
+            | None -> Some 0)
        | _ -> eval_int ~pkgs ~params ref_node)
+  | TUPLE6 (STRING tag, _casting_type, _, _, inner, _) when prefix_is "cast" tag ->
+      (* `T'(expr)` type/size cast — cast1(casting_type, ', (, expr, )).
+         For constant folding the cast value IS the inner value (width
+         truncation is irrelevant to the small register-index localparams
+         that use this, e.g. `DataEnd = dm::dm_csr_e'(dm::Data0 +
+         {4'h0, dm::DataCount} - 8'h1)`).  Without this the whole localparam
+         failed to fold and stayed unbound, so dm_csrs' `[(Data0):DataEnd]`
+         range bound tied to 0. *)
+      eval_int ~pkgs ~params inner
   | TUPLE4 (STRING tag, _, inner, _) when prefix_is "expr_primary_parens" tag ->
       (* `( <expr> )` — TUPLE4(tag, LPAREN, inner_expression, RPAREN).
          The grammar wraps the body via expr_mintypmax →
@@ -407,6 +561,17 @@ let extract_range ~pkgs ~params tok =
       (match m, l with
        | Some mi, Some li -> Some (mi, li)
        | _ -> None)
+  (* `[N]` single-value SIZE form (unpacked `foo [N]` / `foo [PARAM]`):
+     grammar `decl_variable_dimension2` = TUPLE4(tag, LBRACK, size, RBRACK).
+     Size N means indices [N-1:0].  Without this the unpacked array
+     dimension is dropped and `logic [W:0] arr [N]` collapses to a scalar
+     BInt[W] — arr[k>0] then reads/writes out of range, leaving driverless
+     element wires. *)
+  | (TUPLE4 (STRING tag, _lb, size_e, _rb)) :: _
+    when prefix_is "decl_variable_dimension2" tag ->
+      (match eval_int ~pkgs ~params size_e with
+       | Some n when n >= 1 -> Some (n - 1, 0)
+       | _ -> None)
   | _ -> None
 
 (* Return every packed dimension as `(msb, lsb)`, in declaration
@@ -427,6 +592,14 @@ let extract_packed_dims ~pkgs ~params tok =
         (match m, l with
          | Some mi, Some li -> Some (mi, li)
          | _ -> None)
+    (* `[N]` single-value size form (unpacked array dim `arr [N]`) →
+       [N-1:0]; see extract_range.  Keeps arrayed ports (`logic [W:0] p [N]`)
+       as BArray[N x (W+1)] rather than collapsing to BInt[W+1]. *)
+    | TUPLE4 (STRING tag, _, size_e, _)
+      when prefix_is "decl_variable_dimension2" tag ->
+        (match eval_int ~pkgs ~params size_e with
+         | Some n when n >= 1 -> Some (n - 1, 0)
+         | _ -> None)
     | _ -> None
   ) pairs
 
@@ -437,7 +610,11 @@ let extract_packed_dims ~pkgs ~params tok =
  * extract_range, which finds the packed dimension wherever it is). *)
 let extract_typedefs ~pkgs ~params tok =
   let nodes = collect_by (has_tag (prefix_is "type_declaration")) tok in
-  List.filter_map (fun n -> match n with
+  (* Local width map, so a struct field typed by an enum/typedef declared in
+     the SAME scope resolves regardless of declaration order (dmi_req_t.op :
+     dtm_op_e).  Consult local first, then the global type_widths. *)
+  let local : (string, int) Hashtbl.t = Hashtbl.create 32 in
+  let width_of_node n = match n with
     | TUPLE6 (_, _, data_type, SymbolIdentifier nm, _, _) ->
         (* Check struct first — extract_range would otherwise dive
          * into the first field's packed dim and short-circuit. *)
@@ -447,15 +624,34 @@ let extract_typedefs ~pkgs ~params tok =
           let total = List.fold_left (fun acc m ->
             match extract_range ~pkgs ~params m with
             | Some (mb, lb) -> acc + abs (mb - lb) + 1
-            | None -> acc + 1
+            | None ->
+                (* enum/typedef-typed field (`dtm_op_e op`): width is the field
+                   TYPE's, not 1.  This feeds type_widths → the struct PORT
+                   width; dmi_req_t must be 41 (op=2) so dm_csrs' dmi_req_i port
+                   aligns with the 41-bit JTAG DR (else DTM_WRITE mis-decodes). *)
+                let tw = ref None in
+                walk (function
+                  | SymbolIdentifier id when !tw = None ->
+                      (match Hashtbl.find_opt local id with
+                       | Some w -> tw := Some w
+                       | None ->
+                         (match Hashtbl.find_opt type_widths id with
+                          | Some w -> tw := Some w | None -> ()))
+                  | _ -> ()) m;
+                acc + (match !tw with Some w -> w | None -> 1)
           ) 0 members in
           if total > 0 then Some (nm, total) else None
         else
           (match extract_range ~pkgs ~params data_type with
            | Some (m, l) -> Some (nm, abs (m - l) + 1)
            | None -> None)
-    | _ -> None
-  ) nodes
+    | _ -> None in
+  (* Pass 1: populate `local` (enums/scalars resolve immediately; structs whose
+     enum fields aren't in `local` yet get a provisional width). *)
+  List.iter (fun n -> match width_of_node n with
+    | Some (nm, w) -> Hashtbl.replace local nm w | None -> ()) nodes;
+  (* Pass 2: recompute — struct fields now see their enum types in `local`. *)
+  List.filter_map width_of_node nodes
 
 (* For each `typedef struct packed { ... } t;`, extract an ordered
  * list of (field_name, width). Field declaration order is MSB →
@@ -480,13 +676,38 @@ let extract_struct_defs ~pkgs ~params tok
         let fields = List.filter_map (fun m ->
           let w = match extract_range ~pkgs ~params m with
             | Some (mb, lb) -> abs (mb - lb) + 1
-            | None -> 1
+            | None ->
+                (* No packed dim — an enum/typedef-typed field (`dtm_op_e op`).
+                   Its width is that of the field's TYPE, not 1: find the first
+                   identifier that is a known type width (the type precedes the
+                   field name, so it's matched first).  Without this a struct
+                   with an enum field (dmi_req_t.op : dtm_op_e) sums to the
+                   wrong total width and every field slice on it is corrupt. *)
+                let tw = ref None in
+                walk (function
+                  | SymbolIdentifier id when !tw = None ->
+                      (match Hashtbl.find_opt type_widths id with
+                       | Some w -> tw := Some w | None -> ())
+                  | _ -> ()) m;
+                (match !tw with Some w -> w | None -> 1)
           in
-          (* Field name is the SymbolIdentifier inside the member. *)
+          (* Field name is the DECLARATOR.  A packed-struct member is
+             `<type> <name>`, so the declarator is the LAST identifier that is
+             NOT a known type name (the type — possibly `pkg::enum_t` — precedes
+             it; range/param identifiers like `[FOO:0]` are not types either but
+             also precede the name).  Picking the FIRST identifier wrongly named
+             a typedef/enum-typed field after its TYPE (`dm::dtm_op_e op` ->
+             `dtm_op_e`), so `.op` member access never resolved; picking the
+             plain LAST could grab a trailing type token.  Last-non-type is the
+             declarator in both `logic [W] addr` and `dm::dtm_op_e op`. *)
           let fname = ref None in
           walk (function
-            | SymbolIdentifier id when !fname = None -> fname := Some id
+            | SymbolIdentifier id when not (Hashtbl.mem type_widths id) ->
+                fname := Some id
             | _ -> ()) m;
+          (* Degenerate: every identifier was a type name — fall back to last. *)
+          if !fname = None then
+            walk (function SymbolIdentifier id -> fname := Some id | _ -> ()) m;
           match !fname with
           | Some id -> Some (id, w)
           | None -> None
@@ -528,18 +749,23 @@ let width_of ?(typedefs = []) ~pkgs ~params tok =
       (match !atom_w with
        | Some w -> w
        | None ->
-           (* No atom either — the type might be a typedef reference
-            * like `state_type CState`. Walk for the first
-            * SymbolIdentifier and look it up in the typedef map. *)
+           (* No atom either — the type might be a typedef reference like
+            * `state_type CState` or a package-qualified struct `dm::dtmcs_t`.
+            * Take the LAST SymbolIdentifier (the type name AFTER any `pkg::`
+            * qualifier) and look it up in the local typedef map, then the
+            * global type_widths (packed struct/enum widths from all modules +
+            * packages).  Without the global fallback, a struct-typed signal
+            * `dm::dtmcs_t dtmcs_d` got width 1 -> the 32-bit dtmcs literal
+            * truncated to 1 bit -> JTAG DTM dead (dtmcs.abits reads 0). *)
            let nm = ref None in
-           walk (function
-             | SymbolIdentifier id when !nm = None -> nm := Some id
-             | _ -> ()) tok;
+           walk (function SymbolIdentifier id -> nm := Some id | _ -> ()) tok;
            (match !nm with
             | Some id ->
                 (match List.assoc_opt id typedefs with
                  | Some w -> w
-                 | None -> 1)
+                 | None ->
+                     (match Hashtbl.find_opt type_widths id with
+                      | Some w -> w | None -> 1))
             | None -> 1))
 
 (* `typedef enum logic [N-1:0] { A, B = 5, C, … } t;` — every enum
@@ -555,6 +781,13 @@ let extract_enum_items ~pkgs ~params tok =
       | TUPLE6 (_, _, _, _, ln, _) -> ln  (* enum_data_type2: with base *)
       | _ -> EMPTY_TOKEN
     in
+    (* The enum's declared base width (`enum logic [N-1:0]`) — from the packed
+       dim on the base type, BEFORE the `{...}` member list.  Members inherit it
+       so they carry the right width in concats (default 32 corrupts op fields). *)
+    let enum_w =
+      match extract_range ~pkgs ~params n with
+      | Some (m, l) -> Some (abs (m - l) + 1)
+      | None -> None in
     (* enum_name_list is built left-recursively through
      * `enum_name_list_item_last` nodes that nest each item inside the
      * previous list. A simple TLIST iteration only sees the outermost
@@ -619,6 +852,10 @@ let extract_enum_items ~pkgs ~params tok =
         | None ->
             let n = !counter in counter := !counter + 1; n
       in
+      (match enum_w with
+       | Some w when w > 0 && not (Hashtbl.mem enum_member_widths id) ->
+           Hashtbl.replace enum_member_widths id w
+       | _ -> ());
       Some (id, string_of_int v)
     ) items_in_source_order
   ) nodes
@@ -712,10 +949,14 @@ let param_value_to_bexpr id v =
      | _ ->
          (match parse_dec v with
           | Some n ->
-              (* wide unbased-decimal params (48-bit FPGA_MAC as
-                 2199028187441): width 32 truncated the value, so
-                 FPGA_MAC[47:32] read as 0 — size to the value *)
-              let w = max 32 (Z.numbits (Z.of_int n)) in
+              (* An ENUM MEMBER (DMINoError, …) carries its enum's declared
+                 width so it packs correctly in a concat — default 32 corrupts
+                 e.g. the 2-bit DMI op-status field.  Otherwise: wide unbased-
+                 decimal params (48-bit FPGA_MAC) size to the value. *)
+              let w =
+                match Hashtbl.find_opt enum_member_widths id with
+                | Some ew when ew >= Z.numbits (Z.of_int n) -> ew
+                | _ -> max 32 (Z.numbits (Z.of_int n)) in
               BConst { value = Z.of_int n; width = w }
           | None -> BVar id))
 
@@ -1060,13 +1301,32 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
           in
           (match matching_def with
            | Some (_, fields) ->
+               (* Size each field value to the field's DECLARED width, so an
+                  unsized `'0` fill (which recurse gives a 32-bit BConst) or an
+                  over-wide signal doesn't inflate/mis-align the packed struct.
+                  Const -> re-width (masked); other -> truncate via BSlice
+                  (out-of-range high bits zero-pad downstream). *)
+               let size_field w e =
+                 if w <= 0 then e else
+                 match e with
+                 | BConst { value; width } when width <> w ->
+                     let mask =
+                       if w >= 62 then Z.minus_one
+                       else Z.sub (Z.shift_left Z.one w) Z.one in
+                     BConst { value = Z.logand value mask; width = w }
+                 | BConst _ -> e
+                 | _ -> BSlice { signal = e; msb = w - 1; lsb = 0 }
+               in
                let in_order =
-                 List.map (fun (fname, _w) ->
-                   try List.assoc fname pairs
-                   with Not_found ->
-                     (match !default_value with
-                      | Some v -> v
-                      | None -> BConst { value = Z.zero; width = 1 })
+                 List.map (fun (fname, w) ->
+                   let v =
+                     try List.assoc fname pairs
+                     with Not_found ->
+                       (match !default_value with
+                        | Some v -> v
+                        | None -> BConst { value = Z.zero; width = 1 })
+                   in
+                   size_field w v
                  ) fields
                in
                (match in_order with
@@ -1286,6 +1546,12 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         | _ -> ()) ext_id;
       (match signal, !field_name with
        | BVar sig_name, Some fname ->
+           (if Sys.getenv_opt "FIELD_DEBUG" <> None
+               && String.length sig_name >= 7 && String.sub sig_name 0 7 = "dmi_req" then
+              Printf.eprintf "[field] %s.%s in_signal_struct=%b in_struct_defs=%b\n%!"
+                sig_name fname (List.mem_assoc sig_name !cur_signal_struct)
+                (match List.assoc_opt sig_name !cur_signal_struct with
+                 | Some sn -> List.mem_assoc sn !cur_struct_defs | None -> false));
            (match List.assoc_opt sig_name !cur_signal_struct with
             | Some struct_name ->
                 (match List.assoc_opt struct_name !cur_struct_defs with
@@ -1768,6 +2034,43 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
 (* Pull the SymbolIdentifiers out of a `module_port_declaration*`
  * subtree so each name becomes one signal. *)
 let extract_port_decl ~pkgs ~params tok =
+  (* Interface port `if2.wr p` / `if2 p` — parsed by verible as
+   * `type_identifier_followed_by_id` (or interface_port_header) nodes with the
+   * identifiers in order [iface; modport?; portname].  Only the LAST id is the
+   * port name; the iface and modport names must NOT leak as ports.  Emit ONE
+   * signal (the port) with the interface's packed width, direction `Internal so
+   * scalarize_module splits it into members; record (port, iface, modport) so
+   * convert_module promotes the members to formals with modport directions. *)
+  let iface_port =
+    let hdr = collect_by (has_tag (fun t ->
+              prefix_is "type_identifier_followed_by_id" t
+              || prefix_is "interface_port_header" t)) tok in
+    if hdr = [] then None
+    else begin
+      let ids = ref [] in
+      walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) tok;
+      let ids = List.rev !ids in
+      (* iface = first id that is a registered interface *)
+      match List.find_opt (fun id -> Hashtbl.mem iface_reg id) ids with
+      | Some iface ->
+          (match List.rev ids with
+           | portname :: _ when portname <> iface ->
+               (* modport = an id strictly between iface and portname *)
+               let modport =
+                 List.find_opt (fun id -> id <> iface && id <> portname) ids in
+               Some (portname, iface, modport)
+           | _ -> None)
+      | None -> None
+    end
+  in
+  match iface_port with
+  | Some (portname, iface, modport) ->
+      cur_iface_ports :=
+        (portname, iface, Option.value ~default:"" modport) :: !cur_iface_ports;
+      let w = try Hashtbl.find type_widths iface with Not_found -> 1 in
+      [ { name = portname; stype = BInt { width = w; signed = Unsigned };
+          direction = `Internal; initial_value = None; attrs = [] } ]
+  | None ->
   let dir = ref `Internal in
   walk (function
     | Input -> dir := `Input
@@ -1853,7 +2156,39 @@ let extract_port_decl ~pkgs ~params tok =
     | _ -> ()
   in
   walk_loose tok;
-  let w = width_of ~pkgs ~params tok in
+  (* Struct/enum-typed port (`dm::dmi_req_t jtag_dmi_req_i` or bare
+     `dmi_req_t p`): the type identifiers (the package qualifier `dm` and the
+     type name `dmi_req_t`) are NOT port names, and the width is the struct
+     width — not width_of's default 1.  Without this the whole struct port
+     collapses to 1 bit AND the type names leak in as bogus 1-bit ports (the
+     dmi_cdc `dm::dmi_req_t`/`dm::dmi_resp_t` CDC-datapath killer). *)
+  let type_ids : (string, unit) Hashtbl.t = Hashtbl.create 4 in
+  let struct_w = ref None in
+  walk (function
+    | SymbolIdentifier id when Hashtbl.mem type_widths id ->
+        Hashtbl.replace type_ids id ();
+        if !struct_w = None then struct_w := Hashtbl.find_opt type_widths id
+    | _ -> ()) tok;
+  (* exclude every identifier inside a `pkg::type` qualified_id (both the
+     package and the type name) from the port-name set. *)
+  let rec collect_qual t =
+    match t with
+    | TUPLE4 (STRING t', _, _, _) when prefix_is "qualified_id" t' ->
+        walk (function SymbolIdentifier id -> Hashtbl.replace type_ids id () | _ -> ()) t
+    | TUPLE2 (a, b) -> collect_qual a; collect_qual b
+    | TUPLE3 (a, b, c) -> collect_qual a; collect_qual b; collect_qual c
+    | TUPLE4 (a, b, c, d) -> List.iter collect_qual [a; b; c; d]
+    | TUPLE5 (a, b, c, d, e) -> List.iter collect_qual [a; b; c; d; e]
+    | TUPLE6 (a, b, c, d, e, f) -> List.iter collect_qual [a; b; c; d; e; f]
+    | TUPLE7 (a, b, c, d, e, f, g) -> List.iter collect_qual [a; b; c; d; e; f; g]
+    | TLIST xs -> List.iter collect_qual xs
+    | _ -> () in
+  collect_qual tok;
+  (* a `pkg::type` qualifier the AST shape above didn't wrap in qualified_id
+     still leaks the bare package name — exclude every known package name. *)
+  List.iter (fun p -> Hashtbl.replace type_ids p.pkg_name ()) pkgs;
+  names := List.filter (fun n -> not (Hashtbl.mem type_ids n)) !names;
+  let w = match !struct_w with Some sw -> sw | None -> width_of ~pkgs ~params tok in
   (* Detect unpacked-array net decls (`wire [W:0] arr[D:0]`):
      two decl_variable_dimensions, first packed, second unpacked.
      Emit BArray so [merge_array_writes] uses (size, elem_w) from
@@ -1862,11 +2197,28 @@ let extract_port_decl ~pkgs ~params tok =
      source `assign in_[i] = in_$00i` where each element is many
      bits).  Single-dim case stays BInt. *)
   let dims = extract_packed_dims ~pkgs ~params tok in
+  (* A lone `[N]` SIZE-form dimension (grammar decl_variable_dimension2 /
+     TUPLE4) is an UNPACKED array of 1-bit elements — `logic gnt_o [N]`.
+     Without recognising it, such a port collapses to a scalar BInt[N] and
+     element writes/reads `gnt_o[k]` go out of range → driverless wires.
+     A lone `[m:l]` RANGE form is an ordinary packed vector → BInt. *)
+  let dim_nodes =
+    collect_by (has_tag (prefix_is "decl_variable_dimension")) tok in
+  let lone_size_form =
+    match dim_nodes with
+    | [TUPLE4 (STRING tag, _, _, _)]
+      when prefix_is "decl_variable_dimension2" tag -> true
+    | _ -> false in
   let stype =
     match dims with
     | [(im, il); (om, ol)] ->
         BArray {
           element = BInt { width = abs (im - il) + 1; signed = Unsigned };
+          size = abs (om - ol) + 1;
+        }
+    | [(om, ol)] when lone_size_form ->
+        BArray {
+          element = BInt { width = 1; signed = Unsigned };
           size = abs (om - ol) + 1;
         }
     | _ ->
@@ -1949,11 +2301,66 @@ let concat_lhs_parts lhs =
       else None
   | _ -> None
 
+(* Bit range [msb:lsb] of struct field [fname] in struct-typed signal
+   [sig_name] (cur_signal_struct -> cur_struct_defs; MSB-first). *)
+let struct_field_range_g sig_name fname =
+  match List.assoc_opt sig_name !cur_signal_struct with
+  | None -> None
+  | Some sn ->
+    (match List.assoc_opt sn !cur_struct_defs with
+     | None -> None
+     | Some fields ->
+       let tw = List.fold_left (fun a (_, w) -> a + w) 0 fields in
+       let rec find pos = function
+         | [] -> None
+         | (n, w) :: rest ->
+           if n = fname then Some (tw - pos - 1, tw - pos - w)
+           else find (pos + w) rest
+       in find 0 fields)
+
+(* Struct member-select LHS `sig.field` -> (base, field, msb, lsb) of the
+   field's bit-range within the packed struct.  None if not a member-select
+   or the field/struct is unknown.  Used to keep a single-field continuous
+   assign (`assign dmi_req.op = ...`) from being lowered as a WHOLE-struct
+   assign (which drops the member and destroys the other fields). *)
+let member_lhs_of lhs =
+  match lhs with
+  | TUPLE3 (STRING t, ref_node, TUPLE3 (STRING ht, _, ext_id))
+    when prefix_is "reference2" t && prefix_is "hierarchy_extension1" ht ->
+      let base = lhs_name_of ref_node in
+      let fld = ref None in
+      walk (function SymbolIdentifier id when !fld = None -> fld := Some id | _ -> ()) ext_id;
+      (match base, !fld with
+       | Some b, Some f ->
+         (match struct_field_range_g b f with
+          | Some (msb, lsb) -> Some (b, f, msb, lsb) | None -> None)
+       | _ -> None)
+  | _ -> None
+
 let extract_assign ~pkgs ~params ~arrays tok =
   let assigns = collect_by (has_tag (prefix_is "cont_assign")) tok in
   List.concat_map (fun a ->
     match a with
     | TUPLE4 (STRING tag, lhs, _eq, rhs) when prefix_is "cont_assign" tag ->
+        (match member_lhs_of lhs with
+         | Some (base, fld, msb, lsb) ->
+             (* `assign sig.field = rhs` — write ONLY that field's bit-range via
+                @part_sel_write_up (scalarize then maps it to the per-field
+                signal).  Without this the member is dropped and the whole struct
+                is assigned `= rhs`, corrupting every field (e.g. dmi_jtag's
+                `dmi_req.op` became `((state==Write)?2:1)[33:32]` = 0/NOP). *)
+             let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
+             [BCombinational {
+                name = "assign_" ^ base ^ "_" ^ fld;
+                sensitivity = [BAny];
+                body = [BCallStmt {
+                  func = "@part_sel_write_up";
+                  args = [ BVar base;
+                           BConst { value = Z.of_int lsb; width = 32 };
+                           BConst { value = Z.of_int (msb - lsb + 1); width = 32 };
+                           rhs_e ] }];
+              }]
+         | None ->
         (match concat_lhs_parts lhs with
          | Some parts ->
              (* Split: each name gets a slice of the RHS, MSB-first. *)
@@ -2039,7 +2446,7 @@ let extract_assign ~pkgs ~params ~arrays tok =
                                continuous-assign LHS %s — select dropped\n" name;
                             whole ())
                    | `Whole -> whole ())
-              | None -> []))
+              | None -> [])))
     | _ -> []
   ) assigns
 
@@ -2050,7 +2457,47 @@ let extract_assign ~pkgs ~params ~arrays tok =
 let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
   let recurse_e = expr_to_bexpr ~pkgs ~params ~arrays in
   let recurse_s = stmt_to_bstmt ~pkgs ~params ~arrays in
+  (* Bit range [msb:lsb] of struct field [fname] in struct-typed signal
+     [sig_name] (cur_signal_struct -> cur_struct_defs; MSB-first). *)
+  let struct_field_range sig_name fname =
+    match List.assoc_opt sig_name !cur_signal_struct with
+    | None -> None
+    | Some sn ->
+      (match List.assoc_opt sn !cur_struct_defs with
+       | None -> None
+       | Some fields ->
+         let tw = List.fold_left (fun a (_, w) -> a + w) 0 fields in
+         let rec find pos = function
+           | [] -> None
+           | (n, w) :: rest ->
+             if n = fname then Some (tw - pos - 1, tw - pos - w)
+             else find (pos + w) rest
+         in find 0 fields) in
   let assign_to lhs rhs =
+    (* Struct FIELD-write LHS `sig.field = v` -> @part_sel_write_up at the field
+       bit-range (NOT a full assign that destroys the register).  The scalarize
+       pass then maps it to a per-field signal write. *)
+    let member_lhs =
+      match lhs with
+      | TUPLE3 (STRING t, ref_node, TUPLE3 (STRING ht, _, ext_id))
+        when prefix_is "reference2" t && prefix_is "hierarchy_extension1" ht ->
+          let base = lhs_name_of ref_node in
+          let fld = ref None in
+          walk (function SymbolIdentifier id when !fld = None -> fld := Some id | _ -> ()) ext_id;
+          (match base, !fld with
+           | Some b, Some f ->
+             (match struct_field_range b f with
+              | Some (msb, lsb) -> Some (b, msb, lsb) | None -> None)
+           | _ -> None)
+      | _ -> None in
+    match member_lhs with
+    | Some (base, msb, lsb) ->
+        BCallStmt { func = "@part_sel_write_up";
+                    args = [ BVar base;
+                             BConst { value = Z.of_int lsb; width = 32 };
+                             BConst { value = Z.of_int (msb - lsb + 1); width = 32 };
+                             recurse_e rhs ] }
+    | None ->
     (* Concat-LHS detection: `{a, b, c, d} = expr` splits into
        per-name assigns where each name takes a slice of the RHS,
        MSB-first.  Names in the concat may themselves be sliced
@@ -2472,11 +2919,50 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
               if prefix_is "case_item2" t then Some (None, [recurse_s body])
               else Some (Some (key, wildcard_of key), [recurse_s body])
           | _ -> None) case_items in
+      let key_has_range key =
+        let found = ref false in
+        walk (function
+          | TUPLE5 (STRING t, _, _, _, _)
+          | TUPLE6 (STRING t, _, _, _, _, _) when prefix_is "value_range" t ->
+              found := true
+          | _ -> ()) key;
+        !found in
       let has_wild =
         List.exists (function Some (_, Some _), _ -> true | _ -> false)
           (List.map (fun (k, b) -> (k, b)) arms) in
-      if has_wild then begin
+      (* `case (sel) inside` with range labels `[lo:hi]`: BCase only does
+         equality, so lower the whole case to a priority if-chain whose arm
+         condition is a set-membership test (lo<=sel<=hi, OR-combined across
+         multiple ranges).  dm_csrs' DMI read/write case uses exactly this
+         (`[(dm::Data0):DataEnd]`); without it the entire register case dropped
+         and the debug module read all-zero / never latched dmactive. *)
+      let has_range =
+        List.exists (fun (k, _) ->
+          match k with Some (key, _) -> key_has_range key | None -> false) arms in
+      if has_wild || has_range then begin
         let bool_t = BBool in
+        let membership_cond key =
+          let ranges = ref [] in
+          walk (function
+            | TUPLE5 (STRING t, _, lo, _, hi)
+            | TUPLE6 (STRING t, _, lo, _, hi, _) when prefix_is "value_range" t ->
+                ranges := (lo, hi) :: !ranges
+            | _ -> ()) key;
+          match List.rev !ranges with
+          | [] ->
+              BBinOp { op = BEq; lhs = sel; rhs = recurse_e key;
+                       result_type = bool_t }
+          | rs ->
+              let one (lo, hi) =
+                BBinOp { op = BAnd;
+                         lhs = BBinOp { op = BGe; lhs = sel; rhs = recurse_e lo;
+                                        result_type = bool_t };
+                         rhs = BBinOp { op = BLe; lhs = sel; rhs = recurse_e hi;
+                                        result_type = bool_t };
+                         result_type = bool_t } in
+              List.fold_left (fun a r ->
+                BBinOp { op = BOr; lhs = a; rhs = one r; result_type = bool_t })
+                (one (List.hd rs)) (List.tl rs) in
         let cond_of key = function
           | Some (v, m, w) ->
               BBinOp { op = BEq;
@@ -2485,9 +2971,7 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                                       result_type = BInt { width = w; signed = Unsigned } };
                        rhs = BConst { value = v; width = w };
                        result_type = bool_t }
-          | None ->
-              BBinOp { op = BEq; lhs = sel; rhs = recurse_e key;
-                       result_type = bool_t } in
+          | None -> membership_cond key in
         let default_body =
           match List.find_opt (fun (k, _) -> k = None) arms with
           | Some (_, b) -> b | None -> [] in
@@ -2509,6 +2993,74 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
             ([], []) arms in
         BCase { selector = sel; cases; default }
       end
+  (* `case (sel) inside … endcase` — case_statement3 (TUPLE9 with the `Inside`
+     keyword).  Item labels are `open_range_list`s of plain values and/or
+     `[lo:hi]` ranges (case_inside_item1); case_inside_item2/3 are the default.
+     BCase does equality only, so lower to a priority if-chain whose arm
+     condition is a set-membership test.  dm_csrs' DMI register read+write case
+     is exactly this shape; without it the whole block was unhandled → the read
+     mux and dmcontrol write dropped → DM read all-zero and dmactive never set. *)
+  | TUPLE9 (STRING tag, _, _, _, selector, _, _, items, _)
+    when prefix_is "case_statement3" tag ->
+      let sel = recurse_e selector in
+      let cmp_t = BBool in
+      let items_acc = ref [] in
+      let rec go t = match t with
+        | TUPLE3 (STRING t', a, b) when prefix_is "case_inside_items" t' ->
+            go a; go b
+        | TUPLE4 (STRING t', _, _, _)
+          when prefix_is "case_inside_item1" t' || prefix_is "case_inside_item2" t' ->
+            items_acc := t :: !items_acc
+        | TUPLE3 (STRING t', _, _) when prefix_is "case_inside_item3" t' ->
+            items_acc := t :: !items_acc
+        | TLIST xs -> List.iter go xs
+        | _ -> () in
+      go items;
+      let case_inside_items = List.rev !items_acc in
+      (* one open-range-list element → a membership sub-condition *)
+      let arm_cond e = match e with
+        | TUPLE5 (STRING t, _, lo, _, hi)
+        | TUPLE6 (STRING t, _, lo, _, hi, _) when prefix_is "value_range" t ->
+            BBinOp { op = BAnd;
+                     lhs = BBinOp { op = BGe; lhs = sel; rhs = recurse_e lo;
+                                    result_type = cmp_t };
+                     rhs = BBinOp { op = BLe; lhs = sel; rhs = recurse_e hi;
+                                    result_type = cmp_t };
+                     result_type = cmp_t }
+        | _ -> BBinOp { op = BEq; lhs = sel; rhs = recurse_e e;
+                        result_type = cmp_t } in
+      let membership rangelist =
+        let elems = match rangelist with
+          | TLIST xs ->
+              List.filter_map (fun e -> match e with
+                | TLIST [] | EMPTY_TOKEN | COMMA -> None
+                | _ -> Some (arm_cond e)) xs
+          | other -> [arm_cond other] in
+        match elems with
+        | [] -> BConst { value = Z.zero; width = 1 }
+        | first :: rest ->
+            List.fold_left (fun a e ->
+              BBinOp { op = BOr; lhs = a; rhs = e; result_type = cmp_t })
+              first rest in
+      let arms = List.filter_map (fun ci -> match ci with
+        | TUPLE4 (STRING t, _, _, body) when prefix_is "case_inside_item2" t ->
+            Some (None, recurse_s body)
+        | TUPLE3 (STRING t, _, body) when prefix_is "case_inside_item3" t ->
+            Some (None, recurse_s body)
+        | TUPLE4 (STRING t, rangelist, _, body) when prefix_is "case_inside_item1" t ->
+            Some (Some (membership rangelist), recurse_s body)
+        | _ -> None) case_inside_items in
+      let default_body =
+        match List.find_opt (fun (c, _) -> c = None) arms with
+        | Some (_, b) -> [b] | None -> [] in
+      let chain =
+        List.fold_right (fun (c, b) acc ->
+          match c with
+          | None -> acc
+          | Some cond -> [BIf { condition = cond; then_stmts = [b];
+                                else_stmts = acc }])
+          arms default_body in
+      (match chain with [s] -> s | ss -> BBlock ss)
   (* `seq_block1(begin1, TLIST [stmts], end)`. Verible's parser builds
    * the statement list with `TLIST ($2 :: lst)`, prepending each new
    * statement — so the TLIST is in *reverse* source order. We must
@@ -2637,6 +3189,11 @@ let extract_always ~pkgs ~params ~arrays tok =
           let evs = collect_by (has_tag (prefix_is "event_expression")) an in
           let acc = ref [] in
           let pending = ref None in
+          (* When the clock is an interface-port member-select `posedge p.clk`,
+           * the flat walk yields [p; clk]; combine to the scalarized member name
+           * `p$clk` (the field the following id names) so the clock matches the
+           * scalarized port, not the whole interface. *)
+          let expect_field = ref false in
           let collect = function
             | Posedge -> pending := Some `Pos
             | Negedge -> pending := Some `Neg
@@ -2644,8 +3201,16 @@ let extract_always ~pkgs ~params ~arrays tok =
                 (match !pending with
                  | Some e ->
                      acc := (e, id) :: !acc;
-                     pending := None
-                 | None -> ())
+                     pending := None;
+                     expect_field :=
+                       List.exists (fun (pn, _, _) -> pn = id) !cur_iface_ports
+                 | None ->
+                     if !expect_field then begin
+                       (match !acc with
+                        | (e, base) :: tl -> acc := (e, base ^ "$" ^ id) :: tl
+                        | [] -> ());
+                       expect_field := false
+                     end)
             | _ -> ()
           in
           List.iter (walk collect) evs;
@@ -2983,6 +3548,21 @@ let extract_instances ~pkgs ~params tok =
             port_conns := (port, be) :: !port_conns
         | _ -> ()
       ) pn_tags;
+      (* `.*` implicit port connection: verible's grammar emits a bare
+       * DOT_STAR token in the port list (no `port_named` STRING tag), so the
+       * pn_tags scan above misses it and — for a pure `.*` instance — the
+       * positional fallback below would feed the DOT_STAR to expr_to_bexpr
+       * (→ Silent_zero "unhandled expression shape: DOT_STAR").  Record a
+       * `$dotstar` sentinel instead; name_positional_ports expands it, once
+       * every module's formal port order is known, to (formal, formal) for
+       * each formal the instance did NOT connect explicitly.  This is the
+       * SV-2017 `.*` rule (lowrisc's prim_* wrappers rely on it). *)
+      let has_dotstar =
+        collect_by (fun t -> match t with DOT_STAR -> true | _ -> false) in_
+        <> [] in
+      if has_dotstar then
+        port_conns := ("$dotstar", BConst { value = Z.zero; width = 1 })
+                      :: !port_conns;
       (* Positional connections (`sub u1 (a, b, c)`): no port_named
        * children, so capture the actuals in source order under
        * synthetic `$pos<N>` keys.  convert_files_inner resolves these
@@ -3038,9 +3618,32 @@ let extract_instances ~pkgs ~params tok =
              paren-bound port list (possibly empty); mis-tagged array
              decls have no port_named children at all and their
              "module name" is a parameter in scope giving the bound.
-             Drop the candidate when both signs apply.              *)
+             Drop the candidate when both signs apply.
+
+             SAME shape for STRUCT/ENUM-typed BODY declarations:
+               `dm::sba_state_e state_d, state_q;`  -> "instance state_d of dm"
+               `state_e         state_d;`           -> "instance state_d of state_e"
+             The mis-parsed "module name" is a PACKAGE (the `pkg::` qualifier) or
+             a TYPE name (a typedef/enum in type_widths).  These have no port
+             list either — dropping them stops the real register from becoming a
+             phantom submodule instance (which silently deletes the reg: the
+             pulp-debug dm_csrs/dm_sba/dm_mem CSRs, killing JTAG DM activation). *)
           let param_names = List.map fst params in
-          if !port_conns = [] && List.mem m param_names then None
+          let is_pkg_name = List.exists (fun p -> p.Verible_elaborate.pkg_name = m) pkgs in
+          let is_type_name = Hashtbl.mem type_widths m in
+          (* DEFINITIVE discriminator: a real module instantiation ALWAYS has a
+             paren port list `()` (empty allowed) or `#()` params.  A data
+             declaration (`rz_fsm_e src_fsm_d, src_fsm_q;`, `logic [PtrW-1:0]
+             fifo_wptr;`) has NO parens — so no LPAREN => it is a declaration
+             mis-tagged as an instance, drop it.  This catches the cases the
+             param/pkg/type heuristics miss: BODY localparams (PtrW) and
+             module-LOCAL enums (rz_fsm_e) that aren't in header params /
+             type_widths. *)
+          let has_lparen = ref false in
+          walk (function LPAREN -> has_lparen := true | _ -> ()) in_;
+          if !port_conns = []
+             && (List.mem m param_names || is_pkg_name || is_type_name
+                 || not !has_lparen) then None
           else
             let prefixed_inst = String.concat "." (label_stack @ [i]) in
             Some {
@@ -3093,6 +3696,11 @@ let extract_body_params ~pkgs ~params tok =
           || prefix_is "select_variable_dimension" t' -> ()
       | TUPLE3 (STRING t', _, _) when prefix_is "instantiation_type" t'
                                     || prefix_is "data_type" t' -> ()
+      (* a `pkg::type` qualifier (`dm::dm_csr_e DataEnd`) is the localparam's
+         TYPE, not its name — skip it wholesale, else the first bare id `dm`
+         (or the type `dm_csr_e`) is grabbed as the param name and the real
+         name (`DataEnd`) never binds. *)
+      | TUPLE4 (STRING t', _, _, _) when prefix_is "qualified_id" t' -> ()
       (* `trailing_assign1`: TUPLE4(tag, EQ, value, ...).  The `value`
        * subtree is the parameter's default expression; identifiers
        * inside it (struct field names like `BHTEntries`, function
@@ -3105,7 +3713,11 @@ let extract_body_params ~pkgs ~params tok =
       | TUPLE3 (STRING t', SymbolIdentifier id, _)
         when prefix_is "param_assignment" t' || prefix_is "param_decl" t' ->
           if !nm = None then nm := Some id
-      | SymbolIdentifier id when !nm = None -> nm := Some id
+      | SymbolIdentifier id
+        when !nm = None
+          && not (Hashtbl.mem type_widths id)
+          && not (List.exists (fun p -> p.pkg_name = id) pkgs) ->
+          nm := Some id
       | TUPLE2 (a, b) -> walk_skip_type a; walk_skip_type b
       | TUPLE3 (a, b, c) -> walk_skip_type a; walk_skip_type b; walk_skip_type c
       | TUPLE4 (a, b, c, d) -> List.iter walk_skip_type [a; b; c; d]
@@ -3229,6 +3841,13 @@ let extract_body_params ~pkgs ~params tok =
                  | _ -> None
                with _ -> None)
         in
+        (if Sys.getenv_opt "PARAM_DEBUG" <> None
+            && (let l = String.length id in
+                (l >= 7 && String.sub id 0 7 = "DataEnd")
+                || (l >= 10 && String.sub id 0 10 = "ProgBufEnd")
+                || (l >= 14 && String.sub id 0 14 = "SelectableHart")) then
+           Printf.eprintf "[param] id=%s new_val=%s\n%!" id
+             (match new_val with Some v -> v | None -> "<UNRESOLVED>"));
         (match cur, new_val with
          | None, Some v -> (id, v) :: acc
          | Some old, Some v when v <> old ->
@@ -3324,9 +3943,15 @@ let extract_body_params ~pkgs ~params tok =
     loop acc (List.length nodes) in
   let acc = resolve_until_fixed port_nodes  params in
   let acc = resolve_until_fixed local_nodes acc in
-  (* Drop the original `params` we seeded with — caller already has
-   * those, we only want the additions. *)
-  List.filter (fun (k, _) -> not (List.mem_assoc k params)) acc
+  (* Drop the original `params` we seeded with — caller already has those.
+   * EXCEPTION: keep a seeded param whose value we IMPROVED (e.g. an
+   * unresolved incoming `SelectableHarts="SelectableHarts"` that we folded to
+   * its `{NrHarts{1'b1}}` default = 1) so the caller's merge can pick the
+   * resolved value over its own unresolved one. *)
+  List.filter (fun (k, v) ->
+    match List.assoc_opt k params with
+    | None -> true
+    | Some seed -> seed <> v) acc
 
 (* Auto-discovered list of directories searched by `$readmemh`'s
  * resolver in addition to MEM_INIT_DIR / cwd / cwd/generated.  We
@@ -3335,6 +3960,362 @@ let extract_body_params ~pkgs ~params tok =
  * that vendor their hex initialiser files alongside the source.
  * Populated by [convert_files_inner] before per-module conversion. *)
 let mem_init_search_paths : string list ref = ref []
+
+(* ─── Struct scalarization ───────────────────────────────────────────
+   Split each INTERNAL struct-typed signal S into one signal per field
+   (S$field), rewrite field reads/writes to the field signals, whole-struct
+   reads to a MSB-first concat of the fields, and whole-struct writes to
+   per-field slice assigns.  This makes a conditional field-write
+   (`q <= d; if (c) q.f <= 0`) two sequential assigns to ONE variable q$f ->
+   Always.compile builds a mux, instead of the part-select approach's two
+   full-width assigns that collided ("assign wire multiple times").  Also the
+   correct fix for `struct.field = v` being mis-lowered as a full-reg destroy.
+   [signal_struct]: signal -> struct-type name; [struct_defs]: type -> MSB-first
+   [(field,width)].  Gated by STRUCT_SCALARIZE. *)
+(* base signal name -> ordered field list [(field,msb,lsb,width)] (MSB-first)
+   for every scalarized struct register, so the cross-flow miter can tie SVS's
+   `base$field` FF-states to a reference flow's whole `base` register as
+   base == {field_msb, …, field_lsb}.  Keyed by bare base name (unique enough
+   within the DM hierarchy). *)
+(* scalarize_layouts now lives in Behavioral_ir (shared with the miter). *)
+
+let scalarize_module ~signal_struct ~struct_defs (m : bmodule) : bmodule =
+  let is_port = List.exists (fun (s : bsignal) ->
+    s.direction <> `Internal) in
+  ignore is_port;
+  (* split map: S -> [(field, msb, lsb, width)] (within S), for internal
+     struct signals only. *)
+  let split : (string, (string * int * int * int) list) Hashtbl.t =
+    Hashtbl.create 16 in
+  List.iter (fun (s : bsignal) ->
+    if s.direction = `Internal then
+      match List.assoc_opt s.name signal_struct with
+      | Some sn ->
+        (match List.assoc_opt sn struct_defs with
+         | Some fields when fields <> [] ->
+           let tw = List.fold_left (fun a (_, w) -> a + w) 0 fields in
+           let _, layout =
+             List.fold_left (fun (pos, acc) (f, w) ->
+               (pos + w, (f, tw - pos - 1, tw - pos - w, w) :: acc))
+               (0, []) fields in
+           let layout = List.rev layout in
+           Hashtbl.replace split s.name layout;
+           Hashtbl.replace scalarize_layouts s.name layout
+         | _ -> ())
+      | None -> ()) m.signals;
+  if Hashtbl.length split = 0 then m else begin
+    let fvar s f = s ^ "$" ^ f in
+    (* rewrite reads *)
+    let rec re e =
+      match e with
+      | BVar s when Hashtbl.mem split s ->
+          BConcat (List.map (fun (f, _, _, _) -> BVar (fvar s f)) (Hashtbl.find split s))
+      | BSlice { signal = BVar s; msb; lsb } when Hashtbl.mem split s ->
+          (* A part-select on the WHOLE scalarized struct must be RELOCATED
+             onto the member signals: for every field overlapping [msb:lsb],
+             take its LOCAL sub-slice (abs index - fl) and concat MSB-first.
+             The old fallback `BSlice{ re(BVar s); msb; lsb }` sliced the
+             reconstituted BConcat, which a later const-fold rewrote into
+             `field_const[abs:abs]` — an out-of-range extract (e.g. dm_csrs
+             `resp_queue_inp$data` / dmstatus: `9'0[31:23]`) that crashed Z3. *)
+          let layout = Hashtbl.find split s in
+          let parts = List.filter_map (fun (f, fm, fl, _fw) ->
+            let imsb = min fm msb and ilsb = max fl lsb in
+            if imsb < ilsb then None                 (* field outside [msb:lsb] *)
+            else if imsb = fm && ilsb = fl then Some (BVar (fvar s f))
+            else Some (BSlice { signal = BVar (fvar s f);
+                                msb = imsb - fl; lsb = ilsb - fl })) layout in
+          (match parts with
+           | []  -> BSlice { signal = re (BVar s); msb; lsb }  (* no overlap: keep *)
+           | [x] -> x
+           | xs  -> BConcat xs)
+      | BSlice { signal; msb; lsb } -> BSlice { signal = re signal; msb; lsb }
+      | BConcat es -> BConcat (List.map re es)
+      | BSelect { array; index } -> BSelect { array = re array; index = re index }
+      | BBinOp r -> BBinOp { r with lhs = re r.lhs; rhs = re r.rhs }
+      | BUnOp r -> BUnOp { r with operand = re r.operand }
+      | BCond r -> BCond { condition = re r.condition;
+                           then_val = re r.then_val; else_val = re r.else_val }
+      | BReplicate r -> BReplicate { r with value = re r.value }
+      | BCall r -> BCall { r with args = List.map re r.args }
+      | _ -> e in
+    (* one field's next value for a write of [msb:lsb] <- data (data is the
+       write-range value, bit (i-lsb) = write bit i).  RMW: keep field bits
+       outside [msb:lsb], take data bits inside. *)
+    let field_upd s (f, fm, fl, fw) msb lsb data =
+      let imsb = min fm msb and ilsb = max fl lsb in
+      if imsb < ilsb then None  (* no overlap: field unchanged *)
+      else if imsb = fm && ilsb = fl then
+        (* fully covered: field := data[fm-lsb : fl-lsb] *)
+        Some (BAssign { lhs = fvar s f;
+                        rhs = BSlice { signal = data; msb = fm - lsb; lsb = fl - lsb } })
+      else begin
+        (* partial: {field[fm:imsb+1], data[imsb-lsb:ilsb-lsb], field[ilsb-1:fl]} *)
+        let parts = ref [] in
+        if fm > imsb then
+          parts := BSlice { signal = BVar (fvar s f); msb = fw - 1; lsb = imsb - fl + 1 } :: !parts;
+        parts := BSlice { signal = data; msb = imsb - lsb; lsb = ilsb - lsb } :: !parts;
+        if ilsb > fl then
+          parts := BSlice { signal = BVar (fvar s f); msb = ilsb - fl - 1; lsb = 0 } :: !parts;
+        let rhs = match List.rev !parts with [x] -> x | xs -> BConcat xs in
+        Some (BAssign { lhs = fvar s f; rhs })
+      end in
+    (* rewrite statements *)
+    let rec rs stmt =
+      match stmt with
+      | BAssign { lhs; rhs } when Hashtbl.mem split lhs ->
+          let rhs' = re rhs in
+          BBlock (List.map (fun (f, fm, fl, _) ->
+            BAssign { lhs = fvar lhs f;
+                      rhs = BSlice { signal = rhs'; msb = fm; lsb = fl } })
+            (Hashtbl.find split lhs))
+      | BAssign { lhs; rhs } -> BAssign { lhs; rhs = re rhs }
+      | BCallStmt { func = ("@part_sel_write_up" | "@slice_write") as fn;
+                    args = (BVar s) :: rest } when Hashtbl.mem split s ->
+          let rng =
+            match fn, rest with
+            | "@part_sel_write_up", [BConst { value = base; _ }; BConst { value = w; _ }; d] ->
+                let base = Z.to_int base and w = Z.to_int w in Some (base + w - 1, base, d)
+            | "@slice_write", [BConst { value = hi; _ }; BConst { value = lo; _ }; d] ->
+                Some (Z.to_int hi, Z.to_int lo, d)
+            | _ -> None in
+          (match rng with
+           | Some (msb, lsb, data) ->
+               let data' = re data in
+               BBlock (List.filter_map (fun fld -> field_upd s fld msb lsb data')
+                         (Hashtbl.find split s))
+           | None -> BCallStmt { func = fn; args = List.map re ((BVar s) :: rest) })
+      | BCallStmt r -> BCallStmt { r with args = List.map re r.args }
+      | BIf r -> BIf { condition = re r.condition;
+                       then_stmts = List.map rs r.then_stmts;
+                       else_stmts = List.map rs r.else_stmts }
+      | BCase r -> BCase { selector = re r.selector;
+                           cases = List.map (fun (k, b) -> (re k, List.map rs b)) r.cases;
+                           default = List.map rs r.default }
+      | BBlock b -> BBlock (List.map rs b)
+      | BWhile r -> BWhile { condition = re r.condition; body = List.map rs r.body }
+      | BFor r -> BFor { init = rs r.init; condition = re r.condition;
+                         update = rs r.update; body = List.map rs r.body }
+      | BReturn (Some e) -> BReturn (Some (re e))
+      | s -> s in
+    let rs_body = List.map rs in
+    let processes' = List.map (function
+      | BCombinational c -> BCombinational { c with body = rs_body c.body }
+      | BSequential s ->
+        BSequential { s with body = rs_body s.body;
+          blocking_vars = List.concat_map (fun v ->
+            match Hashtbl.find_opt split v with
+            | Some layout -> List.map (fun (f, _, _, _) -> fvar v f) layout
+            | None -> [v]) s.blocking_vars })
+      m.processes in
+    let instances' = List.map (fun (i : binstance) ->
+      { i with port_connections = List.map (fun (p, e) -> (p, re e)) i.port_connections })
+      m.instances in
+    let funcs' = List.map (fun (f : bfunc) -> { f with body = rs_body f.body }) m.funcs in
+    (* replace struct signals with their field signals *)
+    let signals' = List.concat_map (fun (s : bsignal) ->
+      match Hashtbl.find_opt split s.name with
+      | Some layout ->
+          List.map (fun (f, _, _, w) ->
+            { s with name = fvar s.name f;
+                     stype = BInt { width = w; signed = Unsigned } }) layout
+      | None -> [s]) m.signals in
+    { m with signals = signals'; processes = processes';
+             instances = instances'; funcs = funcs' }
+  end
+
+(* ── Constant-index array flatten (packed-array analog of scalarize) ──────
+   A packed array written only at CONSTANT element indices inside a
+   COMBINATIONAL block (e.g. dm_mem's abstract_cmd ROM `logic [7:0][63:0]`)
+   is not a real RAM.  Left as an array it becomes a memory whose
+   read-modify-write element writes read the array back, and gate_map turns
+   that into a combinational loop.  Flatten into per-element scalars arr$i:
+   element writes become blocking scalar assignments (threaded by
+   blocking_subst just like struct fields), a dynamic read becomes an index
+   mux, and a whole-array read becomes a concat.  Reads may be dynamic; only
+   WRITES must be constant-indexed, and the array must never be written in a
+   sequential process (that would be a register file / block RAM — leave it).
+   Prepend per-element zero defaults so partial RMW writes with no `= '0`
+   default (abstract_cmd has none) don't structurally self-reference. *)
+let scalarize_arrays_module (m : bmodule) : bmodule =
+  let cand : (string, int * int) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (s : bsignal) ->
+    match s.direction, s.stype with
+    | `Internal, BArray { element = BInt { width; _ }; size }
+      when size > 0 && size <= 256 && width > 0 ->
+        Hashtbl.replace cand s.name (size, width)
+    | _ -> ()) m.signals;
+  if Hashtbl.length cand = 0 then m else begin
+    let const_i = function BConst { value; _ } -> Some (Z.to_int value) | _ -> None in
+    let disq n = Hashtbl.remove cand n in
+    (* Only arrays with a SELF-REFERENTIAL comb write (element write whose RHS
+       reads the same array — the read-modify-write of abstract_cmd's partial
+       writes) actually form the gate_map loop.  A plain const-index array
+       (e.g. eth's `rs`) is a harmless table; flattening it would needlessly
+       perturb the netlist (and break eth-arp byte-identity).  So flatten ONLY
+       self-referential candidates. *)
+    let self_ref : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+    let rec reads_arr a e =
+      match e with
+      | BSelect { array = BVar x; _ } when x = a -> true
+      | BVar x when x = a -> true
+      | BSelect { array; index } -> reads_arr a array || reads_arr a index
+      | BSlice { signal; _ } -> reads_arr a signal
+      | BConcat es -> List.exists (reads_arr a) es
+      | BBinOp { lhs; rhs; _ } -> reads_arr a lhs || reads_arr a rhs
+      | BUnOp { operand; _ } -> reads_arr a operand
+      | BCond { condition; then_val; else_val } ->
+          reads_arr a condition || reads_arr a then_val || reads_arr a else_val
+      | BReplicate { value; _ } -> reads_arr a value
+      | BCall { args; _ } -> List.exists (reads_arr a) args
+      | _ -> false in
+    (* Disqualify: non-constant write index; any write in a sequential
+       process; non-constant slice-write element range. *)
+    let rec scan_w ~seq st =
+      (match st with
+       | BCallStmt { func = "@mem_write"; args = (BVar a) :: idx :: rest }
+         when Hashtbl.mem cand a ->
+           if seq || const_i idx = None then disq a
+           else if List.exists (reads_arr a) rest then Hashtbl.replace self_ref a ()
+       | BCallStmt { func = ("@slice_write" | "@part_sel_write_up");
+                     args = (BVar a) :: hi :: lo :: rest } when Hashtbl.mem cand a ->
+           if seq || const_i hi = None || const_i lo = None then disq a
+           else if List.exists (reads_arr a) rest then Hashtbl.replace self_ref a ()
+       | BAssign { lhs; rhs } when Hashtbl.mem cand lhs ->
+           if seq then disq lhs
+           else if reads_arr lhs rhs then Hashtbl.replace self_ref lhs ()
+       | _ -> ());
+      match st with
+      | BIf r -> List.iter (scan_w ~seq) r.then_stmts; List.iter (scan_w ~seq) r.else_stmts
+      | BCase r -> List.iter (fun (_, b) -> List.iter (scan_w ~seq) b) r.cases;
+                   List.iter (scan_w ~seq) r.default
+      | BBlock b -> List.iter (scan_w ~seq) b
+      | BWhile r -> List.iter (scan_w ~seq) r.body
+      | BFor r -> scan_w ~seq r.init; scan_w ~seq r.update; List.iter (scan_w ~seq) r.body
+      | _ -> () in
+    List.iter (function
+      | BCombinational c -> List.iter (scan_w ~seq:false) c.body
+      | BSequential s -> List.iter (scan_w ~seq:true) s.body) m.processes;
+    List.iter (fun (f : bfunc) -> List.iter (scan_w ~seq:false) f.body) m.funcs;
+    (* keep only const-index-comb arrays that are ALSO self-referential *)
+    Hashtbl.iter (fun a _ -> if not (Hashtbl.mem self_ref a) then disq a)
+      (Hashtbl.copy cand);
+    if Hashtbl.length cand = 0 then m else begin
+      let evar a i = a ^ "$" ^ string_of_int i in
+      let idx_bits size =
+        let rec b n = if n <= 1 then 0 else 1 + b ((n + 1) / 2) in max 1 (b size) in
+      let rec re e =
+        match e with
+        | BVar a when Hashtbl.mem cand a ->
+            let (size, _) = Hashtbl.find cand a in
+            BConcat (List.init size (fun k -> BVar (evar a (size - 1 - k))))
+        | BSelect { array = BVar a; index } when Hashtbl.mem cand a ->
+            let (size, ew) = Hashtbl.find cand a in
+            (match const_i index with
+             | Some i when i >= 0 && i < size -> BVar (evar a i)
+             | Some _ -> BConst { value = Z.zero; width = ew }
+             | None ->
+                 let nb = idx_bits size in
+                 let sel = BSlice { signal = re index; msb = nb - 1; lsb = 0 } in
+                 let rec build k =
+                   if k >= size - 1 then BVar (evar a (size - 1))
+                   else BCond { condition = BBinOp { op = BEq; lhs = sel;
+                                    rhs = BConst { value = Z.of_int k; width = nb };
+                                    result_type = BBool };
+                                then_val = BVar (evar a k);
+                                else_val = build (k + 1) } in
+                 build 0)
+        | BSelect { array; index } -> BSelect { array = re array; index = re index }
+        | BSlice r -> BSlice { r with signal = re r.signal }
+        | BConcat es -> BConcat (List.map re es)
+        | BBinOp r -> BBinOp { r with lhs = re r.lhs; rhs = re r.rhs }
+        | BUnOp r -> BUnOp { r with operand = re r.operand }
+        | BCond r -> BCond { condition = re r.condition;
+                             then_val = re r.then_val; else_val = re r.else_val }
+        | BReplicate r -> BReplicate { r with value = re r.value }
+        | BCall r -> BCall { r with args = List.map re r.args }
+        | _ -> e in
+      let rec rs st =
+        match st with
+        | BCallStmt { func = "@mem_write"; args = [BVar a; idx; data] }
+          when Hashtbl.mem cand a ->
+            (match const_i idx with
+             | Some i -> BAssign { lhs = evar a i; rhs = re data }
+             | None -> BCallStmt { func = "@mem_write"; args = [BVar a; re idx; re data] })
+        | BCallStmt { func = ("@slice_write" | "@part_sel_write_up") as fn;
+                      args = [BVar a; hi; lo; data] } when Hashtbl.mem cand a ->
+            (match const_i hi, const_i lo with
+             | Some h, Some l when l <= h ->
+                 let (_, ew) = Hashtbl.find cand a in
+                 let d = re data in
+                 BBlock (List.init (h - l + 1) (fun k ->
+                   BAssign { lhs = evar a (l + k);
+                             rhs = BSlice { signal = d; msb = (k + 1) * ew - 1; lsb = k * ew } }))
+             | _ -> BCallStmt { func = fn; args = [BVar a; re hi; re lo; re data] })
+        | BAssign { lhs; rhs } when Hashtbl.mem cand lhs ->
+            let (size, ew) = Hashtbl.find cand lhs in
+            let d = re rhs in
+            BBlock (List.init size (fun i ->
+              BAssign { lhs = evar lhs i;
+                        rhs = BSlice { signal = d; msb = (i + 1) * ew - 1; lsb = i * ew } }))
+        | BAssign { lhs; rhs } -> BAssign { lhs; rhs = re rhs }
+        | BCallStmt r -> BCallStmt { r with args = List.map re r.args }
+        | BIf r -> BIf { condition = re r.condition;
+                         then_stmts = List.map rs r.then_stmts;
+                         else_stmts = List.map rs r.else_stmts }
+        | BCase r -> BCase { selector = re r.selector;
+                             cases = List.map (fun (k, b) -> (re k, List.map rs b)) r.cases;
+                             default = List.map rs r.default }
+        | BBlock b -> BBlock (List.map rs b)
+        | BWhile r -> BWhile { condition = re r.condition; body = List.map rs r.body }
+        | BFor r -> BFor { init = rs r.init; condition = re r.condition;
+                           update = rs r.update; body = List.map rs r.body }
+        | BReturn (Some e) -> BReturn (Some (re e))
+        | s -> s in
+      (* which candidate arrays are written in a body → per-element 0 defaults *)
+      let written_in body =
+        let s = Hashtbl.create 8 in
+        let rec w st =
+          (match st with
+           | BCallStmt { func = ("@mem_write" | "@slice_write" | "@part_sel_write_up");
+                         args = (BVar a) :: _ } when Hashtbl.mem cand a -> Hashtbl.replace s a ()
+           | BAssign { lhs; _ } when Hashtbl.mem cand lhs -> Hashtbl.replace s lhs ()
+           | _ -> ());
+          match st with
+          | BIf r -> List.iter w r.then_stmts; List.iter w r.else_stmts
+          | BCase r -> List.iter (fun (_, b) -> List.iter w b) r.cases; List.iter w r.default
+          | BBlock b -> List.iter w b
+          | BWhile r -> List.iter w r.body
+          | BFor r -> w r.init; w r.update; List.iter w r.body
+          | _ -> () in
+        List.iter w body; Hashtbl.fold (fun k () acc -> k :: acc) s [] in
+      let defaults body =
+        List.concat_map (fun a ->
+          let (size, ew) = Hashtbl.find cand a in
+          List.init size (fun i ->
+            BAssign { lhs = evar a i; rhs = BConst { value = Z.zero; width = ew } }))
+          (written_in body) in
+      let processes' = List.map (function
+        | BCombinational c ->
+            BCombinational { c with body = defaults c.body @ List.map rs c.body }
+        | BSequential s -> BSequential { s with body = List.map rs s.body }) m.processes in
+      let instances' = List.map (fun (i : binstance) ->
+        { i with port_connections = List.map (fun (p, e) -> (p, re e)) i.port_connections })
+        m.instances in
+      let funcs' = List.map (fun (f : bfunc) -> { f with body = List.map rs f.body }) m.funcs in
+      let signals' = List.concat_map (fun (s : bsignal) ->
+        match Hashtbl.find_opt cand s.name with
+        | Some (size, ew) ->
+            List.init size (fun i ->
+              { s with name = evar s.name i;
+                       stype = BInt { width = ew; signed = Unsigned } })
+        | None -> [s]) m.signals in
+      if Sys.getenv_opt "SVS_DEBUG_ARRAYFLAT" <> None then
+        Hashtbl.iter (fun a (sz, w) ->
+          Printf.eprintf "[array-flatten] %s -> %d x uint<%d>\n%!" a sz w) cand;
+      { m with signals = signals'; processes = processes'; instances = instances'; funcs = funcs' }
+    end
+  end
 
 let convert_module ~pkgs (mdecl : module_decl)
                           (params : (string * string) list) : bmodule =
@@ -3345,10 +4326,30 @@ let convert_module ~pkgs (mdecl : module_decl)
      `LUT[sel]` in the always_comb body.                              *)
   Hashtbl.clear cur_array_params;
   Hashtbl.clear cur_struct_params;
+  cur_iface_ports := [];
   (* Merge instance-override params with body-declared defaults; the
    * override wins on conflict (List.assoc_opt finds it first). *)
   let body_params = extract_body_params ~pkgs ~params mdecl.m_body in
   let params =
+    (* An incoming specialisation param may be UNRESOLVED (e.g. dm_csrs'
+       `SelectableHarts = {NrHarts{1'b1}}` that specialise_design couldn't fold,
+       passed through as the bare name).  A resolved body default then must win,
+       or the body reference stays unbound (havereset_q <= SelectableHarts & …
+       degenerates).  Treat a value that is neither an integer nor a quoted
+       string as unresolved. *)
+    let is_resolved v =
+      (String.length v > 0 && v.[0] = '"')
+      || (try let _ = Z.of_string v in true with _ -> false) in
+    (if Sys.getenv_opt "PARAM_DEBUG" <> None then
+       List.iter (fun (n, v) ->
+         if (let l = String.length n in l >= 14 && String.sub n 0 14 = "SelectableHart") then
+           Printf.eprintf "[merge] incoming %s=%S resolved=%b body=%s\n%!" n v (is_resolved v)
+             (match List.assoc_opt n body_params with Some b -> b | None -> "<none>")) params);
+    let params = List.map (fun (n, v) ->
+      if is_resolved v then (n, v)
+      else match List.assoc_opt n body_params with
+        | Some bv when is_resolved bv -> (n, bv)
+        | _ -> (n, v)) params in
     let known = List.map fst params in
     params @ List.filter (fun (n, _) -> not (List.mem n known)) body_params
   in
@@ -3358,9 +4359,25 @@ let convert_module ~pkgs (mdecl : module_decl)
    * branch, with multiple writes to the same signal corrupting
    * downstream Behavioral_flatten. *)
   let int_scope =
-    List.filter_map (fun (n, v) ->
-      Option.map (fun i -> (n, i)) (Verible_elaborate.Eval.eval_string [] v)
-    ) params
+    (* Package-scoped constants (enum members + localparams).  This int_scope is
+     * built BEFORE the module `params` get the enum augmentation below, so a
+     * generate condition referencing a bare imported enum — ibex_alu's
+     * `if (RV32B != RV32BNone)` with a wildcard import of ibex_pkg — would
+     * otherwise not resolve and the whole RV32B bitmanip block would survive,
+     * its conditional shuffle_mode[k]=… slice-writes forming a comb loop.
+     * Build these FIRST and use them as the scope when evaluating each param's
+     * value too: a specialised param can itself be an enum name (RV32B =
+     * RV32BNone), which `eval_string []` can't resolve. *)
+    let pkg_consts =
+      List.concat_map (fun (p : Verible_elaborate.package_decl) ->
+        List.filter_map (fun (n, v) ->
+          Option.map (fun i -> (n, i)) (Verible_elaborate.int_of_pvalue v))
+          p.pkg_params) pkgs in
+    let base = List.filter_map (fun (n, v) ->
+      Option.map (fun i -> (n, i))
+        (Verible_elaborate.Eval.eval_string pkg_consts v)
+    ) params in
+    base @ List.filter (fun (n, _) -> not (List.mem_assoc n base)) pkg_consts
   in
   Verible_elaborate.resolver_for_walk :=
     (fun t -> Verible_elaborate.resolve_value pkgs t);
@@ -3390,11 +4407,58 @@ let convert_module ~pkgs (mdecl : module_decl)
   (* Enum item names fold to their integer values via the same
    * params lookup that handles `parameter`. *)
   let enum_items = extract_enum_items ~pkgs ~params mdecl.m_body in
+  (* Package-scoped constants (enum members + localparams) that a module made
+   * bare-visible with `import pkg::*` — e.g. ibex_alu's `import ibex_pkg::*`
+   * then bare `ALU_GREV`/`ALU_CLMUL`.  These live in the package, not the
+   * module body, so extract_enum_items misses them and the bare reference
+   * folds to an unbound BVar tied to 0 (collapsing case selectors → bad muxes).
+   * eval_int's lookup already searches every package for a bare name; mirror
+   * that here so the bare→BConst path resolves too.  Module-local params and
+   * body enums keep priority. *)
+  let pkg_consts =
+    List.concat_map (fun (p : Verible_elaborate.package_decl) ->
+      List.filter_map (fun (n, v) ->
+        match Verible_elaborate.int_of_pvalue v with
+        | Some i -> Some (n, string_of_int i)
+        | None -> None) p.pkg_params) pkgs in
   let params =
     let known = List.map fst params in
-    params @ List.filter (fun (n, _) -> not (List.mem n known)) enum_items
+    let extra = List.filter (fun (n, _) -> not (List.mem n known))
+                  (enum_items @ pkg_consts) in
+    (* dedup extra by name, first wins *)
+    let seen = Hashtbl.create 64 in
+    let extra = List.filter (fun (n, _) ->
+      if Hashtbl.mem seen n then false
+      else (Hashtbl.replace seen n (); true)) extra in
+    params @ extra
   in
   let typedefs = extract_typedefs ~pkgs ~params mdecl.m_body in
+  (* Register type widths for $bits(<type>): module-local typedefs (full
+     params) take priority; package typedefs fill in cross-package types.
+     Must run BEFORE extract_instances so `.Width($bits(dcsr_t))` folds. *)
+  List.iter (fun (n, w) -> if w > 0 then Hashtbl.replace type_widths n w) typedefs;
+  List.iter (fun p ->
+    List.iter (fun (n, w) ->
+      if w > 0 && not (Hashtbl.mem type_widths n) then Hashtbl.replace type_widths n w)
+      (extract_typedefs ~pkgs ~params:[] p.pkg_body)) pkgs;
+  (* Register SIGNAL widths for `$bits(<signal>)` (e.g. dmi_jtag's
+     `dr_q[$bits(dr_q)-1:1]` where `dr_q` is `logic [$bits(dmi_t)-1:0]`): without
+     this $bits(dr_q) folded to 0 -> slice `dr_q[-1:1]` (invalid extract, and a
+     real malformed shift register).  Runs AFTER typedefs so the signal's own
+     width ($bits(dmi_t)) resolves first.  Types take priority (gated). *)
+  Hashtbl.clear signal_widths;
+  let stype_w = function
+    | BInt { width; _ } -> width | BBool -> 1
+    | BArray { element = BInt { width; _ }; size } -> width * size
+    | _ -> 0 in
+  let decl_nodes = collect_by (has_tag (fun t ->
+    prefix_is "data_declaration" t || prefix_is "net_declaration" t)) mdecl.m_body in
+  List.iter (fun n ->
+    List.iter (fun (s : bsignal) ->
+      let w = stype_w s.stype in
+      if w > 0 && not (Hashtbl.mem signal_widths s.name) then
+        Hashtbl.replace signal_widths s.name w)
+      (try extract_port_decl ~pkgs ~params n with _ -> [])) decl_nodes;
   if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
     List.iter (fun (n, w) ->
       Printf.eprintf "[%s] typedef %s width=%d\n" mdecl.m_name n w
@@ -3403,7 +4467,12 @@ let convert_module ~pkgs (mdecl : module_decl)
    * expression converter. Reset between modules so a typedef in one
    * doesn't leak into another. *)
   cur_struct_defs :=
-    extract_struct_defs ~pkgs ~params mdecl.m_body;
+    extract_struct_defs ~pkgs ~params mdecl.m_body
+    @ List.concat_map (fun p -> extract_struct_defs ~pkgs ~params:[] p.pkg_body) pkgs
+    (* Interfaces-as-structs: make each registered interface visible as a struct
+     * typedef so interface ports (if.modport p) register in cur_signal_struct and
+     * member access (p.field) slices the packed interface. *)
+    @ Hashtbl.fold (fun name members acc -> (name, members) :: acc) iface_reg [];
   if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then begin
     Printf.eprintf "[%s] struct_defs:\n" mdecl.m_name;
     List.iter (fun (n, fs) ->
@@ -3421,10 +4490,15 @@ let convert_module ~pkgs (mdecl : module_decl)
     List.iter (fun base ->
       (* The type name is the first SymbolIdentifier under the
        * `instantiation_type`; collect the var names that follow. *)
+      (* Pick the identifier that IS a known struct type — robust to a
+         `pkg::type_t` qualifier (the FIRST unqualified_id would be the PACKAGE
+         `dm`, not `dmcontrol_t`, so `dm::dmcontrol_t dmcontrol_d` never
+         registered as struct-typed).  Variable names aren't struct types so
+         only the type matches. *)
       let type_name = ref None in
       walk (function
-        | TUPLE3 (STRING t, SymbolIdentifier id, _)
-          when prefix_is "unqualified_id" t && !type_name = None ->
+        | SymbolIdentifier id
+          when !type_name = None && List.mem_assoc id !cur_struct_defs ->
             type_name := Some id
         | _ -> ()) base;
       if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
@@ -3461,6 +4535,10 @@ let convert_module ~pkgs (mdecl : module_decl)
     !acc
   in
   cur_signal_struct := signal_struct_decls;
+  (* Record the interface instances among these struct-typed locals for the
+   * interface-elaboration pass (type is a registered interface). *)
+  (let ifis = List.filter (fun (_, tn) -> Hashtbl.mem iface_reg tn) signal_struct_decls in
+   if ifis <> [] then Hashtbl.replace module_iface_insts mdecl.m_name ifis);
   (* Reset per-module width cache; populated below as soon as the
    * port + internal signals are extracted, before any expr_to_bexpr
    * call. Keeps result_type_for from falling back to dummy_bool. *)
@@ -3479,12 +4557,64 @@ let convert_module ~pkgs (mdecl : module_decl)
   let port_nodes = collect_by (has_tag (fun t ->
     prefix_is "module_port_declaration" t ||
     prefix_is "port_declaration_noattr" t)) mdecl.m_body in
+  if Sys.getenv_opt "IFACE_DEBUG" <> None then begin
+    let rec dmp d t =
+      let pad = String.make (2*d) ' ' in
+      (match t with
+       | STRING s -> Printf.eprintf "%sSTRING %s\n%!" pad s
+       | SymbolIdentifier s -> Printf.eprintf "%sID %s\n%!" pad s
+       | TUPLE2 (a,b) -> dmp d a; dmp (d+1) b
+       | TUPLE3 (a,b,c) -> dmp d a; dmp (d+1) b; dmp (d+1) c
+       | TUPLE4 (a,b,c,e) -> dmp d a; List.iter (dmp (d+1)) [b;c;e]
+       | TUPLE5 (a,b,c,e,f) -> dmp d a; List.iter (dmp (d+1)) [b;c;e;f]
+       | TUPLE6 (a,b,c,e,f,g) -> dmp d a; List.iter (dmp (d+1)) [b;c;e;f;g]
+       | TUPLE7 (a,b,c,e,f,g,h) -> dmp d a; List.iter (dmp (d+1)) [b;c;e;f;g;h]
+       | TUPLE8 (a,b,c,e,f,g,h,i) -> dmp d a; List.iter (dmp (d+1)) [b;c;e;f;g;h;i]
+       | TLIST xs -> Printf.eprintf "%sTLIST\n%!" pad; List.iter (dmp (d+1)) xs
+       | EMPTY_TOKEN -> Printf.eprintf "%s<empty>\n%!" pad
+       | _ -> Printf.eprintf "%s<other>\n%!" pad) in
+    List.iteri (fun i pn ->
+      Printf.eprintf "[iface] %s port_node #%d:\n%!" mdecl.m_name i; dmp 1 pn) port_nodes
+  end;
   let explicit_signals =
     List.concat_map (extract_port_decl ~pkgs ~params) port_nodes
   in
-  if Sys.getenv_opt "PORT_DEBUG" <> None then
-    Printf.eprintf "[port] %s: port_nodes=%d explicit=%d\n%!"
-      mdecl.m_name (List.length port_nodes) (List.length explicit_signals);
+  (* Register struct-typed PORTS in cur_signal_struct too, so a field read
+     like `dmi_req_i.addr` on a `dm::dmi_req_t` port resolves to a BSlice of
+     the packed port.  signal_struct_decls above only scans instantiation_base
+     (INTERNAL decls); a struct INPUT port therefore had no resolvable field
+     reads, hence no fanout, and gate_map dropped it entirely — dm_csrs lost
+     `dmi_req_i`, so its read mux saw addr=0 and every DMI read returned 0
+     (constant fields incl. dmstatus.version too), and dmcontrol writes lost
+     their data (dmactive never latched).  Output struct ports survive via
+     their assignment; inputs need this.  scalarize_module skips non-Internal
+     signals, so the packed port is preserved (sliced per field, not split). *)
+  let port_struct_decls =
+    List.concat_map (fun pn ->
+      let type_name = ref None in
+      walk (function
+        | SymbolIdentifier id
+          when !type_name = None && List.mem_assoc id !cur_struct_defs ->
+            type_name := Some id
+        | _ -> ()) pn;
+      match !type_name with
+      | Some tn ->
+          List.filter_map (fun (s : bsignal) ->
+            if s.name <> tn then Some (s.name, tn) else None)
+            (try extract_port_decl ~pkgs ~params pn with _ -> [])
+      | None -> []) port_nodes
+  in
+  cur_signal_struct := port_struct_decls @ !cur_signal_struct;
+  if Sys.getenv_opt "PORT_DEBUG" <> None then begin
+    Printf.eprintf "[port] %s: port_nodes=%d explicit=%d struct_ports=[%s]\n%!"
+      mdecl.m_name (List.length port_nodes) (List.length explicit_signals)
+      (String.concat "," (List.map (fun (n, t) -> n ^ ":" ^ t) port_struct_decls));
+    List.iter (fun (s : bsignal) ->
+      if (let l = String.length s.name in l >= 7 && String.sub s.name 0 7 = "dmi_req") then
+        Printf.eprintf "[port]   explicit sig %s w=%s\n%!" s.name
+          (match s.stype with BInt { width; _ } -> string_of_int width | BBool -> "1" | _ -> "?"))
+      explicit_signals
+  end;
   let explicit_names = List.map (fun (s : bsignal) -> s.name)
                          explicit_signals in
   (* Inherited ports (`output [3:0] sum1, sum2;` — sum2 is a bare
@@ -3617,7 +4747,28 @@ let convert_module ~pkgs (mdecl : module_decl)
     ) ([], []) rev
     |> snd |> List.rev
   in
+  (* Drop interface type/modport names that the inherited-port walker wrongly
+   * surfaced as bogus 1-bit ports: for `if2.wr p`, `if2` sits inside an
+   * unqualified_id so it looked like a port name.  The real port `p` came from
+   * explicit_signals (the interface-port path); exclude the interface type and
+   * every modport name of the interfaces used by this module's ports. *)
+  let iface_noise =
+    List.concat_map (fun (_, iface, _) ->
+      let mps = Hashtbl.fold (fun k _ acc ->
+        match String.index_opt k '$' with
+        | Some i when String.sub k 0 i = iface ->
+            String.sub k (i+1) (String.length k - i - 1) :: acc
+        | _ -> acc) iface_modports [] in
+      iface :: mps) !cur_iface_ports in
+  let inherited_signals =
+    List.filter (fun (s : bsignal) -> not (List.mem s.name iface_noise))
+      inherited_signals in
   let port_signals = explicit_signals @ inherited_signals in
+  (* Record this module's interface ports (port_name, iface) so the interface
+   * elaboration pass can rebuild source-order port slots from the FINAL
+   * (scalarized) signal order — collapsing each port's members into one slot. *)
+  (let ifps = List.map (fun (pn, iface, _) -> (pn, iface)) !cur_iface_ports in
+   if ifps <> [] then Hashtbl.replace module_iface_ports mdecl.m_name ifps);
   (* Internal nets — `net_declaration1` (wires) plus
    * `non_anonymous_gate_instance_or_register_variable1` (the
    * register-variable shape Verible uses for `reg X;` / `logic X;`
@@ -4114,18 +5265,20 @@ let convert_module ~pkgs (mdecl : module_decl)
       in
       (* Sort msb-first so the concat reads top-to-bottom. *)
       let sorted = List.sort (fun (a, _) (b, _) -> compare b a) writes in
-      (* Filler for uncovered slots.  For true unpacked arrays we keep
-         the self-read so existing behaviour around inferred RAMs
-         doesn't change.  For scalar bit-vectors a self-read closes a
-         combinational loop (cfgreg_do[k] driven by cfgreg_do[k]) the
-         moment any bit isn't covered by an explicit `assign cfgreg_do[i]
-         = …` site — which happens whenever multi-bit slice assigns
-         like `assign cfgreg_do[30:23] = 0` aren't decomposed to per-bit
-         writes by the upstream collector.  Fall back to constant zero
-         instead, which is the synthesizable default for an undriven
-         output wire and unblocks Hardcaml's Always.compile.            *)
+      (* Filler for uncovered slots.  merge_array_writes only ever runs on
+         COMBINATIONAL processes, where a slot not covered by an explicit
+         write is simply undriven → its synthesizable default is constant
+         zero.  A self-read (`arr[k] = arr[k]`) would instead close a
+         combinational loop and leave the element wire driverless — which is
+         exactly what happens now that arrayed ports/regs (`logic [W:0]
+         arr [N]`) correctly carry BArray type: a partially-written comb
+         array (e.g. only arr[0] assigned) used to be a scalar BInt and hit
+         the zero branch, but as a true BArray it fell into the self-read
+         branch and Hardcaml aborted.  Sequential array writes (inferred
+         RAMs / register files) keep their read-modify-write self-read via
+         lower_mem_writes_in_seq, which is unaffected by this. *)
       let filler_at _k =
-        if is_scalar then BConst { value = Z.zero; width = elem_w }
+        if true then BConst { value = Z.zero; width = elem_w }
         else BSelect {
           array = BVar arr;
           index = BConst { value = Z.of_int _k; width = 32 };
@@ -4891,15 +6044,68 @@ let convert_module ~pkgs (mdecl : module_decl)
         processes in
       signals, processes
     end in
-  {
-    name = mdecl.m_name;
-    params = [];
-    signals;
-    processes;
-    instances;
-    funcs;
-    mems = []; attrs = [];
-  }
+  let m =
+    {
+      name = mdecl.m_name;
+      params = [];
+      signals;
+      processes;
+      instances;
+      funcs;
+      mems = []; attrs = [];
+    } in
+  (* Scalarize by default (splits internal struct registers into per-field FFs
+     to fix conditional field-write wire-conflicts; whole-struct references are
+     reconstituted as a MSB-first concat of the fields).  Opt out with
+     STRUCT_SCALARIZE=0 or NO_STRUCT_SCALARIZE. *)
+  let m =
+    if Sys.getenv_opt "STRUCT_SCALARIZE" = Some "0"
+       || Sys.getenv_opt "NO_STRUCT_SCALARIZE" <> None then m
+    else
+      scalarize_module ~signal_struct:!cur_signal_struct
+        ~struct_defs:!cur_struct_defs m
+  in
+  (* Also flatten constant-index combinational packed arrays (abstract_cmd
+     ROM class) into per-element scalars, else meminfer treats them as RAMs
+     with self-referential RMW and gate_map forms a combinational loop.
+     Opt out with NO_ARRAY_SCALARIZE. *)
+  let m =
+    if Sys.getenv_opt "NO_ARRAY_SCALARIZE" <> None then m
+    else scalarize_arrays_module m
+  in
+  (* Promote interface-port members to formals with modport directions.
+   * scalarize_module split each interface port `p` (Internal, packed) into
+   * per-member scalars `p$clk`, `p$data`, … (still Internal).  For port `if2.wr p`
+   * the modport `wr` says clk=input, data=output — so `p$clk` becomes an input
+   * formal and `p$data` an output formal, matching Vivado's flattened interface
+   * ports.  Members not named by the modport stay Internal (unused).  A bare
+   * `if2 p` (no modport) exposes every member as inout→input. *)
+  if !cur_iface_ports = [] then m
+  else begin
+    let dir_of port field =
+      let (_, iface, mp) =
+        List.find (fun (pn, _, _) -> pn = port) !cur_iface_ports in
+      match Hashtbl.find_opt iface_modports (iface ^ "$" ^ mp) with
+      | Some entries ->
+          (match List.assoc_opt field entries with
+           | Some d -> Some (d :> [ `Input | `Output | `Internal ])
+           | None -> None)                       (* not in modport → stay internal *)
+      | None -> Some `Input   (* no modport: whole interface, expose as input *)
+    in
+    let ports = List.map (fun (pn, _, _) -> pn) !cur_iface_ports in
+    let signals = List.map (fun (s : bsignal) ->
+      match String.index_opt s.name '$' with
+      | Some i when s.direction = `Internal ->
+          let base = String.sub s.name 0 i in
+          let field = String.sub s.name (i+1) (String.length s.name - i - 1) in
+          if List.mem base ports then
+            (match dir_of base field with
+             | Some d -> { s with direction = d }
+             | None -> s)
+          else s
+      | _ -> s) m.signals in
+    { m with signals }
+  end
 
 (* ─── Top-level entry ────────────────────────────────────────────── *)
 
@@ -4922,6 +6128,217 @@ let discover_init_dirs files =
 
 (* Parse a list of SV files via Verible, find the top module, and
  * convert it (and its specialised children) to BIR. *)
+
+(* Interface-INSTANCE elaboration (top-level miters).  An interface instance
+ * `if2 u(clk)` is a bundle of nets, not a child module: scalarize it into per-
+ * member nets (u$clk, u$cnt, u$data), wire its header ports (u$clk := clk), and
+ * fan out every connection that binds an interface PORT to it — `drv d(u)` →
+ * `.p$clk(u$clk), .p$data(u$data)` (only the child's modport members).  Reads of
+ * the bundle (`u.cnt`, sliced to `u[15:8]` by the struct machinery) are relocated
+ * to the member scalars.  Runs BEFORE name_positional_ports and fully resolves
+ * any interface-touching instance's connections (so no `$posN` is left for it).
+ * A module with no interface instances and no interface-port child is untouched. *)
+let elaborate_interfaces (bmods : bmodule list) : bmodule list =
+  let is_iface_mod n = Hashtbl.mem iface_reg n in
+  let is_pos k = String.length k > 4 && String.sub k 0 4 = "$pos" in
+  let pos_idx k = int_of_string_opt (String.sub k 4 (String.length k - 4)) in
+  (* MSB-first bit layout of an interface: [(member, msb, lsb)] *)
+  let iface_layout iface =
+    match Hashtbl.find_opt iface_reg iface with
+    | None -> []
+    | Some members ->
+        let tw = List.fold_left (fun a (_, w) -> a + w) 0 members in
+        let _, layout = List.fold_left (fun (pos, acc) (m, w) ->
+          (pos + w, (m, tw - pos - 1, tw - pos - w) :: acc)) (0, []) members in
+        List.rev layout
+  in
+  (* Source-order port SLOTS for a module, in the SAME order name_positional_ports
+   * uses (the module's Input|Output signals), but with each interface port's
+   * scalarized members (p$clk, p$data, …) collapsed to ONE slot (base, Some iface)
+   * at the position of its first member. *)
+  let slots_of (mm : bmodule) =
+    let ifps = Option.value ~default:[] (Hashtbl.find_opt module_iface_ports mm.name) in
+    let member_base name =
+      (* if `name` is `base$mem` with base a known interface port, return (base,iface) *)
+      match String.index_opt name '$' with
+      | Some i ->
+          let base = String.sub name 0 i in
+          (match List.assoc_opt base ifps with
+           | Some iface -> Some (base, iface) | None -> None)
+      | None -> None in
+    let seen = Hashtbl.create 8 in
+    (* m.signals is in REVERSE source order; reverse it back so positional slot
+     * indices match forward-source ports (the order instance actuals use). *)
+    List.rev (List.filter_map (fun (s : bsignal) ->
+      match s.direction with
+      | `Input | `Output ->
+          (match member_base s.name with
+           | Some (base, iface) ->
+               if Hashtbl.mem seen base then None
+               else (Hashtbl.replace seen base (); Some (base, Some iface))
+           | None -> Some (s.name, None))
+      | _ -> None) mm.signals)
+  in
+  let by_name = Hashtbl.create 64 in
+  List.iter (fun (mm : bmodule) -> Hashtbl.replace by_name mm.name mm) bmods;
+  List.map (fun (m : bmodule) ->
+    let inst_iface = Hashtbl.create 8 in
+    (* interface instances declared in this module (incl. port-less bundles that
+     * never became a binstance) *)
+    List.iter (fun (nm, iface) -> Hashtbl.replace inst_iface nm iface)
+      (Option.value ~default:[] (Hashtbl.find_opt module_iface_insts m.name));
+    (* also any that DID surface as a binstance (safety net) *)
+    List.iter (fun (i : binstance) ->
+      if is_iface_mod i.module_name then
+        Hashtbl.replace inst_iface i.inst_name i.module_name) m.instances;
+    let child_iface_slots (i : binstance) =
+      match Hashtbl.find_opt by_name i.module_name with
+      | Some mm -> List.exists (fun (_, io) -> io <> None) (slots_of mm)
+      | None -> false in
+    let touches =
+      Hashtbl.length inst_iface > 0
+      || List.exists child_iface_slots m.instances in
+    if not touches then m
+    else begin
+      (* Relocate references to an interface-instance bundle net onto its members. *)
+      let rec re e =
+        match e with
+        | BVar u when Hashtbl.mem inst_iface u ->
+            let iface = Hashtbl.find inst_iface u in
+            BConcat (List.map (fun (mem, _) -> BVar (u ^ "$" ^ mem))
+                       (Hashtbl.find iface_reg iface))
+        | BSlice { signal = BVar u; msb; lsb } when Hashtbl.mem inst_iface u ->
+            let iface = Hashtbl.find inst_iface u in
+            let parts = List.filter_map (fun (mem, fm, fl) ->
+              let imsb = min fm msb and ilsb = max fl lsb in
+              if imsb < ilsb then None
+              else if imsb = fm && ilsb = fl then Some (BVar (u ^ "$" ^ mem))
+              else Some (BSlice { signal = BVar (u ^ "$" ^ mem);
+                                  msb = imsb - fl; lsb = ilsb - fl }))
+              (iface_layout iface) in
+            (match parts with [] -> e | [x] -> x | xs -> BConcat xs)
+        | BSlice { signal; msb; lsb } -> BSlice { signal = re signal; msb; lsb }
+        | BBinOp r -> BBinOp { r with lhs = re r.lhs; rhs = re r.rhs }
+        | BUnOp r -> BUnOp { r with operand = re r.operand }
+        | BSelect r -> BSelect { array = re r.array; index = re r.index }
+        | BConcat es -> BConcat (List.map re es)
+        | BReplicate r -> BReplicate { r with value = re r.value }
+        | BCond r -> BCond { condition = re r.condition;
+                             then_val = re r.then_val; else_val = re r.else_val }
+        | BCall r -> BCall { r with args = List.map re r.args }
+        | (BVar _ | BConst _) as x -> x
+      in
+      let rec re_stmt s =
+        match s with
+        | BAssign { lhs; rhs } -> BAssign { lhs; rhs = re rhs }
+        | BIf r -> BIf { condition = re r.condition;
+                         then_stmts = List.map re_stmt r.then_stmts;
+                         else_stmts = List.map re_stmt r.else_stmts }
+        | BCase r -> BCase { selector = re r.selector;
+                             cases = List.map (fun (e, ss) -> (re e, List.map re_stmt ss)) r.cases;
+                             default = List.map re_stmt r.default }
+        | BWhile r -> BWhile { condition = re r.condition; body = List.map re_stmt r.body }
+        | BFor r -> BFor { init = re_stmt r.init; condition = re r.condition;
+                           update = re_stmt r.update; body = List.map re_stmt r.body }
+        | BBlock ss -> BBlock (List.map re_stmt ss)
+        | BCallStmt r -> BCallStmt { r with args = List.map re r.args }
+        | BReturn eo -> BReturn (Option.map re eo)
+      in
+      let re_proc = function
+        | BCombinational r -> BCombinational { r with body = List.map re_stmt r.body }
+        | BSequential r -> BSequential { r with body = List.map re_stmt r.body }
+      in
+      (* Member nets for every interface instance. *)
+      let new_sigs = Hashtbl.fold (fun u iface acc ->
+        List.map (fun (mem, w) ->
+          { name = u ^ "$" ^ mem; stype = BInt { width = w; signed = Unsigned };
+            direction = `Internal; initial_value = None; attrs = [] })
+          (Hashtbl.find iface_reg iface) @ acc) inst_iface [] in
+      (* Header-port connections of each interface instance -> assigns. *)
+      let hdr_procs = ref [] in
+      List.iter (fun (i : binstance) ->
+        if is_iface_mod i.module_name then begin
+          let hdrs = Option.value ~default:[]
+              (Hashtbl.find_opt iface_hdr_ports i.module_name) in
+          let hdr_names = List.map fst hdrs in
+          List.iter (fun (k, be) ->
+            let port =
+              if is_pos k then
+                (match pos_idx k with
+                 | Some idx when idx < List.length hdr_names -> Some (List.nth hdr_names idx)
+                 | _ -> None)
+              else Some k in
+            match port with
+            | Some p ->
+                (match List.assoc_opt p hdrs with
+                 | Some `Input ->
+                     hdr_procs := BCombinational
+                       { name = i.inst_name ^ "_" ^ p; sensitivity = [BAny];
+                         body = [BAssign { lhs = i.inst_name ^ "$" ^ p; rhs = re be }] }
+                       :: !hdr_procs
+                 | Some `Output ->
+                     (match be with
+                      | BVar tgt ->
+                          hdr_procs := BCombinational
+                            { name = i.inst_name ^ "_" ^ p; sensitivity = [BAny];
+                              body = [BAssign { lhs = tgt; rhs = BVar (i.inst_name ^ "$" ^ p) }] }
+                            :: !hdr_procs
+                      | _ -> ())
+                 | None -> ())
+            | None -> ()) i.port_connections
+        end) m.instances;
+      (* Resolve non-interface instances, fanning out interface-port connections. *)
+      let resolve (i : binstance) =
+        if is_iface_mod i.module_name then None
+        else
+          match Hashtbl.find_opt by_name i.module_name with
+          | None -> Some { i with port_connections =
+                             List.map (fun (k, be) -> (k, re be)) i.port_connections }
+          | Some child_mod ->
+              let slots = slots_of child_mod in
+              let n = List.length slots in
+              let has_iface_slot = List.exists (fun (_, io) -> io <> None) slots in
+              let refs_iface = List.exists (fun (_, be) ->
+                match be with BVar u -> Hashtbl.mem inst_iface u | _ -> false)
+                i.port_connections in
+              if not has_iface_slot && not refs_iface then
+                Some { i with port_connections =
+                         List.map (fun (k, be) -> (k, re be)) i.port_connections }
+              else begin
+                let formals_scalar =
+                  List.filter_map (fun (s : bsignal) ->
+                    match s.direction with `Input | `Output -> Some s.name | _ -> None)
+                    child_mod.signals in
+                let conns = List.concat_map (fun (k, be) ->
+                  let slot =
+                    if is_pos k then
+                      (match pos_idx k with
+                       | Some idx when idx < n -> Some (List.nth slots idx)
+                       | _ -> None)
+                    else List.find_opt (fun (nm, _) -> nm = k) slots in
+                  match slot with
+                  | Some (name, None) -> [(name, re be)]
+                  | Some (name, Some iface) ->
+                      (match be with
+                       | BVar u when Hashtbl.mem inst_iface u ->
+                           List.filter_map (fun (mem, _) ->
+                             let formal = name ^ "$" ^ mem in
+                             if List.mem formal formals_scalar
+                             then Some (formal, BVar (u ^ "$" ^ mem)) else None)
+                             (Hashtbl.find iface_reg iface)
+                       | _ -> [(name, re be)])
+                  | None -> [(k, re be)]) i.port_connections in
+                Some { i with port_connections = conns }
+              end
+      in
+      let insts' = List.filter_map resolve m.instances in
+      { m with
+        signals = m.signals @ new_sigs;
+        processes = List.map re_proc m.processes @ List.rev !hdr_procs;
+        instances = insts' }
+    end
+  ) bmods
+
 (* Normalisation pass: rewrite positional instance port connections
  * (captured by extract_instances under synthetic `$pos<N>` keys) into
  * named form, using each module's formal port order.  This runs once,
@@ -4947,21 +6364,41 @@ let name_positional_ports (bmods : bmodule list) : bmodule list =
       | `Input | `Output -> Some s.name
       | _ -> None) m.signals in
     Hashtbl.replace port_order m.name ports) bmods;
+  let is_dotstar k = k = "$dotstar" in
   let resolve_inst (i : Behavioral_ir.binstance) =
-    if not (List.exists (fun (k, _) -> is_pos k) i.port_connections) then i
+    let has_pos = List.exists (fun (k, _) -> is_pos k) i.port_connections in
+    let has_ds  = List.exists (fun (k, _) -> is_dotstar k) i.port_connections in
+    if not has_pos && not has_ds then i
     else
       let formals = Option.value ~default:[]
         (Hashtbl.find_opt port_order i.module_name) in
       let n = List.length formals in
-      let pc = List.map (fun (k, be) ->
-        if not (is_pos k) then (k, be)
+      (* First resolve positionals; drop the $dotstar sentinel (expanded next). *)
+      let pc = List.filter_map (fun (k, be) ->
+        if is_dotstar k then None
+        else if not (is_pos k) then Some (k, be)
         else match int_of_string_opt (String.sub k 4 (String.length k - 4)) with
-          | Some idx when idx < n -> (List.nth formals idx, be)
+          | Some idx when idx < n -> Some (List.nth formals idx, be)
           | _ ->
               Printf.eprintf
                 "[verible_to_bir] %s: positional port %s of %s unresolved \
                  (%d formals)\n" i.inst_name k i.module_name n;
-              (k, be)) i.port_connections in
+              Some (k, be)) i.port_connections in
+      (* `.*`: connect every formal the instance did not name explicitly to a
+       * parent net of the same name (SV-2017 implicit port connection). *)
+      let pc =
+        if not has_ds then pc
+        else if formals = [] then begin
+          Printf.eprintf
+            "[verible_to_bir] %s: `.*` on %s but no formal port order known\n"
+            i.inst_name i.module_name;
+          pc
+        end else
+          let connected = List.map fst pc in
+          let extra = List.filter_map (fun f ->
+            if List.mem f connected then None else Some (f, BVar f)) formals in
+          pc @ extra
+      in
       { i with port_connections = pc }
   in
   List.map (fun (m : bmodule) ->
@@ -4973,6 +6410,85 @@ let convert_files_inner ~top files : bprogram =
     Printf.eprintf "[mem_init] auto-discovered: %s\n"
       (String.concat ", " !mem_init_search_paths);
   let mods, pkgs = parse_files_full files in
+  (* Register every SystemVerilog interface as a packed struct: convert it like a
+   * module (its nets/ports become signals), then record its members in iface_reg
+   * and its total width in type_widths.  This lets interface ports (if.modport p)
+   * be treated as struct-typed ports and member access (p.field) slice correctly. *)
+  List.iter (fun (mdecl : module_decl) ->
+    let is_iface = ref false in
+    walk (function Interface -> is_iface := true | _ -> ()) mdecl.m_body;
+    if !is_iface then
+      try
+        let im = convert_module ~pkgs mdecl [] in
+        let stype_w = function
+          | BInt { width; _ } -> width | BBool -> 1
+          | BArray { element = BInt { width; _ }; size } -> width * size
+          | _ -> 0 in
+        let members = List.filter_map (fun (s : bsignal) ->
+          let w = stype_w s.stype in
+          if w > 0 then Some (s.name, w) else None) im.signals in
+        if members <> [] then begin
+          Hashtbl.replace iface_reg mdecl.m_name members;
+          let total = List.fold_left (fun a (_, w) -> a + w) 0 members in
+          Hashtbl.replace type_widths mdecl.m_name total;
+          (* Header ports of the interface itself (`interface if2(input clk)`)
+           * — the Input/Output signals of the converted interface module. *)
+          let hdr = List.filter_map (fun (s : bsignal) ->
+            match s.direction with
+            | `Input -> Some (s.name, `Input)
+            | `Output -> Some (s.name, `Output)
+            | _ -> None) im.signals in
+          Hashtbl.replace iface_hdr_ports mdecl.m_name hdr;
+          (* Parse modports: `modport wr(input clk, output data)`.  A single
+           * IN-ORDER (pre-order DFS) walk of each modport_item yields the flat
+           * leaf sequence [name; input; clk; output; data]: the first id is the
+           * modport name, then each id inherits the most-recent direction leaf.
+           * (Do NOT `collect_by` on generic prefixes — `prefix_is "modport_item"`
+           * also matches `modport_item_list`, double-counting every member.) *)
+          let modport_nodes =
+            collect_by (has_tag (fun t ->
+              prefix_is "modport_item" t
+              && not (prefix_is "modport_item_list" t))) mdecl.m_body in
+          List.iter (fun mi ->
+            let mp_name = ref None in
+            let cur_dir = ref `Input in
+            let entries = ref [] in
+            walk (function
+              | Input -> cur_dir := `Input
+              | Output -> cur_dir := `Output
+              | Inout -> cur_dir := `Input
+              | SymbolIdentifier id ->
+                  if !mp_name = None then mp_name := Some id
+                  else entries := (id, !cur_dir) :: !entries
+              | _ -> ()) mi;
+            let entries = List.rev !entries in
+            match !mp_name with
+            | Some mp when entries <> [] ->
+                (if Sys.getenv_opt "IFACE_DEBUG" <> None then
+                   Printf.eprintf "[iface] modport %s$%s: %s\n%!" mdecl.m_name mp
+                     (String.concat "," (List.map (fun (n,d) ->
+                        n ^ ":" ^ (match d with `Input -> "in" | `Output -> "out")) entries)));
+                Hashtbl.replace iface_modports (mdecl.m_name ^ "$" ^ mp) entries
+            | _ -> ()) modport_nodes
+        end
+      with _ -> ()) mods;
+  (* Augment each package's params with its enum members so `pkg::Member`
+   * references resolve via eval_int's package fallback (resolve_pkg_ref).
+   * extract_enum_items previously ran only on MODULE bodies, so a package-
+   * scoped state enum — `dm_pkg`'s `typedef enum {Idle,Read,…} sba_state_e`
+   * used as `dm::Idle` in dm_sba — was unresolved, fell back to a bare
+   * BVar "Idle" tied to zero, and collapsed the FSM into a combinational
+   * loop. *)
+  let pkgs =
+    List.map (fun (p : Verible_elaborate.package_decl) ->
+      let items = extract_enum_items ~pkgs ~params:[] p.pkg_body in
+      let enum_params =
+        List.filter_map (fun (nm, vstr) ->
+          match int_of_string_opt vstr with
+          | Some n -> Some (nm, Verible_elaborate.PInt n)
+          | None -> None) items in
+      if enum_params = [] then p
+      else { p with pkg_params = p.pkg_params @ enum_params }) pkgs in
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
   let specs = specialise_design ~pkgs mods ~top_name:top in
@@ -5007,6 +6523,51 @@ let convert_files_inner ~top files : bprogram =
         ) m.instances in
         Some { m with name = s.s_name; instances = rewritten }
   ) specs in
+  (* Fallback specialisation: an instance can reference a PARSED user module
+   * that specialise_design never specialised — e.g. the LIVE branch of a
+   * conditional generate when walk_live's condition evaluation diverges from
+   * the module body's.  dm_mem's `if (HasSndScratch) debug_rom else
+   * debug_rom_one_scratch` keeps `debug_rom_one_scratch` in the body (default
+   * DmBaseAddress='0 → HasSndScratch=0), but walk_live collected the other
+   * branch, so debug_rom_one_scratch got no bmodule and gate_map's
+   * port-direction check bombs on it.  Convert any still-missing referenced
+   * module with DEFAULT params (parameterless leaves like ROMs are the common
+   * case) so its interface exists downstream.  Iterated to a fixpoint so a
+   * fallback module's own missing children are covered too. *)
+  let bmods =
+    let acc = ref bmods in
+    let changed = ref true in
+    while !changed do
+      changed := false;
+      let have = Hashtbl.create 128 in
+      List.iter (fun (m : bmodule) -> Hashtbl.replace have m.name ()) !acc;
+      let missing = Hashtbl.create 16 in
+      List.iter (fun (m : bmodule) ->
+        List.iter (fun (i : Behavioral_ir.binstance) ->
+          if not (Hashtbl.mem have i.module_name)
+             && Hashtbl.mem by_name i.module_name
+             && not (Hashtbl.mem missing i.module_name)
+          then Hashtbl.replace missing i.module_name ()) m.instances) !acc;
+      Hashtbl.iter (fun name () ->
+        match Hashtbl.find_opt by_name name with
+        | Some mdecl ->
+            (try
+               let m = convert_module ~pkgs mdecl [] in
+               acc := !acc @ [m]; changed := true;
+               Printf.eprintf
+                 "[verible_to_bir] fallback-specialised %s (default params) — \
+                  referenced but not in specialise_design output\n" name
+             with e ->
+               Printf.eprintf
+                 "[verible_to_bir] fallback specialise %s failed: %s\n"
+                 name (Printexc.to_string e))
+        | None -> ()) missing
+    done;
+    !acc
+  in
+  (* Elaborate interface instances (bundle nets + header wiring + interface-port
+   * connection fan-out) before positional resolution. *)
+  let bmods = elaborate_interfaces bmods in
   (* Positional → named port connections, before prep_for_z3's
    * destructive flatten/ffrip/share. *)
   let bmods = name_positional_ports bmods in
