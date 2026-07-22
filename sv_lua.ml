@@ -159,8 +159,14 @@ let run_synlig_to_rtlil ~top ~files ~out =
   let script = Filename.temp_file "synlig_" ".ys" in
   let oc = open_out script in
   Printf.fprintf oc "read_systemverilog %s\n" (String.concat " " files);
-  Printf.fprintf oc
-    "hierarchy -top %s\nproc\nopt -fast\nflatten\nopt -fast\n" top;
+  (* For a FRONTEND miter (SYNLIG_MIN) skip yosys `opt` — it merges/removes FFs so
+     the register SET no longer matches the RTL, defeating register correspondence.
+     `proc` + `flatten` (+ opt_clean = unused-cell removal, no FF merge) keeps one
+     $dff per source register, isolating Surelog's elaboration from synthesis opt. *)
+  if Sys.getenv_opt "SYNLIG_MIN" <> None then
+    Printf.fprintf oc "hierarchy -top %s\nproc\nflatten\nopt_clean\n" top
+  else
+    Printf.fprintf oc "hierarchy -top %s\nproc\nopt -fast\nflatten\nopt -fast\n" top;
   Printf.fprintf oc "write_rtlil %s\n" out;
   close_out oc;
   let rc = Sys.command
@@ -1500,6 +1506,170 @@ let lalias_output_regs mod_h =
     List.map (fun (mm : bmodule) -> if mm.name = m.name then m' else mm) p.modules } in
   hadd (Mod (n, m', cp))
 
+(* ── Simulation-based register correspondence ─────────────────────────────
+ * Match a target module's registers to a reference module's by their next-state
+ * VALUES under shared random stimulus, refining register equivalence classes to
+ * a fixpoint, then rename each unique correspondent.  Robust to synthesis
+ * restructuring / register RENAMING (synlig, yosys) where name-based FF matching
+ * and alias_output_regs fail: equivalent registers produce identical __D values
+ * under identical (input, class-assigned state) vectors, so they land in the same
+ * class; non-equivalent ones diverge and split.  Anchored by primary inputs
+ * (shared by name) — the classic random-simulation signal-correspondence method. *)
+let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list =
+  let module BI = Behavioral_initeval in
+  let rr = Behavioral_ffrip.rip_module ref_m in
+  let rt = Behavioral_ffrip.rip_module tgt_m in
+  let suf s n = let l = String.length s and k = String.length n in
+    k >= l && String.sub n (k - l) l = s in
+  let sigw (s : bsignal) = match s.stype with
+    | BInt { width; _ } -> width | BBool -> 1
+    | BArray { size; element = BInt { width; _ }; _ } -> size * width | _ -> 1 in
+  (* registers = base X for each X__D output; state input = X__Q if present (output
+     FF) else X (internal reg promoted to input). *)
+  let regs_of (rm : bmodule) =
+    let inset = Hashtbl.create 128 in
+    List.iter (fun (s : bsignal) -> if s.direction = `Input then Hashtbl.replace inset s.name ()) rm.signals;
+    List.filter_map (fun (s : bsignal) ->
+      if s.direction = `Output && suf "__D" s.name then
+        let base = String.sub s.name 0 (String.length s.name - 3) in
+        let qin = if Hashtbl.mem inset (base ^ "__Q") then base ^ "__Q" else base in
+        Some (base, sigw s, qin)
+      else None) rm.signals in
+  let rregs = regs_of rr and tregs = regs_of rt in
+  if Sys.getenv_opt "REGCORR_DEBUG" <> None then begin
+    let outs m = List.filter_map (fun (s:bsignal) -> if s.direction=`Output then Some s.name else None) m.signals in
+    let seqs m = List.length (List.filter (function BSequential _ -> true | _ -> false) m.processes) in
+    Printf.eprintf "[regcorr] pre-check rregs=%d tregs=%d | ref: sigs=%d outs=%d seq=%d sample_outs=[%s]\n%!"
+      (List.length rregs) (List.length tregs) (List.length rr.signals)
+      (List.length (outs rr)) (seqs rr)
+      (String.concat "," (List.filteri (fun i _ -> i < 8) (outs rr)))
+  end;
+  if rregs = [] || tregs = [] then [] else begin
+    let make_sim (rm : bmodule) (regs : (string * int * string) list) =
+      let widths = Hashtbl.create 512 in
+      List.iter (fun (s : bsignal) -> Hashtbl.replace widths s.name (sigw s)) rm.signals;
+      let comb = List.filter_map (function BCombinational r -> Some r.body | _ -> None) rm.processes in
+      let cap = 4 + List.length rm.signals in
+      let inames = List.filter_map (fun (s : bsignal) ->
+        if s.direction = `Input then Some s.name else None) rm.signals in
+      let dnames = List.map (fun (b, _, _) -> b ^ "__D") regs in
+      (inames, fun (assign : (string * Z.t) list) ->
+         let env = { BI.widths; arrays = Hashtbl.create 4; elemw = Hashtbl.create 4;
+                     scalars = Hashtbl.create 512; awrites = Hashtbl.create 4 } in
+         List.iter (fun (n, v) -> BI.set_scalar env n v) assign;
+         (* iterate combinational net to a fixpoint (early-exit on __D stability) *)
+         let chksum () = List.fold_left (fun a d ->
+           Z.logxor (Z.of_int (Hashtbl.hash d)) (Z.add a
+             (try Hashtbl.find env.BI.scalars d with Not_found -> Z.zero))) Z.zero dnames in
+         let prev = ref (chksum ()) and i = ref 0 and stop = ref false in
+         while not !stop && !i < cap do
+           List.iter (List.iter (fun st -> try BI.exec env st with _ -> ())) comb;
+           incr i;
+           let c = chksum () in if Z.equal c !prev && !i > 1 then stop := true else prev := c
+         done;
+         env.BI.scalars)
+    in
+    let (r_in, r_sim) = make_sim rr rregs and (t_in, t_sim) = make_sim rt tregs in
+    let rng = Random.State.make [| 0x5eed; 0x1234; 0x9a1c |] in
+    let randz w =
+      if w <= 0 then Z.zero else begin
+        let rec go acc bits = if bits <= 0 then acc
+          else go (Z.logor (Z.shift_left acc 30) (Z.of_int (Random.State.bits rng))) (bits - 30) in
+        Z.logand (go Z.zero w) (Z.sub (Z.shift_left Z.one w) Z.one)
+      end in
+    let key tag b = tag ^ "\000" ^ b in
+    let cls = Hashtbl.create 256 and rw = Hashtbl.create 256 in
+    List.iter (fun (b, w, _) -> Hashtbl.replace cls (key "R" b) w; Hashtbl.replace rw (key "R" b) w) rregs;
+    List.iter (fun (b, w, _) -> Hashtbl.replace cls (key "T" b) w; Hashtbl.replace rw (key "T" b) w) tregs;
+    let all_in = List.sort_uniq compare (r_in @ t_in) in
+    let nclasses () = let s = Hashtbl.create 64 in
+      Hashtbl.iter (fun _ c -> Hashtbl.replace s c ()) cls; Hashtbl.length s in
+    let refine () =
+      let inval = List.map (fun n -> (n, randz 64)) all_in in
+      let class_val = Hashtbl.create 64 in
+      Hashtbl.iter (fun k c -> if not (Hashtbl.mem class_val c) then
+                      Hashtbl.replace class_val c (randz (Hashtbl.find rw k))) cls;
+      let qvals regs tag = List.filter_map (fun (b, _, qin) ->
+        match Hashtbl.find_opt cls (key tag b) with
+        | Some c -> Some (qin, Hashtbl.find class_val c) | None -> None) regs in
+      let r_out = r_sim (inval @ qvals rregs "R") in
+      let t_out = t_sim (inval @ qvals tregs "T") in
+      let dval out b = try Hashtbl.find out (b ^ "__D") with Not_found -> Z.zero in
+      let sig_of tag regs out = List.map (fun (b, _, _) ->
+        (key tag b, (Hashtbl.find cls (key tag b), dval out b))) regs in
+      let sigs = sig_of "R" rregs r_out @ sig_of "T" tregs t_out in
+      let g = Hashtbl.create 256 and next = ref 0 in
+      List.iter (fun (k, sg) ->
+        let c = match Hashtbl.find_opt g sg with Some c -> c
+          | None -> let c = !next in incr next; Hashtbl.replace g sg c; c in
+        Hashtbl.replace cls k c) sigs in
+    let stable = ref 0 and it = ref 0 in
+    while !stable < 3 && !it < 40 do
+      let b = nclasses () in refine (); incr it;
+      if nclasses () = b then incr stable else stable := 0
+    done;
+    if Sys.getenv_opt "REGCORR_DEBUG" <> None then begin
+      (* probe: how many distinct __D values does one random vector give each side *)
+      let inval = List.map (fun n -> (n, randz 64)) all_in in
+      let cv = Hashtbl.create 64 in
+      Hashtbl.iter (fun k c -> if not (Hashtbl.mem cv c) then Hashtbl.replace cv c (randz (Hashtbl.find rw k))) cls;
+      let qv regs tag = List.filter_map (fun (b,_,q) -> match Hashtbl.find_opt cls (key tag b) with Some c -> Some (q, Hashtbl.find cv c) | None -> None) regs in
+      let ro = r_sim (inval @ qv rregs "R") in
+      let nz = List.length (List.filter (fun (b,_,_) -> not (Z.equal (try Hashtbl.find ro (b^"__D") with Not_found -> Z.zero) Z.zero)) rregs) in
+      Printf.eprintf "[regcorr] rregs=%d tregs=%d classes=%d iters=%d ref_nonzero_D=%d/%d\n%!"
+        (List.length rregs) (List.length tregs) (nclasses ()) !it nz (List.length rregs);
+      if List.length rregs <= 12 then begin
+        List.iter (fun (b,_,_) -> Printf.eprintf "  R %s -> c%d\n%!" b (Hashtbl.find cls (key "R" b))) rregs;
+        List.iter (fun (b,_,_) -> Printf.eprintf "  T %s -> c%d\n%!" b (Hashtbl.find cls (key "T" b))) tregs
+      end
+    end;
+    let byc = Hashtbl.create 256 in
+    Hashtbl.iter (fun k c ->
+      let tag = String.sub k 0 1 and b = String.sub k 2 (String.length k - 2) in
+      let (rl, tl) = try Hashtbl.find byc c with Not_found -> ([], []) in
+      Hashtbl.replace byc c (if tag = "R" then (b :: rl, tl) else (rl, b :: tl))) cls;
+    let map = ref [] in
+    (* Registers in one class are simulation-EQUIVALENT (interchangeable), so when a
+       class has equal ref/target counts pair them by sorted canonical name — this
+       matches same-named regs and pairs symmetric/constant ones consistently.  A
+       class with unequal ref/target counts is a genuine structural mismatch: skip. *)
+    Hashtbl.iter (fun _ (rl, tl) ->
+      if List.length rl = List.length tl then begin
+        let sortc l = List.map snd (List.sort compare (List.map (fun x -> (canon_sep_name x, x)) l)) in
+        List.iter2 (fun r t -> if r <> t then map := (t, r) :: !map) (sortc rl) (sortc tl)
+      end) byc;
+    !map
+  end
+
+(* Miter with simulation-based register correspondence: prep BOTH modules ONCE
+ * (prep_for_z3 lowers always-blocks so ffrip can see registers), match b's
+ * registers to a's by simulation, rename, then check equivalence on the prepped
+ * modules directly (no second prep that would re-rename). *)
+let lmiter_regcorr a_h b_h =
+  let _, ma, pa = find_mod a_h in
+  let _, mb, pb = find_mod b_h in
+  let _ = Behavioral_hier.take_unresolved () in
+  let ma' = prep_for_z3 ma pa in
+  let mb' = prep_for_z3 mb pb in
+  let _ = Behavioral_hier.take_unresolved () in
+  let map = reg_correspond ma' mb' in
+  let f x = match List.assoc_opt x map with Some r -> r | None -> x in
+  let mb'' = rename_module f mb' in
+  (try if Z3_miter.check_miter_equivalence ma' mb'' then "EQUIVALENT" else "DIFFER"
+   with e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
+
+let lreg_correspond tgt_h ref_h =
+  let n, tm, tp = find_mod tgt_h in
+  let _, rm, _ = find_mod ref_h in
+  let mp = reg_correspond rm tm in
+  if Sys.getenv_opt "REGCORR_DEBUG" <> None then
+    Printf.eprintf "[regcorr] %s<-%s: %d register(s) matched\n%!" tm.name rm.name (List.length mp);
+  let f x = match List.assoc_opt x mp with Some r -> r | None -> x in
+  let tm' = rename_module f tm in
+  let cp = { tp with modules =
+    List.map (fun (mm : bmodule) -> if mm.name = tm.name then tm' else mm) tp.modules } in
+  hadd (Mod (n, tm', cp))
+
 let lcanon_sep mod_h =
   let n, m, p = find_mod mod_h in
   (* prep_for_z3 re-fetches the module by name from the PROGRAM and flattens
@@ -2443,6 +2613,8 @@ module MakeLib
                            (wrap1 lcanon_module_names);
         "canon_sep",  V.efunc (V.string **->> V.string) (wrap1 lcanon_sep);
         "alias_output_regs", V.efunc (V.string **->> V.string) (wrap1 lalias_output_regs);
+        "reg_correspond", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lreg_correspond);
+        "miter_regcorr", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lmiter_regcorr);
         "splice",         V.efunc (V.string **-> V.string **-> V.string
                                    **->> V.string)
                            (wrap3 lsplice);

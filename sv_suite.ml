@@ -81,6 +81,14 @@ let load_frontend name ~top files : bprogram =
       let p = Rtlil_to_behavioral.convert_file tmp in
       (try Sys.remove tmp with _ -> ());
       p
+  | "synlig" ->
+      (* synlig (yosys+Surelog SV frontend): same RTLIL consumer as yosys,
+         different read script.  A cross-tool miter peer for the SVS frontend. *)
+      let tmp = Filename.temp_file "synlig_" ".il" in
+      Sv_lua.run_synlig_to_rtlil ~top ~files ~out:tmp;
+      let p = Rtlil_to_behavioral.convert_file tmp in
+      (try Sys.remove tmp with _ -> ());
+      p
   | "verilator" ->
       (* Verilator path expects exactly one JSON file produced by
        * `verilator --json-only`; running verilator end-to-end is the
