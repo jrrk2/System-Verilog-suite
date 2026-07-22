@@ -333,7 +333,16 @@ let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
     | RAMB36E1 -> 16, 32, 4, 4, 8, [ kconst 1 1 ]
   in
   let word_addr_w = addr_total - shift - List.length top in
+  if Sys.getenv_opt "BRAM_DEBUG" <> None then
+    Printf.eprintf "[bram] %s: prim=%s tw=%d n=%d shift=%d aw=%d word_addr_w=%d depth=%d width=%d\n%!"
+      name (prim_name prim) tw n shift aw word_addr_w depth width;
+  (* The read/write address expr can be WIDER than bits_needed(depth) — e.g. a ROM
+     with 512 used words whose RTL address is addr[13:2] (12b).  zext assumes the
+     expr is exactly `aw` bits; if it is wider the concat overflows addr_total and
+     the MSB `top` (the RAMB cascade-tie / high address bits) is pushed off the pin.
+     Clamp the expr to `aw` low bits first so zext math is exact. *)
   let addr_expr a =
+    let a = if aw >= 1 then BSlice { signal = a; msb = aw - 1; lsb = 0 } else a in
     BConcat
       (top @ [ zext a ~from_w:aw ~to_w:word_addr_w ]
        @ (if shift > 0 then [ kconst 0 shift ] else []))
