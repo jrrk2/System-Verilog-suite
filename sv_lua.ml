@@ -1633,15 +1633,32 @@ let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list 
       let tag = String.sub k 0 1 and b = String.sub k 2 (String.length k - 2) in
       let (rl, tl) = try Hashtbl.find byc c with Not_found -> ([], []) in
       Hashtbl.replace byc c (if tag = "R" then (b :: rl, tl) else (rl, b :: tl))) cls;
+    (* qin (state-input name) per register base — needed to align an internal reg
+       (state input = base) against an output-FF (state input = base__Q). *)
+    let rq_of = Hashtbl.create 64 and tq_of = Hashtbl.create 64 in
+    List.iter (fun (b, _, q) -> Hashtbl.replace rq_of b q) rregs;
+    List.iter (fun (b, _, q) -> Hashtbl.replace tq_of b q) tregs;
     let map = ref [] in
     (* Registers in one class are simulation-EQUIVALENT (interchangeable), so when a
        class has equal ref/target counts pair them by sorted canonical name — this
        matches same-named regs and pairs symmetric/constant ones consistently.  A
-       class with unequal ref/target counts is a genuine structural mismatch: skip. *)
+       class with unequal ref/target counts is a genuine structural mismatch: skip.
+       For each pair rename the target's STATE INPUT -> ref's state input and its
+       next-state (__D) -> ref's __D so Z3 ties/compares them; when the target is an
+       output-FF (state input = base__Q, distinct from base) also align the base
+       (port/value) name.  Aligning state-input names is what lets an internal reg
+       (synlig) correspond to an output-FF (verible) with the same next-state. *)
     Hashtbl.iter (fun _ (rl, tl) ->
       if List.length rl = List.length tl then begin
         let sortc l = List.map snd (List.sort compare (List.map (fun x -> (canon_sep_name x, x)) l)) in
-        List.iter2 (fun r t -> if r <> t then map := (t, r) :: !map) (sortc rl) (sortc tl)
+        List.iter2 (fun r t ->
+          let rq = try Hashtbl.find rq_of r with Not_found -> r in
+          let tq = try Hashtbl.find tq_of t with Not_found -> t in
+          if tq <> rq then map := (tq, rq) :: !map;
+          if t <> r then map := (t ^ "__D", r ^ "__D") :: !map;
+          (* output-FF: base is a port distinct from its __Q state input *)
+          if tq <> t && t <> r then map := (t, r) :: !map)
+          (sortc rl) (sortc tl)
       end) byc;
     !map
   end

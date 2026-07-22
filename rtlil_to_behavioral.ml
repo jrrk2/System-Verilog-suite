@@ -151,20 +151,75 @@ let comb_sliced name (lhs, slice) rhs =
     body = [assign_or_slice_write lhs slice rhs];
   })
 
+(* Bit-width of one concat chunk (for placing it in the RHS value). *)
+let sigchunk_width = function
+  | SigBit _ -> Some 1
+  | SigRange (_, hi, lo) -> Some (abs (hi - lo) + 1)
+  | SigConst s ->
+      let s = String.trim s in
+      (match String.index_opt s '\'' with
+       | Some i -> (try Some (int_of_string (String.sub s 0 i)) with _ -> None)
+       | None -> None)
+  | SigWire _ -> None            (* unknown width without the wire table *)
+  | SigConcat _ -> None          (* nested concat: unsupported *)
+
+(* Distribute a computed `rhs` value across an output that is a
+ * concatenation of scattered bit-selects.  Yosys emits this after
+ * const-cell replacement splits e.g. `a ^ 8'ha5` into a $not on the
+ * set-bits with Y = {q[7],q[5],q[2],q[0]}; the old reader returned
+ * None here (SigConcat unsupported by pin_lhs_slice) and silently
+ * DROPPED the cell, zeroing those bits.  RTLIL concat is MSB-first,
+ * so we walk the reversed list assigning bit offsets from the LSB and
+ * slice-write each chunk from the matching bits of `rhs`.  Returns the
+ * per-chunk writes (LSB first) or None if any chunk width is unknown. *)
+let concat_out_writes chunks rhs =
+  let rec go off acc = function
+    | [] -> Some (List.rev acc)
+    | ch :: rest ->
+        (match sigchunk_width ch with
+         | None -> None
+         | Some w ->
+             let src = BSlice { signal = rhs; msb = off + w - 1; lsb = off } in
+             (match ch with
+              | SigBit (n, b) ->
+                  go (off + w) (assign_or_slice_write n (Some (b, b)) src :: acc) rest
+              | SigRange (n, hi, lo) ->
+                  go (off + w) (assign_or_slice_write n (Some (hi, lo)) src :: acc) rest
+              | SigConst _ -> go (off + w) acc rest   (* const target: consume, don't write *)
+              | SigWire _ | SigConcat _ -> None))
+  in
+  go 0 [] (List.rev chunks)
+
+(* Emit the combinational process driving cell `c`'s output pin `pn`
+ * from `rhs`, transparently handling a single (possibly sliced) wire
+ * or a concat of scattered slices. *)
+let comb_out c pn label rhs =
+  match pin c pn with
+  | Some (SigConcat chunks) ->
+      (match concat_out_writes chunks rhs with
+       | Some ((_ :: _) as stmts) ->
+           Some (BCombinational { name = label; sensitivity = [BAny]; body = stmts })
+       | _ -> None)
+  | Some _ ->
+      (match pin_lhs_slice c pn with
+       | Some lhs_slice -> comb_sliced label lhs_slice rhs
+       | None -> None)
+  | None -> None
+
 (* Convert a Yosys cell to a BIR process. Returns None when we don't
  * yet model the cell type. *)
 let cell_to_bprocess (c : rtlil_cell) =
   let bin_2 op result_w =
-    match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B" with
-    | Some lhs_slice, Some a, Some b ->
-        comb_sliced (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst) lhs_slice
+    match pin_expr c "A", pin_expr c "B" with
+    | Some a, Some b ->
+        comb_out c "Y" (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst)
           (BBinOp { op; lhs = a; rhs = b; result_type = int_t result_w })
     | _ -> None
   in
   let un_1 op result_w =
-    match pin_lhs_slice c "Y", pin_expr c "A" with
-    | Some lhs_slice, Some a ->
-        comb_sliced (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst) lhs_slice
+    match pin_expr c "A" with
+    | Some a ->
+        comb_out c "Y" (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst)
           (BUnOp { op; operand = a; result_type = int_t result_w })
     | _ -> None
   in
@@ -198,25 +253,25 @@ let cell_to_bprocess (c : rtlil_cell) =
    * operands this is just bit-AND/OR/NOT; for wider operands we wrap
    * each input in BRedOr first so the semantics match. *)
   | "$logic_and" | "$logic_or" as ct ->
-      (match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B" with
-       | Some lhs_slice, Some a, Some b ->
+      (match pin_expr c "A", pin_expr c "B" with
+       | Some a, Some b ->
            let red x = BUnOp { op = BRedOr; operand = x; result_type = bool_t } in
            let op = if ct = "$logic_and" then BAnd else BOr in
-           comb_sliced (Printf.sprintf "%s_%s" (strip_dollar ct) c.cell_inst) lhs_slice
+           comb_out c "Y" (Printf.sprintf "%s_%s" (strip_dollar ct) c.cell_inst)
              (BBinOp { op; lhs = red a; rhs = red b; result_type = bool_t })
        | _ -> None)
   | "$logic_not" ->
-      (match pin_lhs_slice c "Y", pin_expr c "A" with
-       | Some lhs_slice, Some a ->
+      (match pin_expr c "A" with
+       | Some a ->
            let red = BUnOp { op = BRedOr; operand = a; result_type = bool_t } in
-           comb_sliced (Printf.sprintf "logic_not_%s" c.cell_inst) lhs_slice
+           comb_out c "Y" (Printf.sprintf "logic_not_%s" c.cell_inst)
              (BUnOp { op = BNot; operand = red; result_type = bool_t })
        | _ -> None)
   (* Mux: Y = S ? B : A *)
   | "$mux" | "$_MUX_" ->
-      (match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B", pin_expr c "S" with
-       | Some lhs_slice, Some a, Some b, Some s ->
-           comb_sliced (Printf.sprintf "mux_%s" c.cell_inst) lhs_slice
+      (match pin_expr c "A", pin_expr c "B", pin_expr c "S" with
+       | Some a, Some b, Some s ->
+           comb_out c "Y" (Printf.sprintf "mux_%s" c.cell_inst)
              (BCond { condition = s; then_val = b; else_val = a })
        | _ -> None)
   (* Parallel mux: case-statement lowering.  yosys emits $pmux for
@@ -226,8 +281,8 @@ let cell_to_bprocess (c : rtlil_cell) =
        S: S_WIDTH one-hot select bits — chunk i is taken when S[i]=1
      Semantics: Y = S[0] ? B[WIDTH-1:0] : S[1] ? B[2*WIDTH-1:WIDTH] : ... : A *)
   | "$pmux" ->
-      (match pin_lhs_slice c "Y", pin_expr c "A", pin_expr c "B", pin_expr c "S" with
-       | Some lhs_slice, Some a, Some b, Some s ->
+      (match pin_expr c "A", pin_expr c "B", pin_expr c "S" with
+       | Some a, Some b, Some s ->
            let yw = get_width c "WIDTH" in
            let sw = get_width c "S_WIDTH" in
            if yw <= 0 || sw <= 0 then None
@@ -242,7 +297,7 @@ let cell_to_bprocess (c : rtlil_cell) =
                               then_val = b_i;
                               else_val = !acc }
              done;
-             comb_sliced (Printf.sprintf "pmux_%s" c.cell_inst) lhs_slice !acc
+             comb_out c "Y" (Printf.sprintf "pmux_%s" c.cell_inst) !acc
        | _ -> None)
   (* Pass-through: Y = A. yosys-slang's `proc; flatten` flow uses
    * `$buf` as the structural placeholder that wires a wide
@@ -251,9 +306,9 @@ let cell_to_bprocess (c : rtlil_cell) =
    * this case those concat-driven outputs were unwired on the
    * yosys-slang side. *)
   | "$buf" | "$_BUF_" | "$pos" ->
-      (match pin_lhs_slice c "Y", pin_expr c "A" with
-       | Some lhs_slice, Some a ->
-           comb_sliced (Printf.sprintf "buf_%s" c.cell_inst) lhs_slice a
+      (match pin_expr c "A" with
+       | Some a ->
+           comb_out c "Y" (Printf.sprintf "buf_%s" c.cell_inst) a
        | _ -> None)
   (* Flip-flops (positive-edge variants). *)
   | "$dff" | "$_DFF_P_" ->
