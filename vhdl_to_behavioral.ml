@@ -463,12 +463,31 @@ let rec expr_to_bexpr ctx = function
             (Double (VhdSelectedName, List _) as head_node), params) ->
       let head_e = expr_to_bexpr ctx head_node in
       let name = match head_e with BVar n -> n | _ -> "_unknown_call" in
-      let actual_e = match params with
-        | Triple (Vhdassociation_element, _, Double (VhdActualExpression, e)) -> e
-        | Triple (Vhdassociation_element, _, e) -> e
-        | other -> other
-      in
-      BCall { func = name; args = [expr_to_bexpr ctx actual_e] }
+      (* A selected name followed by `(…)` is usually a slice/bit-select of a
+         record field (`ctrl_i.ir_funct12(11 downto 5)` → the scalarised field
+         `ctrl_i__ir_funct12[11:5]`), not a function call — the record collapse
+         used to drop the range and mis-read it as a call. *)
+      (match params with
+       | Triple (Vhdassociation_element, VhdFormalIndexed,
+                Double (VhdActualDiscreteRange,
+                  Double (VhdRange, Triple (VhdDecreasingRange, hi_e, lo_e)))) ->
+           (match fold_range_int ctx hi_e, fold_range_int ctx lo_e with
+            | Some h, Some l -> BSlice { signal = BVar name; msb = h; lsb = l }
+            | _ -> BVar name)
+       | Triple (Vhdassociation_element, VhdFormalIndexed,
+                Double (VhdActualDiscreteRange,
+                  Double (VhdRange, Triple (VhdIncreasingRange, lo_e, hi_e)))) ->
+           (match fold_range_int ctx hi_e, fold_range_int ctx lo_e with
+            | Some h, Some l -> BSlice { signal = BVar name; msb = h; lsb = l }
+            | _ -> BVar name)
+       | _ ->
+           let actual_e = match params with
+             | Triple (Vhdassociation_element, _, Double (VhdActualExpression, e)) -> e
+             | Triple (Vhdassociation_element, _, e) -> e
+             | other -> other in
+           (match fold_range_int ctx actual_e with
+            | Some i -> BSlice { signal = BVar name; msb = i; lsb = i }
+            | None -> BCall { func = name; args = [expr_to_bexpr ctx actual_e] }))
 
   (* Edge-detection builtins surface in conds as `rising_edge(clk)`.
      Convert to a BCall so the clock-guard elider can recognise it. *)
@@ -492,6 +511,16 @@ let rec expr_to_bexpr ctx = function
         | other -> Some other
       in
       let is_cast = List.mem name cast_names in
+      let reduce_ops = [ "or_reduce_f", BRedOr; "and_reduce_f", BRedAnd;
+                         "xor_reduce_f", BRedXor ] in
+      if List.mem_assoc name reduce_ops then
+        (match extract_actual params with
+         | Some actual ->
+             BUnOp { op = List.assoc name reduce_ops;
+                     operand = expr_to_bexpr ctx actual;
+                     result_type = BInt { width = 1; signed = Unsigned } }
+         | None -> BVar name)
+      else
       (match params with
        (* range argument: sig(M downto L) → slice *)
        | Triple (Vhdassociation_element, VhdFormalIndexed,
@@ -1005,6 +1034,74 @@ let process_to_bprocess ctx name sens_list ?(proc_decls=VhdNone) body =
         body = body_stmts;
       }
 
+(* ── Record / enum type resolution (shared by the type pre-pass and both the
+ *    port and internal-signal extractors) ─────────────────────────────────── *)
+let resolve_user_type_g ctx subty =
+  match subty with
+  | Quadruple (Vhdsubtype_indication, _, Str type_name, VhdNoConstraint)
+  | Quadruple (Vhdsubtype_indication, _, Str type_name, _) ->
+      (match List.assoc_opt type_name ctx.record_types with
+       | Some fields -> `Record (type_name, fields)
+       | None ->
+           (match List.assoc_opt type_name ctx.enum_types with
+            | Some values -> `Enum (BInt { width = bits_needed (List.length values); signed = Unsigned })
+            | None -> `Scalar (infer_btype ctx subty)))
+  | _ -> `Scalar (infer_btype ctx subty)
+
+let extract_record_fields_g ctx elems =
+  let acc = ref [] in
+  List.iter (function
+    | Triple (Vhdelement_declaration, names_node, subty) ->
+        let names = match names_node with
+          | List xs -> List.filter_map (function Str n -> Some n | _ -> None) xs
+          | Str n -> [n] | _ -> [] in
+        let fty = match resolve_user_type_g ctx subty with
+          | `Record _ -> infer_btype ctx subty
+          | `Enum ty | `Scalar ty -> ty in
+        List.iter (fun n -> acc := (n, fty) :: !acc) names
+    | _ -> ()) elems;
+  List.rev !acc
+
+(* Pre-pass: scan whole design units (entities, architectures AND packages) for
+ * record/enum type declarations so record-typed PORTS resolve.  Ports are
+ * extracted before the architecture body, and package types (ctrl_bus_t) live in
+ * a separate design unit — without this pre-pass a record port collapsed to the
+ * 1-bit infer_btype default and its fields dangled. *)
+let scan_types_into ctx trees =
+  let register_enum type_name lits =
+    let value_names = List.filter_map (function
+      | Double (VhdIdentifierEnumeration, Str n) -> Some n
+      | Double (VhdIdentifierEnumeration, Double (VhdSimpleName, Str n)) -> Some n
+      | Str n -> Some n | _ -> None) lits in
+    if not (List.mem_assoc type_name ctx.enum_types) then begin
+      ctx.enum_types <- (type_name, value_names) :: ctx.enum_types;
+      List.iteri (fun i n -> ctx.enum_values <- (n, (type_name, i)) :: ctx.enum_values) value_names
+    end in
+  let register_record type_name elems =
+    if not (List.mem_assoc type_name ctx.record_types) then
+      ctx.record_types <- (type_name, extract_record_fields_g ctx elems) :: ctx.record_types in
+  let rec go = function
+    | List xs -> List.iter go xs
+    | Triple (Vhddesign_unit, _, x) -> go x
+    | Double (VhdPrimaryUnit, x) | Double (VhdSecondaryUnit, x) -> go x
+    | Double (VhdPackageDeclaration, x) -> go x
+    | Quintuple (Vhdpackage_declaration, _, _, _, decls) -> go decls
+    | Double (VhdPackageTypeDeclaration, body) -> go body
+    | Double (VhdArchitectureBody, x) -> go x
+    | Quintuple (Vhdarchitecture_body, _, _, decls, _) -> go decls
+    | Double (VhdBlockTypeDeclaration, body) | Double (VhdFullType, body) -> go body
+    | Triple (VhdEnumerationTypeDefinition, Str type_name, List lits) ->
+        register_enum type_name lits
+    | Triple (Vhdfull_type_declaration, Str type_name, def) ->
+        (match def with
+         | Double (VhdRecordTypeDefinition, Triple (Vhdrecord_type_definition, List elems, _)) ->
+             register_record type_name elems
+         | Double (VhdEnumerationTypeDefinition, List lits) -> register_enum type_name lits
+         | _ -> ())
+    | _ -> ()
+  in
+  List.iter go trees
+
 (* Extract entity ports *)
 let extract_entity_ports ctx = function
   | Triple (Vhddesign_unit, _,
@@ -1036,38 +1133,26 @@ let extract_entity_ports ctx = function
         | Double (VhdInterfaceObjectDeclaration,
                  Double (VhdInterfaceDefaultDeclaration,
                         Sextuple (Vhdinterface_default_declaration, Str name,
-                                 VhdInterfaceModeIn, subtype, _kind, _default))) ->
-            let stype = infer_btype ctx subtype in
-            let signal = {
-              name; stype; direction = `Input;
-              initial_value = None; attrs = [];
-            } in
-            add_signal_type ctx name stype;
-            [signal]
-
-        | Double (VhdInterfaceObjectDeclaration,
-                 Double (VhdInterfaceDefaultDeclaration,
-                        Sextuple (Vhdinterface_default_declaration, Str name,
-                                 VhdInterfaceModeOut, subtype, _kind, _default))) ->
-            let stype = infer_btype ctx subtype in
-            let signal = {
-              name; stype; direction = `Output;
-              initial_value = None; attrs = [];
-            } in
-            add_signal_type ctx name stype;
-            [signal]
-
-        | Double (VhdInterfaceObjectDeclaration,
-                 Double (VhdInterfaceDefaultDeclaration,
-                        Sextuple (Vhdinterface_default_declaration, Str name,
-                                 VhdInterfaceModeInOut, subtype, _kind, _default))) ->
-            let stype = infer_btype ctx subtype in
-            let signal = {
-              name; stype; direction = `Output;  (* approximate inout as out *)
-              initial_value = None; attrs = [];
-            } in
-            add_signal_type ctx name stype;
-            [signal]
+                                 mode, subtype, _kind, _default))) ->
+            let dir = match mode with
+              | VhdInterfaceModeOut -> `Output
+              | VhdInterfaceModeInOut -> `Output   (* approximate inout as out *)
+              | _ -> `Input in
+            (* A record-typed port (`ctrl_i : ctrl_bus_t`) scalarizes to one port
+             * per field (`ctrl_i__ir_funct3`, …), matching how record field
+             * accesses are lowered — without this the whole record collapses to
+             * the 1-bit infer_btype default and every field read dangled. *)
+            (match resolve_user_type_g ctx subtype with
+             | `Record (type_name, fields) ->
+                 ctx.record_signals <- (name, type_name) :: ctx.record_signals;
+                 List.map (fun (fname, fty) ->
+                   let sn = name ^ "__" ^ fname in
+                   add_signal_type ctx sn fty;
+                   { name = sn; stype = fty; direction = dir;
+                     initial_value = None; attrs = [] }) fields
+             | `Enum ty | `Scalar ty ->
+                 add_signal_type ctx name ty;
+                 [{ name; stype = ty; direction = dir; initial_value = None; attrs = [] }])
 
         | _ -> []
       in
@@ -1387,40 +1472,74 @@ let extract_architecture ctx entity_name = function
   | _ -> ([], [], [])
 
 (* Main conversion function *)
+let rec dbg_tree depth t =
+  if depth > 6 then () else
+  let pad = String.make (2*depth) ' ' in
+  let tag h = try Vhd_front.Asctoken.asctoken h with _ -> "?" in
+  match t with
+  | Str s -> Printf.eprintf "%sStr %S\n%!" pad s
+  | Num s -> Printf.eprintf "%sNum %s\n%!" pad s
+  | List xs -> Printf.eprintf "%sList[%d]\n%!" pad (List.length xs);
+               List.iter (dbg_tree (depth+1)) xs
+  | Double (h, a) -> Printf.eprintf "%sDouble %s\n%!" pad (tag h); dbg_tree (depth+1) a
+  | Triple (h, a, b) -> Printf.eprintf "%sTriple %s\n%!" pad (tag h);
+                        dbg_tree (depth+1) a; dbg_tree (depth+1) b
+  | Quadruple (h,a,b,c) -> Printf.eprintf "%sQuad %s\n%!" pad (tag h);
+                        List.iter (dbg_tree (depth+1)) [a;b;c]
+  | Quintuple (h,a,b,c,d) -> Printf.eprintf "%sQuint %s\n%!" pad (tag h);
+                        List.iter (dbg_tree (depth+1)) [a;b;c;d]
+  | Sextuple (h,a,b,c,d,e) -> Printf.eprintf "%sSext %s\n%!" pad (tag h);
+                        List.iter (dbg_tree (depth+1)) [a;b;c;d;e]
+  | h -> Printf.eprintf "%s<%s>\n%!" pad (tag h)
+
 let convert_vhdl_to_behavioral vhdl_ast =
+  if Sys.getenv_opt "VHDL_DEBUG" <> None then
+    List.iter (fun du ->
+      match du with
+      | Triple (Vhddesign_unit, _, Double (VhdPrimaryUnit, Double (h, _)))
+        when (try Vhd_front.Asctoken.asctoken h with _ -> "") = "VhdPackageDeclaration" ->
+          Printf.eprintf "==== PACKAGE DU ====\n%!"; dbg_tree 0 du
+      | _ -> ()) vhdl_ast;
   (* The input may carry several designs (entity+architecture pairs)
      when multiple .vhd files were parsed together.  Build one bmodule
      per entity rather than folding everything into a single module
      (the old behaviour mashed all units together — for a multi-file
      parse that produced one giant self-referential module that hung
      the flattener). *)
-  let entities =
-    List.filter_map (fun du ->
-      let (n, p) = extract_entity_ports (create_context ()) du in
-      if n <> "" then Some (n, p) else None) vhdl_ast
-  in
+  (* Pre-scan every design unit (incl. packages) for record/enum types so
+     record-typed PORTS resolve and scalarize. *)
+  let type_ctx = create_context () in
+  scan_types_into type_ctx vhdl_ast;
+  let seed_types ctx =
+    ctx.record_types <- type_ctx.record_types;
+    ctx.enum_types <- type_ctx.enum_types;
+    ctx.enum_values <- type_ctx.enum_values in
+  (* One context per entity, shared between port extraction and the architecture
+     body, so record-typed ports registered in ctx.record_signals are visible
+     when the body's field accesses / whole-record copies are lowered. *)
   let modules =
-    List.map (fun (entity_name, entity_ports) ->
-      (* Fresh context per module so signal-name state doesn't bleed
-         across designs.  extract_architecture filters by entity_name,
-         so folding over all units picks this entity's architecture. *)
+    List.filter_map (fun du ->
       let ctx = create_context () in
-      let (internal_signals, processes, instances) =
-        List.fold_left (fun (sigs, procs, insts) design_unit ->
-          let (s, p, i) = extract_architecture ctx entity_name design_unit in
-          (s @ sigs, p @ procs, i @ insts)
-        ) ([], [], []) vhdl_ast
-      in
-      {
-        name = entity_name;
-        params = [];
-        signals = entity_ports @ internal_signals;
-        processes;
-        instances;
-        funcs = [];
-        mems = []; attrs = [];
-      }
-    ) entities
+      seed_types ctx;
+      let (entity_name, entity_ports) = extract_entity_ports ctx du in
+      if entity_name = "" then None
+      else begin
+        let (internal_signals, processes, instances) =
+          List.fold_left (fun (sigs, procs, insts) design_unit ->
+            let (s, p, i) = extract_architecture ctx entity_name design_unit in
+            (s @ sigs, p @ procs, i @ insts)
+          ) ([], [], []) vhdl_ast
+        in
+        Some {
+          name = entity_name;
+          params = [];
+          signals = entity_ports @ internal_signals;
+          processes;
+          instances;
+          funcs = [];
+          mems = []; attrs = [];
+        }
+      end) vhdl_ast
   in
   { modules; library_cells = [] }
 

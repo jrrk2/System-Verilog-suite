@@ -1363,6 +1363,80 @@ let linline prog_h =
   let label, p = find_prog prog_h in
   hadd (Prog (label, Behavioral_inline.inline_program p))
 
+(* Canonicalise interface / hierarchy separators ('.', '$', '\') in every name to
+ * a single '_', so a verible-scalarised interface member `m$awid` and a Vivado-
+ * flattened `m.awid` / `m\.awid` align by name in a cross-flow miter.  Intended
+ * for LEAF (or already-flattened) modules — a module with instances would also
+ * need its children canonicalised for the flatten to reconnect. *)
+let canon_sep_name s =
+  let b = Buffer.create (String.length s) in
+  let prev = ref false in
+  String.iter (fun c ->
+    if c = '.' || c = '$' || c = '\\' then
+      (if not !prev then Buffer.add_char b '_'; prev := true)
+    else (Buffer.add_char b c; prev := false)) s;
+  Buffer.contents b
+
+let rec canon_expr e =
+  match e with
+  | BVar s -> BVar (canon_sep_name s)
+  | BConst _ -> e
+  | BBinOp r -> BBinOp { r with lhs = canon_expr r.lhs; rhs = canon_expr r.rhs }
+  | BUnOp r -> BUnOp { r with operand = canon_expr r.operand }
+  | BSelect r -> BSelect { array = canon_expr r.array; index = canon_expr r.index }
+  | BSlice r -> BSlice { r with signal = canon_expr r.signal }
+  | BConcat es -> BConcat (List.map canon_expr es)
+  | BReplicate r -> BReplicate { r with value = canon_expr r.value }
+  | BCond r -> BCond { condition = canon_expr r.condition;
+                       then_val = canon_expr r.then_val; else_val = canon_expr r.else_val }
+  | BCall r -> BCall { r with args = List.map canon_expr r.args }
+
+let rec canon_stmt s =
+  match s with
+  | BAssign r -> BAssign { lhs = canon_sep_name r.lhs; rhs = canon_expr r.rhs }
+  | BIf r -> BIf { condition = canon_expr r.condition;
+                   then_stmts = List.map canon_stmt r.then_stmts;
+                   else_stmts = List.map canon_stmt r.else_stmts }
+  | BCase r -> BCase { selector = canon_expr r.selector;
+                       cases = List.map (fun (e, ss) -> (canon_expr e, List.map canon_stmt ss)) r.cases;
+                       default = List.map canon_stmt r.default }
+  | BWhile r -> BWhile { condition = canon_expr r.condition; body = List.map canon_stmt r.body }
+  | BFor r -> BFor { init = canon_stmt r.init; condition = canon_expr r.condition;
+                     update = canon_stmt r.update; body = List.map canon_stmt r.body }
+  | BBlock ss -> BBlock (List.map canon_stmt ss)
+  | BCallStmt r -> BCallStmt { r with args = List.map canon_expr r.args }
+  | BReturn eo -> BReturn (Option.map canon_expr eo)
+
+let canon_sens = function
+  | BPosEdge s -> BPosEdge (canon_sep_name s)
+  | BNegEdge s -> BNegEdge (canon_sep_name s)
+  | BLevel s -> BLevel (canon_sep_name s)
+  | BAny -> BAny
+
+let canon_proc = function
+  | BCombinational r -> BCombinational { r with sensitivity = List.map canon_sens r.sensitivity;
+                                                body = List.map canon_stmt r.body }
+  | BSequential r -> BSequential { r with clock = canon_sep_name r.clock;
+                                          reset = Option.map canon_sep_name r.reset;
+                                          body = List.map canon_stmt r.body }
+
+let canon_module (m : bmodule) =
+  { m with
+    signals = List.map (fun (s : bsignal) -> { s with name = canon_sep_name s.name }) m.signals;
+    processes = List.map canon_proc m.processes;
+    instances = List.map (fun (i : binstance) ->
+      { i with port_connections =
+                 List.map (fun (k, e) -> (canon_sep_name k, canon_expr e)) i.port_connections })
+      m.instances;
+    mems = List.map (fun (mm : bmem) -> { mm with mname = canon_sep_name mm.mname }) m.mems }
+
+let lcanon_sep mod_h =
+  let n, m, p = find_mod mod_h in
+  (* prep_for_z3 re-fetches the module by name from the PROGRAM and flattens
+   * using it, so the whole program must be canonicalised, not just [m]. *)
+  let cp = { p with modules = List.map canon_module p.modules } in
+  hadd (Mod (n, canon_module m, cp))
+
 let liflift prog_h =
   let label, p = find_prog prog_h in
   hadd (Prog (label, Behavioral_iflift.lift_program p))
@@ -2297,6 +2371,7 @@ module MakeLib
                            (wrap1 lmodule_names);
         "canon_module_names", V.efunc (V.string **->> V.string)
                            (wrap1 lcanon_module_names);
+        "canon_sep",  V.efunc (V.string **->> V.string) (wrap1 lcanon_sep);
         "splice",         V.efunc (V.string **-> V.string **-> V.string
                                    **->> V.string)
                            (wrap3 lsplice);
