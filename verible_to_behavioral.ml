@@ -3954,6 +3954,20 @@ let extract_body_params ~pkgs ~params tok =
     loop acc (List.length nodes) in
   let acc = resolve_until_fixed port_nodes  params in
   let acc = resolve_until_fixed local_nodes acc in
+  (* Port-param defaults may FORWARD-reference a body localparam — e.g.
+     verilog-axi's crossbar has `parameter M_ID_WIDTH = S_ID_WIDTH +
+     $clog2(S_COUNT)` in the #(...) port list with `localparam S_COUNT = 3`
+     in the module BODY (declared textually later).  The two passes above
+     resolve the port params before any body localparam exists, so
+     $clog2(S_COUNT) folds to $clog2(0)=0 and M_ID_WIDTH sticks at 8 instead
+     of 10 (verilator and synlig both give 10).  Now that BOTH groups are
+     seeded in `acc`, run one more fixpoint over ALL nodes: `one` re-binds a
+     param whenever its value improves, so this re-evaluates the port params
+     with the body localparams in scope (M_ID_WIDTH 8 -> 10) while leaving the
+     already-correct body localparams unchanged.  Instance overrides are
+     protected by the caller's merge, which drops any body-derived value for a
+     name it already holds. *)
+  let acc = resolve_until_fixed (port_nodes @ local_nodes) acc in
   (* Drop the original `params` we seeded with — caller already has those.
    * EXCEPTION: keep a seeded param whose value we IMPROVED (e.g. an
    * unresolved incoming `SelectableHarts="SelectableHarts"` that we folded to
