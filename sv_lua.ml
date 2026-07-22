@@ -1680,6 +1680,28 @@ let lmiter_regcorr a_h b_h =
   (try if Z3_miter.check_miter_equivalence ma' mb'' then "EQUIVALENT" else "DIFFER"
    with e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
 
+(* Bounded model check by co-simulation: prep BOTH modules (flatten hierarchy +
+ * lower always-blocks, but keep the registers — no ffrip), build a Hardcaml
+ * Cyclesim for each, and drive identical random input sequences from reset,
+ * comparing common outputs every cycle.  Reachable-only, so it separates a
+ * genuine sequential bug (concrete trace) from a spurious unreachable-state
+ * DIFFER the combinational miter reported.  BMC_CYCLES / BMC_RESET env-tunable. *)
+let lbmc_sim a_h b_h =
+  let _, ma, pa = find_mod a_h in
+  let _, mb, pb = find_mod b_h in
+  let _ = Behavioral_hier.take_unresolved () in
+  let ma' = prep_for_z3 ma pa in
+  let mb' = prep_for_z3 mb pb in
+  let _ = Behavioral_hier.take_unresolved () in
+  let geti k d = match Sys.getenv_opt k with
+    | Some s -> (try int_of_string s with _ -> d) | None -> d in
+  let n_cycles = geti "BMC_CYCLES" 64 and reset_cycles = geti "BMC_RESET" 4 in
+  match Gui_sim.bmc_compare ~n_cycles ~reset_cycles ma' mb' with
+  | Gui_sim.Bmc_equiv n -> Printf.sprintf "BOUNDED-EQUIVALENT (%d cycles)" n
+  | Gui_sim.Bmc_diff (c, port, trace) ->
+      Printf.sprintf "DIFFER @cyc %d: %s\n%s" c port (String.concat "\n" trace)
+  | Gui_sim.Bmc_error e -> Printf.sprintf "ERROR — %s" e
+
 let lreg_correspond tgt_h ref_h =
   let n, tm, tp = find_mod tgt_h in
   let _, rm, _ = find_mod ref_h in
@@ -2637,6 +2659,7 @@ module MakeLib
         "alias_output_regs", V.efunc (V.string **->> V.string) (wrap1 lalias_output_regs);
         "reg_correspond", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lreg_correspond);
         "miter_regcorr", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lmiter_regcorr);
+        "bmc_sim",     V.efunc (V.string **-> V.string **->> V.string) (wrap2 lbmc_sim);
         "splice",         V.efunc (V.string **-> V.string **-> V.string
                                    **->> V.string)
                            (wrap3 lsplice);

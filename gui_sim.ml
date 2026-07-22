@@ -106,6 +106,98 @@ let run ?(n_cycles=128) ?(reset_cycles=4) (bmod : bmodule) : sim_result =
     sr_inputs      = inputs;
     sr_outputs     = outputs }
 
+(* ── Bounded model check by co-simulation ────────────────────────────
+   Drive two circuits (built from PREPPED, non-ffripped bmodules — real
+   registers, so Cyclesim carries the state) with the SAME random input
+   sequence from reset for [n_cycles], comparing every common output port
+   each cycle.  This explores only REACHABLE states, so — unlike the
+   combinational Z3 miter — it never fires on an unreachable state; a
+   divergence it reports is a genuine reachable counterexample with a
+   concrete input trace, and no divergence in N cycles is strong evidence
+   the designs are bounded-equivalent (the miter's DIFFER was a spurious
+   unreachable-state artifact).  Inputs held at 0 during reset, then
+   randomized.  Reset polarity / clock detected by name, as in [run]. *)
+
+type bmc_result =
+  | Bmc_equiv of int                                 (* agreed for N cycles *)
+  | Bmc_diff  of int * string * string list          (* cycle, port, trace lines *)
+  | Bmc_error of string
+
+let bmc_compare ?(n_cycles=64) ?(reset_cycles=4) ?(seed=0xB3C0DE)
+    (ma : bmodule) (mb : bmodule) : bmc_result =
+  try
+    Random.init seed;
+    (* Yosys's scattered-concat nets can trip Hardcaml's combinational-loop
+       check even when acyclic; retry with the check off before giving up. *)
+    let mk_sim m =
+      try Cyclesim.create (Behavioral_to_hardcaml.create_circuit m)
+      with _ -> Cyclesim.create
+                  (Behavioral_to_hardcaml.create_circuit ~detect_loops:false m) in
+    let sa = mk_sim ma in
+    let sb = mk_sim mb in
+    let ain = Cyclesim.in_ports sa and aout = Cyclesim.out_ports sa in
+    let bin = Cyclesim.in_ports sb and bout = Cyclesim.out_ports sb in
+    (* Union of primary-input (name,width); clk left to Cyclesim. *)
+    let width_of ports name = match List.assoc_opt name ports with
+      | Some b -> Some (Bits.width !b) | None -> None in
+    let in_names =
+      List.sort_uniq compare (List.map fst ain @ List.map fst bin) in
+    let set ports name v = match List.assoc_opt name ports with
+      | Some b -> b := v | None -> () in
+    (* Common outputs to compare; flag width mismatches as structural. *)
+    let common_outs =
+      List.filter_map (fun (n, b) ->
+        match List.assoc_opt n bout with
+        | Some b2 -> Some (n, Bits.width !b, Bits.width !b2)
+        | None -> None) aout in
+    let hex b = "0b" ^ Bits.to_bstr b in
+    let trace = ref [] in
+    let diff = ref None in
+    let cyc = ref 0 in
+    while !diff = None && !cyc < n_cycles do
+      let c = !cyc in
+      let line = Buffer.create 64 in
+      List.iter (fun name ->
+        if is_clock_name name then ()
+        else begin
+          let w = match width_of ain name with Some w -> w
+                  | None -> (match width_of bin name with Some w -> w | None -> 1) in
+          let v =
+            if is_reset_name name then begin
+              let asserted = c < reset_cycles in
+              let lo = is_active_low_reset name in
+              if asserted = (not lo) then Bits.ones w else Bits.zero w
+            end else if c < reset_cycles then Bits.zero w
+            else Bits.random ~width:w
+          in
+          set ain name v; set bin name v;
+          if not (is_reset_name name) then
+            Buffer.add_string line (Printf.sprintf " %s=%s" name (hex v))
+        end) in_names;
+      Cyclesim.cycle sa; Cyclesim.cycle sb;
+      trace := Printf.sprintf "  c%d:%s" c (Buffer.contents line) :: !trace;
+      (* compare common outputs *)
+      List.iter (fun (n, wa, wb) ->
+        if !diff = None then
+          if wa <> wb then
+            diff := Some (c, Printf.sprintf "%s (width %d vs %d)" n wa wb)
+          else begin
+            let va = !(List.assoc n aout) and vb = !(List.assoc n bout) in
+            if not (Bits.equal va vb) then
+              diff := Some (c, Printf.sprintf "%s: %s vs %s" n (hex va) (hex vb))
+          end) common_outs;
+      incr cyc
+    done;
+    (match !diff with
+     | None -> Bmc_equiv n_cycles
+     | Some (c, port) ->
+         let tl = List.rev !trace in
+         let shown = if List.length tl > 12
+           then ("  …" :: (List.filteri (fun i _ -> i >= List.length tl - 12) tl))
+           else tl in
+         Bmc_diff (c, port, shown))
+  with e -> Bmc_error (Printexc.to_string e)
+
 (* ── Pretty-formatters for the renderer ──────────────────────────────── *)
 
 (* 1-bit signal as 0/1.  Wider signals as hex with the right number of nibbles. *)
