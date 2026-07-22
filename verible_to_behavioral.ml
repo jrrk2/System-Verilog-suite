@@ -6156,8 +6156,20 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
    * uses (the module's Input|Output signals), but with each interface port's
    * scalarized members (p$clk, p$data, …) collapsed to ONE slot (base, Some iface)
    * at the position of its first member. *)
+  (* Strip a specialise_design suffix (`axi_master_passthru__MIW4_IIW4` ->
+   * `axi_master_passthru`): module_iface_ports/_insts are keyed by the BASE name
+   * (from mdecl.m_name at convert time) but bmodules carry the specialised name. *)
+  let base_name n =
+    let len = String.length n in
+    let rec find i =
+      if i + 1 >= len then n
+      else if n.[i] = '_' && n.[i+1] = '_' then String.sub n 0 i
+      else find (i + 1) in
+    find 0
+  in
   let slots_of (mm : bmodule) =
-    let ifps = Option.value ~default:[] (Hashtbl.find_opt module_iface_ports mm.name) in
+    let ifps = Option.value ~default:[]
+        (Hashtbl.find_opt module_iface_ports (base_name mm.name)) in
     let member_base name =
       (* if `name` is `base$mem` with base a known interface port, return (base,iface) *)
       match String.index_opt name '$' with
@@ -6186,7 +6198,7 @@ let elaborate_interfaces (bmods : bmodule list) : bmodule list =
     (* interface instances declared in this module (incl. port-less bundles that
      * never became a binstance) *)
     List.iter (fun (nm, iface) -> Hashtbl.replace inst_iface nm iface)
-      (Option.value ~default:[] (Hashtbl.find_opt module_iface_insts m.name));
+      (Option.value ~default:[] (Hashtbl.find_opt module_iface_insts (base_name m.name)));
     (* also any that DID surface as a binstance (safety net) *)
     List.iter (fun (i : binstance) ->
       if is_iface_mod i.module_name then
