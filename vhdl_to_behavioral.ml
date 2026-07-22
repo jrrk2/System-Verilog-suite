@@ -1142,29 +1142,52 @@ let extract_entity_ports ctx = function
 
         | Double (VhdInterfaceObjectDeclaration,
                  Double (VhdInterfaceDefaultDeclaration,
-                        Sextuple (Vhdinterface_default_declaration, Str name,
+                        Sextuple (Vhdinterface_default_declaration, name_node,
                                  mode, subtype, _kind, _default))) ->
             let dir = match mode with
               | VhdInterfaceModeOut -> `Output
               | VhdInterfaceModeInOut -> `Output   (* approximate inout as out *)
               | _ -> `Input in
+            (* Multi-name port declarations (`clk_i, rstn_i : in std_ulogic`) put a
+               List of names in the name slot; single-name a bare Str. *)
+            let names = match name_node with
+              | Str n -> [n]
+              | List xs -> List.filter_map (function Str n -> Some n | _ -> None) xs
+              | _ -> [] in
             (* A record-typed port (`ctrl_i : ctrl_bus_t`) scalarizes to one port
              * per field (`ctrl_i__ir_funct3`, …), matching how record field
              * accesses are lowered — without this the whole record collapses to
              * the 1-bit infer_btype default and every field read dangled. *)
-            (match resolve_user_type_g ctx subtype with
-             | `Record (type_name, fields) ->
-                 ctx.record_signals <- (name, type_name) :: ctx.record_signals;
-                 List.map (fun (fname, fty) ->
-                   let sn = name ^ "__" ^ fname in
-                   add_signal_type ctx sn fty;
-                   { name = sn; stype = fty; direction = dir;
-                     initial_value = None; attrs = [] }) fields
-             | `Enum ty | `Scalar ty ->
-                 add_signal_type ctx name ty;
-                 [{ name; stype = ty; direction = dir; initial_value = None; attrs = [] }])
+            List.concat_map (fun name ->
+              match resolve_user_type_g ctx subtype with
+              | `Record (type_name, fields) ->
+                  ctx.record_signals <- (name, type_name) :: ctx.record_signals;
+                  List.map (fun (fname, fty) ->
+                    let sn = name ^ "__" ^ fname in
+                    add_signal_type ctx sn fty;
+                    { name = sn; stype = fty; direction = dir;
+                      initial_value = None; attrs = [] }) fields
+              | `Enum ty | `Scalar ty ->
+                  add_signal_type ctx name ty;
+                  [{ name; stype = ty; direction = dir; initial_value = None; attrs = [] }])
+              names
 
-        | _ -> []
+        | other ->
+            if Sys.getenv_opt "VHDL_DEBUG" <> None then begin
+              let tag h = try Vhd_front.Asctoken.asctoken h with _ -> "?" in
+              let shp = function
+                | Double (h, _) -> "Double " ^ tag h
+                | Triple (h, _, _) -> "Triple " ^ tag h
+                | Sextuple (h, _, _, _, _, _) -> "Sext " ^ tag h
+                | List xs -> Printf.sprintf "List[%d]" (List.length xs)
+                | Str s -> "Str " ^ s | _ -> "?" in
+              Printf.eprintf "[port-miss] %s\n%!" (shp other);
+              (match other with
+               | Double (_, Double (_, Sextuple (_, nm, _, _, _, _))) ->
+                   Printf.eprintf "  name-slot: %s\n%!" (shp nm)
+               | _ -> ())
+            end;
+            []
       in
       (entity_name, extract_ports [] port_list)
 

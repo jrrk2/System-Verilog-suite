@@ -1435,11 +1435,23 @@ let rename_module f (m : bmodule) =
 
 let canon_module m = rename_module canon_sep_name m
 
-(* Rename a register aliased directly to an output (`assign res_o = n101_q` with
- * n101_q a register) so it carries the output's name — GHDL/yosys synth names
- * registers `nNN_q`, the behavioural reference names them after the output, and
- * the miter's FF-rip needs the state (`__Q`) names to correspond. *)
+(* Rename a register aliased directly to a named signal (`assign cnt = n61_q` /
+ * `assign res_o = n101_q`, n61_q/n101_q registers) so it carries that signal's
+ * name.  GHDL/yosys synth name registers `nNN_q` but keep the source signal as a
+ * wire aliasing them — the behavioural reference names the register after that
+ * same source signal, so this makes the FF-rip state (`__Q`) names correspond
+ * across flows for EVERY register, not just output-driving ones.  A register with
+ * a synthetic name aliased to a meaningful one is renamed to the meaningful name;
+ * ties (two aliases of one register) resolve to the first, preferring outputs. *)
 let alias_output_regs (m : bmodule) =
+  let is_synth n =
+    (* nNN_q / nNN_o style synthesizer temporaries *)
+    String.length n >= 2 && n.[0] = 'n'
+    && (let ok = ref true in String.iteri (fun i c ->
+          if i > 0 && i < String.length n - 2 && not (c >= '0' && c <= '9') then ok := false) n;
+        !ok)
+    && (let l = String.length n in
+        (l >= 2 && String.sub n (l-2) 2 = "_q") || (l >= 2 && String.sub n (l-2) 2 = "_o")) in
   let outs = List.filter_map (fun (s : bsignal) ->
     if s.direction = `Output then Some s.name else None) m.signals in
   let seq_lhs = Hashtbl.create 16 in
@@ -1454,12 +1466,17 @@ let alias_output_regs (m : bmodule) =
     | _ -> () in
   List.iter (function BSequential r -> List.iter collect r.body | _ -> ()) m.processes;
   let renames = Hashtbl.create 8 in
-  List.iter (function
-    | BCombinational { body = [BAssign { lhs; rhs = BVar r }]; _ }
-      when List.mem lhs outs && r <> lhs && not (List.mem r outs)
-           && Hashtbl.mem seq_lhs r && not (Hashtbl.mem renames r) ->
-        Hashtbl.replace renames r lhs
-    | _ -> ()) m.processes;
+  (* pass 1: outputs win the name; pass 2: any other named alias *)
+  let consider ~outputs_only =
+    List.iter (function
+      | BCombinational { body = [BAssign { lhs; rhs = BVar r }]; _ }
+        when r <> lhs && Hashtbl.mem seq_lhs r && not (Hashtbl.mem seq_lhs lhs)
+             && not (is_synth lhs) && not (Hashtbl.mem renames r)
+             && (if outputs_only then List.mem lhs outs else true) ->
+          Hashtbl.replace renames r lhs
+      | _ -> ()) m.processes in
+  consider ~outputs_only:true;
+  consider ~outputs_only:false;
   if Hashtbl.length renames = 0 then m
   else begin
     let f n = match Hashtbl.find_opt renames n with Some o -> o | None -> n in
