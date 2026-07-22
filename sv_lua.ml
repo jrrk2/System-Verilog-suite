@@ -1619,8 +1619,13 @@ let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list 
       Printf.eprintf "[regcorr] rregs=%d tregs=%d classes=%d iters=%d ref_nonzero_D=%d/%d\n%!"
         (List.length rregs) (List.length tregs) (nclasses ()) !it nz (List.length rregs);
       if List.length rregs <= 12 then begin
-        List.iter (fun (b,_,_) -> Printf.eprintf "  R %s -> c%d\n%!" b (Hashtbl.find cls (key "R" b))) rregs;
-        List.iter (fun (b,_,_) -> Printf.eprintf "  T %s -> c%d\n%!" b (Hashtbl.find cls (key "T" b))) tregs
+        (* one shared-input, all-state=1 probe: print each reg's __D value *)
+        let iv = List.map (fun n -> (n, Z.of_int 7)) all_in in
+        let qv regs tag = List.map (fun (b,_,q) -> (q, Z.of_int 3)) regs in
+        let ro = r_sim (iv @ qv rregs "R") and to_ = t_sim (iv @ qv tregs "T") in
+        let dv o b = try Hashtbl.find o (b^"__D") with Not_found -> Z.minus_one in
+        List.iter (fun (b,_,_) -> Printf.eprintf "  R %s c%d D=%s\n%!" b (Hashtbl.find cls (key "R" b)) (Z.to_string (dv ro b))) rregs;
+        List.iter (fun (b,_,_) -> Printf.eprintf "  T %s c%d D=%s\n%!" b (Hashtbl.find cls (key "T" b)) (Z.to_string (dv to_ b))) tregs
       end
     end;
     let byc = Hashtbl.create 256 in
