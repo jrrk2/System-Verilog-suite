@@ -1369,66 +1369,119 @@ let linline prog_h =
  * for LEAF (or already-flattened) modules — a module with instances would also
  * need its children canonicalised for the flatten to reconnect. *)
 let canon_sep_name s =
+  (* Collapse any run of separator chars ('.', '$', '\', '_') to a SINGLE '_'.
+   * Different flows spell a scalarized record/interface member differently — the
+   * VHDL frontend uses `ctrl_i__ir_funct3` (double underscore), GHDL-synth
+   * Verilog uses `ctrl_i_ir_funct3` (single), Vivado uses `m.awid` — this maps
+   * them all to one canonical `ctrl_i_ir_funct3` so they align by name. *)
   let b = Buffer.create (String.length s) in
   let prev = ref false in
   String.iter (fun c ->
-    if c = '.' || c = '$' || c = '\\' then
+    if c = '.' || c = '$' || c = '\\' || c = '_' then
       (if not !prev then Buffer.add_char b '_'; prev := true)
     else (Buffer.add_char b c; prev := false)) s;
   Buffer.contents b
 
-let rec canon_expr e =
+(* Generic name-rewrite over a module (f : name -> name). *)
+let rec rn_expr f e =
   match e with
-  | BVar s -> BVar (canon_sep_name s)
+  | BVar s -> BVar (f s)
   | BConst _ -> e
-  | BBinOp r -> BBinOp { r with lhs = canon_expr r.lhs; rhs = canon_expr r.rhs }
-  | BUnOp r -> BUnOp { r with operand = canon_expr r.operand }
-  | BSelect r -> BSelect { array = canon_expr r.array; index = canon_expr r.index }
-  | BSlice r -> BSlice { r with signal = canon_expr r.signal }
-  | BConcat es -> BConcat (List.map canon_expr es)
-  | BReplicate r -> BReplicate { r with value = canon_expr r.value }
-  | BCond r -> BCond { condition = canon_expr r.condition;
-                       then_val = canon_expr r.then_val; else_val = canon_expr r.else_val }
-  | BCall r -> BCall { r with args = List.map canon_expr r.args }
+  | BBinOp r -> BBinOp { r with lhs = rn_expr f r.lhs; rhs = rn_expr f r.rhs }
+  | BUnOp r -> BUnOp { r with operand = rn_expr f r.operand }
+  | BSelect r -> BSelect { array = rn_expr f r.array; index = rn_expr f r.index }
+  | BSlice r -> BSlice { r with signal = rn_expr f r.signal }
+  | BConcat es -> BConcat (List.map (rn_expr f) es)
+  | BReplicate r -> BReplicate { r with value = rn_expr f r.value }
+  | BCond r -> BCond { condition = rn_expr f r.condition;
+                       then_val = rn_expr f r.then_val; else_val = rn_expr f r.else_val }
+  | BCall r -> BCall { r with args = List.map (rn_expr f) r.args }
 
-let rec canon_stmt s =
+let rec rn_stmt f s =
   match s with
-  | BAssign r -> BAssign { lhs = canon_sep_name r.lhs; rhs = canon_expr r.rhs }
-  | BIf r -> BIf { condition = canon_expr r.condition;
-                   then_stmts = List.map canon_stmt r.then_stmts;
-                   else_stmts = List.map canon_stmt r.else_stmts }
-  | BCase r -> BCase { selector = canon_expr r.selector;
-                       cases = List.map (fun (e, ss) -> (canon_expr e, List.map canon_stmt ss)) r.cases;
-                       default = List.map canon_stmt r.default }
-  | BWhile r -> BWhile { condition = canon_expr r.condition; body = List.map canon_stmt r.body }
-  | BFor r -> BFor { init = canon_stmt r.init; condition = canon_expr r.condition;
-                     update = canon_stmt r.update; body = List.map canon_stmt r.body }
-  | BBlock ss -> BBlock (List.map canon_stmt ss)
-  | BCallStmt r -> BCallStmt { r with args = List.map canon_expr r.args }
-  | BReturn eo -> BReturn (Option.map canon_expr eo)
+  | BAssign r -> BAssign { lhs = f r.lhs; rhs = rn_expr f r.rhs }
+  | BIf r -> BIf { condition = rn_expr f r.condition;
+                   then_stmts = List.map (rn_stmt f) r.then_stmts;
+                   else_stmts = List.map (rn_stmt f) r.else_stmts }
+  | BCase r -> BCase { selector = rn_expr f r.selector;
+                       cases = List.map (fun (e, ss) -> (rn_expr f e, List.map (rn_stmt f) ss)) r.cases;
+                       default = List.map (rn_stmt f) r.default }
+  | BWhile r -> BWhile { condition = rn_expr f r.condition; body = List.map (rn_stmt f) r.body }
+  | BFor r -> BFor { init = rn_stmt f r.init; condition = rn_expr f r.condition;
+                     update = rn_stmt f r.update; body = List.map (rn_stmt f) r.body }
+  | BBlock ss -> BBlock (List.map (rn_stmt f) ss)
+  | BCallStmt r -> BCallStmt { r with args = List.map (rn_expr f) r.args }
+  | BReturn eo -> BReturn (Option.map (rn_expr f) eo)
 
-let canon_sens = function
-  | BPosEdge s -> BPosEdge (canon_sep_name s)
-  | BNegEdge s -> BNegEdge (canon_sep_name s)
-  | BLevel s -> BLevel (canon_sep_name s)
-  | BAny -> BAny
+let rn_sens f = function
+  | BPosEdge s -> BPosEdge (f s) | BNegEdge s -> BNegEdge (f s)
+  | BLevel s -> BLevel (f s) | BAny -> BAny
 
-let canon_proc = function
-  | BCombinational r -> BCombinational { r with sensitivity = List.map canon_sens r.sensitivity;
-                                                body = List.map canon_stmt r.body }
-  | BSequential r -> BSequential { r with clock = canon_sep_name r.clock;
-                                          reset = Option.map canon_sep_name r.reset;
-                                          body = List.map canon_stmt r.body }
+let rn_proc f = function
+  | BCombinational r -> BCombinational { r with sensitivity = List.map (rn_sens f) r.sensitivity;
+                                                body = List.map (rn_stmt f) r.body }
+  | BSequential r -> BSequential { r with clock = f r.clock;
+                                          reset = Option.map f r.reset;
+                                          body = List.map (rn_stmt f) r.body }
 
-let canon_module (m : bmodule) =
+let rename_module f (m : bmodule) =
   { m with
-    signals = List.map (fun (s : bsignal) -> { s with name = canon_sep_name s.name }) m.signals;
-    processes = List.map canon_proc m.processes;
+    signals = List.map (fun (s : bsignal) -> { s with name = f s.name }) m.signals;
+    processes = List.map (rn_proc f) m.processes;
     instances = List.map (fun (i : binstance) ->
-      { i with port_connections =
-                 List.map (fun (k, e) -> (canon_sep_name k, canon_expr e)) i.port_connections })
+      { i with port_connections = List.map (fun (k, e) -> (f k, rn_expr f e)) i.port_connections })
       m.instances;
-    mems = List.map (fun (mm : bmem) -> { mm with mname = canon_sep_name mm.mname }) m.mems }
+    mems = List.map (fun (mm : bmem) -> { mm with mname = f mm.mname }) m.mems }
+
+let canon_module m = rename_module canon_sep_name m
+
+(* Rename a register aliased directly to an output (`assign res_o = n101_q` with
+ * n101_q a register) so it carries the output's name — GHDL/yosys synth names
+ * registers `nNN_q`, the behavioural reference names them after the output, and
+ * the miter's FF-rip needs the state (`__Q`) names to correspond. *)
+let alias_output_regs (m : bmodule) =
+  let outs = List.filter_map (fun (s : bsignal) ->
+    if s.direction = `Output then Some s.name else None) m.signals in
+  let seq_lhs = Hashtbl.create 16 in
+  let rec collect = function
+    | BAssign { lhs; _ } -> Hashtbl.replace seq_lhs lhs ()
+    | BIf r -> List.iter collect r.then_stmts; List.iter collect r.else_stmts
+    | BCase r -> List.iter (fun (_, ss) -> List.iter collect ss) r.cases;
+                 List.iter collect r.default
+    | BBlock ss -> List.iter collect ss
+    | BWhile r -> List.iter collect r.body
+    | BFor r -> List.iter collect r.body
+    | _ -> () in
+  List.iter (function BSequential r -> List.iter collect r.body | _ -> ()) m.processes;
+  let renames = Hashtbl.create 8 in
+  List.iter (function
+    | BCombinational { body = [BAssign { lhs; rhs = BVar r }]; _ }
+      when List.mem lhs outs && r <> lhs && not (List.mem r outs)
+           && Hashtbl.mem seq_lhs r && not (Hashtbl.mem renames r) ->
+        Hashtbl.replace renames r lhs
+    | _ -> ()) m.processes;
+  if Hashtbl.length renames = 0 then m
+  else begin
+    let f n = match Hashtbl.find_opt renames n with Some o -> o | None -> n in
+    let m = rename_module f m in
+    (* drop the now self-referential alias `O := O` and the merged reg signals *)
+    let processes = List.filter (function
+      | BCombinational { body = [BAssign { lhs; rhs = BVar r }]; _ } -> lhs <> r
+      | _ -> true) m.processes in
+    let seen = Hashtbl.create 16 in
+    let signals = List.filter (fun (s : bsignal) ->
+      if Hashtbl.mem seen s.name then false
+      else (Hashtbl.replace seen s.name (); true)) m.signals in
+    { m with processes; signals }
+  end
+
+let lalias_output_regs mod_h =
+  let n, m, p = find_mod mod_h in
+  let m' = alias_output_regs m in
+  (* Update the module in the PROGRAM too — prep_for_z3 re-fetches by name. *)
+  let cp = { p with modules =
+    List.map (fun (mm : bmodule) -> if mm.name = m.name then m' else mm) p.modules } in
+  hadd (Mod (n, m', cp))
 
 let lcanon_sep mod_h =
   let n, m, p = find_mod mod_h in
@@ -2372,6 +2425,7 @@ module MakeLib
         "canon_module_names", V.efunc (V.string **->> V.string)
                            (wrap1 lcanon_module_names);
         "canon_sep",  V.efunc (V.string **->> V.string) (wrap1 lcanon_sep);
+        "alias_output_regs", V.efunc (V.string **->> V.string) (wrap1 lalias_output_regs);
         "splice",         V.efunc (V.string **-> V.string **-> V.string
                                    **->> V.string)
                            (wrap3 lsplice);

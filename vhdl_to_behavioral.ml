@@ -885,6 +885,18 @@ let rec find_reset_in_expr = function
   | Double (VhdParenthesedPrimary, expr) -> find_reset_in_expr expr
   | _ -> None
 
+(* Reset polarity from the reset condition: `rstn = '0'` is active-LOW (`Neg),
+   `rst = '1'` / bare `rst` is active-HIGH (`Pos).  Downstream, ffrip inverts the
+   reset cone for `Neg so a synthesised active-high reset (a tool emits `~rstn`)
+   and this active-low source agree in the miter. *)
+let rec reset_edge_of_cond = function
+  | Double (VhdCondition, e) | Double (VhdParenthesedPrimary, e) -> reset_edge_of_cond e
+  | Triple (VhdEqualRelation, _, Double (VhdCharPrimary, Char '0'))
+  | Triple (VhdEqualRelation, Double (VhdCharPrimary, Char '0'), _) -> `Neg
+  | Triple (VhdEqualRelation, _, Double (VhdCharPrimary, Char '1'))
+  | Triple (VhdEqualRelation, Double (VhdCharPrimary, Char '1'), _) -> `Pos
+  | _ -> `Pos
+
 (* Analyze process to determine if it's sequential or combinational *)
 let analyze_process_structure body =
   let clock_info = ref None in
@@ -903,7 +915,7 @@ let analyze_process_structure body =
          | None ->
              (* Outer cond is the reset; clock should be in elsif. *)
              (match find_reset_in_expr cond with
-              | Some rst -> reset_info := Some (rst, `Pos)
+              | Some rst -> reset_info := Some (rst, reset_edge_of_cond cond)
               | None -> ());
              (match elsif_part with
               | Double (VhdElsif,
@@ -927,19 +939,6 @@ let analyze_process_structure body =
    clock edge into the BSequential metadata, the inner gate is
    pure noise — replace `[BIf {clk_cond, X, []}]` in the else
    branch with X. *)
-let rec elide_clock_guard clk = function
-  | [] -> []
-  | [BIf { condition; then_stmts; else_stmts = [] }]
-    when (match condition with
-          | BBinOp { op = BAnd; rhs = BBinOp { op = BEq;
-                       lhs = BVar c; rhs = BConst { value = zv; _ } }; _ }
-            when c = clk && Z.equal zv Z.one -> true
-          | BBinOp { op = BAnd; lhs = BBinOp { op = BEq;
-                       lhs = BVar c; rhs = BConst { value = zv; _ } }; _ }
-            when c = clk && Z.equal zv Z.one -> true
-          | _ -> false) -> then_stmts
-  | x :: tl -> x :: elide_clock_guard clk tl
-
 (* `if rising_edge(clk) then BODY end if;` (no else) is a pure clock
    guard — once we know the process is sequential on `clk`, the BIf
    itself is redundant and we want to expose BODY directly. *)
@@ -951,6 +950,17 @@ let is_clock_guard clk = function
   | BBinOp { op = BAnd; lhs = BBinOp { op = BEq;
                lhs = BVar c; rhs = BConst { value = zv; _ } }; _ } when Z.equal zv Z.one -> c = clk
   | _ -> false
+
+(* Drop a redundant inner clock guard from a reset else-branch: the idiom
+       if (rst = '1') then ... elsif rising_edge(clk) then BODY end if
+   parses as a BIf whose else-branch is `[BIf {clk_guard, BODY, []}]`.  Once the
+   clock edge is in the BSequential metadata the inner gate is noise → BODY.
+   (Handles BOTH `rising_edge(clk)` and `clk'event and clk='1'` guard forms.) *)
+let rec elide_clock_guard clk = function
+  | [] -> []
+  | [BIf { condition; then_stmts; else_stmts = [] }]
+    when is_clock_guard clk condition -> then_stmts
+  | x :: tl -> x :: elide_clock_guard clk tl
 
 let rec elide_clock_guard_outer clk = function
   | [] -> []
