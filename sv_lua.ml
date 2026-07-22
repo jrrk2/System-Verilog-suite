@@ -797,6 +797,17 @@ let canonicalize_ff_names (m : bmodule) : bmodule =
     | BInt { width; _ } -> Hashtbl.replace widths s.name width
     | BBool -> Hashtbl.replace widths s.name 1
     | _ -> ()) m.signals;
+  (* Ports (esp. outputs) that another signal drives via `assign <port> =
+     <port>_reg`.  Canonicalising a behavioural `<port>_reg` to `<port>__b0`
+     lets resolve_input_bitbus rewrite the READ of `<port>_reg` to `<port>[0:0]`
+     while the FF WRITE stays `<port>__b0` — the port then self-loops
+     (`x = x[0:0]`) and the register goes dead (breaks Cyclesim/BMC and the
+     comb-cone the Z3 miter sees).  Exempt a `<base>_reg` scalar whose base IS a
+     module PORT, mirroring the width>1 guard; the output-alias register stays
+     `<port>_reg`, kept loop-free. *)
+  let ports : (string, unit) Hashtbl.t = Hashtbl.create 32 in
+  List.iter (fun (s : bsignal) ->
+    if s.direction <> `Internal then Hashtbl.replace ports s.name ()) m.signals;
   let canon_ff_name nm =
     let c = canon_ff_name nm in
     if String.equal c nm then nm
@@ -807,9 +818,12 @@ let canonicalize_ff_names (m : bmodule) : bmodule =
         not (String.contains nm '[')
         && String.length c > 4
         && String.sub c (String.length c - 4) 4 = "__b0" in
+      let base_is_port =
+        scalar_rule && Hashtbl.mem ports (String.sub c 0 (String.length c - 4)) in
       if scalar_rule
-         && (match Hashtbl.find_opt widths nm with
-             | Some w -> w > 1 | None -> false)
+         && (base_is_port
+             || (match Hashtbl.find_opt widths nm with
+                 | Some w -> w > 1 | None -> false))
       then nm else c in
   let rec re_e e = match e with
     | BVar n -> BVar (canon_ff_name n)
