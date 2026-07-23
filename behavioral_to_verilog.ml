@@ -514,6 +514,22 @@ let verilog_of_module prog bmod =
   (* Processes *)
   let process_strs = String.concat "\n" (List.map verilog_of_process processes) in
 
+  (* Dedup instance NAMES within this module.  An unrolled generate-FOR block
+     replicates its instances under one shared block label (gpio's
+     `for (i) begin : gen_debounce  debounce dbnc(...)` flattens to 8×
+     `gen_debounce_dbnc`), which xvlog rejects as re-declared.  Instance names
+     are pure labels — connectivity is by net, not by instance name — so
+     suffixing the 2nd+ collision of each name is safe.  The first keeps its
+     name so the common (non-replicated) case is untouched. *)
+  let instances =
+    let seen = Hashtbl.create 64 in
+    List.map (fun (i : binstance) ->
+      match Hashtbl.find_opt seen i.inst_name with
+      | None -> Hashtbl.replace seen i.inst_name 0; i
+      | Some n ->
+          let n = n + 1 in
+          Hashtbl.replace seen i.inst_name n;
+          { i with inst_name = Printf.sprintf "%s__g%d" i.inst_name n }) instances in
   (* Instances *)
   let instance_strs = String.concat "\n\n" (List.map (verilog_of_instance prog) instances) in
 
