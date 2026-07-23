@@ -1460,10 +1460,24 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
    * are sign-cast no-ops at the Z3 BV level. Other recognised system
    * tasks: $clog2 (folded to a constant by eval_int — see above). *)
   | TUPLE3 (STRING "reference_or_call_base1", ref_node, call_base) ->
-      let fname = ref None in
+      (* A package-qualified callee `pkg::func(args)` (dm::nop(), dm::auipc(),
+         the pulp-debug abstract-command instruction encoders) parses as a
+         qualified_id whose FIRST identifier is the package and LAST is the
+         function.  Taking the first id named the call `dm` and dropped the
+         member, so Behavioral_inline could never substitute the constant
+         function body — the whole abstract_cmd ROM stayed as opaque `dm()`
+         calls.  For a qualified callee use the MEMBER (last id); otherwise the
+         plain first id. *)
+      let is_qualified = ref false in
+      let first_id = ref None and last_id = ref None in
       walk (function
-        | SymbolIdentifier id when !fname = None -> fname := Some id
+        | TUPLE4 (STRING t, _, _, _) when prefix_is "qualified_id" t ->
+            is_qualified := true
+        | SymbolIdentifier id ->
+            if !first_id = None then first_id := Some id;
+            last_id := Some id
         | _ -> ()) ref_node;
+      let fname = ref (if !is_qualified then !last_id else !first_id) in
       (match !fname with
        | Some (("$unsigned" | "$signed") as cast_name) ->
            (* Find the inner expression argument.  `reference` matches
