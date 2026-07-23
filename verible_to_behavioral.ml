@@ -4443,6 +4443,31 @@ let scalarize_arrays_module (m : bmodule) : bmodule =
     end
   end
 
+(* Extract (field, int) pairs from a struct assignment-pattern initializer node
+   — the standalone form of extract_body_params inner extract_struct_pairs, used
+   to fold PACKAGE struct localparams (ibex_pkg exc_cause_t ExcCause) the same
+   way as module struct localparams. *)
+let struct_field_pairs ~pkgs ~params node : (string * int) list =
+  (* Find the (first / outermost) `'{field: v, …}` assignment_pattern2 anywhere
+     in the node — robust whether called on the raw value expression or the whole
+     param-declaration node. *)
+  let ap2_body =
+    match collect_by (has_tag (prefix_is "assignment_pattern2")) node with
+    | TUPLE4 (_, _, body, _) :: _ -> Some body
+    | _ -> None in
+  match ap2_body with
+  | Some (TLIST xs) ->
+      List.filter_map (fun e -> match e with
+        | TUPLE4 (STRING t, key, _, value)
+          when prefix_is "structure_or_array_pattern_expression" t ->
+            let kname = ref None in
+            walk (function SymbolIdentifier id when !kname = None ->
+                          kname := Some id | _ -> ()) key;
+            (match !kname, eval_int ~pkgs ~params value with
+             | Some k, Some n -> Some (k, n) | _ -> None)
+        | _ -> None) xs
+  | _ -> []
+
 let convert_module ~pkgs (mdecl : module_decl)
                           (params : (string * string) list) : bmodule =
   (* Reset the per-module array-typed localparam ROM table BEFORE
@@ -4682,6 +4707,47 @@ let convert_module ~pkgs (mdecl : module_decl)
        (collect_by (has_tag (prefix_is "any_param_declaration")) mdecl.m_body);
      !acc in
    cur_signal_struct := param_struct_decls @ !cur_signal_struct);
+  (* PACKAGE struct localparams (ibex_pkg exc_cause_t ExcCauseIllegalInsn, a
+     struct assignment-pattern with irq_ext/irq_int/lower_cause fields) are the
+     same shape as module struct localparams (DebugHartInfo) but live in package
+     bodies.  Register their field VALUES (cur_struct_params) + name->type
+     (cur_signal_struct) here too, so pack_struct_const folds a whole/sliced use
+     everywhere downstream, not just inside the package that declares them.
+     Guarded by (not mem cur_struct_params n) so a module-local decl wins. *)
+  List.iter (fun (p : Verible_elaborate.package_decl) ->
+    List.iter (fun pn ->
+      (* The struct TYPE is the id that is a known struct typedef. *)
+      let ty = ref None in
+      walk (function
+        | SymbolIdentifier id
+          when !ty = None && List.mem_assoc id !cur_struct_defs -> ty := Some id
+        | _ -> ()) pn;
+      (* The param NAME is the first id that is neither the type nor one of its
+         fields — for a user-typed param (`exc_cause_t ExcCauseIllegalInsn`) the
+         last id of param_type_followed_by_id is the TYPE, not the name, and the
+         initializer contributes the field ids. *)
+      let name = match !ty with
+        | None -> None
+        | Some t ->
+            let fields = match List.assoc_opt t !cur_struct_defs with
+              | Some l -> List.map fst l | None -> [] in
+            let nm = ref None in
+            walk (function
+              | SymbolIdentifier id
+                when !nm = None && id <> t && not (List.mem id fields) ->
+                  nm := Some id
+              | _ -> ()) pn;
+            !nm in
+      match name, !ty with
+      | Some n, Some t when not (Hashtbl.mem cur_struct_params n) ->
+          let pairs = struct_field_pairs ~pkgs ~params:[] pn in
+          if pairs <> [] then begin
+            Hashtbl.replace cur_struct_params n pairs;
+            cur_signal_struct := (n, t) :: !cur_signal_struct
+          end
+      | _ -> ())
+      (collect_by (has_tag (prefix_is "any_param_declaration")) p.pkg_body)
+  ) pkgs;
   (* Record the interface instances among these struct-typed locals for the
    * interface-elaboration pass (type is a registered interface), together with
    * each instance's parameter overrides so its bundle members can be sized
