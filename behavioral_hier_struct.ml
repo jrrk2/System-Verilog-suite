@@ -481,6 +481,56 @@ let flatten_structural (p : bprogram) ~top : bmodule =
              attrs = [];
            } :: acc) referenced []
   in
+  (* ERC (post-flatten): every primitive INPUT pin must read a DRIVEN net — a
+     primitive OUTPUT pin, a top-level INPUT port, or a constant.  A driverless
+     reader is a dropped driver from gate_map/flatten: it reads X in simulation
+     and its cell is pruned in P&R (this silently killed the ibex hybrid CPU —
+     obuf_<port> inputs left undriven by the __<bit> name-resolution miss).
+     Enabled by SVS_FLATTEN_ERC/SVS_FLATTEN_DEBUG; the former also fails loudly. *)
+  (if Sys.getenv_opt "SVS_FLATTEN_ERC" <> None
+      || Sys.getenv_opt "SVS_FLATTEN_DEBUG" <> None then begin
+    let out_pin p =
+      (String.length p >= 2 && String.sub p 0 2 = "DO")
+      || List.mem p [ "O"; "CO"; "Q"; "MC31" ] in
+    let driven : (string, unit) Hashtbl.t = Hashtbl.create 4096 in
+    List.iter (fun (s : bsignal) ->
+      if s.direction = `Input then Hashtbl.replace driven s.name ()) port_signals;
+    List.iter (fun c -> Hashtbl.replace driven c ())
+      [ "VCC"; "GND"; "<const0>"; "<const1>" ];
+    let rec mark = function
+      | BVar n -> Hashtbl.replace driven n ()
+      | BSlice { signal; _ } -> mark signal
+      | BSelect { array; _ } -> mark array
+      | BConcat es -> List.iter mark es
+      | _ -> () in
+    List.iter (fun (i : binstance) ->
+      List.iter (fun (pin, e) -> if out_pin pin then mark e) i.port_connections) prims;
+    let reads : (string, string) Hashtbl.t = Hashtbl.create 4096 in
+    let rec rd inst = function
+      | BVar n -> if not (Hashtbl.mem driven n) then Hashtbl.replace reads n inst
+      | BSlice { signal = BVar n; _ } ->
+          if not (Hashtbl.mem driven n) then Hashtbl.replace reads n inst
+      | BSlice { signal; _ } -> rd inst signal
+      | BSelect { array; _ } -> rd inst array
+      | BConcat es -> List.iter (rd inst) es
+      | _ -> () in
+    List.iter (fun (i : binstance) ->
+      List.iter (fun (pin, e) -> if not (out_pin pin) then rd i.inst_name e)
+        i.port_connections) prims;
+    let n = Hashtbl.length reads in
+    if n > 0 then begin
+      Printf.eprintf
+        "[flatten-ERC] %d driverless net(s) feed primitive inputs \
+         (dropped driver in gate_map/flatten):\n" n;
+      let c = ref 0 in
+      Hashtbl.iter (fun net reader ->
+        if !c < 20 then (Printf.eprintf "  %s  read by %s\n" net reader; incr c))
+        reads;
+      if Sys.getenv_opt "SVS_FLATTEN_ERC" <> None then
+        failwith (Printf.sprintf
+          "flatten_structural ERC: %d driverless net(s) — see [flatten-ERC] above" n)
+    end
+  end);
   { top_mod with
     signals = port_signals @ extra_signals;
     instances = prims;
