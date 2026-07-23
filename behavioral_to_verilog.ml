@@ -464,6 +464,29 @@ let verilog_of_signal sig_ =
     Some decl
 
 (* Generate module *)
+(* Emit an inferred memory (ROM/RAM) as a `reg` array plus, when it carries
+   init_values, an `initial` block loading them.  meminfer lifts decoder `case`
+   tables to BRom + `x = rom_x[sel]` and the program RAM to a BRam with the
+   $readmemh image in init_values; without emitting bmod.mems those `rom_*`
+   reads (and the program image) had no declaration and xvlog rejected them. *)
+let verilog_of_mem ~decl (m : bmem) =
+  let dw = max 1 m.data_width in
+  (* [decl]=false when the memory is ALSO an already-declared signal array
+     (dm_mem's `mem`/`progbuf`, etc.) — emit only the init block to avoid a
+     second declaration, but still load init_values (the $readmemh image). *)
+  let decl_str =
+    if decl then
+      Printf.sprintf "  reg [%d:0] %s [0:%d];" (dw - 1) m.mname (max 0 (m.depth - 1))
+    else "" in
+  if m.init_values = [] then decl_str
+  else
+    let mask = if dw >= 62 then -1 else (1 lsl dw) - 1 in
+    let assigns = List.mapi (fun i v ->
+      Printf.sprintf "    %s[%d] = %d'h%x;" m.mname i dw (v land mask)) m.init_values in
+    let init_str =
+      Printf.sprintf "  initial begin\n%s\n  end" (String.concat "\n" assigns) in
+    if decl_str = "" then init_str else decl_str ^ "\n" ^ init_str
+
 let verilog_of_module prog bmod =
   let { name; params; signals; processes; instances } = bmod in
 
@@ -511,6 +534,20 @@ let verilog_of_module prog bmod =
   let internal_signals = List.filter (fun (s : bsignal) -> s.direction = `Internal) signals in
   let signal_decls = String.concat "\n" (List.filter_map verilog_of_signal internal_signals) in
 
+  (* Inferred memory (ROM/RAM) declarations + init blocks.  Skip the array
+     declaration when the name is already a declared signal (emit only its init
+     block) to avoid a second declaration. *)
+  let mem_decls =
+    (* Dedup by name: meminfer can lift the same lhs to a rom_<lhs> in more than
+       one branch, producing duplicate bmems that would re-declare the array. *)
+    let seen = Hashtbl.create 16 in
+    let uniq = List.filter (fun (m : bmem) ->
+      if Hashtbl.mem seen m.mname then false
+      else (Hashtbl.replace seen m.mname (); true)) bmod.mems in
+    String.concat "\n" (List.map (fun (m : bmem) ->
+      let already_sig = List.exists (fun (s : bsignal) -> s.name = m.mname) signals in
+      verilog_of_mem ~decl:(not already_sig) m) uniq) in
+
   (* Processes *)
   let process_strs = String.concat "\n" (List.map verilog_of_process processes) in
 
@@ -534,7 +571,7 @@ let verilog_of_module prog bmod =
   let instance_strs = String.concat "\n\n" (List.map (verilog_of_instance prog) instances) in
 
   (* Combine all *)
-  let body_parts = [signal_decls; process_strs; instance_strs]
+  let body_parts = [signal_decls; mem_decls; process_strs; instance_strs]
     |> List.filter (fun s -> s <> "")
     |> String.concat "\n\n"
   in
