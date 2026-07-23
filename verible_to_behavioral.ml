@@ -313,6 +313,19 @@ let rec eval_int ~pkgs ~params tok =
        | Some 0 -> eval_int ~pkgs ~params e
        | Some _ -> eval_int ~pkgs ~params t
        | None -> None)
+  (* Unary prefix `!x` / `-x` / `+x`.  Without this, ibex's
+       MISA_VALUE = … | (32'(!RV32E) << 8) | …
+     failed to fold (`!` unhandled) and, since eval_int returns None on the
+     whole `|`-chain if ANY operand is None, the entire localparam leaked. *)
+  | TUPLE3 (STRING tag, op_tok, operand) when prefix_is "unary_prefix_expr" tag ->
+      (match eval_int ~pkgs ~params operand with
+       | None -> None
+       | Some v ->
+           (match op_tok with
+            | PLING  -> Some (if v = 0 then 1 else 0)
+            | HYPHEN -> Some (- v)
+            | PLUS   -> Some v
+            | _      -> None))
   (* Concat `{a, b, c}` — fold to integer when every part is a sized
      literal (so we know its width).  picorv32-style trace-flag
      localparams like
