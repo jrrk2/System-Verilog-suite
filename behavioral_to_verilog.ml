@@ -42,8 +42,12 @@ let rec verilog_of_type = function
       (* PACKED 2-D with the array dimension FIRST, so `a[idx]` selects a
          `width`-bit element AND the whole `a` is a packed vector (needed for
          both `a[idx][..]` reads/`@mem_write` and wholesale `x = a` assigns).
-         `logic [31:0][0:1]` would make `a[idx]` index the 32-bit dim instead. *)
-      Printf.sprintf "logic [0:%d][%d:0]" (size - 1) (width - 1)
+         `logic [31:0][0:1]` would make `a[idx]` index the 32-bit dim instead.
+         The outer dimension is DESCENDING ([size-1:0]) so a descending
+         part-select `a[1:0]` (gpio's `{gp_i_q[1:0], gp_i}`) matches the
+         declared direction — an ascending [0:size-1] made xelab reject the
+         part-select (VRFC 10-1219, opposite direction). *)
+      Printf.sprintf "logic [%d:0][%d:0]" (size - 1) (width - 1)
   | BArray { element; size } ->
       Printf.sprintf "%s [0:%d]" (verilog_of_type element) (size - 1)
   | BStruct _ -> "/* struct not supported in Verilog */"
