@@ -1007,6 +1007,27 @@ let cur_signal_struct : (string * string) list ref = ref []
  * back to dummy_bool. *)
 let cur_signal_widths : (string * int) list ref = ref []
 
+(* Per-module table of signals declared with a NON-ZERO packed LSB, e.g.
+ * `logic [31:1] instr_addr_q`.  The emitted declaration is normalised to
+ * zero-based `[width-1:0]` (BInt keeps only width), so every bit/part-
+ * select written against the source indices must be REBASED by the
+ * declared LSB to stay consistent with the zero-based declaration —
+ * `instr_addr_q[31:1]` -> `[30:0]`, `instr_addr_q[1:1]` -> `[0:0]`.
+ * Without this, ibex_fetch_fifo reads out-of-range/off-by-one bits and
+ * the fetch aligner picks the wrong half-word.  Maps name -> lsb. *)
+let cur_signal_lsb : (string * int) list ref = ref []
+
+(* Build a BSlice, rebasing the indices when the base is a plain signal
+ * declared with a non-zero LSB (see cur_signal_lsb).  A no-op for the
+ * common zero-LSB case. *)
+let mk_bslice signal msb lsb =
+  match signal with
+  | BVar name ->
+      (match List.assoc_opt name !cur_signal_lsb with
+       | Some l when l <> 0 -> BSlice { signal; msb = msb - l; lsb = lsb - l }
+       | _ -> BSlice { signal; msb; lsb })
+  | _ -> BSlice { signal; msb; lsb }
+
 (* Per-module table of array-typed localparams from .svh includes /
    inline `'{e1, e2, …}` initialisers.  Maps the localparam name to
    the list of element bexprs in source order (index 0 = first elem).
@@ -1858,7 +1879,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                 (match eval_int ~pkgs ~params e1,
                        eval_int ~pkgs ~params e2 with
                  | Some b, Some w when w > 0 ->
-                     BSlice { signal; msb = b + w - 1; lsb = b }
+                     mk_bslice signal (b + w - 1) b
                  | _, Some w when w > 0 ->
                      let base = recurse e1 in
                      let result_t = BInt { width = w; signed = Unsigned } in
@@ -1876,7 +1897,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                 (match eval_int ~pkgs ~params e1,
                        eval_int ~pkgs ~params e2 with
                  | Some b, Some w when w > 0 ->
-                     BSlice { signal; msb = b; lsb = b - w + 1 }
+                     mk_bslice signal b (b - w + 1)
                  | _, Some w when w > 0 ->
                      (* signal[base -: width] = bits [base : base-w+1]
                         = (signal >> (base - w + 1)) & {w{1'b1}}. *)
@@ -1901,7 +1922,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
                    logic with $high-style fallback. *)
                 (match eval_int ~pkgs ~params e1,
                        eval_int ~pkgs ~params e2 with
-                 | Some m, Some l -> BSlice { signal; msb = m; lsb = l }
+                 | Some m, Some l -> mk_bslice signal m l
                  | None, Some l ->
                      (match signal_width () with
                       | Some w when w > 0 ->
@@ -1916,7 +1937,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
              BSelect { array = signal; index = recurse idx }
            else
              (match eval_int ~pkgs ~params idx with
-              | Some i -> BSlice { signal; msb = i; lsb = i }
+              | Some i -> mk_bslice signal i i
               | None ->
                   (* Dynamic-index single-bit select on a packed signal:
                      SV `signal[idx]` returns one bit.  Lower to
@@ -3147,6 +3168,32 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
               found := true
           | _ -> ()) key;
         !found in
+      (* A case item with MULTIPLE comma-separated labels
+         (`3'b000, 3'b010, 3'b011: stmt`) carries an `expression_list_proper`
+         key.  recurse_e on it would collapse the whole list into a single
+         BConcat, so the arm matched `sel == {L1,L2,L3}` and NEVER fired
+         (ibex_decoder marked every addi/branch illegal).  Split the comma
+         spine into the individual label ASTs so each becomes its own
+         equality arm.  A braced `{a,b}` label is a genuine concat node (not
+         expression_list_proper) and is intentionally left intact. *)
+      let case_key_labels key =
+        let rec flatten acc t = match t with
+          | TUPLE4 (STRING tag', x, _comma, y)
+            when prefix_is "expression_list_proper" tag' -> flatten (y :: acc) x
+          | other -> other :: acc in
+        let found = ref None in
+        let rec look t = match t with
+          | TUPLE4 (STRING tag', _, _, _)
+            when prefix_is "expression_list_proper" tag' ->
+              if !found = None then found := Some t
+          | TUPLE2 (a, b) -> look a; look b
+          | TUPLE3 (a, b, c) -> look a; look b; look c
+          | TUPLE4 (a, b, c, d) -> List.iter look [a; b; c; d]
+          | TUPLE5 (a, b, c, d, e) -> List.iter look [a; b; c; d; e]
+          | TLIST xs -> List.iter look xs
+          | _ -> () in
+        look key;
+        (match !found with Some l -> flatten [] l | None -> [key]) in
       let has_wild =
         List.exists (function Some (_, Some _), _ -> true | _ -> false)
           (List.map (fun (k, b) -> (k, b)) arms) in
@@ -3170,8 +3217,17 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
             | _ -> ()) key;
           match List.rev !ranges with
           | [] ->
-              BBinOp { op = BEq; lhs = sel; rhs = recurse_e key;
-                       result_type = bool_t }
+              (* no ranges: OR an equality per comma-separated label so a
+                 multi-label arm in a wild/range case still matches. *)
+              let eq lbl = BBinOp { op = BEq; lhs = sel; rhs = recurse_e lbl;
+                                    result_type = bool_t } in
+              (match case_key_labels key with
+               | [single] -> eq single
+               | l :: rest ->
+                   List.fold_left (fun a lbl ->
+                     BBinOp { op = BOr; lhs = a; rhs = eq lbl;
+                              result_type = bool_t }) (eq l) rest
+               | [] -> eq key)
           | rs ->
               let one (lo, hi) =
                 BBinOp { op = BAnd;
@@ -3209,7 +3265,11 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
           List.fold_left (fun (cs, def) (k, b) ->
             match k with
             | None -> (cs, b)
-            | Some (key, _) -> (cs @ [(recurse_e key, b)], def))
+            | Some (key, _) ->
+                (* one equality arm per comma-separated label, all sharing b *)
+                let arms_for_key =
+                  List.map (fun lbl -> (recurse_e lbl, b)) (case_key_labels key) in
+                (cs @ arms_for_key, def))
             ([], []) arms in
         BCase { selector = sel; cases; default }
       end
@@ -4930,6 +4990,7 @@ let convert_module ~pkgs (mdecl : module_decl)
    * port + internal signals are extracted, before any expr_to_bexpr
    * call. Keeps result_type_for from falling back to dummy_bool. *)
   cur_signal_widths := [];
+  cur_signal_lsb := [];
   if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
     List.iter (fun (n, t) ->
       Printf.eprintf "  signal %s : %s\n" n t
@@ -5258,7 +5319,14 @@ let convert_module ~pkgs (mdecl : module_decl)
             when prefix_is "trailing_decl_assignment" t -> try_value v
           | _ -> ()) n;
         match !nm with
-        | Some id -> Some {
+        | Some id ->
+            (* Record a non-zero packed LSB (scalar `logic [31:1] X`) so
+             * reference3's slices get rebased to the zero-based decl. *)
+            (match stype, unpacked, packed_dims with
+             | BInt _, None, [(_, l)] when l <> 0 ->
+                 cur_signal_lsb := (id, l) :: !cur_signal_lsb
+             | _ -> ());
+            Some {
             name = id;
             stype;
             direction = `Internal;
