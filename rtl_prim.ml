@@ -112,15 +112,22 @@ let comb_cell (sel_val : string option) (i : binstance) : bprocess option =
           | _ -> acc) base (List.rev arms) in
         emit rhs
     | None -> None in
-  match strip_bs i.module_name with
+  (* Vivado suffixes bit-width variants with digits (RTL_AND0 = 1-bit AND); strip
+     them so the base operation matches. *)
+  let mname = strip_bs i.module_name in
+  let mstem =
+    let n = ref (String.length mname) in
+    while !n > 0 && mname.[!n - 1] >= '0' && mname.[!n - 1] <= '9' do decr n done;
+    String.sub mname 0 !n in
+  match mstem with
   | "RTL_INV" -> un BNot
   | "RTL_AND" -> bin BAnd ut | "RTL_OR" -> bin BOr ut | "RTL_XOR" -> bin BXor ut
   | "RTL_ADD" -> bin BAdd ut | "RTL_SUB" -> bin BSub ut | "RTL_MUL" -> bin BMul ut
-  | "RTL_LSHIFT" -> bin BShl ut | "RTL_RSHIFT" -> bin BShr ut
+  | "RTL_LSHIFT" -> bin BShl ut | "RTL_RSHIFT" -> bin BShr ut | "RTL_ARSHIFT" -> bin BAshr ut
   | "RTL_EQ" -> bin BEq bool_t | "RTL_NEQ" -> bin BNe bool_t
   | "RTL_LT" -> bin BLt bool_t | "RTL_LEQ" -> bin BLe bool_t
   | "RTL_GT" -> bin BGt bool_t | "RTL_GEQ" -> bin BGe bool_t
-  | m when String.length m >= 7 && String.sub m 0 7 = "RTL_MUX" -> mux ()
+  | "RTL_MUX" -> mux ()
   | _ -> None
 
 (* Group per-bit RTL_REG cells writing the same (base signal, clock, enable) into
