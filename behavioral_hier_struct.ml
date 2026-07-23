@@ -91,6 +91,15 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
   match e with
   | BVar nm when is_const_sentinel nm -> e
   | BVar nm ->
+      (* FIRST try the FULL name as a port: gate_map may have split a vector
+         port into PER-BIT ports each literally named "<base>__<bit>", so the
+         child's reference and the port share that exact name.  Splitting into
+         base+bit first (below) then looks up "<base>", which misses the per-bit
+         port and leaves the reference an undriven orphan (gp_i__2, obuf inputs,
+         CDC-FIFO cross-domain bits). *)
+      (match port_actual nm with
+       | Some actual -> actual
+       | None ->
       let base, idx_opt = parse_bit nm in
       (match port_actual base, idx_opt with
        | Some actual, None        -> actual
@@ -102,7 +111,7 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
                 (match port_actual b with
                  | Some actual -> bit_select actual bit
                  | None        -> BVar (pname prefix nm))
-            | None -> BVar (pname prefix nm)))
+            | None -> BVar (pname prefix nm))))
   | BSelect { array; index } ->
       let array' = rewrite_bexpr ~prefix ~port_actual array in
       (match array', index with
