@@ -398,11 +398,19 @@ let verilog_of_instance prog inst =
   List.iter (fun (port, _) -> Hashtbl.add connected_ports port true) port_connections;
 
   let all_port_connections =
-    List.map (fun port_name ->
-      match List.assoc_opt port_name port_connections with
-      | Some expr -> Printf.sprintf ".%s(%s)" port_name (verilog_of_expr expr)
-      | None -> Printf.sprintf ".%s()" port_name  (* Empty connection *)
-    ) expected_ports
+    if expected_ports <> [] then
+      List.map (fun port_name ->
+        match List.assoc_opt port_name port_connections with
+        | Some expr -> Printf.sprintf ".%s(%s)" port_name (verilog_of_expr expr)
+        | None -> Printf.sprintf ".%s()" port_name  (* Empty connection *)
+      ) expected_ports
+    else
+      (* Unknown primitive (LUT/FDRE/RAMB/… not in library_cells and not a user
+         module — the usual case for a gate-mapped program): emit the instance's
+         ACTUAL port_connections verbatim, else the cell loses ALL connectivity
+         (`the_LUT1 ()`) and the whole gate netlist is dead in simulation. *)
+      List.map (fun (port, expr) ->
+        Printf.sprintf ".%s(%s)" port (verilog_of_expr expr)) port_connections
   in
 
   let ports_str = String.concat ",\n    " all_port_connections in
