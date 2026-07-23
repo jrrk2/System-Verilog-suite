@@ -944,6 +944,10 @@ let dummy_bool = BInt { width = 1; signed = Unsigned }
  * hand `'1`. Falls back to `BVar id` if the value isn't recognisable
  * as a numeric constant — that way `parameter type T = …` keeps its
  * symbolic name. *)
+(* Params whose value could not be folded to a constant, already warned about
+   (dedup so one unresolved param does not spam per reference). *)
+let unresolved_param_warned : (string, unit) Hashtbl.t = Hashtbl.create 16
+
 let param_value_to_bexpr id v =
   let v = String.trim v in
   if v = "" then BVar id
@@ -1215,7 +1219,22 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
   match tok with
   | SymbolIdentifier id ->
       (match List.assoc_opt id params with
-       | Some v -> param_value_to_bexpr id v
+       | Some v ->
+           (match param_value_to_bexpr id v with
+            | BVar _ ->
+                (* A PARAMETER whose value could not be folded to a constant
+                   (e.g. an ibex_csr `.ResetValue({MSTATUS_RST_VAL})` struct-
+                   localparam override that specialise_design cannot pack).  A
+                   param is always a constant, so fold to 0 rather than emit an
+                   undeclared identifier that xvlog rejects.  Warn (deduped). *)
+                (if not (Hashtbl.mem unresolved_param_warned id) then begin
+                   Hashtbl.replace unresolved_param_warned id ();
+                   Printf.eprintf
+                     "[verible_to_bir] WARN: param %s value %S did not fold to a \
+                      constant — using 0\n%!" id v
+                 end);
+                BConst { value = Z.zero; width = 32 }
+            | b -> b)
        | None -> (match pack_struct_const id with Some c -> c | None -> BVar id))
   | TK_DecNumber n | TK_UnBasedNumber n ->
       (* SV unbased-unsized literals: `'0`, `'1`, `'x`, `'z`. The bit
@@ -1262,7 +1281,17 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        * value here so downstream Z3 sees a concrete int rather than a
        * free variable. *)
       (match List.assoc_opt id params with
-       | Some v -> param_value_to_bexpr id v
+       | Some v ->
+           (match param_value_to_bexpr id v with
+            | BVar _ ->
+                (if not (Hashtbl.mem unresolved_param_warned id) then begin
+                   Hashtbl.replace unresolved_param_warned id ();
+                   Printf.eprintf
+                     "[verible_to_bir] WARN: param %s value %S did not fold to a \
+                      constant — using 0\n%!" id v
+                 end);
+                BConst { value = Z.zero; width = 32 }
+            | b -> b)
        | None -> (match pack_struct_const id with Some c -> c | None -> BVar id))
   (* Array assignment pattern `'{e1, e2, …}` — Verible's
      `assignment_pattern1` wraps a TLIST of bare expressions (no key
