@@ -1622,6 +1622,45 @@ let convert_vhdl_files_to_behavioral filenames =
       (* Convert to behavioral IR *)
       let result = convert_vhdl_to_behavioral !trees in
 
+      (* Resolve Vivado RTL_* primitives (from `synth_design -rtl; write_vhdl`)
+         into behavioural processes.  The mux family needs the per-instance
+         SEL_VAL attribute (select->input map); text-scan it from the source
+         since the VHDL AST drops attribute specifications. *)
+      let result =
+        let norm s =
+          let s = String.trim s in
+          let s = if String.length s > 0 && s.[0] = '\\'
+                  then String.sub s 1 (String.length s - 1) else s in
+          if String.length s > 0 && s.[String.length s - 1] = '\\'
+          then String.sub s 0 (String.length s - 1) else s in
+        let sel_tbl : (string, string) Hashtbl.t = Hashtbl.create 64 in
+        let re = Str.regexp
+          "attribute SEL_VAL of \\([^ ]+\\) : label is \"\\([^\"]*\\)\"" in
+        List.iter (fun fn ->
+          try
+            let ic = open_in fn in
+            (try while true do
+               let line = input_line ic in
+               (try
+                  ignore (Str.search_forward re line 0);
+                  Hashtbl.replace sel_tbl (norm (Str.matched_group 1 line))
+                    (Str.matched_group 2 line)
+                with Not_found -> ())
+             done with End_of_file -> ());
+            close_in ic
+          with _ -> ()) filenames;
+        if Hashtbl.length sel_tbl = 0
+           && not (List.exists (fun (m : Behavioral_ir.bmodule) ->
+                     List.exists (fun (i : Behavioral_ir.binstance) ->
+                       String.length i.module_name >= 4
+                       && String.sub i.module_name 0 4 = "RTL_") m.instances)
+                     result.modules)
+        then result
+        else
+          let sel_val_of inst = Hashtbl.find_opt sel_tbl (norm inst) in
+          { result with modules =
+              List.map (Rtl_prim.resolve_rtl_instances sel_val_of) result.modules } in
+
       (* Restore old hashtable and settings before returning *)
       Vhd_front.Vabstraction.vhdlhash := old_hash;
       Vhd_front.VhdlSettings.settings := old_settings;

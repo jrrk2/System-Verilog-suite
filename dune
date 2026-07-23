@@ -32,6 +32,7 @@
           behavioural_to_opt_ir opt_ir_to_sv opt_ir_to_behavioral opt_ir_naming sv_opt_ir
           behavioral_unroll behavioral_initeval behavioral_mem_merge behavioral_inline behavioral_iflift behavioral_meminfer behavioral_srl_infer behavioral_ffrip behavioral_share behavioral_sanity behavioral_blocking_subst behavioral_flatten behavioral_hier behavioral_boundary mem_macro_resolve behavioral_memlower fpga_bram_resolve
           verible_elaborate verible_to_behavioral verible_emit_source rtlil_to_behavioral
+          rtl_prim
           slang_to_behavioral
           sv_verify_hardcaml sv_memory sv_liberty sv_gate_map gate_netlist_to_behavioral
           liberty liberty_lex liberty_rewrite sv_lua arch_verify sv_attr_extract behavioral_arch_subst behavioral_ffpack behavioral_timing cell_delay post_swap_check block_tag lib_map lib_size cell_verilog_emit hier_synth tie_fanout mux_chain_flatten kary_merge timing_ref scan_insert mem_boundary_scan jtag_tap_insert gate_sim atpg_directed atpg_podem fault_sim block_arch_swap synth_pipeline gui_sim gui_waveform cdc_analysis symbol_lib schematic_layout schematic_view
