@@ -321,6 +321,22 @@ let lparse frontend top files =
   let p = load_frontend ~frontend ~top ~files in
   hadd (Prog (top, p))
 
+(* Parse with TOP parameter overrides ("CounterWidth=64,Foo=1"), so verible
+ * elaborates the top with the same parameters its instantiation site uses (e.g.
+ * comparing ibex_counter as the CounterWidth=64 instance, not the default 32). *)
+let lparse_spec frontend top files params_str =
+  let top_params =
+    String.split_on_char ',' params_str
+    |> List.filter_map (fun kv ->
+         match String.index_opt kv '=' with
+         | Some i -> Some (String.trim (String.sub kv 0 i),
+                           String.trim (String.sub kv (i + 1) (String.length kv - i - 1)))
+         | None -> None) in
+  let p = match frontend with
+    | "verible" -> post_load (Verible_to_behavioral.convert_files ~top ~top_params files)
+    | _ -> load_frontend ~frontend ~top ~files in
+  hadd (Prog (top, p))
+
 (* No-top "read everything" entry — see Verible_to_behavioral.convert_files_all.
  * Currently only the verible frontend has a no-top path; the others fall
  * back to load_frontend with "" as top, which slang/yosys will reject —
@@ -2699,6 +2715,9 @@ module MakeLib
         "parse",      V.efunc (V.string **-> V.string **-> V.list V.string
                                **->> V.string)
                        (wrap3 lparse);
+        "parse_spec", V.efunc (V.string **-> V.string **-> V.list V.string
+                               **-> V.string **->> V.string)
+                       (wrap4 lparse_spec);
         "parse_all",  V.efunc (V.string **-> V.list V.string
                                **->> V.string)
                        (wrap2 lparse_all);

@@ -6555,7 +6555,7 @@ let name_positional_ports (bmods : bmodule list) : bmodule list =
   List.map (fun (m : bmodule) ->
     { m with instances = List.map resolve_inst m.instances }) bmods
 
-let convert_files_inner ~top files : bprogram =
+let convert_files_inner ~top ?(top_params : (string * string) list = []) files : bprogram =
   mem_init_search_paths := discover_init_dirs files;
   if Sys.getenv_opt "MEM_INIT_DEBUG" <> None && !mem_init_search_paths <> [] then
     Printf.eprintf "[mem_init] auto-discovered: %s\n"
@@ -6644,6 +6644,17 @@ let convert_files_inner ~top files : bprogram =
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
   let specs = specialise_design ~pkgs mods ~top_name:top in
+  (* Override the TOP module's parameters (e.g. compare ibex_counter as the
+     CounterWidth=64 instance Vivado synthesised, not the default 32).  A
+     standalone top has no instantiation site, so specialise_design gives it its
+     defaults; the caller can pin the real values here. *)
+  let specs =
+    if top_params = [] then specs
+    else List.map (fun (s : specialised) ->
+      if s.s_name = top || s.s_base = top then
+        { s with s_params = top_params
+                 @ List.filter (fun (n, _) -> not (List.mem_assoc n top_params)) s.s_params }
+      else s) specs in
   let bmods = List.filter_map (fun (s : specialised) ->
     match Hashtbl.find_opt by_name s.s_base with
     | None ->
@@ -6753,8 +6764,8 @@ let convert_files_inner ~top files : bprogram =
   List.fold_left (fun p tbl -> Sv_attr_extract.stamp_program tbl p)
     prog attr_tables
 
-let convert_files ~top files : bprogram =
-  convert_files_inner ~top files
+let convert_files ~top ?(top_params : (string * string) list = []) files : bprogram =
+  convert_files_inner ~top ~top_params files
 
 (* Retained as an alias: external (unmatched) instances are ALWAYS kept now, so
  * this behaves identically to convert_files.  Kept so existing callers (gate-
