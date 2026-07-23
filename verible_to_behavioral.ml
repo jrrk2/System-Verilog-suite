@@ -5366,7 +5366,16 @@ let convert_module ~pkgs (mdecl : module_decl)
     let nb  = scan_indexed_lhs [mdecl.m_body] "nonblocking_assignment" 1 in
     List.sort_uniq compare (cont @ blk @ nb) in
   let array_names =
-    List.sort_uniq compare (array_names @ indexed_targets) in
+    (* The initial array_names came only from reg_var_signals (internal regs),
+       so an array-typed PORT (`input [W-1:0] host_addr_i [NrHosts]`) was NOT
+       treated as an array: a dynamic index `host_addr_i[sel]` then lowered to a
+       1-bit select `(host_addr_i >> sel) & 1` instead of a W-bit element select,
+       truncating the bus master-address mux (device_addr = 1 bit) and stalling
+       the CPU fetch.  Include every BArray signal from the full port+internal
+       list. *)
+    let all_arrays = List.filter_map (fun (s : bsignal) ->
+      match s.stype with BArray _ -> Some s.name | _ -> None) signals in
+    List.sort_uniq compare (array_names @ indexed_targets @ all_arrays) in
   let assign_procs = List.concat_map (fun ca ->
     extract_assign ~pkgs ~params ~arrays:array_names ca
   ) cont_assigns in
