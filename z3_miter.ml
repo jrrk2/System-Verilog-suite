@@ -769,6 +769,51 @@ let get_undriven_internals bmod =
     else None
   ) bmod.signals
 
+(* Collect the BASE name of every WRITE TARGET in a statement: BAssign LHS
+ * (base before any '['), plus the first argument of a @slice_write / @mem_write
+ * BCallStmt (the partial-write target).  Unlike collect_written this also sees
+ * the partial-write pseudo-ops, so a slice/bit write onto a signal is counted
+ * as driving it. *)
+let rec collect_write_targets acc = function
+  | BAssign { lhs; _ } ->
+      let base = match String.index_opt lhs '[' with
+        | Some i when i > 0 -> String.sub lhs 0 i | _ -> lhs in
+      base :: acc
+  | BBlock ss -> List.fold_left collect_write_targets acc ss
+  | BIf { then_stmts; else_stmts; _ } ->
+      let acc = List.fold_left collect_write_targets acc then_stmts in
+      List.fold_left collect_write_targets acc else_stmts
+  | BCase { cases; default; _ } ->
+      let acc = List.fold_left (fun a (_, ss) ->
+        List.fold_left collect_write_targets a ss) acc cases in
+      List.fold_left collect_write_targets acc default
+  | BWhile { body; _ } | BFor { body; _ } ->
+      List.fold_left collect_write_targets acc body
+  | BCallStmt { func = ("@slice_write" | "@mem_write"); args = BVar tgt :: _ } ->
+      tgt :: acc
+  | BCallStmt _ | BReturn _ -> acc
+
+(* A well-formed module NEVER drives its own input ports.  A frontend / pass
+ * bug that redirects a write onto an input port — e.g. blocking_subst
+ * substituting a @slice_write TARGET so dm_csrs's `sbaddr_d[31:0] = …` becomes
+ * `sbaddress_i[31:0] = …` (sbaddress_i is an INPUT) — is INVISIBLE to the
+ * equivalence encoder: it models every input port as a free primary input and
+ * silently discards the internal write, so the miter returns a VACUOUS
+ * EQUIVALENT (the write, and any divergence it causes, never enters Z3).
+ * Return the list of input ports that are internally driven. *)
+let driven_input_ports bmod =
+  let written = List.fold_left (fun acc p ->
+    let body = match p with
+      | BCombinational { body; _ } -> body
+      | BSequential   { body; _ } -> body in
+    List.fold_left collect_write_targets acc body
+  ) [] bmod.processes in
+  let written_set = List.sort_uniq compare written in
+  List.filter_map (fun (s : bsignal) ->
+    if s.direction = `Input && List.mem s.name written_set
+    then Some s.name else None
+  ) bmod.signals
+
 (* Create miter circuit and check equivalence *)
 (* [input_consts]: contextual assume-guarantee — port constants the PARENT
    instantiation binds identically on both flows.  Vivado const-propagates
@@ -783,6 +828,23 @@ let get_undriven_internals bmod =
    trusted optimisation.  Mask 0 skips the output entirely. *)
 let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
                             ?(output_masks : (string * Z.t) list = []) bmod1 bmod2 =
+  (* STRUCTURAL GUARD (runs BEFORE any Z3 encoding): a module that internally
+     drives one of its own INPUT ports is malformed — the encoder treats input
+     ports as free primary inputs and silently drops the write, so the miter
+     would return a vacuous EQUIVALENT.  Fail loudly here so the frontend / pass
+     bug surfaces as an ERROR verdict instead of a false pass. *)
+  List.iter (fun (bmod, tag) ->
+    match driven_input_ports bmod with
+    | [] -> ()
+    | ports ->
+        failwith (Printf.sprintf
+          "malformed %s module %s: input port(s) internally driven [%s] — a \
+           frontend/pass bug redirected a write onto an input port; the \
+           equivalence encoder models input ports as free inputs and silently \
+           drops such writes (would give a VACUOUS EQUIVALENT). Fix the source \
+           of the input-port write."
+          tag bmod.name (String.concat ", " ports))
+  ) [ (bmod1, "design-1"); (bmod2, "design-2") ];
   Printf.printf "═══════════════════════════════════════════════════════════════\n";
   Printf.printf "  Z3 Miter Equivalence Checking\n";
   Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
