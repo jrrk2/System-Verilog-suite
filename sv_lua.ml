@@ -1006,6 +1006,82 @@ let canonicalize_ff_names (m : bmodule) : bmodule =
                port_connections =
                  List.map (fun (p,e) -> (p, re_e e)) i.port_connections }) m.instances }
 
+(* Coalesce combinational processes that each write a disjoint CONSTANT slice of the
+   SAME signal into one concat assignment.  Verilator lowers `assign s[hi:lo]=a;
+   assign s[hi2:lo2]=b;` (ibex splits a signal across several continuous assigns —
+   e.g. ibex_counter's `counter[31:0]=counter_q; counter[63:32]='0`) into one
+   always_comb per slice, each a @slice_write to `s`.  The Z3/ffrip path assembles a
+   signal from statements WITHIN one process (SSA), not ACROSS processes, so `s` was
+   left under-constrained (free) and the miter found a spurious counterexample.
+   Verible sidesteps this by emitting a single concat.  Only merge when EVERY writer
+   of `s` is one such single-slice process AND the slices tile [0,W-1] exactly
+   (disjoint + complete) — so nothing else drives `s` and there is no gap needing a
+   self-read (which would loop). *)
+let merge_slice_processes (m : bmodule) : bmodule =
+  let open Behavioral_ir in
+  let widths : (string, int) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun (s : bsignal) ->
+    match s.stype with
+    | BInt { width; _ } -> Hashtbl.replace widths s.name width
+    | BBool -> Hashtbl.replace widths s.name 1
+    | _ -> ()) m.signals;
+  let rec stmt_writes acc = function
+    | BAssign { lhs; _ } -> lhs :: acc
+    | BCallStmt { func; args = BVar s :: _ }
+      when func = "@slice_write" || func = "@part_sel_write_up"
+        || func = "@part_sel_write_down" || func = "@mem_write" -> s :: acc
+    | BIf { then_stmts; else_stmts; _ } ->
+        List.fold_left stmt_writes (List.fold_left stmt_writes acc then_stmts) else_stmts
+    | BCase { cases; default; _ } ->
+        List.fold_left (fun a (_, b) -> List.fold_left stmt_writes a b)
+          (List.fold_left stmt_writes acc default) cases
+    | BWhile { body; _ } | BFor { body; _ } | BBlock body ->
+        List.fold_left stmt_writes acc body
+    | _ -> acc in
+  let proc_writes = function
+    | BCombinational { body; _ } | BSequential { body; _ } ->
+        List.sort_uniq compare (List.fold_left stmt_writes [] body)
+    | _ -> [] in
+  let single_slice = function
+    | BCombinational { body = [BCallStmt { func = "@slice_write";
+        args = [BVar s; BConst { value = hi; _ }; BConst { value = lo; _ }; data] }]; _ } ->
+        (try Some (s, Z.to_int hi, Z.to_int lo, data) with _ -> None)
+    | _ -> None in
+  let writer_count : (string, int) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun p -> List.iter (fun s ->
+    Hashtbl.replace writer_count s
+      (1 + (try Hashtbl.find writer_count s with Not_found -> 0))) (proc_writes p))
+    m.processes;
+  let groups : (string, (int * int * bexpr) list) Hashtbl.t = Hashtbl.create 32 in
+  List.iter (fun p -> match single_slice p with
+    | Some (s, hi, lo, d) ->
+        Hashtbl.replace groups s ((hi, lo, d) :: (try Hashtbl.find groups s with Not_found -> []))
+    | None -> ()) m.processes;
+  let mergeable : (string, (int * int * bexpr) list) Hashtbl.t = Hashtbl.create 32 in
+  Hashtbl.iter (fun s slices ->
+    match Hashtbl.find_opt widths s with
+    | Some w when List.length slices >= 2
+               && (try Hashtbl.find writer_count s with Not_found -> 0) = List.length slices ->
+        let by_lo = List.sort (fun (_, a, _) (_, b, _) -> compare a b) slices in
+        let ok = ref true and cursor = ref 0 in
+        List.iter (fun (hi, lo, _) ->
+          if lo <> !cursor || hi < lo then ok := false else cursor := hi + 1) by_lo;
+        if !ok && !cursor = w then Hashtbl.replace mergeable s slices
+    | _ -> ()) groups;
+  if Hashtbl.length mergeable = 0 then m
+  else begin
+    let merged = Hashtbl.fold (fun s slices acc ->
+      let msb_first = List.sort (fun (a, _, _) (b, _, _) -> compare b a) slices in
+      let rhs = match List.map (fun (_, _, d) -> d) msb_first with
+        | [x] -> x | xs -> BConcat xs in
+      BCombinational { name = "mergeslice_" ^ s; sensitivity = [BAny];
+                       body = [BAssign { lhs = s; rhs }] } :: acc) mergeable [] in
+    let keep p = match single_slice p with
+      | Some (s, _, _, _) when Hashtbl.mem mergeable s -> false
+      | _ -> true in
+    { m with processes = merged @ List.filter keep m.processes }
+  end
+
 let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmodule =
   let p, _n = Behavioral_arch_subst.substitute_program p in
   let result =
@@ -1039,7 +1115,7 @@ let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmo
      resolve the multi-bit-port bitbus. *)
   let result = Behavioral_ffpack.pack_module
                  (canonicalize_ff_names (Behavioral_iflift.lift_module result)) in
-  resolve_input_bitbus result
+  merge_slice_processes (resolve_input_bitbus result)
 
 (* One module's cross-design verdict, with [trusted] submodules black-boxed
  * (not flattened) on both sides. *)
