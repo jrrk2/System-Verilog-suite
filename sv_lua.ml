@@ -158,7 +158,13 @@ let run_synlig_to_rtlil ~top ~files ~out =
     | None -> failwith "synlig not found (set SYNLIG_BIN)" in
   let script = Filename.temp_file "synlig_" ".ys" in
   let oc = open_out script in
-  Printf.fprintf oc "read_systemverilog %s\n" (String.concat " " files);
+  (* Pass `-top` to read_systemverilog so Surelog elaborates the REQUESTED
+     module as top.  Without it, a multi-module file auto-picks the natural top
+     (e.g. picorv32.v -> `picorv32`) and prunes every module not in that
+     hierarchy, so `hierarchy -top picorv32_pcpi_div` (a leaf the core never
+     instantiates) fails "module not found".  For a single-module file this is a
+     no-op (the top is that module). *)
+  Printf.fprintf oc "read_systemverilog -top %s %s\n" top (String.concat " " files);
   (* For a FRONTEND miter (SYNLIG_MIN) skip yosys `opt` — it merges/removes FFs so
      the register SET no longer matches the RTL, defeating register correspondence.
      `proc` + `flatten` (+ opt_clean = unused-cell removal, no FF merge) keeps one

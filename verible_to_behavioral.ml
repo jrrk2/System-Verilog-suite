@@ -2720,14 +2720,35 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                  with 1.  Collect the select dims in source order; with
                  two, lower to a read-modify-write of the element. *)
               let dims = ref [] in
-              walk (function
+              (* Collect ONLY the dimensions directly on `name`.  Do NOT recurse
+                 into a dimension's INDEX EXPRESSION: a bit-slice inside the index
+                 (`mem[waddr[4:0]]`) is otherwise mis-read as a SECOND dimension of
+                 `mem`, so the element gets a partial `[4:0]` slice-write instead of
+                 a full write (picorv32_regs then only wrote 5 bits per register).
+                 Sibling dimensions (`arr[i][j]`) are reached via the parent, so
+                 stopping at each dimension boundary still finds them. *)
+              let rec collect t = match t with
                 | TUPLE4 (STRING dt, _, e, _)
                   when prefix_is "select_variable_dimension" dt ->
                     dims := `Single e :: !dims
                 | TUPLE6 (STRING dt, _, m, _, l, _)
                   when prefix_is "select_variable_dimension" dt ->
                     dims := `Rng (m, l) :: !dims
-                | _ -> ()) lhs;
+                | TUPLE2 (a, b) -> collect a; collect b
+                | TUPLE3 (a, b, c) -> collect a; collect b; collect c
+                | TUPLE4 (a, b, c, d) -> List.iter collect [a; b; c; d]
+                | TUPLE5 (a, b, c, d, e) -> List.iter collect [a; b; c; d; e]
+                | TUPLE6 (a, b, c, d, e, f) -> List.iter collect [a; b; c; d; e; f]
+                | TUPLE7 (a, b, c, d, e, f, g) -> List.iter collect [a; b; c; d; e; f; g]
+                | TUPLE8 (a, b, c, d, e, f, g, h) ->
+                    List.iter collect [a; b; c; d; e; f; g; h]
+                | TUPLE9 (a, b, c, d, e, f, g, h, i) ->
+                    List.iter collect [a; b; c; d; e; f; g; h; i]
+                | TUPLE10 (a, b, c, d, e, f, g, h, i, j) ->
+                    List.iter collect [a; b; c; d; e; f; g; h; i; j]
+                | TLIST xs -> List.iter collect xs
+                | _ -> () in
+              collect lhs;
               let dims = List.rev !dims in
               let plain () =
                 BCallStmt {
