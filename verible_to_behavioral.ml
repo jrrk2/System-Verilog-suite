@@ -5157,24 +5157,42 @@ let convert_module ~pkgs (mdecl : module_decl)
       with _ -> None in
     let initial_nodes =
       collect_by (has_tag (prefix_is "initial_construct")) mdecl.m_body in
+    let strip_quotes p =
+      let n = String.length p in
+      if n >= 2 && p.[0] = '"' && p.[n - 1] = '"'
+      then String.sub p 1 (n - 2) else p in
     List.filter_map (fun init ->
+      (* Bind the $readmemh(FILE, MEM) call's TWO arguments specifically: the
+         first token after $readmemh is FILE (a string literal, or a param
+         identifier like MemInitFile), the second is the target MEM array.
+         Scanning the whole initial block for "first string / first id" was
+         wrong — it bound the $value$plusargs / $display strings and picked
+         MemInitFile (the file) as the target. *)
       let saw_readmemh = ref false in
-      let str = ref None in
-      let target = ref None in
+      let args = ref [] in  (* reversed: at most the first 2 arg tokens *)
       walk (function
         | SymbolIdentifier id when id = "$readmemh" -> saw_readmemh := true
-        | TK_StringLiteral s when !str = None -> str := Some s
+        | TK_StringLiteral s when !saw_readmemh && List.length !args < 2 ->
+            args := `Str s :: !args
         | SymbolIdentifier id
-          when !saw_readmemh && !str <> None && id <> "$readmemh"
-               && !target = None -> target := Some id
+          when !saw_readmemh && id <> "$readmemh" && List.length !args < 2 ->
+            args := `Id id :: !args
         | _ -> ()) init;
-      match !saw_readmemh, !str, !target with
-      | true, Some path, Some tgt ->
+      match !saw_readmemh, List.rev !args with
+      | true, [ file_arg; `Id tgt ] ->
+          (* FILE: a literal path, or a parameter (MemInitFile) resolved from
+             this module's specialised params.  Empty/unset -> no init, which
+             matches the RTL guard `if (MemInitFile != "")`. *)
           let path =
-            (* Strip surrounding quotes if Verible kept them. *)
-            let n = String.length path in
-            if n >= 2 && path.[0] = '"' && path.[n - 1] = '"'
-            then String.sub path 1 (n - 2) else path in
+            match file_arg with
+            | `Str s -> strip_quotes s
+            | `Id pid ->
+                (match List.assoc_opt pid params with
+                 | Some v -> strip_quotes (String.trim v)
+                 | None -> "")
+          in
+          if path = "" then None
+          else
           (match mem_shape tgt with
            | None ->
                Printf.eprintf
@@ -6643,7 +6661,7 @@ let convert_files_inner ~top ?(top_params : (string * string) list = []) files :
       else { p with pkg_params = p.pkg_params @ enum_params }) pkgs in
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
-  let specs = specialise_design ~pkgs mods ~top_name:top in
+  let specs = specialise_design ~pkgs ~top_params mods ~top_name:top in
   (* Override the TOP module's parameters (e.g. compare ibex_counter as the
      CounterWidth=64 instance Vivado synthesised, not the default 32).  A
      standalone top has no instantiation site, so specialise_design gives it its

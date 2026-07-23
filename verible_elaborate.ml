@@ -2240,7 +2240,8 @@ type specialised = {
 let inst_specialised : (string * string, string) Hashtbl.t =
   Hashtbl.create 64
 
-let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
+let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
+    (mods : module_decl list) ~top_name =
   let by_name = Hashtbl.create 32 in
   List.iter (fun m -> Hashtbl.replace by_name m.m_name m) mods;
   Hashtbl.clear inst_specialised;
@@ -2322,7 +2323,13 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
    * resolve correctly. *)
   let int_scope_of mdecl overrides =
     let scope = List.filter_map (fun (k, v) ->
-      Option.map (fun n -> (k, n)) (Eval.eval_string [] v)
+      (* A quoted string parameter value (VMEM path, "TDP", …) is NOT an integer;
+         letting Eval coerce it into the int scope corrupts it (a path folds to a
+         junk number and then propagates as that number).  Keep string params out
+         of the int scope — they travel via the str_env path instead. *)
+      let vt = String.trim v in
+      if String.length vt >= 1 && vt.[0] = '"' then None
+      else Option.map (fun n -> (k, n)) (Eval.eval_string [] v)
     ) overrides in
     (* For every module port-parameter that does NOT have an override,
      * fold its DEFAULT into the scope. Lets a top-level instantiation
@@ -2333,7 +2340,12 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
       if List.mem_assoc name sc then sc
       else
         let s = resolve_value pkgs rhs_tok in
-        match Eval.eval_string sc s with
+        (* A string-typed param DEFAULT (empty "" or a quoted literal) must not be
+           Eval-coerced into the int scope: an empty default folds to a junk int
+           (2^30) that then shadows the real string override during propagation. *)
+        let st = String.trim s in
+        if st = "" || (String.length st >= 1 && st.[0] = '"') then sc
+        else match Eval.eval_string sc s with
         | Some n -> (name, n) :: sc
         | None -> sc
     ) scope defaults in
@@ -2372,13 +2384,21 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
           Option.map (fun i -> (n, i)) (int_of_pvalue v)) p.pkg_params) pkgs in
     scope @ List.filter (fun (n, _) -> not (List.mem_assoc n scope)) pkg_consts
   in
-  let resolve_overrides_with scope ovs =
+  (* [str_env] = the enclosing module's own overrides (its s_params), so a child
+     instantiation `#(.MemInitFile(SRAMInitFile))` whose RHS is a bare STRING
+     parameter of the parent resolves to that parent value — propagating string
+     params (VMEM paths, RAM_MODE, …) down the hierarchy, which the int-only
+     Eval path cannot do. *)
+  let resolve_overrides_with scope str_env ovs =
     List.map (fun (name, tok) ->
       let s = resolve_value pkgs tok in
       let v =
         match Eval.eval_string scope s with
         | Some n -> string_of_int n
-        | None -> s
+        | None ->
+            (match List.assoc_opt (String.trim s) str_env with
+             | Some sv -> sv
+             | None -> s)
       in
       (name, v)
     ) ovs
@@ -2414,7 +2434,7 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
              * target module name actually exists. *)
             if not (Hashtbl.mem by_name inst.i_module) then ()
             else begin
-              let ovs = resolve_overrides_with scope inst.i_overrides_tok in
+              let ovs = resolve_overrides_with scope overrides inst.i_overrides_tok in
               if debug then
                 Printf.eprintf "[elab]   inst %s of %s: %s\n%!"
                   inst.i_inst inst.i_module
@@ -2429,7 +2449,7 @@ let specialise_design ?(pkgs = []) (mods : module_decl list) ~top_name =
           ) (extract_instantiations ~scope mdecl.m_body)
         end
   in
-  visit ~inst_label:None top_name [];
+  visit ~inst_label:None top_name top_params;
   Hashtbl.fold (fun _ v acc -> v :: acc) seen []
   |> List.sort (fun a b -> compare a.s_name b.s_name)
 

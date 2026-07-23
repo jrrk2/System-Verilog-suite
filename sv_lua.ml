@@ -1397,6 +1397,10 @@ let lmiter_hier a_prog_h b_prog_h top =
                 end else None) mm.signals
           | None -> [] in
         let verdict = miter_core ~input_consts ~output_masks (ma, pa) (mb, pb) in
+        (* Live per-module progress to stderr (flushed with %!) so a long
+           hierarchical walk is watchable as it runs; stdout still receives the
+           full buffered report once, on return. *)
+        Printf.eprintf "HIER %-34s %s\n%!" n verdict;
         if verdict = "EQUIVALENT" then incr n_eq;
         Buffer.add_string buf
           (Printf.sprintf "HIER %-34s %s%s\n" n verdict
@@ -2103,6 +2107,18 @@ let lwrite_mod_edif mod_h path =
 (* Direct Netlist → EDIF, bypassing both hardcaml and yosys.  Used to
  * feed a flattened structural wrapper into Vivado as a DRC / bitstream
  * oracle with LUT INIT parameters preserved correctly. *)
+(* Vivado's read_edif/link_design matches the EDIF *filename* to the top cell
+ * name ("No files found to match top module 'X'" when they differ), so always
+ * write to <top>.edf in the requested output directory regardless of the
+ * basename the caller passed.  Returns the actual path written. *)
+let edif_named_after_top ~top path =
+  let want = Filename.concat (Filename.dirname path) (top ^ ".edf") in
+  if want <> path then
+    Printf.eprintf
+      "[write_edif] output renamed to match top cell for Vivado read_edif: \
+       %s -> %s\n%!" path want;
+  want
+
 let lwrite_netlist_edif net_h path =
   let _, m, lc = find_netlist net_h in
   (* Apply the same structural collapses the nextpnr emitter does, so the EDIF
@@ -2112,6 +2128,7 @@ let lwrite_netlist_edif net_h path =
      register clock pins -> Place 30-568 / global-signal congestion). *)
   let m = Bir_to_nextpnr_json.collapse_gt_serial m in
   let m = Bir_to_nextpnr_json.bypass_clock_ident_buffers m in
+  let path = edif_named_after_top ~top:m.Behavioral_ir.name path in
   Bir_to_edif.write_edif ~library_cells:lc ~path m;
   path
 
@@ -2120,6 +2137,7 @@ let lwrite_netlist_edif net_h path =
  * module boundaries (avoids the flatten bit-bus artifacts) for Vivado read_edif. *)
 let lwrite_hier_edif prog_h top path =
   let _, p = find_prog prog_h in
+  let path = edif_named_after_top ~top path in
   Bir_to_edif.write_edif_hier ~library_cells:p.Behavioral_ir.library_cells ~path p ~top;
   path
 
