@@ -2105,11 +2105,15 @@ module Eval = struct
 end
 
 (* Width of the first packed dimension [msb:lsb] under [tok], via string eval. *)
-let elab_range_width tok =
+let elab_range_width ?(scope = []) tok =
   match collect_by (has_tag (prefix_is "decl_variable_dimension")) tok with
   | (TUPLE6 (_, _, msb, _, lsb, _)) :: _ ->
-      (match Eval.eval_string [] (deep_string_of_token msb),
-             Eval.eval_string [] (deep_string_of_token lsb) with
+      (* [scope] carries package/param constants so a parameterised typedef range
+         resolves, e.g. `typedef logic [IbexMuBiWidth-1:0] ibex_mubi_t` needs
+         IbexMuBiWidth=4 or $bits(ibex_mubi_t) folds to 1 (a 1-bit fetch_enable
+         buffer -> undriven mubi bits -> the ibex core never fetches). *)
+      (match Eval.eval_string scope (deep_string_of_token msb),
+             Eval.eval_string scope (deep_string_of_token lsb) with
        | Some m, Some l -> Some (abs (m - l) + 1)
        | _ -> None)
   | _ -> None
@@ -2117,7 +2121,7 @@ let elab_range_width tok =
 (* Populate [type_widths] from every `typedef` in [body]: a packed struct sums
  * its members' packed-dim widths (field with no dim = 1 bit); any other typedef
  * takes its own packed-dim width.  First definition wins. *)
-let collect_type_widths body =
+let collect_type_widths ?(scope = []) body =
   let nodes = collect_by (has_tag (prefix_is "type_declaration")) body in
   (* returns (name, width, is_struct) *)
   let width_of_node n = match n with
@@ -2126,7 +2130,7 @@ let collect_type_widths body =
         let w =
           if members <> [] then
             List.fold_left (fun acc m ->
-              match elab_range_width m with
+              match elab_range_width ~scope m with
               | Some w -> acc + w
               | None ->
                   (* member with no packed dim: an enum/typedef-typed field
@@ -2138,7 +2142,7 @@ let collect_type_widths body =
                          | Some w -> tw := Some w | None -> ())
                     | _ -> ()) m;
                   acc + (match !tw with Some w -> w | None -> 1)) 0 members
-          else (match elab_range_width data_type with Some w -> w | None -> 1) in
+          else (match elab_range_width ~scope data_type with Some w -> w | None -> 1) in
         Some (nm, w, members <> [])
     | _ -> None in
   (* Pass 1: register enums/scalars + provisional struct widths (first-wins). *)
@@ -2313,10 +2317,17 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
     @ List.concat_map (fun p -> extract_functions p.pkg_body) pkgs
   in
   Hashtbl.clear struct_table;
-  (* Register type widths so `$bits(<type>)` folds during specialization. *)
+  (* Register type widths so `$bits(<type>)` folds during specialization.
+     Feed package constants as the eval scope so a parameterised typedef range
+     (`logic [IbexMuBiWidth-1:0] ibex_mubi_t`) resolves to its real width. *)
   Hashtbl.clear type_widths;
-  List.iter (fun m -> collect_type_widths m.m_body) mods;
-  List.iter (fun p -> collect_type_widths p.pkg_body) pkgs;
+  let pkg_scope =
+    List.concat_map (fun (p : package_decl) ->
+      List.filter_map (fun (n, v) ->
+        match int_of_pvalue v with Some i -> Some (n, i) | None -> None)
+        p.pkg_params) pkgs in
+  List.iter (fun m -> collect_type_widths ~scope:pkg_scope m.m_body) mods;
+  List.iter (fun p -> collect_type_widths ~scope:pkg_scope p.pkg_body) pkgs;
   (* second pass: struct-typed signal/port names (needs all typedefs first) *)
   List.iter (fun m -> collect_signal_widths m.m_body) mods;
   List.iter (fun p -> collect_signal_widths p.pkg_body) pkgs;
