@@ -363,15 +363,25 @@ let verilog_of_instance prog inst =
   let keep name = match declared_params with
     | None -> true | Some ps -> List.mem name ps in
   let int_params = List.filter_map (fun (name, value) ->
-    if keep name then Some (Printf.sprintf ".%s(%d)" name value) else None) param_values in
+    if keep name then Some (name, Printf.sprintf ".%s(%d)" name value) else None) param_values in
   let is_vlit s =
     s <> "" && (String.contains s '\'' ||
                 String.for_all (fun c -> c >= '0' && c <= '9') s) in
   let str_params = List.filter_map (fun (name, value) ->
     if not (keep name) then None
-    else if is_vlit value then Some (Printf.sprintf ".%s(%s)" name value)
-    else Some (Printf.sprintf ".%s(\"%s\")" name value)) param_strs in
-  let all_params = int_params @ str_params in
+    else if is_vlit value then Some (name, Printf.sprintf ".%s(%s)" name value)
+    else Some (name, Printf.sprintf ".%s(\"%s\")" name value)) param_strs in
+  (* Dedup by parameter NAME, keeping the first occurrence.  The param
+     extraction can list the same name in BOTH param_values and param_strs, or
+     twice in param_strs (a Vivado string INIT re-added already-quoted), which
+     emitted e.g. `.DIVCLK_DIVIDE(1), .DIVCLK_DIVIDE(1)` and
+     `.STARTUP_WAIT("FALSE"), .STARTUP_WAIT(""FALSE"")` — a duplicate-override
+     and a doubled-quote syntax error that made xvlog reject the whole module. *)
+  let all_params =
+    let seen = Hashtbl.create 16 in
+    List.filter_map (fun (name, s) ->
+      if Hashtbl.mem seen name then None
+      else (Hashtbl.add seen name (); Some s)) (int_params @ str_params) in
   let params_str =
     if all_params <> [] then
       Printf.sprintf " #(%s)" (String.concat ", " all_params)
