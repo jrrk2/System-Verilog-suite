@@ -20,6 +20,20 @@ let strip_bs s =
   if String.length s > 0 && s.[String.length s - 1] = '\\'
   then String.sub s 0 (String.length s - 1) else s
 
+let contains_sub sub s =
+  let ls = String.length sub and lm = String.length s in
+  let rec go k = k + ls <= lm && (String.sub s k ls = sub || go (k + 1)) in
+  ls = 0 || go 0
+
+(* Vivado names an output port's internal net `\^q\` (escaped, `^`-prefixed) and
+   ties it to the port with a concurrent `q <= \^q\` the VHDL frontend drops.
+   Canonicalise `\^<name>\` -> `<name>` so the driver lands on the port directly. *)
+let canon_net n =
+  let l = String.length n in
+  if l >= 3 && n.[0] = '\\' && n.[1] = '^' && n.[l - 1] = '\\'
+  then String.sub n 2 (l - 3)   (* \^q\ -> q *)
+  else n
+
 (* "2'b11" / "3'd5" / "8'hA" -> Some (width, value). *)
 let parse_based (v : string) : (int * int) option =
   let v = String.trim v in
@@ -119,10 +133,11 @@ let register_processes (regs : binstance list) : bprocess list =
     | Some (base, _), Some clk ->
         let clk_n = match clk with BVar n -> n | _ -> "clk" in
         let ce_s = match pin "CE" with Some e -> Behavioral_ir.string_of_bexpr e | None -> "" in
-        let rst = match strip_bs i.module_name with m ->
-          if (let l = String.length m in
-              let rec has k = k + 5 <= l && (String.sub m k 5 = "ASYNC" || has (k+1)) in has 0)
-          then (match pin "RST" with Some e -> Behavioral_ir.string_of_bexpr e | None -> "") else "" in
+        let mn = strip_bs i.module_name in
+        let rst =
+          if contains_sub "SYNC" mn || contains_sub "ASYNC" mn
+          then (match pin "RST" with Some e -> Behavioral_ir.string_of_bexpr e | None -> "")
+          else "" in
         Some (base, clk_n, ce_s, rst)
     | _ -> None in
   let tbl : (string * string * string * string, binstance list) Hashtbl.t = Hashtbl.create 16 in
@@ -135,30 +150,91 @@ let register_processes (regs : binstance list) : bprocess list =
   List.rev_map (fun ((base, clk, _ce, rst) as k) ->
     let insts = Hashtbl.find tbl k in
     let pin (i : binstance) n = List.assoc_opt n i.port_connections in
-    (* per-bit data writes *)
-    let writes = List.filter_map (fun i ->
-      match out_target (pin i "Q"), pin i "D" with
-      | Some t, Some d -> Some (write_out t d) | _ -> None) insts in
+    (* Assemble the per-bit D's into ONE clean multi-bit assignment `base <= {…}`
+       (MSB-first, gaps self-read) instead of per-bit @slice_writes — a single
+       bus register that ffrip/ssa keep whole (else the register bit-blasts into a
+       per-bit SSA explosion the miter can't correspond to a source array). *)
+    let bit_of (i : binstance) = match out_target (pin i "Q") with
+      | Some (b, Some (msb, lsb)) when b = base -> Some (msb, lsb, pin i "D")
+      | Some (b, None) when b = base -> Some (0, 0, pin i "D")
+      | _ -> None in
+    let slices = List.filter_map (fun i ->
+      match bit_of i with Some (m, l, Some d) -> Some (m, l, d) | _ -> None) insts in
+    let maxmsb = List.fold_left (fun a (m, _, _) -> max a m) 0 slices in
+    let sorted = List.sort (fun (a, _, _) (b, _, _) -> compare b a) slices in
+    let parts = ref [] and cursor = ref maxmsb in
+    List.iter (fun (msb, lsb, d) ->
+      if msb < !cursor then
+        parts := BSlice { signal = BVar base; msb = !cursor; lsb = msb + 1 } :: !parts;
+      parts := d :: !parts;
+      cursor := lsb - 1) sorted;
+    if !cursor >= 0 then
+      parts := BSlice { signal = BVar base; msb = !cursor; lsb = 0 } :: !parts;
+    let data = match List.rev !parts with [x] -> x | xs -> BConcat xs in
     let ce = match insts with i :: _ -> pin i "CE" | [] -> None in
+    let assign = BAssign { lhs = base; rhs = data } in
     let gated = match ce with
-      | Some ce -> [BIf { condition = ce; then_stmts = writes; else_stmts = [] }]
-      | None -> writes in
+      | Some ce -> BIf { condition = ce; then_stmts = [assign];
+                         else_stmts = [BAssign { lhs = base; rhs = BVar base }] }
+      | None -> assign in
     let rst_pin = match insts with i :: _ -> pin i "RST" | [] -> None in
     let body =
       if rst <> "" then
-        let zero = List.filter_map (fun i -> match out_target (pin i "Q") with
-          | Some t -> Some (write_out t (BConst { value = Z.zero; width = 1 })) | None -> None) insts in
+        let w = maxmsb + 1 in
         (match rst_pin with
-         | Some r -> [BIf { condition = r; then_stmts = zero; else_stmts = gated }]
-         | None -> gated)
-      else gated in
+         | Some r -> [BIf { condition = r;
+                            then_stmts = [BAssign { lhs = base; rhs = BConst { value = Z.zero; width = w } }];
+                            else_stmts = [gated] }]
+         | None -> [gated])
+      else [gated] in
+    let is_async = match insts with i :: _ -> contains_sub "ASYNC" (strip_bs i.module_name) | _ -> false in
     BSequential { name = base ^ "_rtlreg"; clock = clk; clock_edge = `Pos;
                   reset = (if rst <> "" then match rst_pin with Some (BVar n) -> Some n | _ -> None else None);
-                  reset_edge = (if rst <> "" then Some `Pos else None);
-                  reset_async = (rst <> ""); body; blocking_vars = [] })
+                  reset_edge = (if is_async then Some `Pos else None);
+                  reset_async = is_async; body; blocking_vars = [] })
     !order
 
+(* Canonicalise \^port\ nets -> port throughout a module (bexpr, stmt, signals,
+   instance connections), then drop the now-duplicate \^port\ signal decl. *)
+let canon_ports_module (m : bmodule) : bmodule =
+  let rec re_e e = match e with
+    | BVar n -> BVar (canon_net n)
+    | BConst _ -> e
+    | BBinOp r -> BBinOp { r with lhs = re_e r.lhs; rhs = re_e r.rhs }
+    | BUnOp r -> BUnOp { r with operand = re_e r.operand }
+    | BSelect r -> BSelect { array = re_e r.array; index = re_e r.index }
+    | BSlice r -> BSlice { r with signal = re_e r.signal }
+    | BConcat es -> BConcat (List.map re_e es)
+    | BReplicate r -> BReplicate { r with value = re_e r.value }
+    | BCond r -> BCond { condition = re_e r.condition; then_val = re_e r.then_val; else_val = re_e r.else_val }
+    | BCall r -> BCall { r with args = List.map re_e r.args } in
+  let rec re_s s = match s with
+    | BAssign r -> BAssign { lhs = canon_net r.lhs; rhs = re_e r.rhs }
+    | BIf r -> BIf { condition = re_e r.condition; then_stmts = List.map re_s r.then_stmts; else_stmts = List.map re_s r.else_stmts }
+    | BCase r -> BCase { selector = re_e r.selector; cases = List.map (fun (g, b) -> (re_e g, List.map re_s b)) r.cases; default = List.map re_s r.default }
+    | BWhile r -> BWhile { condition = re_e r.condition; body = List.map re_s r.body }
+    | BFor r -> BFor { init = re_s r.init; condition = re_e r.condition; update = re_s r.update; body = List.map re_s r.body }
+    | BBlock b -> BBlock (List.map re_s b)
+    | BCallStmt r -> BCallStmt { r with args = List.map re_e r.args }
+    | BReturn eo -> BReturn (Option.map re_e eo) in
+  let re_proc = function
+    | BCombinational r -> BCombinational { r with body = List.map re_s r.body }
+    | BSequential r -> BSequential { r with clock = canon_net r.clock;
+                                            reset = Option.map canon_net r.reset;
+                                            body = List.map re_s r.body } in
+  let seen = Hashtbl.create 64 in
+  let signals = List.filter_map (fun (s : bsignal) ->
+    let n = canon_net s.name in
+    if Hashtbl.mem seen n then None    (* \^q\ collapsed onto the port q *)
+    else (Hashtbl.replace seen n (); Some { s with name = n })) m.signals in
+  { m with signals;
+    processes = List.map re_proc m.processes;
+    instances = List.map (fun (i : binstance) ->
+      { i with port_connections = List.map (fun (p, e) -> (p, re_e e)) i.port_connections })
+      m.instances }
+
 let resolve_rtl_instances (sel_val_of : string -> string option) (m : bmodule) : bmodule =
+  let m = canon_ports_module m in
   let is_reg i = let mn = strip_bs i.module_name in
     String.length mn >= 7 && String.sub mn 0 7 = "RTL_REG" in
   let is_rtl i = let mn = strip_bs i.module_name in
