@@ -400,7 +400,7 @@ let rec expr_to_bexpr = function
       let else_expr = expr_to_bexpr else_val in
       BCond { condition = cond_expr; then_val = then_expr; else_val = else_expr }
 
-  | Sel { expr; lsb; width; _ } ->
+  | Sel { expr; lsb; width; width_const = width_attr; _ } ->
       (* Sel is a part-select of a *vector* (NOT an unpacked array —
        * that's ArraySel below). Two flavours:
        *   - constant lsb + width  →  static `BSlice` with fixed msb/lsb
@@ -414,9 +414,14 @@ let rec expr_to_bexpr = function
         | _ -> None
       in
       let lsb_const = Option.bind lsb const_int_of in
+      (* Verilator encodes the select width as a `widthConst` ATTRIBUTE
+         (parsed into `width_attr`), not a `widthp` CHILD node — the latter is
+         usually absent.  Reading only `width` collapsed every multi-bit
+         part-select to 1 bit (`waddr[4:0]` -> `waddr[0:0]`); single-bit selects
+         worked by accident.  Fall back to the attribute. *)
       let width_const = match width with
         | Some w -> (match const_int_of w with Some v -> v | None -> 1)
-        | None -> 1
+        | None -> (match width_attr with Some v when v > 0 -> v | _ -> 1)
       in
       (match lsb_const with
        | Some lsb_val ->
