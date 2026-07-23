@@ -461,9 +461,11 @@ let rec eval_int ~pkgs ~params tok =
    * above.  Names NOT in the whitelist (user functions, $readmemh, …)
    * still arrive here as SymbolIdentifier-wrapped reference_or_call_base1. *)
   | TUPLE3 (STRING "reference_or_call_base1", ref_node, call_base) ->
-      let fname = ref None in
+      let fname = ref None and last_id = ref None in
       walk (function
-        | SymbolIdentifier id when !fname = None -> fname := Some id
+        | SymbolIdentifier id ->
+            if !fname = None then fname := Some id;
+            last_id := Some id
         | _ -> ()) ref_node;
       let inner_arg () =
         let cands = collect_by (function
@@ -514,6 +516,22 @@ let rec eval_int ~pkgs ~params tok =
            (match !last with
             | Some id -> (match Hashtbl.find_opt type_widths id with Some w -> Some w | None -> (match Hashtbl.find_opt signal_widths id with Some w -> Some w | None -> Some 0))
             | None -> Some 0)
+       (* lowRISC width helper `prim_util_pkg::vbits(n) = (n==1) ? 1 : $clog2(n)`
+          — every prim FIFO derives its pointer widths (PtrW/DepthW) this way,
+          and those feed chained localparams (WrapPtrW = PtrW+1).  eval_int names
+          the call by its package (first id), so match the MEMBER (last id) and
+          CTFE it.  ($clog2 via the same ceil-log loop used above.) *)
+       | _ when !last_id = Some "vbits" ->
+           (match inner_arg () with
+            | Some e ->
+                (match eval_int ~pkgs ~params e with
+                 | Some 1 -> Some 1
+                 | Some n ->
+                     let rec lg n acc =
+                       if n <= 1 then acc else lg ((n + 1) / 2) (acc + 1) in
+                     Some (lg n 0)
+                 | None -> None)
+            | None -> None)
        | _ -> eval_int ~pkgs ~params ref_node)
   | TUPLE6 (STRING tag, _casting_type, _, _, inner, _) when prefix_is "cast" tag ->
       (* `T'(expr)` type/size cast — cast1(casting_type, ', (, expr, )).
