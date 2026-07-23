@@ -2456,6 +2456,55 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
 (* ─── Multi-file convenience ─────────────────────────────────────── *)
 
 (* Parse multiple SV files and yield (modules, packages). *)
+(* Resolve DERIVED package localparams.  extract_pvalue_from_param_decl is a
+   crude first-leaf extractor with no scope, so a chained localparam like
+     localparam logic [63:0] HaltAddress   = 64'h800;
+     localparam logic [63:0] ResumeAddress = HaltAddress + 8;
+   left ResumeAddress as PStr "HaltAddress" (the first identifier leaf), and any
+   body reference `dm::ResumeAddress` stayed an unresolved bare id.  Re-evaluate
+   each package's params in fixpoint against an accumulating int scope seeded
+   with the literal params, using the same resolve_value+Eval path as the
+   module-level int_scope_of.  Only params that newly fold to an int are
+   updated; everything else keeps its existing pvalue (non-regressive). *)
+let resolve_pkg_param_chains (pkgs : package_decl list) : package_decl list =
+  List.map (fun (p : package_decl) ->
+    if p.pkg_body = EMPTY_TOKEN then p else
+    let pn_list =
+      let nodes = collect_by
+        (has_tag (prefix_is "any_param_declaration")) p.pkg_body in
+      List.filter_map (fun pn ->
+        let id_subs = collect_by
+          (has_tag (prefix_is "param_type_followed_by_id")) pn in
+        let name = match id_subs with
+          | s :: _ ->
+              let ids = ref [] in
+              walk (function SymbolIdentifier id -> ids := id :: !ids
+                           | _ -> ()) s;
+              (match List.rev !ids with last :: _ -> Some last | [] -> None)
+          | [] -> None in
+        let rhs = match collect_by
+                    (has_tag (prefix_is "trailing_assign")) pn with
+          | a :: _ -> Some a | [] -> None in
+        match name, rhs with Some n, Some r -> Some (n, r) | _ -> None) nodes in
+    let seed = List.filter_map (fun (n, v) ->
+      match int_of_pvalue v with Some i -> Some (n, i) | None -> None)
+      p.pkg_params in
+    let rec fixpoint scope =
+      let scope', changed = List.fold_left (fun (sc, ch) (n, rhs_tok) ->
+        if List.mem_assoc n sc then (sc, ch)
+        else match Eval.eval_string sc (resolve_value pkgs rhs_tok) with
+          | Some i -> ((n, i) :: sc, true)
+          | None -> (sc, ch)) (scope, false) pn_list in
+      if changed then fixpoint scope' else scope' in
+    let resolved = fixpoint seed in
+    let pkg_params' = List.map (fun (n, v) ->
+      match int_of_pvalue v with
+      | Some _ -> (n, v)                        (* already a literal *)
+      | None -> (match List.assoc_opt n resolved with
+                 | Some i -> (n, PInt i) | None -> (n, v))) p.pkg_params in
+    { p with pkg_params = pkg_params' }
+  ) pkgs
+
 let parse_files_full files =
   let mods = ref [] in
   let pkgs = ref [] in
@@ -2479,6 +2528,6 @@ let parse_files_full files =
     else [{ pkg_name  = "$unit";
             pkg_params = List.rev !file_scope;
             pkg_body   = EMPTY_TOKEN }] in
-  (List.rev !mods, List.rev !pkgs @ unit_pkg)
+  (List.rev !mods, resolve_pkg_param_chains (List.rev !pkgs) @ unit_pkg)
 
 let parse_files files = fst (parse_files_full files)
