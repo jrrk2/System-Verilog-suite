@@ -1021,9 +1021,19 @@ let thread_body ?(blocking_vars = [])
               when (match elem_w_of name with Some e -> e = 1 | None -> true) ->
                 (* packed-vector single-bit write (real arrays pre-folded). *)
                 set_field name (subst env idx) 1 (subst env data)
-            (* @slice_write (constant bit-ranges) is left to merge_slice_writes,
-               which already lowers it correctly without a comb loop; folding it
-               here would needlessly change silicon-validated netlists. *)
+            (* @slice_write (constant bit-range) — fold into the running value the
+               SAME way as @part_sel_write (COMBINATIONAL only; sequential targets
+               stay with merge_slice_writes_deep, whose nested-branch handling is
+               silicon-validated).  merge_slice_writes batch-merged and APPENDED the
+               collapsed base behind a later conditional override (`ld[..]=base;
+               if(c) ld[..]=v` → base ran last, always winning) — wrong for the
+               not-taken branch (ibex_counter counter_load).  set_field threads it in
+               order and uses comb-ZERO for unwritten bits (no self-read loop). *)
+            | "@slice_write", [BVar name; BConst { value = hi; _ }; BConst { value = lo; _ }; data]
+              when is_comb && Z.geq hi lo ->
+                let lo_i = Z.to_int lo and hi_i = Z.to_int hi in
+                set_field name (BConst { value = Z.of_int lo_i; width = 32 })
+                  (hi_i - lo_i + 1) (subst env data)
             | _ -> None in
           (match folded, args with
            | Some newv, BVar name :: _ ->
@@ -1149,7 +1159,8 @@ let process_to_always ctx = function
         let rec go = function
           | BCallStmt { func; args = BVar n :: _ }
             when func = "@mem_write"
-              || func = "@part_sel_write_up" || func = "@part_sel_write_down" ->
+              || func = "@part_sel_write_up" || func = "@part_sel_write_down"
+              || func = "@slice_write" ->
               add n
           | BIf { then_stmts; else_stmts; _ } ->
               List.iter go then_stmts; List.iter go else_stmts
