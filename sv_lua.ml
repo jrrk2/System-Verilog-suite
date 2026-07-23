@@ -2017,6 +2017,26 @@ let lgate_map mod_h k_lut io_flag =
       m.Behavioral_ir.name (String.concat ", " unresolved));
   let port_dir mn port = Hashtbl.find_opt pd_tbl (mn, port) in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
+  (* GATE_MAP_EMIT_CIRCUIT=<dir>: dump the Hardcaml circuit IMMEDIATELY after
+     create_circuit (before bir_to_aig / LUT cover / reconstruction) as Verilog,
+     one file per module, so a hierarchical pre-mapping netlist can be simulated
+     to bisect whether a bug is in create_circuit or downstream. Side-effect only. *)
+  (match Sys.getenv_opt "GATE_MAP_EMIT_CIRCUIT" with
+   | None -> ()
+   | Some d ->
+       let dir = if d = "1" then "/tmp/svs_circuit" else d in
+       (try Unix.mkdir dir 0o755 with _ -> ());
+       let buf = Buffer.create 4096 in
+       (try
+          Hardcaml.Rtl.output
+            ~output_mode:(Hardcaml.Rtl.Output_mode.To_buffer buf)
+            Hardcaml.Rtl.Language.Verilog circ
+        with e ->
+          Buffer.add_string buf
+            (Printf.sprintf "// create_circuit RTL emit failed for %s: %s\n"
+               m.Behavioral_ir.name (Printexc.to_string e)));
+       let oc = open_out (Filename.concat dir (m.Behavioral_ir.name ^ ".v")) in
+       Buffer.output_buffer oc buf; close_out oc);
   let l = Fpga_synth.Bir_to_aig.lower_circuit circ in
   (* Cost mode for the LUT cover, selectable via env so the timing-driven
      mapping can be exercised without recompiling.  Default `Area keeps the

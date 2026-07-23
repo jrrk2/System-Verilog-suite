@@ -108,6 +108,12 @@ let rec map_stmt f = function
                        (map_expr f e, List.map (map_stmt f) ss)) cases;
               default = List.map (map_stmt f) default }
   | BBlock ss -> BBlock (List.map (map_stmt f) ss)
+  | BCallStmt { func = ("@slice_write" | "@mem_write") as func;
+               args = (BVar _ as tgt) :: rest } ->
+      (* The FIRST arg is the write TARGET, not a read — substitution only ever
+         rewrites RHS/read positions, never a write target (else a partial write
+         is redirected to a different signal). *)
+      BCallStmt { func; args = tgt :: List.map (map_expr f) rest }
   | BCallStmt { func; args } ->
       BCallStmt { func; args = List.map (map_expr f) args }
   | BReturn (Some e) -> BReturn (Some (map_expr f e))
@@ -120,6 +126,33 @@ let assignment_count name stmts =
     match s with BAssign { lhs; _ } when lhs = name -> acc + 1 | _ -> acc
   ) 0 stmts
 
+(* True if `name` is the TARGET of a @slice_write / @mem_write ANYWHERE in the
+ * stmt list, including nested BIf / BCase / BBlock.  Such a variable is a
+ * register that is PARTIALLY written, so its top-level default assignment
+ * (`sbaddr_d := sbaddress_i`) is NOT the whole story — substituting it forward
+ * rewrites the partial-write TARGET itself (map_stmt maps the @slice_write's
+ * first arg), turning `@slice_write(sbaddr_d,..)` into
+ * `@slice_write(sbaddress_i,..)` and clobbering an unrelated signal (a real
+ * input!).  Exclude such variables from substitution entirely. *)
+let rec partial_write_target name stmts =
+  let is_bracket_write lhs =
+    (* a bracket-keyed part/bit-select write "name[..]" (an earlier pass may have
+       lowered @slice_write into this BAssign form). *)
+    let ln = String.length name in
+    String.length lhs > ln && String.sub lhs 0 ln = name && lhs.[ln] = '[' in
+  List.exists (function
+    | BCallStmt { func = ("@slice_write" | "@mem_write"); args = BVar n :: _ } ->
+        n = name
+    | BAssign { lhs; _ } -> is_bracket_write lhs
+    | BIf { then_stmts; else_stmts; _ } ->
+        partial_write_target name then_stmts
+        || partial_write_target name else_stmts
+    | BCase { cases; default; _ } ->
+        List.exists (fun (_, ss) -> partial_write_target name ss) cases
+        || partial_write_target name default
+    | BBlock ss -> partial_write_target name ss
+    | _ -> false) stmts
+
 let process_seq_body stmts =
   (* Pass 1: identify candidate substitutions: variables assigned
    * exactly once at the top level of the block AND read at least
@@ -128,7 +161,8 @@ let process_seq_body stmts =
     | [] -> List.rev acc
     | BAssign { lhs; rhs } as s :: rest
       when assignment_count lhs stmts = 1
-        && count_in_stmts lhs rest >= 1 ->
+        && count_in_stmts lhs rest >= 1
+        && not (partial_write_target lhs stmts) ->
         collect (i + 1) ((i, lhs, rhs, s) :: acc) rest
     | _ :: rest -> collect (i + 1) acc rest
   in
@@ -228,6 +262,12 @@ let thread_comb_body orig_stmts =
       | BAssign { lhs; rhs } ->
           let rhs' = subst rhs in
           Hashtbl.replace env lhs rhs';
+          (* A bracket part/bit-select write `base[..] = ..` also invalidates the
+             threaded whole-`base` value: later reads of `base` must see the
+             partially-updated register, not the entering default. *)
+          (match String.index_opt lhs '[' with
+           | Some i when i > 0 -> Hashtbl.remove env (String.sub lhs 0 i)
+           | _ -> ());
           BAssign { lhs; rhs = rhs' }
       | BIf { condition; then_stmts; else_stmts } ->
           let cond' = subst condition in
@@ -271,6 +311,17 @@ let thread_comb_body orig_stmts =
                   cases = List.map (fun (k', ss', _) -> (k', ss')) cases';
                   default = default' }
       | BBlock ss -> BBlock (List.map thread_stmt ss)
+      | BCallStmt { func = ("@slice_write" | "@mem_write") as func;
+                    args = (BVar tgt as tgt_e) :: rest } ->
+          (* The FIRST arg is the write TARGET — NEVER substitute it, else the
+             partial write is redirected to whatever value was threaded for that
+             name (the `sbaddr_d := sbaddress_i` default made
+             `@slice_write(sbaddr_d,..)` become `@slice_write(sbaddress_i,..)`,
+             clobbering a module INPUT).  Substitute only the index/value args,
+             and invalidate the target's threaded value (it is now partially
+             re-written; later reads must see the real signal, not the default). *)
+          Hashtbl.remove env tgt;
+          BCallStmt { func; args = tgt_e :: List.map subst rest }
       | BCallStmt { func; args } ->
           BCallStmt { func; args = List.map subst args }
       | BReturn (Some e) -> BReturn (Some (subst e))
