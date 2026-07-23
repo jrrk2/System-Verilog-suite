@@ -275,13 +275,58 @@ let verilog_of_sensitivity = function
   | BLevel sig_ -> sig_
   | BAny -> "*"
 
+(* Does an expression read any signal (BVar)?  A combinational block that reads
+   NO signal has a pure-constant RHS, so a star-sensitivity always infers an
+   EMPTY sensitivity list and never executes in simulation. *)
+let rec expr_reads_var = function
+  | BVar _ -> true
+  | BConst _ -> false
+  | BBinOp { lhs; rhs; _ } -> expr_reads_var lhs || expr_reads_var rhs
+  | BUnOp { operand; _ } -> expr_reads_var operand
+  | BCond { condition; then_val; else_val } ->
+      expr_reads_var condition || expr_reads_var then_val || expr_reads_var else_val
+  | BConcat es -> List.exists expr_reads_var es
+  | BReplicate { value; _ } -> expr_reads_var value
+  | BSelect { array; index } -> expr_reads_var array || expr_reads_var index
+  | BSlice { signal; _ } -> expr_reads_var signal
+  | BCall { args; _ } -> List.exists expr_reads_var args
+
+let rec stmt_reads_var = function
+  | BAssign { rhs; _ } -> expr_reads_var rhs
+  | BIf { condition; then_stmts; else_stmts } ->
+      expr_reads_var condition
+      || List.exists stmt_reads_var then_stmts
+      || List.exists stmt_reads_var else_stmts
+  | BCase { selector; cases; default } ->
+      expr_reads_var selector
+      || List.exists (fun (_, ss) -> List.exists stmt_reads_var ss) cases
+      || List.exists stmt_reads_var default
+  | BBlock ss -> List.exists stmt_reads_var ss
+  | BCallStmt { args; _ } -> List.exists expr_reads_var args
+  | BReturn (Some e) -> expr_reads_var e
+  | BWhile { condition; body } ->
+      expr_reads_var condition || List.exists stmt_reads_var body
+  | BFor { init; condition; update; body } ->
+      stmt_reads_var init || expr_reads_var condition || stmt_reads_var update
+      || List.exists stmt_reads_var body
+  | _ -> false
+
 (* Generate process *)
 let verilog_of_process proc =
   match proc with
   | BCombinational { name; sensitivity; body } ->
       let comment = Printf.sprintf "// Combinational process: %s" name in
       let sens_list = String.concat " or " (List.map verilog_of_sensitivity sensitivity) in
-      let always_header = Printf.sprintf "always @(%s) begin" sens_list in
+      (* A block with a pure-constant RHS (cfg_device_addr_mask = concat of
+         literals) reads no signal, so a star-sensitivity always gets an EMPTY
+         sensitivity list and xsim NEVER runs it - the signal stays X, leaving
+         the bus address-decode config X and stalling the CPU fetch.  Emit
+         always_comb for those (runs at time 0).  Keep the star-sensitivity form
+         for blocks that read signals, since always_comb rejects the SVS pattern
+         of one variable driven by several combinational blocks. *)
+      let always_header =
+        if List.exists stmt_reads_var body then Printf.sprintf "always @(%s) begin" sens_list
+        else "always_comb begin" in
       let body_stmts = String.concat "\n" (List.map (verilog_of_stmt 1) body) in
       Printf.sprintf "%s\n%s\n%s\nend\n" comment always_header body_stmts
 
