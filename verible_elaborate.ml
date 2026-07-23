@@ -161,6 +161,12 @@ let leaf_text = function
   | VBAR_VBAR -> Some "||"
   | PLING -> Some "!"
   | QUERY -> Some "?" | COLON -> Some ":"
+  (* Cast tick: `RegFileDataWidth'(expr)` carries the `'` as a QUOTE leaf.
+     Dropping it rendered the cast as a function-call-looking
+     `RegFileDataWidth ( expr )`, so the evaluator returned the width id
+     (32) instead of the cast value — x0 read 32 in the register file.
+     Emit it so the cast-strip in Eval.eval_string recognises the cast. *)
+  | QUOTE -> Some "'"
   | _ -> None
 
 let deep_string_of_token tok =
@@ -545,12 +551,39 @@ let namespace_genblk_locals ~label ~v ~eval_idx tok =
   let locals : (string, unit) Hashtbl.t = Hashtbl.create 16 in
   let is_decl t = prefix_is "net_variable" t || prefix_is "net_decl_assign" t
                   || prefix_is "register_variable" t in
+  (* A bare `logic [W:0] name;` with no port list parses as the ambiguous
+     `(non_anonymous_)gate_instance_or_register_variable1` — the REGISTER-
+     VARIABLE form (the `…2` variant is the module/gate INSTANCE form with a
+     port list, which we must NOT rename as a net).  ibex_register_file_ff's
+     generate-local `rf_reg_q` is exactly this, so without covering the `…1`
+     tag every iteration shared one flop and the whole RF aliased. *)
+  let is_gate_var_decl t =
+    prefix_is "gate_instance_or_register_variable1" t
+    || prefix_is "non_anonymous_gate_instance_or_register_variable1" t in
+  (* First SymbolIdentifier in a subtree = the declared name (the tag is a
+     STRING leaf, and the name precedes any dimension/init expression). *)
+  let first_sym t =
+    let r = ref None in
+    let rec go t = if !r = None then match t with
+      | SymbolIdentifier id -> r := Some id
+      | TUPLE2 (a,b) -> go a; go b
+      | TUPLE3 (a,b,c) -> go a; go b; go c
+      | TUPLE4 (a,b,c,d) -> go a; go b; go c; go d
+      | TUPLE5 (a,b,c,d,e) -> go a; go b; go c; go d; go e
+      | TUPLE6 (a,b,c,d,e,f) -> List.iter go [a;b;c;d;e;f]
+      | TLIST xs -> List.iter go xs
+      | _ -> () in
+    go t; !r in
   let rec collect t =
     (match t with
      | TUPLE3 (STRING tg, SymbolIdentifier nm, _) when is_decl tg ->
          Hashtbl.replace locals nm ()
      | TUPLE4 (STRING tg, SymbolIdentifier nm, _, _) when is_decl tg ->
          Hashtbl.replace locals nm ()
+     | (TUPLE2 (STRING tg, _) | TUPLE3 (STRING tg, _, _)
+       | TUPLE4 (STRING tg, _, _, _) | TUPLE5 (STRING tg, _, _, _, _))
+       when is_gate_var_decl tg ->
+         (match first_sym t with Some nm -> Hashtbl.replace locals nm () | None -> ())
      | _ -> ());
     iter_children collect t
   and iter_children f = function
@@ -2085,11 +2118,49 @@ module Eval = struct
           let j = ref !i in
           while !j < n && is_id s.[!j] do incr j done;
           let id_end = !j in
-          (* Skip optional whitespace before `'(`. *)
+          (* Skip optional whitespace before the `'`. *)
           while !j < n && (s.[!j] = ' ' || s.[!j] = '\t') do incr j done;
-          if !j + 1 < n && s.[!j] = '\'' && s.[!j + 1] = '(' then begin
-            (* Cast — drop the id and the apostrophe. *)
-            i := !j + 1
+          (* A cast is `id '(...)`.  deep_string_of_token renders the tick and
+             paren with spaces (`RegFileDataWidth ' ( … )`), so also skip
+             whitespace BETWEEN the `'` and the `(` — otherwise the cast isn't
+             recognised and `parse_expr` evaluates just the width identifier
+             (RegFileDataWidth=32), which is how WordZeroVal='0-cast became 32
+             and x0 read non-zero in the register file. *)
+          let paren_after_tick =
+            !j < n && s.[!j] = '\'' &&
+            (let k = ref (!j + 1) in
+             while !k < n && (s.[!k] = ' ' || s.[!k] = '\t') do incr k done;
+             !k < n && s.[!k] = '(') in
+          if paren_after_tick then begin
+            (* `(`, skipping ws after the tick. *)
+            let k = ref (!j + 1) in
+            while !k < n && (s.[!k] = ' ' || s.[!k] = '\t') do incr k done;
+            let idname = String.sub s !i (id_end - !i) in
+            (* If the cast type is a WIDTH that resolves in scope (e.g.
+               `RegFileDataWidth'(SecdedInv3932ZeroWord)`, width 32), the cast
+               TRUNCATES to that many bits — dropping it kept the full 39-bit
+               0x2A00000000 and misaligned the register-file concat.  Rewrite
+               `W'(E)` -> `((E) % 2^W)` so the value is masked to W bits (→0).
+               A non-width cast (`unsigned'(x)`) isn't in scope: drop as before
+               (value-preserving). *)
+            match List.assoc_opt idname scope with
+            | Some w when w >= 1 && w < 62 ->
+                (* find the ')' matching the cast's '(' *)
+                let depth = ref 0 and p = ref !k and closed = ref (-1) in
+                while !p < n && !closed < 0 do
+                  (if s.[!p] = '(' then incr depth
+                   else if s.[!p] = ')' then begin
+                     decr depth; if !depth = 0 then closed := !p end);
+                  incr p
+                done;
+                if !closed >= 0 then begin
+                  let inner = String.sub s (!k + 1) (!closed - !k - 1) in
+                  let modulus = Int64.shift_left 1L w in
+                  Buffer.add_string buf
+                    (Printf.sprintf "((%s) %% %Ld)" inner modulus);
+                  i := !closed + 1
+                end else i := !k        (* unbalanced — just drop the cast *)
+            | _ -> i := !k              (* non-width cast — drop it *)
           end else begin
             Buffer.add_substring buf s !i (id_end - !i);
             i := id_end
@@ -2205,7 +2276,14 @@ let extract_module_port_param_defaults (body : token) : (string * token) list =
       | s :: _ ->
           let ids = ref [] in
           walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) s;
-          (match List.rev !ids with last :: _ -> Some last | [] -> None)
+          (* walk prepends, so !ids is reverse-source-order and its HEAD is
+             the LAST source id — the param NAME.  A ranged/user-typed param
+             (`logic [DataWidth-1:0] WordZeroVal = '0`) also has the type's
+             identifier (DataWidth) EARLIER in source; List.rev-then-head
+             wrongly took that, so WordZeroVal's `='0` default registered
+             under "DataWidth" and the body reference fell back to the width
+             (32) — x0 read 32 in the register file. Take !ids head. *)
+          (match !ids with last :: _ -> Some last | [] -> None)
       | [] -> None
     in
     let rhs = match collect_by
@@ -2231,7 +2309,14 @@ let extract_module_internal_params (body : token) : (string * token) list =
       | s :: _ ->
           let ids = ref [] in
           walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) s;
-          (match List.rev !ids with last :: _ -> Some last | [] -> None)
+          (* walk prepends, so !ids is reverse-source-order and its HEAD is
+             the LAST source id — the param NAME.  A ranged/user-typed param
+             (`logic [DataWidth-1:0] WordZeroVal = '0`) also has the type's
+             identifier (DataWidth) EARLIER in source; List.rev-then-head
+             wrongly took that, so WordZeroVal's `='0` default registered
+             under "DataWidth" and the body reference fell back to the width
+             (32) — x0 read 32 in the register file. Take !ids head. *)
+          (match !ids with last :: _ -> Some last | [] -> None)
       | [] -> None
     in
     let rhs = match collect_by
