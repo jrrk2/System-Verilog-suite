@@ -778,6 +778,14 @@ let extract_signals stmts =
     | _ -> `Internal
   in
   let var_of_node = function
+    (* Skip parameters/localparams (GPARAM/LPARAM, isParam).  Verilator folds
+       their references to constants during elaboration, so they are never read
+       as signals; emitting a `logic` for one leaves it undriven, and ffrip then
+       promotes it to a FREE INPUT that doesn't tie across frontends — a spurious
+       miter interface mismatch (ibex_counter's `CounterWidth` leaked as a 7th
+       input, blocking an otherwise-equivalent module). *)
+    | Var { is_param = true; _ } -> None
+    | Var { var_type = ("GPARAM" | "LPARAM"); _ } -> None
     | Var { name; dtype_ref; direction; _ } ->
         let elem_width = get_width_from_dtype dtype_ref in
         let signed = is_signed_dtype dtype_ref in
