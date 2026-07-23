@@ -287,6 +287,28 @@ let parse_rtlil_file filename =
             cell_conns = [];
           }
 
+      | "memory" :: rest ->
+          (* `memory [width N] [size N] [offset N] \name` — carry it through as a
+             synthetic $mem_decl cell so module_to_bmodule can create the BArray
+             signal the $memrd/$memwr ports index (the reader had no memory model,
+             so synlig-read memories silently read 0). *)
+          finish_cell ();
+          let width = ref 1 and size = ref 0 and name = ref "" in
+          let rec scan = function
+            | "width"  :: n :: tl -> (try width := int_of_string n with _ -> ()); scan tl
+            | "size"   :: n :: tl -> (try size  := int_of_string n with _ -> ()); scan tl
+            | "offset" :: _ :: tl -> scan tl
+            | tok :: tl ->
+                if String.length tok > 0 && tok.[0] = '\\' then name := strip_backslash tok;
+                scan tl
+            | [] -> () in
+          scan rest;
+          if !name <> "" then
+            add_cell { cell_type = "$mem_decl"; cell_inst = !name;
+                       cell_params = [ ("WIDTH", string_of_int !width);
+                                       ("SIZE",  string_of_int !size) ];
+                       cell_conns = [] }
+
       | "parameter" :: param_name :: rest ->
           (match !current_cell with
            | Some cell ->

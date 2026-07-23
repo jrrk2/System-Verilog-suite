@@ -887,8 +887,81 @@ let merge_sliced_ff_processes ~wire_widths processes =
  * a single full-width concat assignment, MSB-first. Without the
  * merge, the two partial writes generate two separate BAssigns to
  * the same lhs and the second wins, dropping the rest of the wire. *)
+(* Clean a $memrd/$memwr MEMID param ("\\mem" — quoted, backslash-escaped) down
+   to the bare memory name ("mem"). *)
+let clean_memid s =
+  let s = String.trim s in
+  let s = if String.length s >= 2 && s.[0] = '"' && s.[String.length s - 1] = '"'
+          then String.sub s 1 (String.length s - 2) else s in
+  let strip1 s = if String.length s >= 1 && s.[0] = '\\'
+                 then String.sub s 1 (String.length s - 1) else s in
+  strip1 (strip1 s)
+
+(* $memrd / $memwr ports → BIR.  The memory is a BArray signal (created from the
+   $mem_decl synthetic cell); a write is a clocked @mem_write with the port's
+   per-bit EN folded into a read-modify-write mask (so `if (wen) m[a] <= d`
+   lowers correctly — EN = {W{wen}} makes it a no-op when wen=0); an async read
+   ($memrd CLK_ENABLE=0) is a combinational `data := mem[addr]`. *)
+let mem_cell_to_bprocess mems_tbl (c : rtlil_cell) =
+  let is_pfx p = let lp = String.length p in
+    String.length c.cell_type >= lp && String.sub c.cell_type 0 lp = p in
+  let memid () = clean_memid (try List.assoc "MEMID" c.cell_params with Not_found -> "") in
+  if is_pfx "$memwr" then
+    match pin_expr c "ADDR", pin_expr c "DATA" with
+    | Some addr, Some data ->
+        let mem = memid () in
+        let w = (try fst (Hashtbl.find mems_tbl mem) with Not_found -> 0) in
+        let u = BInt { width = (if w > 0 then w else 32); signed = Unsigned } in
+        let value = match pin_expr c "EN" with
+          | Some en ->
+              let old = BSelect { array = BVar mem; index = addr } in
+              BBinOp { op = BOr;
+                lhs = BBinOp { op = BAnd; lhs = old;
+                               rhs = BUnOp { op = BNot; operand = en; result_type = u };
+                               result_type = u };
+                rhs = BBinOp { op = BAnd; lhs = data; rhs = en; result_type = u };
+                result_type = u }
+          | None -> data in
+        let write = BCallStmt { func = "@mem_write"; args = [BVar mem; addr; value] } in
+        (match pin c "CLK" with
+         | Some (SigWire clk) ->
+             Some (BSequential { name = "memwr_" ^ c.cell_inst; clock = clk;
+               clock_edge = `Pos; reset = None; reset_edge = None; reset_async = false;
+               body = [write]; blocking_vars = [] })
+         | _ -> Some (BCombinational { name = "memwr_" ^ c.cell_inst;
+                                       sensitivity = [BAny]; body = [write] }))
+    | _ -> None
+  else if is_pfx "$memrd" then
+    match pin_expr c "ADDR", pin_lhs c "DATA" with
+    | Some addr, Some dname ->
+        let read = BAssign { lhs = dname;
+                             rhs = BSelect { array = BVar (memid ()); index = addr } } in
+        let clk_en = (try List.assoc "CLK_ENABLE" c.cell_params with Not_found -> "0") in
+        (match (clk_en = "1'1" || clk_en = "1"), pin c "CLK" with
+         | true, Some (SigWire clk) ->
+             Some (BSequential { name = "memrd_" ^ c.cell_inst; clock = clk;
+               clock_edge = `Pos; reset = None; reset_edge = None; reset_async = false;
+               body = [read]; blocking_vars = [] })
+         | _ -> Some (BCombinational { name = "memrd_" ^ c.cell_inst;
+                                       sensitivity = [BAny]; body = [read] }))
+    | _ -> None
+  else None
+
 let module_to_bmodule (m : rtlil_module) : bmodule =
-  let signals = List.map wire_to_bsignal m.mod_wires in
+  (* Memory declarations arrive as synthetic $mem_decl cells: create one BArray
+     signal each and index (width,size) by name for the port handlers. *)
+  let mem_param c k = try int_of_string (List.assoc k c.cell_params) with _ -> 0 in
+  let mems_tbl : (string, int * int) Hashtbl.t = Hashtbl.create 8 in
+  let mem_signals = List.filter_map (fun (c : rtlil_cell) ->
+    if c.cell_type = "$mem_decl" then begin
+      let w = mem_param c "WIDTH" and sz = mem_param c "SIZE" in
+      Hashtbl.replace mems_tbl c.cell_inst (w, sz);
+      Some { name = c.cell_inst;
+             stype = BArray { element = BInt { width = w; signed = Unsigned }; size = sz };
+             direction = `Internal; initial_value = None; attrs = [] }
+    end else None) m.mod_cells in
+  let mem_procs = List.filter_map (mem_cell_to_bprocess mems_tbl) m.mod_cells in
+  let signals = List.map wire_to_bsignal m.mod_wires @ mem_signals in
   let cell_procs = List.filter_map cell_to_bprocess m.mod_cells in
   (* Look up each wire's declared width (used to fill in any bits
    * the partial-write set doesn't cover with a self-read). *)
@@ -973,7 +1046,7 @@ let module_to_bmodule (m : rtlil_module) : bmodule =
     name = m.mod_name;
     params = [];
     signals;
-    processes = cell_procs @ connect_procs;
+    processes = cell_procs @ mem_procs @ connect_procs;
     instances = [];
     funcs = [];
     mems = []; attrs = [];
