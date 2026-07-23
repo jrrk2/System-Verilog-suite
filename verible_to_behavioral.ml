@@ -169,8 +169,13 @@ let rec eval_int ~pkgs ~params tok =
       (try Some (int_of_string ("0x" ^ !s)) with _ -> None)
   | TUPLE3 (STRING tag, _base, digits) when prefix_is "dec_based_number" tag ->
       let s = ref "" in
+      (* A SIZED decimal literal (`5'd10`) carries its digits as TK_DecDigits,
+         parallel to the TK_{Bin,Hex,Oct}Digits the other bases use — only an
+         UNSIZED decimal is TK_DecNumber.  Walking for TK_DecNumber alone left
+         `5'd10` folding to "" → None, so dm_mem's `LoadBaseAddr` ternary
+         branches never resolved. *)
       walk (function
-        | TK_DecNumber n -> s := !s ^ n
+        | TK_DecDigits n | TK_DecNumber n -> s := !s ^ n
         | _ -> ()) digits;
       (try Some (int_of_string !s) with _ -> None)
   | TUPLE3 (STRING tag, _base, digits) when prefix_is "oct_based_number" tag ->
@@ -293,7 +298,11 @@ let rec eval_int ~pkgs ~params tok =
        | _ -> None)
   | TUPLE4 (STRING tag, lhs, _op, rhs)
     when prefix_is "logneq_expr"     tag
-      || prefix_is "binary_neq_expr" tag ->
+      || prefix_is "binary_neq_expr" tag
+      (* Verible emits `!=` as `logeq_expr3` (the `==` form is `logeq_expr2`).
+         Matching only logneq/binary_neq left `(DmBaseAddress != 0)` unfolded,
+         so dm_mem's `HasSndScratch` localparam stayed a bare identifier. *)
+      || prefix_is "logeq_expr3"     tag ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (if a <> b then 1 else 0)
        | _ -> None)
@@ -497,6 +506,15 @@ let rec eval_int ~pkgs ~params tok =
          {4'h0, dm::DataCount} - 8'h1)`).  Without this the whole localparam
          failed to fold and stayed unbound, so dm_csrs' `[(Data0):DataEnd]`
          range bound tied to 0. *)
+      eval_int ~pkgs ~params inner
+  (* SVA-grammar transparent wrappers Verible inserts inside `( … )`: a
+     parenthesised expression nests as
+       expr_primary_parens → sequence_repetition_expr → expression_or_dist → <expr>
+     so the comparison inside `(DmBaseAddress != 0)` was never reached.  Strip
+     them so eval_int recurses to the real operand. *)
+  | TUPLE3 (STRING tag, inner, _)
+    when prefix_is "sequence_repetition_expr" tag
+      || prefix_is "expression_or_dist"       tag ->
       eval_int ~pkgs ~params inner
   | TUPLE4 (STRING tag, _, inner, _) when prefix_is "expr_primary_parens" tag ->
       (* `( <expr> )` — TUPLE4(tag, LPAREN, inner_expression, RPAREN).
@@ -3710,6 +3728,17 @@ let extract_body_params ~pkgs ~params tok =
     collect_by (has_tag (prefix_is "module_parameter_port")) tok in
   let local_nodes =
     collect_by (has_tag (prefix_is "any_param_declaration")) tok in
+  (* Instance overrides (RESOLVED incoming params) are AUTHORITATIVE: a module's
+     own port-param DEFAULT must never clobber them.  dm_mem is instantiated with
+     `.DmBaseAddress(1)` but its declared default is `'0`; re-evaluating that
+     default rebound DmBaseAddress 1->0, which in turn collapsed the derived
+     localparams `HasSndScratch = (DmBaseAddress != 0)` and `LoadBaseAddr`.
+     Lock every resolved incoming name against rebind (unresolved incoming
+     params — e.g. `SelectableHarts = {NrHarts{1'b1}}` passed through as a bare
+     name — stay improvable). *)
+  let is_int_str v = (try let _ = Z.of_string (String.trim v) in true with _ -> false) in
+  let locked_names = List.filter_map (fun (n, v) ->
+    if is_int_str v then Some n else None) params in
   let one acc n =
     (* Find the parameter NAME — but skip identifiers that live inside
      * the parameter's type/range subtree. For
@@ -3882,12 +3911,14 @@ let extract_body_params ~pkgs ~params tok =
              (match new_val with Some v -> v | None -> "<UNRESOLVED>"));
         (match cur, new_val with
          | None, Some v -> (id, v) :: acc
-         | Some old, Some v when v <> old ->
+         | Some old, Some v when v <> old && not (List.mem id locked_names) ->
              (* Re-bind: a later fixed-point pass found a better value
                 (e.g. ICW=0 from expr_to_bexpr fallback got overridden
                 to ICW=7 once H landed in acc and eval_int's $clog2 path
                 could fire).  Without this, the partial first-pass
-                result stuck and `[ICW-1:0]` widths stayed at 1 bit. *)
+                result stuck and `[ICW-1:0]` widths stayed at 1 bit.
+                Locked (resolved incoming override) names are exempt — their
+                value is authoritative and must not revert to a default. *)
              (id, v) :: List.remove_assoc id acc
          | _ -> acc)
     | _ -> acc
@@ -3945,7 +3976,7 @@ let extract_body_params ~pkgs ~params tok =
              with _ -> None) in
       match cur, new_val with
       | None, Some v -> (id, v) :: acc
-      | Some old, Some v when v <> old ->
+      | Some old, Some v when v <> old && not (List.mem id locked_names) ->
           (id, v) :: List.remove_assoc id acc
       | _ -> acc
     ) acc (List.rev !extras)
