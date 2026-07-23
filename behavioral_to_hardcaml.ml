@@ -124,6 +124,16 @@ let get_signal ctx name =
   match List.assoc_opt name ctx.signals with
   | Some s -> s
   | None ->
+  (* A combinationally-driven wire lives in ctx.variables (an Always.Variable),
+     not ctx.signals.  get_signal is used directly for a BSequential's CLOCK
+     name (line ~1167); when a clock is such a wire — axi_vfifo derives a
+     per-channel clock `axi_ch_0_ch_clk = m_axi_clk[0]` and clocks its FFs on it
+     — missing the variables lookup fell through to the 32-bit-zero stub below,
+     and Hardcaml rejected the resulting non-1-bit clock ("unexpected width").
+     Resolve the variable's current value instead. *)
+  match List.assoc_opt name ctx.variables with
+  | Some v -> Always.Variable.value v
+  | None ->
       (* Unknown name — almost always a bug upstream (missing input
          port, missing variable in pre-pass, expression referencing a
          free identifier).  Previously we minted an unassigned 32-bit
