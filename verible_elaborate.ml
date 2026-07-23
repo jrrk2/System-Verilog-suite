@@ -1100,6 +1100,38 @@ let extract_pvalue_from_param_decl node =
   let assigns = collect_by (has_tag (prefix_is "trailing_assign")) node in
   match assigns with
   | a :: _ ->
+      (* A sized/based literal (`4'b0101`, `64'h800`) must be read in ITS OWN
+         base: the flat leaf walk below grabs the digit string and int_of_pvalue
+         parses it base-10 (4'b0101 -> 101 not 5, 64'h800 -> 800 not 0x800).
+         Parse the first based_number node explicitly first. *)
+      let based =
+        let parse_based = function
+          | TUPLE3 (STRING tag, _b, digits) ->
+              let pfx =
+                if prefix_is "bin_based_number" tag then Some "0b"
+                else if prefix_is "hex_based_number" tag then Some "0x"
+                else if prefix_is "oct_based_number" tag then Some "0o"
+                else if prefix_is "dec_based_number" tag then Some ""
+                else None in
+              (match pfx with
+               | None -> None
+               | Some pfx ->
+                   let s = ref "" in
+                   walk (function
+                     | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n
+                     | TK_DecDigits n | TK_DecNumber n -> s := !s ^ n
+                     | _ -> ()) digits;
+                   if !s = "" then None
+                   else (try Some (int_of_string (pfx ^ !s)) with _ -> None))
+          | _ -> None in
+        match collect_by (has_tag (fun t ->
+          prefix_is "bin_based_number" t || prefix_is "hex_based_number" t
+          || prefix_is "oct_based_number" t || prefix_is "dec_based_number" t)) a with
+        | bn :: _ -> parse_based bn
+        | [] -> None in
+      (match based with
+       | Some n -> PInt n
+       | None ->
       let leaves = ref [] in
       walk (function
         | TK_DecNumber n | TK_UnBasedNumber n -> leaves := n :: !leaves
@@ -1113,7 +1145,7 @@ let extract_pvalue_from_param_decl node =
            (match int_of_pvalue (PStr v) with
             | Some n -> PInt n
             | None -> PStr v)
-       | _ -> PExpr a)
+       | _ -> PExpr a))
   | [] -> PExpr node
 
 (* Walk the root token but stop descending when we hit a node that
@@ -1213,7 +1245,12 @@ let extract_packages root : package_decl list =
                 let ids = ref [] in
                 walk (function SymbolIdentifier id ->
                               ids := id :: !ids | _ -> ()) s;
-                (match List.rev !ids with
+                (* The param NAME is the LAST identifier in `<type> NAME` — `!ids`
+                   is reverse-visit order so its head IS the last id.  Taking the
+                   FIRST id named a USER-TYPED param after its type
+                   (`ibex_mubi_t IbexMuBiOn` -> "ibex_mubi_t"), so the real name
+                   never entered pkg_params and bare `IbexMuBiOn` never resolved. *)
+                (match !ids with
                  | last :: _ -> Some last
                  | [] -> None)
             | [] -> None
@@ -2480,7 +2517,8 @@ let resolve_pkg_param_chains (pkgs : package_decl list) : package_decl list =
               let ids = ref [] in
               walk (function SymbolIdentifier id -> ids := id :: !ids
                            | _ -> ()) s;
-              (match List.rev !ids with last :: _ -> Some last | [] -> None)
+              (* LAST id is the name (see extract_packages); !ids head = last. *)
+              (match !ids with last :: _ -> Some last | [] -> None)
           | [] -> None in
         let rhs = match collect_by
                     (has_tag (prefix_is "trailing_assign")) pn with
