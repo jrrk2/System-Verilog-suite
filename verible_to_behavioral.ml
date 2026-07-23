@@ -3220,6 +3220,17 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
            BFor { init = init_b; condition = cond_b;
                   update = upd_b; body = [recurse_s body] }
        | _ -> BBlock [])
+  | TUPLE4 (STRING t, _return_kw, ret_expr, _semi)
+    when prefix_is "jump_statement" t ->
+      (* `return <expr>;` inside a function body — encode as BReturn so
+         Behavioral_inline (which treats a trailing `[BReturn (Some e)]` as the
+         call's value) can substitute it.  dm_pkg's instruction encoders
+         (nop/auipc/jal/csrr/…) are single-`return` functions; without this arm
+         their bodies extracted to 0 statements and inline left every
+         `dm::nop()` etc. as an opaque, unfoldable call. *)
+      (match ret_expr with
+       | EMPTY_TOKEN -> BReturn None
+       | e -> BReturn (Some (recurse_e e)))
   | TLIST [single] -> recurse_s single
   | _ -> BBlock []
 
@@ -5805,8 +5816,18 @@ let convert_module ~pkgs (mdecl : module_decl)
          - first unqualified_id with `function` keyword nearby → fname
          - input declarations under the function → params
          - statements not under input/output decls → body *)
-    let function_decls = collect_by (has_tag (fun t ->
-      prefix_is "function_declaration" t)) mdecl_body in
+    (* Package functions (dm::nop, dm::auipc, … — the pulp-debug instruction
+       encoders) live in package bodies, not the module body, so they were
+       never extracted into m.funcs and Behavioral_inline could not substitute
+       them: dm_mem's abstract_cmd stayed a tree of opaque calls.  Also collect
+       every package's function_declarations so a `pkg::func()` call (now named
+       by its member) resolves and folds.  inline only substitutes the ones a
+       module actually calls, so surplus package functions are harmless. *)
+    let function_decls =
+      collect_by (has_tag (fun t -> prefix_is "function_declaration" t)) mdecl_body
+      @ List.concat_map (fun (p : Verible_elaborate.package_decl) ->
+          collect_by (has_tag (fun t -> prefix_is "function_declaration" t))
+            p.pkg_body) pkgs in
     List.filter_map (fun fdecl ->
       (* Function name: header has `function ... NAME ;`.  The first
          unqualified_id under the function_declaration whose parent
@@ -5935,6 +5956,8 @@ let convert_module ~pkgs (mdecl : module_decl)
           || prefix_is "conditional_statement" t
           || prefix_is "assignment_statement_no_expr" t
           || prefix_is "nonblocking_assignment" t
+          || prefix_is "jump_statement" t   (* `return <expr>;` — single-return
+                                               package funcs (dm_pkg encoders) *)
           || prefix_is "seq_block" t in
         let stmt_nodes =
           let acc = ref [] in
