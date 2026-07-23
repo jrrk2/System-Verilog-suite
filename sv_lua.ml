@@ -2372,6 +2372,26 @@ let lmodule_names prog_h =
   let _, p = find_prog prog_h in
   String.concat "," (List.map (fun (m : bmodule) -> m.name) p.modules)
 
+(* Structural sweep for the input-port-driver malformation (a frontend/pass bug
+ * that redirects a write onto a module INPUT port — invisible to the Z3 miter,
+ * which models inputs as free and drops the write, yielding a vacuous
+ * EQUIVALENT).  Runs Z3_miter.driven_input_ports over EVERY module, no Z3.
+ * Returns a multi-line report; "CLEAN" if none. *)
+let lcheck_input_drivers prog_h =
+  let _, p = find_prog prog_h in
+  let hits = List.filter_map (fun (m : bmodule) ->
+    match Z3_miter.driven_input_ports m with
+    | [] -> None
+    | ports -> Some (Printf.sprintf "  %-40s driven input port(s): %s"
+                       m.name (String.concat ", " ports))) p.modules in
+  let n = List.length hits in
+  if n = 0 then
+    Printf.sprintf "INPUT-DRIVER SWEEP: CLEAN (%d modules scanned)"
+      (List.length p.modules)
+  else
+    Printf.sprintf "INPUT-DRIVER SWEEP: %d/%d module(s) MALFORMED\n%s"
+      n (List.length p.modules) (String.concat "\n" hits)
+
 (* ──────────────────────────────────────────────────────────────────
  * Second-tier generic operations: extracted from the standalones in
  * old/, used both by ASIC miters and FPGA recipes.  Where a pass has
@@ -2806,6 +2826,8 @@ module MakeLib
                            (wrap2 lflatten_struct);
         "module_names",   V.efunc (V.string **->> V.string)
                            (wrap1 lmodule_names);
+        "check_input_drivers", V.efunc (V.string **->> V.string)
+                           (wrap1 lcheck_input_drivers);
         "canon_module_names", V.efunc (V.string **->> V.string)
                            (wrap1 lcanon_module_names);
         "canon_sep",  V.efunc (V.string **->> V.string) (wrap1 lcanon_sep);
