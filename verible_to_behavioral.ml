@@ -136,6 +136,31 @@ let signal_widths : (string, int) Hashtbl.t = Hashtbl.create 128
  * "DMI operation didn't complete".  Populated by extract_enum_items. *)
 let enum_member_widths : (string, int) Hashtbl.t = Hashtbl.create 128
 
+(* Recursion guard for compile-time evaluation of user function bodies. *)
+let eval_fn_depth = ref 0
+
+(* Package function table (fname, formals, body), built once from the package
+   bodies for eval_user_fn — the whole design shares one package set. *)
+let cached_pkg_fns : Verible_elaborate.sv_function list option ref = ref None
+
+(* Actual argument expressions of a call, in source order, from the
+   `call_base1(LPAREN, argument_list, RPAREN)` node — mirrors the argument-spine
+   walk used by expr_to_bexpr's user-call handling. *)
+let call_args call_base =
+  let arg_list = match call_base with
+    | TUPLE4 (STRING t, _, body, _) when prefix_is "call_base" t -> body
+    | _ -> call_base in
+  let rec collect = function
+    | TLIST xs -> List.concat_map collect xs
+    | TUPLE3 (STRING t, prev, last)
+      when prefix_is "any_argument_list_item_last" t -> collect prev @ collect last
+    | TUPLE3 (STRING t, prev, _)
+      when prefix_is "any_argument_list_trailing_comma" t -> collect prev
+    | EMPTY_TOKEN -> []
+    | other -> [other]
+  in
+  collect arg_list
+
 let rec eval_int ~pkgs ~params tok =
   let lookup name =
     match List.assoc_opt name params with
@@ -516,23 +541,19 @@ let rec eval_int ~pkgs ~params tok =
            (match !last with
             | Some id -> (match Hashtbl.find_opt type_widths id with Some w -> Some w | None -> (match Hashtbl.find_opt signal_widths id with Some w -> Some w | None -> Some 0))
             | None -> Some 0)
-       (* lowRISC width helper `prim_util_pkg::vbits(n) = (n==1) ? 1 : $clog2(n)`
-          — every prim FIFO derives its pointer widths (PtrW/DepthW) this way,
-          and those feed chained localparams (WrapPtrW = PtrW+1).  eval_int names
-          the call by its package (first id), so match the MEMBER (last id) and
-          CTFE it.  ($clog2 via the same ceil-log loop used above.) *)
-       | _ when !last_id = Some "vbits" ->
-           (match inner_arg () with
-            | Some e ->
-                (match eval_int ~pkgs ~params e with
-                 | Some 1 -> Some 1
-                 | Some n ->
-                     let rec lg n acc =
-                       if n <= 1 then acc else lg ((n + 1) / 2) (acc + 1) in
-                     Some (lg n 0)
-                 | None -> None)
-            | None -> None)
-       | _ -> eval_int ~pkgs ~params ref_node)
+       | _ ->
+           (* General compile-time evaluation of a USER function call (e.g.
+              prim_util_pkg::vbits): look the callee up by its member name in the
+              package function table, bind its formals to the evaluated actual
+              args, and evaluate its `return <expr>` body — no per-function
+              special-casing.  Falls back to resolving ref_node as a plain
+              reference when it is not a callable const function. *)
+           (match !last_id with
+            | Some fn ->
+                (match eval_user_fn ~pkgs ~params fn call_base with
+                 | Some v -> Some v
+                 | None -> eval_int ~pkgs ~params ref_node)
+            | None -> eval_int ~pkgs ~params ref_node))
   | TUPLE6 (STRING tag, _casting_type, _, _, inner, _) when prefix_is "cast" tag ->
       (* `T'(expr)` type/size cast — cast1(casting_type, ', (, expr, )).
          For constant folding the cast value IS the inner value (width
@@ -611,6 +632,53 @@ let rec eval_int ~pkgs ~params tok =
             | None -> Some 0))
   | TUPLE2 (a, _) | TUPLE3 (_, a, _) -> eval_int ~pkgs ~params a
   | _ -> None
+
+(* Compile-time evaluation of a USER function call by its DEFINITION (not by a
+   hard-coded name): find the function among the package function tables, bind
+   its formals to the evaluated actual args, and evaluate its `return <expr>`
+   body.  Handles simple single-return const functions (prim_util_pkg::vbits,
+   etc.); returns None for anything it cannot fold so the caller falls back. *)
+and eval_user_fn ~pkgs ~params fname call_base =
+  if !eval_fn_depth > 16 then None
+  else begin
+    incr eval_fn_depth;
+    let fns =
+      match !cached_pkg_fns with
+      | Some f -> f
+      | None ->
+          let f = List.concat_map (fun (p : Verible_elaborate.package_decl) ->
+            Verible_elaborate.extract_functions p.pkg_body) pkgs in
+          cached_pkg_fns := Some f; f in
+    let result =
+      match List.find_opt (fun (f : Verible_elaborate.sv_function) ->
+        f.Verible_elaborate.fn_name = fname) fns with
+      | None -> None
+      | Some f ->
+          let ret =
+            match collect_by (has_tag (prefix_is "jump_statement")) f.fn_body with
+            | TUPLE4 (_, _, e, _) :: _ -> Some e
+            | _ -> None in
+          let formals = f.fn_args in
+          (match ret with
+           | None -> None
+           | Some ret_e ->
+               let actuals = call_args call_base in
+               if List.length actuals <> List.length formals then None
+               else
+                 let rec bind fs acts acc = match fs, acts with
+                   | [], [] -> Some acc
+                   | fm :: fs', a :: acts' ->
+                       (match eval_int ~pkgs ~params a with
+                        | Some v -> bind fs' acts' ((fm, string_of_int v) :: acc)
+                        | None -> None)
+                   | _ -> None in
+                 (match bind formals actuals [] with
+                  | Some binds -> eval_int ~pkgs ~params:(binds @ params) ret_e
+                  | None -> None))
+    in
+    decr eval_fn_depth;
+    result
+  end
 
 (* `decl_variable_dimension1`: TUPLE6(tag, LBRACK, msb_expr, COLON,
  * lsb_expr, RBRACK). Pull the msb/lsb subtrees directly — collect_by
