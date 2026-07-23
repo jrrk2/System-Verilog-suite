@@ -553,6 +553,24 @@ let infer_module (m : bmodule) =
     ) (find_ram_writes processes);
     Hashtbl.fold (fun _ v acc -> v :: acc) h []
   in
+  (* The $readmemh loader is a combinational whole-array assign
+     `mem = {word_{d-1}, ..., word_0}` (MSB-first constants).  For a ROM that
+     drive IS the memory; for a read-WRITE RAM we LIFT the constants into
+     init_values (baked into the BRAM INIT at config, exactly like real
+     hardware) and STRIP the driver below — otherwise it re-clamps mem to the
+     boot image every cycle and the RAM is never writable. *)
+  let mem_init_words n =
+    let of_stmt = function
+      | BAssign { lhs; rhs = BConcat parts }
+        when lhs = n && parts <> []
+             && List.for_all (function BConst _ -> true | _ -> false) parts ->
+          (* MSB-first parts -> address order (word_0 first) via rev_map *)
+          Some (List.rev_map (function
+                  | BConst { value; _ } -> Z.to_int value | _ -> 0) parts)
+      | _ -> None in
+    List.find_map (fun p ->
+      let body = match p with BCombinational c -> c.body | BSequential s -> s.body in
+      List.find_map of_stmt body) processes in
   let ram_mems = List.map (fun (n, _aw, dw) ->
     let data_w = match signal_data_width n with
       | Some w -> w
@@ -568,11 +586,24 @@ let infer_module (m : bmodule) =
       addr_width = max 1 addr_w;
       depth;
       kind = BRam;
-      init_values = [];
+      init_values = (match mem_init_words n with Some vs -> vs | None -> []);
       n_write_ports = count_write_ports n processes;
       n_read_ports = count_read_ports n processes;
       read_is_sync = not (read_is_async n processes) }
   ) ram_writes in
+  (* STRIP the $readmemh whole-array const driver for every inferred RAM: its
+     values now live in init_values (BRAM INIT), and keeping the combinational
+     driver would clobber writes (RAM non-writable) and dangle once mem becomes
+     a RAMB primitive. *)
+  let ram_names = List.map (fun (n, _, _) -> n) ram_writes in
+  let is_mem_init_driver p =
+    let body = match p with BCombinational c -> c.body | BSequential s -> s.body in
+    match body with
+    | [ BAssign { lhs; rhs = BConcat parts } ]
+      when List.mem lhs ram_names
+           && List.for_all (function BConst _ -> true | _ -> false) parts -> true
+    | _ -> false in
+  let processes = List.filter (fun p -> not (is_mem_init_driver p)) processes in
 
   (* Step 3: read-only memory inference — names appearing in BSelect
    * but never in @mem_write are marked as ROM with empty contents
