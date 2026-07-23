@@ -989,7 +989,42 @@ let module_to_bmodule (m : rtlil_module) : bmodule =
           try Hashtbl.find groups name with Not_found -> [] in
         Hashtbl.replace groups name ((msb, lsb, r) :: bucket)
     | None ->
-        unsupported_connects := (lhs, rhs) :: !unsupported_connects
+        (* Scattered-concat LHS: `connect { a[hi:lo], b[i], ... } = rhs`.
+           Yosys ties a signal's undriven bits this way — e.g. picorv32_pcpi_mul's
+           next_rdx has its non-carry bits zeroed via
+           `connect { next_rdx[63:61], ..., next_rdx[3:0] } = 49'0`.  The old code
+           dropped the whole connect (unsupported), leaving those bits undriven so
+           the slice-merge filled them with SELF-READS — a false combinational loop
+           that broke Cyclesim/BMC and corrupted the Z3 comb-cone.  Distribute rhs
+           across the chunks (RTLIL concat is MSB-first; walk LSB-first assigning
+           bit offsets) so each lands in `groups` and merges with the cell-driven
+           slices. *)
+        (match lhs with
+         | SigConcat chunks ->
+             let add name msb lsb src =
+               let bucket = try Hashtbl.find groups name with Not_found -> [] in
+               Hashtbl.replace groups name ((msb, lsb, src) :: bucket) in
+             let off = ref 0 and ok = ref true in
+             List.iter (fun ch ->
+               let w = match ch with
+                 | SigBit _ -> 1
+                 | SigRange (_, hi, lo) -> abs (hi - lo) + 1
+                 | SigWire n -> wire_width n
+                 | SigConst s -> (match sigchunk_width (SigConst s) with Some w -> w | None -> -1)
+                 | SigConcat _ -> -1 in
+               if w <= 0 then ok := false
+               else begin
+                 let src = BSlice { signal = r; msb = !off + w - 1; lsb = !off } in
+                 (match ch with
+                  | SigBit (n, b) -> add n b b src
+                  | SigRange (n, hi, lo) -> add n (max hi lo) (min hi lo) src
+                  | SigWire n -> add n (w - 1) 0 src
+                  | SigConst _ | SigConcat _ -> ());   (* const target: consume, don't write *)
+                 off := !off + w
+               end) (List.rev chunks);
+             if not !ok then
+               unsupported_connects := (lhs, rhs) :: !unsupported_connects
+         | _ -> unsupported_connects := (lhs, rhs) :: !unsupported_connects)
   ) m.mod_connects;
   let connect_procs =
     Hashtbl.fold (fun name slices acc ->
@@ -1000,35 +1035,18 @@ let module_to_bmodule (m : rtlil_module) : bmodule =
             (* Single full-width write — emit directly. *)
             [BAssign { lhs = name; rhs = r }]
         | _ ->
-            (* Multiple partial writes. Sort msb-descending so the
-             * concat reads MSB-first, then walk top-down filling any
-             * bits not driven by these connects with `BSlice (BVar
-             * name) [hi:lo]` (i.e. preserve whatever else drives
-             * those bits — typically a cell with a slice-LHS Y pin
-             * that wrote elsewhere; for our purposes a self-read is
-             * a safe placeholder). *)
-            let sorted = List.sort
-              (fun (a, _, _) (b, _, _) -> compare b a) slices in
-            let parts = ref [] in
-            let cursor = ref (w - 1) in
-            List.iter (fun (msb, lsb, r) ->
-              if msb < !cursor then begin
-                parts := BSlice { signal = BVar name;
-                                  msb = !cursor;
-                                  lsb = msb + 1 } :: !parts;
-              end;
-              parts := r :: !parts;
-              cursor := lsb - 1
-            ) sorted;
-            if !cursor >= 0 then
-              parts := BSlice { signal = BVar name;
-                                msb = !cursor;
-                                lsb = 0 } :: !parts;
-            let rhs = match List.rev !parts with
-              | [single] -> single
-              | many -> BConcat many
-            in
-            [BAssign { lhs = name; rhs }]
+            (* Partial / multiple writes: emit one @slice_write per slice so
+             * they MERGE with any cell-driven slices of the same wire (via
+             * behavioral_to_hardcaml's slice merger).  The old code instead
+             * built a full-width concat and filled the uncovered bits with a
+             * self-read `BSlice (BVar name)`; when those bits are actually
+             * driven by a CELL (yosys drives a signal's carry bits by cells and
+             * zeroes the gaps with a scattered-concat connect — picorv32_pcpi_mul's
+             * next_rdx), the self-read created a false combinational loop that
+             * broke Cyclesim/BMC and corrupted the Z3 comb-cone.  @slice_writes
+             * carry no self-read, so every bit is driven exactly once. *)
+            List.map (fun (msb, lsb, r) ->
+              assign_or_slice_write name (Some (msb, lsb)) r) slices
       in
       BCombinational {
         name = "connect_" ^ name;
