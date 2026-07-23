@@ -325,6 +325,10 @@ let rec eval_int ~pkgs ~params tok =
             | PLING  -> Some (if v = 0 then 1 else 0)
             | HYPHEN -> Some (- v)
             | PLUS   -> Some v
+            (* bitwise `~`: width-agnostic here, so mask to 32 bits (the common
+               `logic [31:0]` mask width, e.g. ibex DEBUG_MASK = ~(DEBUG_SIZE-1))
+               and let the use-site width truncate further if narrower. *)
+            | TILDE  -> Some (lnot v land 0xFFFFFFFF)
             | _      -> None))
   (* Concat `{a, b, c}` — fold to integer when every part is a sized
      literal (so we know its width).  picorv32-style trace-flag
