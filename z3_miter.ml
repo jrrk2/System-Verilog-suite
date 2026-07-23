@@ -796,6 +796,14 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
    * output `<Q>__D`. The miter then reduces to a combinational
    * check, with EDFFs and DFF+MUX naturally producing the same
    * D-pin function. *)
+  (* SSA-fold both modules first: encode_stmt below ignores BIf conditions and
+     @slice_write BCallStmts, so it needs each signal in single-assignment form.
+     module_to_ssa folds conditionals into BCond and lowers slice-writes via
+     per-version concat — without it, a base slice-write + conditional slice-override
+     (ibex_counter's counter_load) leaves the signal unconstrained (free), giving a
+     spurious counterexample even though the Cyclesim path agrees. *)
+  let bmod1 = Behavioral_ssa.module_to_ssa bmod1 in
+  let bmod2 = Behavioral_ssa.module_to_ssa bmod2 in
   let bmod1 = Behavioral_ffrip.rip_module bmod1 in
   let bmod2 = Behavioral_ffrip.rip_module bmod2 in
   (* Post-FF-rip register sharing: collapse pairs of FFs whose D-cones
