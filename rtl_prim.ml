@@ -231,9 +231,10 @@ let register_processes (regs : binstance list) : bprocess list =
         let clk_n = match clk with BVar n -> n | _ -> "clk" in
         let ce_s = match pin "CE" with Some e -> Behavioral_ir.string_of_bexpr e | None -> "" in
         let mn = strip_bs i.module_name in
+        let rst_conn = match pin "RST" with Some e -> Some e | None -> pin "CLR" in
         let rst =
           if contains_sub "SYNC" mn || contains_sub "ASYNC" mn
-          then (match pin "RST" with Some e -> Behavioral_ir.string_of_bexpr e | None -> "")
+          then (match rst_conn with Some e -> Behavioral_ir.string_of_bexpr e | None -> "")
           else "" in
         Some (base, clk_n, ce_s, rst)
     | _ -> None in
@@ -274,20 +275,29 @@ let register_processes (regs : binstance list) : bprocess list =
       | Some ce -> BIf { condition = ce; then_stmts = [assign];
                          else_stmts = [BAssign { lhs = base; rhs = BVar base }] }
       | None -> assign in
-    let rst_pin = match insts with i :: _ -> pin i "RST" | [] -> None in
+    (* Vivado's async CLR pin is ACTIVE-LOW (connected directly to rst_ni: reset when
+       rst_ni=0) — invert the condition and use negedge; the sync RST pin is
+       active-high. *)
+    let rst_pin, is_clr = match insts with
+      | i :: _ -> (match pin i "RST" with
+                   | Some x -> (Some x, false)
+                   | None -> (pin i "CLR", pin i "CLR" <> None))
+      | [] -> (None, false) in
     let body =
       if rst <> "" then
         let w = maxmsb + 1 in
         (match rst_pin with
-         | Some r -> [BIf { condition = r;
-                            then_stmts = [BAssign { lhs = base; rhs = BConst { value = Z.zero; width = w } }];
-                            else_stmts = [gated] }]
+         | Some r ->
+             let cond = if is_clr then BUnOp { op = BNot; operand = r; result_type = BInt { width = 1; signed = Unsigned } } else r in
+             [BIf { condition = cond;
+                    then_stmts = [BAssign { lhs = base; rhs = BConst { value = Z.zero; width = w } }];
+                    else_stmts = [gated] }]
          | None -> [gated])
       else [gated] in
     let is_async = match insts with i :: _ -> contains_sub "ASYNC" (strip_bs i.module_name) | _ -> false in
     BSequential { name = base ^ "_rtlreg"; clock = clk; clock_edge = `Pos;
                   reset = (if rst <> "" then match rst_pin with Some (BVar n) -> Some n | _ -> None else None);
-                  reset_edge = (if is_async then Some `Pos else None);
+                  reset_edge = (if is_async then Some (if is_clr then `Neg else `Pos) else None);
                   reset_async = is_async; body; blocking_vars = [] })
     !order
 
@@ -295,7 +305,13 @@ let register_processes (regs : binstance list) : bprocess list =
    instance connections), then drop the now-duplicate \^port\ signal decl. *)
 let canon_ports_module (m : bmodule) : bmodule =
   let rec re_e e = match e with
-    | BVar n -> BVar (canon_net n)
+    | BVar n ->
+        (* Vivado ties constants through shared nets \<const0>\ / \<const1>\ (driven
+           by GND/VCC prims we don't model); resolve them to literals or they read 0. *)
+        (match strip_bs n with
+         | "<const0>" -> BConst { value = Z.zero; width = 1 }
+         | "<const1>" -> BConst { value = Z.one; width = 1 }
+         | _ -> BVar (canon_net n))
     | BConst _ -> e
     | BBinOp r -> BBinOp { r with lhs = re_e r.lhs; rhs = re_e r.rhs }
     | BUnOp r -> BUnOp { r with operand = re_e r.operand }
