@@ -516,7 +516,7 @@ let rec stmt_to_bstmt = function
                           expr_to_bexpr rhs];
                 }
             | None -> BBlock [])
-       | Sel { expr = sel_expr; lsb; width; _ } ->
+       | Sel { expr = sel_expr; lsb; width; width_const = width_attr; _ } ->
            (* Bit-slice write: `name[lsb +: width] <= rhs` (also used
               for the `[hi:lo]` form, which Verilator lowers to lsb +
               width).  Drop the slice indexing here and you get a
@@ -532,7 +532,13 @@ let rec stmt_to_bstmt = function
                   | _ -> None
                 in
                 let lsb_const   = Option.bind lsb   const_int_of in
-                let width_const = Option.bind width const_int_of in
+                (* Width is a `widthConst` ATTRIBUTE, not a `widthp` child node —
+                   fall back to it, else a `[hi:lo]` LHS part-select collapses to
+                   1 bit (ibex_counter's `counter_val_upd_o[31:0] <= '0` wrote only
+                   bit 0, leaving 62 bits undriven). *)
+                let width_const = match Option.bind width const_int_of with
+                  | Some w -> Some w
+                  | None -> (match width_attr with Some w when w > 0 -> Some w | _ -> None) in
                 let rhs_e = expr_to_bexpr rhs in
                 (match lsb_const, width_const with
                  | Some lo, Some w ->
