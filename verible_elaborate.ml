@@ -184,12 +184,33 @@ let deep_string_of_token tok =
  * if present.
  *)
 let extract_module_param tok =
+  (* The parameter name is the last identifier BEFORE the `=` default.  Taking
+     the first id named the TYPE for a user-typed param (`rv32b_e RV32B`) or the
+     RANGE param for a ranged one (`bit [Width-1:0] ResetValue` -> "Width"), so
+     the override never matched and the body reference leaked.  Skip the default
+     expression (else `rv32b_e RV32B = RV32BNone` would pick "RV32BNone") and
+     take the last remaining id. *)
   let names = ref [] in
-  walk (function
+  let rec w t = match t with
     | SymbolIdentifier id -> names := id :: !names
+    | TUPLE3 (STRING tag, _, _) when prefix_is "trailing_assign" tag -> ()
+    | TUPLE4 (STRING tag, _, _, _) when prefix_is "trailing_assign" tag -> ()
+    | TUPLE2 (a,b) -> w a; w b
+    | TUPLE3 (a,b,c) -> w a; w b; w c
+    | TUPLE4 (a,b,c,d) -> List.iter w [a;b;c;d]
+    | TUPLE5 (a,b,c,d,e) -> List.iter w [a;b;c;d;e]
+    | TUPLE6 (a,b,c,d,e,f) -> List.iter w [a;b;c;d;e;f]
+    | TUPLE7 (a,b,c,d,e,f,g) -> List.iter w [a;b;c;d;e;f;g]
+    | TUPLE8 (a,b,c,d,e,f,g,h) -> List.iter w [a;b;c;d;e;f;g;h]
+    | TUPLE9 (a,b,c,d,e,f,g,h,i) -> List.iter w [a;b;c;d;e;f;g;h;i]
+    | TUPLE10 (a,b,c,d,e,f,g,h,i,j) -> List.iter w [a;b;c;d;e;f;g;h;i;j]
+    | TUPLE11 (a,b,c,d,e,f,g,h,i,j,k) -> List.iter w [a;b;c;d;e;f;g;h;i;j;k]
+    | TUPLE12 (a,b,c,d,e,f,g,h,i,j,k,l) -> List.iter w [a;b;c;d;e;f;g;h;i;j;k;l]
+    | TUPLE13 (a,b,c,d,e,f,g,h,i,j,k,l,m) -> List.iter w [a;b;c;d;e;f;g;h;i;j;k;l;m]
+    | TLIST xs -> List.iter w xs
     | _ -> ()
-  ) tok;
-  match List.rev !names with
+  in w tok;
+  match !names with
   | n :: _ -> Some n
   | [] -> None
 
