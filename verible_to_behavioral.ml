@@ -3699,8 +3699,13 @@ let children_of = function
   | TLIST xs -> xs
   | _ -> []
 
-let extract_instances ~pkgs ~params tok =
-  let arrays = [] in
+let extract_instances ~pkgs ~params ?(arrays = []) tok =
+  (* `arrays` = the enclosing module's array-typed signal names, so a
+     port-connection expression `arr[a][b]` on a packed-2D array (e.g. gpio's
+     `.btn_i(gp_i_q[2][i])`) lowers the outer index as an element-SELECT, not
+     a bit-select.  Without it the inner `arr[a]` became a 1-bit BSlice and the
+     nested `[b]` flattened to `arr[a+b]` (gp_i_q[2][i] -> gp_i_q[2+i]) — an
+     out-of-range flat index Vivado rejects. *)
   (* Use the labeled walker so each instance picks up the
    * `<begin_label>.` prefix of every enclosing labeled generate
    * block. This matches the inst_name format that
@@ -5659,7 +5664,7 @@ let convert_module ~pkgs (mdecl : module_decl)
   in
   let assign_procs = assign_procs @ initial_procs in
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
-  let instances = extract_instances ~pkgs ~params mdecl.m_body in
+  let instances = extract_instances ~pkgs ~params ~arrays:array_names mdecl.m_body in
   (* Post-pass: merge combinational @mem_write groups targeting the
    * same array into a single full-array concat assignment. lzc's
    * `for (genvar j…) assign index_lut[j] = …` unrolls to N
