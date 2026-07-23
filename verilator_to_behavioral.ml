@@ -551,12 +551,21 @@ let rec stmt_to_bstmt = function
                               ; rhs_e ];
                      }
                  | _ ->
+                     (* Dynamic lsb (e.g. a flattened packed-array element write
+                        `mem[widx] <= wdata` -> mem[widx*W +: W]).  The width is
+                        still the constant `widthConst` attribute; prefer it, else a
+                        dynamic width node, else 1.  Reading only the (absent) width
+                        node defaulted to 1, so packreg wrote 1 bit of each 32-bit
+                        element (ibex_fetch_fifo's rdata_q). *)
                      let lsb_e = match lsb with
                        | Some l -> expr_to_bexpr l
                        | None   -> BConst { value = Z.zero; width = 32 } in
-                     let width_e = match width with
-                       | Some w -> expr_to_bexpr w
-                       | None   -> BConst { value = Z.one; width = 32 } in
+                     let width_e = match width_const with
+                       | Some w -> BConst { value = Z.of_int w; width = 32 }
+                       | None ->
+                           (match width with
+                            | Some w -> expr_to_bexpr w
+                            | None   -> BConst { value = Z.one; width = 32 }) in
                      BCallStmt {
                        func = "@part_sel_write_up";
                        args = [ BVar name; lsb_e; width_e; rhs_e ];
