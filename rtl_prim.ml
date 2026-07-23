@@ -112,6 +112,26 @@ let comb_cell (attr : string -> string option) (i : binstance) : bprocess option
     | Some a, Some b -> emit (BBinOp { op; lhs = a; rhs = b; result_type = rt })
     | _ -> None in
   let un op = match pin "I0" with Some a -> emit (BUnOp { op; operand = a; result_type = ut }) | _ -> None in
+  let red op = match pin "I0" with Some a -> emit (BUnOp { op; operand = a; result_type = bool_t }) | _ -> None in
+  let red_n op = match pin "I0" with
+    | Some a -> emit (BUnOp { op = BNot;
+        operand = BUnOp { op; operand = a; result_type = bool_t }; result_type = bool_t })
+    | _ -> None in
+  (* RTL_BSEL: O = I[S] dynamic bit-select -> (I >> S) & 1. *)
+  let bsel () = match pin "I", pin "S" with
+    | Some i, Some s -> emit (BBinOp { op = BAnd;
+        lhs = BBinOp { op = BShr; lhs = i; rhs = s; result_type = ut };
+        rhs = BConst { value = Z.one; width = 1 }; result_type = ut })
+    | _ -> None in
+  (* RTL_BMERGE: O = DATA with bit S replaced by I -> (DATA & ~(1<<S)) | (I<<S). *)
+  let bmerge () = match pin "DATA", pin "I", pin "S" with
+    | Some data, Some ib, Some s ->
+        let mask = BBinOp { op = BShl; lhs = BConst { value = Z.one; width = 64 }; rhs = s; result_type = ut } in
+        emit (BBinOp { op = BOr;
+          lhs = BBinOp { op = BAnd; lhs = data;
+                         rhs = BUnOp { op = BNot; operand = mask; result_type = ut }; result_type = ut };
+          rhs = BBinOp { op = BShl; lhs = ib; rhs = s; result_type = ut }; result_type = ut })
+    | _ -> None in
   (* Build `sel == v0 || sel == v1 || …` for an arm's value set. *)
   let arm_cond selpin vals = match pin selpin with
     | None -> None
@@ -185,11 +205,16 @@ let comb_cell (attr : string -> string option) (i : binstance) : bprocess option
   match mstem with
   | "RTL_INV" -> un BNot
   | "RTL_AND" -> bin BAnd ut | "RTL_OR" -> bin BOr ut | "RTL_XOR" -> bin BXor ut
-  | "RTL_ADD" -> bin BAdd ut | "RTL_SUB" -> bin BSub ut | "RTL_MUL" -> bin BMul ut
+  | "RTL_ADD" -> bin BAdd ut | "RTL_SUB" -> bin BSub ut
+  | "RTL_MUL" | "RTL_MULT" -> bin BMul ut
   | "RTL_LSHIFT" -> bin BShl ut | "RTL_RSHIFT" -> bin BShr ut | "RTL_ARSHIFT" -> bin BAshr ut
   | "RTL_EQ" -> bin BEq bool_t | "RTL_NEQ" -> bin BNe bool_t
   | "RTL_LT" -> bin BLt bool_t | "RTL_LEQ" -> bin BLe bool_t
   | "RTL_GT" -> bin BGt bool_t | "RTL_GEQ" -> bin BGe bool_t
+  | "RTL_REDUCTION_OR" -> red BRedOr | "RTL_REDUCTION_AND" -> red BRedAnd
+  | "RTL_REDUCTION_XOR" -> red BRedXor
+  | "RTL_REDUCTION_NOR" -> red_n BRedOr | "RTL_REDUCTION_NAND" -> red_n BRedAnd
+  | "RTL_BSEL" -> bsel () | "RTL_BMERGE" -> bmerge ()
   | "RTL_MUX" -> mux ()
   | "RTL_ROM" -> rom ()
   | "RTL_LATCH" -> latch ()
