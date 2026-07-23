@@ -416,9 +416,24 @@ let verilog_of_instance prog inst =
   let is_vlit s =
     s <> "" && (String.contains s '\'' ||
                 String.for_all (fun c -> c >= '0' && c <= '9') s) in
+  (* A REAL literal (`5.000`, `20.000`, `0.500`) must be emitted RAW, not
+     quoted: a `real`-typed parameter (MMCME2_ADV.CLKFBOUT_MULT_F/CLKIN1_PERIOD
+     etc.) given the string "5.000" makes Vivado pack the string's ASCII bytes
+     as the real value (0x352E303030 = 228408176688), so the MMCM gets garbage
+     multipliers/periods.  Detect a plain decimal: optional sign, exactly one
+     '.' with digits on both sides. *)
+  let is_real s =
+    let s = if String.length s > 0 && (s.[0] = '+' || s.[0] = '-')
+            then String.sub s 1 (String.length s - 1) else s in
+    let n = String.length s in
+    let dot = ref (-1) and ok = ref true in
+    String.iteri (fun i c ->
+      if c = '.' then (if !dot >= 0 then ok := false else dot := i)
+      else if not (c >= '0' && c <= '9') then ok := false) s;
+    !ok && !dot > 0 && !dot < n - 1 in
   let str_params = List.filter_map (fun (name, value) ->
     if not (keep name) then None
-    else if is_vlit value then Some (name, Printf.sprintf ".%s(%s)" name value)
+    else if is_vlit value || is_real value then Some (name, Printf.sprintf ".%s(%s)" name value)
     else Some (name, Printf.sprintf ".%s(\"%s\")" name value)) param_strs in
   (* Dedup by parameter NAME, keeping the first occurrence.  The param
      extraction can list the same name in BOTH param_values and param_strs, or
