@@ -1633,9 +1633,10 @@ let convert_vhdl_files_to_behavioral filenames =
                   then String.sub s 1 (String.length s - 1) else s in
           if String.length s > 0 && s.[String.length s - 1] = '\\'
           then String.sub s 0 (String.length s - 1) else s in
-        let sel_tbl : (string, string) Hashtbl.t = Hashtbl.create 64 in
+        (* (inst, attr) -> value, for SEL_VAL (mux) and INIT_VAL (ROM). *)
+        let attr_tbl : (string * string, string) Hashtbl.t = Hashtbl.create 128 in
         let re = Str.regexp
-          "attribute SEL_VAL of \\([^ ]+\\) : label is \"\\([^\"]*\\)\"" in
+          "attribute \\(SEL_VAL\\|INIT_VAL\\) of \\([^ ]+\\) : label is \"\\([^\"]*\\)\"" in
         List.iter (fun fn ->
           try
             let ic = open_in fn in
@@ -1643,23 +1644,24 @@ let convert_vhdl_files_to_behavioral filenames =
                let line = input_line ic in
                (try
                   ignore (Str.search_forward re line 0);
-                  Hashtbl.replace sel_tbl (norm (Str.matched_group 1 line))
-                    (Str.matched_group 2 line)
+                  Hashtbl.replace attr_tbl
+                    (norm (Str.matched_group 2 line), Str.matched_group 1 line)
+                    (Str.matched_group 3 line)
                 with Not_found -> ())
              done with End_of_file -> ());
             close_in ic
           with _ -> ()) filenames;
-        if Hashtbl.length sel_tbl = 0
-           && not (List.exists (fun (m : Behavioral_ir.bmodule) ->
-                     List.exists (fun (i : Behavioral_ir.binstance) ->
-                       String.length i.module_name >= 4
-                       && String.sub i.module_name 0 4 = "RTL_") m.instances)
-                     result.modules)
-        then result
+        let has_rtl = List.exists (fun (m : Behavioral_ir.bmodule) ->
+          List.exists (fun (i : Behavioral_ir.binstance) ->
+            let mn = if String.length i.module_name > 0 && i.module_name.[0] = '\\'
+                     then String.sub i.module_name 1 (String.length i.module_name - 1)
+                     else i.module_name in
+            String.length mn >= 4 && String.sub mn 0 4 = "RTL_") m.instances) result.modules in
+        if not has_rtl then result
         else
-          let sel_val_of inst = Hashtbl.find_opt sel_tbl (norm inst) in
+          let attr_of inst name = Hashtbl.find_opt attr_tbl (norm inst, name) in
           { result with modules =
-              List.map (Rtl_prim.resolve_rtl_instances sel_val_of) result.modules } in
+              List.map (Rtl_prim.resolve_rtl_instances attr_of) result.modules } in
 
       (* Restore old hashtable and settings before returning *)
       Vhd_front.Vabstraction.vhdlhash := old_hash;

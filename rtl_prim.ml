@@ -50,19 +50,34 @@ let parse_based (v : string) : (int * int) option =
        with _ -> None)
   | _ -> (try Some (32, int_of_string v) with _ -> None)
 
-(* "I0:S=2'b11,I1:S=default" -> [("I0", Some (2,3)); ("I1", None)]. *)
-let parse_sel_val (s : string) : (string * (int * int) option) list =
+(* An arm of a SEL_VAL / INIT_VAL attribute: either the default input, or an input
+   routed when a select signal equals one of a set of values.  Formats seen:
+     "I0:S=2'b11"                 single select S, one value
+     "I2:S=7'b001;7'b010"         single select S, several values (;)
+     "I0:S0=1'b1,I1:S1=1'b1"      ONE-HOT: per-arm select pins S0,S1,…
+     "I4:default" / "I4:S=default"
+   RTL_ROM's INIT_VAL uses "INIT_<addr>:<val>" / "INIT_DEFAULT:<val>" (address == A). *)
+type arm =
+  | ADefault of string                                 (* input pin *)
+  | ASel of string * string * (int * int) list         (* input pin, select pin, values *)
+
+let parse_sel_val (s : string) : arm list =
   String.split_on_char ',' s
-  |> List.filter_map (fun arm ->
-       match String.index_opt arm ':' with
+  |> List.filter_map (fun a ->
+       match String.index_opt a ':' with
        | Some c ->
-           let inp = String.trim (String.sub arm 0 c) in
-           let rest = String.sub arm (c + 1) (String.length arm - c - 1) in
-           (match String.index_opt rest '=' with
-            | Some e ->
-                let v = String.trim (String.sub rest (e + 1) (String.length rest - e - 1)) in
-                if v = "default" then Some (inp, None) else Some (inp, parse_based v)
-            | None -> None)
+           let inp = String.trim (String.sub a 0 c) in
+           let rest = String.trim (String.sub a (c + 1) (String.length a - c - 1)) in
+           if rest = "default" then Some (ADefault inp)
+           else (match String.index_opt rest '=' with
+             | Some e ->
+                 let selpin = String.trim (String.sub rest 0 e) in
+                 let vs = String.trim (String.sub rest (e + 1) (String.length rest - e - 1)) in
+                 if vs = "default" then Some (ADefault inp)
+                 else
+                   let vals = String.split_on_char ';' vs |> List.filter_map parse_based in
+                   Some (ASel (inp, selpin, vals))
+             | None -> None)
        | None -> None)
 
 (* An output pin drives either a whole signal or a constant bit-slice of one.
@@ -85,7 +100,7 @@ let self_read = function
 
 (* Combinational RTL_* cell (logic / mux) -> process.  Registers are handled by
    the grouping pass below. *)
-let comb_cell (sel_val : string option) (i : binstance) : bprocess option =
+let comb_cell (attr : string -> string option) (i : binstance) : bprocess option =
   let pin name = List.assoc_opt name i.port_connections in
   let ut = BInt { width = 64; signed = Unsigned }
   and bool_t = BInt { width = 1; signed = Unsigned } in
@@ -97,21 +112,69 @@ let comb_cell (sel_val : string option) (i : binstance) : bprocess option =
     | Some a, Some b -> emit (BBinOp { op; lhs = a; rhs = b; result_type = rt })
     | _ -> None in
   let un op = match pin "I0" with Some a -> emit (BUnOp { op; operand = a; result_type = ut }) | _ -> None in
-  let mux () = match pin "S" with
+  (* Build `sel == v0 || sel == v1 || …` for an arm's value set. *)
+  let arm_cond selpin vals = match pin selpin with
+    | None -> None
     | Some s ->
-        let arms = match sel_val with Some sv -> parse_sel_val sv | None -> [] in
-        let base = List.find_map (fun (inp, v) -> if v = None then pin inp else None) arms in
+        (match List.map (fun (w, v) ->
+                  BBinOp { op = BEq; lhs = s;
+                           rhs = BConst { value = Z.of_int v; width = (if w > 0 then w else 32) };
+                           result_type = bool_t }) vals with
+         | [] -> None
+         | c :: rest -> Some (List.fold_left (fun a c ->
+             BBinOp { op = BOr; lhs = a; rhs = c; result_type = bool_t }) c rest)) in
+  (* N-input mux from SEL_VAL arms (one-hot per-arm select pin, or single S with a
+     value set). *)
+  let mux () = match attr "SEL_VAL" with
+    | Some sv ->
+        let arms = parse_sel_val sv in
+        let base = List.find_map (function ADefault inp -> pin inp | _ -> None) arms in
         let base = match base with Some e -> e | None -> BConst { value = Z.zero; width = 1 } in
-        let rhs = List.fold_left (fun acc (inp, v) ->
-          match v, pin inp with
-          | Some (w, sel), Some ie ->
-              BCond { condition = BBinOp { op = BEq; lhs = s;
-                        rhs = BConst { value = Z.of_int sel; width = (if w > 0 then w else 32) };
-                        result_type = bool_t };
-                      then_val = ie; else_val = acc }
-          | _ -> acc) base (List.rev arms) in
+        let rhs = List.fold_left (fun acc a -> match a with
+          | ADefault _ -> acc
+          | ASel (inp, selpin, vals) ->
+              (match arm_cond selpin vals, pin inp with
+               | Some cond, Some ie -> BCond { condition = cond; then_val = ie; else_val = acc }
+               | _ -> acc)) base (List.rev arms) in
         emit rhs
     | None -> None in
+  (* RTL_ROM: O = ROM[A].  INIT_VAL "INIT_<addr>:<v>,INIT_DEFAULT:<v>" -> O = (A==addr
+     ? v : … : default).  Reuse mux_of by treating INIT_<addr> like an input==addr arm. *)
+  let rom () = match attr "INIT_VAL" with
+    | Some iv ->
+        let arms = String.split_on_char ',' iv |> List.filter_map (fun a ->
+          match String.index_opt a ':' with
+          | Some c ->
+              let key = String.trim (String.sub a 0 c) in
+              let v = String.trim (String.sub a (c + 1) (String.length a - c - 1)) in
+              if key = "INIT_DEFAULT" then
+                (match parse_based v with Some (w, x) -> Some (`Def (w, x)) | None -> None)
+              else if String.length key >= 5 && String.sub key 0 5 = "INIT_" then
+                (try let addr = int_of_string (String.sub key 5 (String.length key - 5)) in
+                     (match parse_based v with Some (w, x) -> Some (`E (addr, w, x)) | None -> None)
+                 with _ -> None)
+              else None
+          | None -> None) in
+        let deflt = List.find_map (function `Def (w, x) -> Some (w, x) | _ -> None) arms in
+        let base = match deflt with Some (w, x) -> BConst { value = Z.of_int x; width = w } | None -> BConst { value = Z.zero; width = 1 } in
+        (match pin "A" with
+         | Some a ->
+             let rhs = List.fold_left (fun acc arm -> match arm with
+               | `E (addr, w, x) ->
+                   BCond { condition = BBinOp { op = BEq; lhs = a;
+                             rhs = BConst { value = Z.of_int addr; width = 32 }; result_type = bool_t };
+                           then_val = BConst { value = Z.of_int x; width = (if w > 0 then w else 1) };
+                           else_val = acc }
+               | `Def _ -> acc) base (List.rev arms) in
+             emit rhs
+         | None -> None)
+    | None -> None in
+  (* RTL_LATCH: transparent latch, Q = G ? D : Q (per-bit gate G). *)
+  let latch () = match out_target (pin "Q"), pin "D", pin "G" with
+    | Some t, Some d, Some g ->
+        Some (BCombinational { name = i.inst_name ^ "_rtl"; sensitivity = [BAny];
+          body = [write_out t (BCond { condition = g; then_val = d; else_val = self_read t })] })
+    | _ -> None in
   (* Vivado suffixes bit-width variants with digits (RTL_AND0 = 1-bit AND); strip
      them so the base operation matches. *)
   let mname = strip_bs i.module_name in
@@ -128,6 +191,8 @@ let comb_cell (sel_val : string option) (i : binstance) : bprocess option =
   | "RTL_LT" -> bin BLt bool_t | "RTL_LEQ" -> bin BLe bool_t
   | "RTL_GT" -> bin BGt bool_t | "RTL_GEQ" -> bin BGe bool_t
   | "RTL_MUX" -> mux ()
+  | "RTL_ROM" -> rom ()
+  | "RTL_LATCH" -> latch ()
   | _ -> None
 
 (* Group per-bit RTL_REG cells writing the same (base signal, clock, enable) into
@@ -240,7 +305,7 @@ let canon_ports_module (m : bmodule) : bmodule =
       { i with port_connections = List.map (fun (p, e) -> (p, re_e e)) i.port_connections })
       m.instances }
 
-let resolve_rtl_instances (sel_val_of : string -> string option) (m : bmodule) : bmodule =
+let resolve_rtl_instances (attr_of : string -> string -> string option) (m : bmodule) : bmodule =
   let m = canon_ports_module m in
   let is_reg i = let mn = strip_bs i.module_name in
     String.length mn >= 7 && String.sub mn 0 7 = "RTL_REG" in
@@ -248,7 +313,7 @@ let resolve_rtl_instances (sel_val_of : string -> string option) (m : bmodule) :
     String.length mn >= 4 && String.sub mn 0 4 = "RTL_" in
   let regs = List.filter is_reg m.instances in
   let combs, kept = List.partition is_rtl (List.filter (fun i -> not (is_reg i)) m.instances) in
-  let comb_procs = List.filter_map (fun i -> comb_cell (sel_val_of i.inst_name) i) combs in
+  let comb_procs = List.filter_map (fun i -> comb_cell (attr_of i.inst_name) i) combs in
   let reg_procs = register_processes regs in
   { m with instances = kept;
            processes = m.processes @ comb_procs @ reg_procs }
