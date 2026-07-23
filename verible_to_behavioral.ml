@@ -3872,9 +3872,24 @@ let extract_instances ~pkgs ~params tok =
              type_widths. *)
           let has_lparen = ref false in
           walk (function LPAREN -> has_lparen := true | _ -> ()) in_;
+          (* A data declaration WITH an initializer (`logic unused = a & (|b);`,
+             ibex_top's gen_noscramble unused-signal tie-off) has a net_decl_assign
+             and its RHS parens set has_lparen, defeating the paren discriminator
+             — it was mis-emitted as `<first-rhs-id> <label> ()`, an instance of a
+             nonexistent module.  A real instantiation never carries a
+             net_decl_assign, so treat its presence as decisive: not an instance. *)
+          let has_decl_assign =
+            collect_by (has_tag (fun t ->
+              prefix_is "net_decl_assign" t
+              || prefix_is "variable_decl_assignment" t
+              (* `logic unused = a & (|b);` parses as a
+                 non_anonymous_gate_instance_or_register_variable with a
+                 trailing_decl_assignment initializer — the RHS parens fool the
+                 has_lparen instance discriminator. *)
+              || prefix_is "trailing_decl_assignment" t)) in_ <> [] in
           if !port_conns = []
              && (List.mem m param_names || is_pkg_name || is_type_name
-                 || not !has_lparen) then None
+                 || not !has_lparen || has_decl_assign) then None
           else
             let prefixed_inst = String.concat "." (label_stack @ [i]) in
             Some {
