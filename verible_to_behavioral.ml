@@ -1109,6 +1109,30 @@ let result_type_for_un op operand =
     | Some w -> BInt { width = w; signed = Unsigned }
     | None -> BInt { width = 1; signed = Unsigned }
 
+(* Pack a struct-typed localparam into a single BConst: field VALUES from
+   cur_struct_params, field WIDTHS/order from cur_struct_defs (via the
+   name->type map cur_signal_struct).  Lets a whole-struct or bit-sliced use
+   (dm_top's `localparam dm::hartinfo_t DebugHartInfo = '{...}` referenced as
+   DebugHartInfo[31:24]) fold instead of leaking as an undeclared identifier.
+   MSB-first packing (SV packed-struct layout); unspecified fields default to 0
+   per `'{...}` semantics.  None if the type or its layout is unknown. *)
+let pack_struct_const id : bexpr option =
+  match Hashtbl.find_opt cur_struct_params id,
+        List.assoc_opt id !cur_signal_struct with
+  | Some field_vals, Some sty ->
+      (match List.assoc_opt sty !cur_struct_defs with
+       | Some layout when layout <> [] ->
+           let total = List.fold_left (fun a (_, w) -> a + max 0 w) 0 layout in
+           let value = List.fold_left (fun acc (fname, w) ->
+             let w = max 0 w in
+             let fv = match List.assoc_opt fname field_vals with
+               | Some v -> Z.of_int v | None -> Z.zero in
+             let masked = Z.logand fv (Z.sub (Z.shift_left Z.one w) Z.one) in
+             Z.logor (Z.shift_left acc w) masked) Z.zero layout in
+           Some (BConst { value; width = total })
+       | _ -> None)
+  | _ -> None
+
 let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
   let recurse = expr_to_bexpr ~pkgs ~params ~arrays in
   let bin op a b =
@@ -1179,7 +1203,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
   | SymbolIdentifier id ->
       (match List.assoc_opt id params with
        | Some v -> param_value_to_bexpr id v
-       | None -> BVar id)
+       | None -> (match pack_struct_const id with Some c -> c | None -> BVar id))
   | TK_DecNumber n | TK_UnBasedNumber n ->
       (* SV unbased-unsized literals: `'0`, `'1`, `'x`, `'z`. The bit
        * pattern broadcasts to the LHS width.  We don't have the LHS
@@ -1226,7 +1250,7 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
        * free variable. *)
       (match List.assoc_opt id params with
        | Some v -> param_value_to_bexpr id v
-       | None -> BVar id)
+       | None -> (match pack_struct_const id with Some c -> c | None -> BVar id))
   (* Array assignment pattern `'{e1, e2, …}` — Verible's
      `assignment_pattern1` wraps a TLIST of bare expressions (no key
      prefix, unlike the struct variant).  Distilled use case:
@@ -4637,6 +4661,27 @@ let convert_module ~pkgs (mdecl : module_decl)
     !acc
   in
   cur_signal_struct := signal_struct_decls;
+  (* Struct-typed LOCALPARAMS (`localparam dm::hartinfo_t DebugHartInfo = '{…}`)
+     are param declarations, not instantiation_base nodes, so signal_struct_decls
+     above misses them.  Register name->struct-type for each so pack_struct_const
+     can fold a whole/sliced reference.  Within each param decl, the NAME is the
+     id already recorded in cur_struct_params (its `'{…}` fields), and the TYPE is
+     the id that is a known struct typedef. *)
+  (let param_struct_decls =
+     let acc = ref [] in
+     List.iter (fun pn ->
+       let name = ref None and ty = ref None in
+       walk (function
+         | SymbolIdentifier id ->
+             if !name = None && Hashtbl.mem cur_struct_params id then name := Some id;
+             if !ty = None && List.mem_assoc id !cur_struct_defs then ty := Some id
+         | _ -> ()) pn;
+       match !name, !ty with
+       | Some n, Some t -> acc := (n, t) :: !acc
+       | _ -> ())
+       (collect_by (has_tag (prefix_is "any_param_declaration")) mdecl.m_body);
+     !acc in
+   cur_signal_struct := param_struct_decls @ !cur_signal_struct);
   (* Record the interface instances among these struct-typed locals for the
    * interface-elaboration pass (type is a registered interface), together with
    * each instance's parameter overrides so its bundle members can be sized
