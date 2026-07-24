@@ -281,6 +281,17 @@ let thread_comb_body orig_stmts =
           let snap_else = snapshot () in
           restore snap;
           merge cond' snap_then snap_else names;
+          (* A var that was partially written in a branch (a bracket / @mem_write
+             LHS → removed from env by thread_stmt) has an uncertain post-branch
+             value: it is NO LONGER equal to its entering default.  The merge
+             above can't express it (its name isn't in `names` — a bracketed lhs
+             `rdata[i]` collects as "rdata[i]", not "rdata"), so INVALIDATE any
+             entering var that disappeared from either branch snapshot.  Without
+             this, `rdata='0; if(c) rdata[i]={..}; rdata_d = rdata` folded to
+             `rdata_d = 0`, dropping dm_mem's go-flag byte. *)
+          List.iter (fun (k, _) ->
+            if not (List.mem_assoc k snap_then)
+               || not (List.mem_assoc k snap_else) then Hashtbl.remove env k) snap;
           BIf { condition = cond'; then_stmts = te; else_stmts = ee }
       | BCase { selector; cases; default } ->
           let sel' = subst selector in
@@ -307,6 +318,12 @@ let thread_comb_body orig_stmts =
                                                 result_type = BBool };
                            then_val = va; else_val = acc }) cases' vdef in
             Hashtbl.replace env nm m) names;
+          (* Same partial-write invalidation as BIf: any entering var that a
+             case arm (or default) removed from env is now uncertain. *)
+          List.iter (fun (k, _) ->
+            if (not (List.mem_assoc k snap_def))
+               || List.exists (fun (_, _, sn) -> not (List.mem_assoc k sn)) cases'
+            then Hashtbl.remove env k) snap;
           BCase { selector = sel';
                   cases = List.map (fun (k', ss', _) -> (k', ss')) cases';
                   default = default' }
