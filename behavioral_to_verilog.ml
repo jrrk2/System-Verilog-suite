@@ -304,6 +304,20 @@ let verilog_of_sensitivity = function
 (* Does an expression read any signal (BVar)?  A combinational block that reads
    NO signal has a pure-constant RHS, so a star-sensitivity always infers an
    EMPTY sensitivity list and never executes in simulation. *)
+let rec expr_mentions_name name = function
+  | BVar n -> n = name
+  | BConst _ -> false
+  | BBinOp { lhs; rhs; _ } -> expr_mentions_name name lhs || expr_mentions_name name rhs
+  | BUnOp { operand; _ } -> expr_mentions_name name operand
+  | BCond { condition; then_val; else_val } ->
+      expr_mentions_name name condition || expr_mentions_name name then_val
+      || expr_mentions_name name else_val
+  | BConcat es -> List.exists (expr_mentions_name name) es
+  | BReplicate { value; _ } -> expr_mentions_name name value
+  | BSelect { array; index } -> expr_mentions_name name array || expr_mentions_name name index
+  | BSlice { signal; _ } -> expr_mentions_name name signal
+  | BCall { args; _ } -> List.exists (expr_mentions_name name) args
+
 let rec expr_reads_var = function
   | BVar _ -> true
   | BConst _ -> false
@@ -411,16 +425,48 @@ let verilog_of_process proc =
               | Some `Neg -> Printf.sprintf "!%s" rst
               | None -> rst
             in
-            let resets = List.map (fun n ->
-                (* Unpacked-array reset needs `'{default:'0}` (Vivado rejects a
-                   bare `= '0` packed literal on an unpacked target). *)
-                let rhs = if List.mem n !current_unpacked then "'{default: '0}" else "'0" in
-                Printf.sprintf "    %s <= %s;" (sanitize_name n) rhs)
-                           (collect_targets body) in
-            Printf.sprintf "  if (%s) begin\n%s\n  end else begin\n%s\n  end"
-              rst_check
-              (String.concat "\n" resets)
-              (String.concat "\n" (List.map (verilog_of_stmt ~nb:true 2) body))
+            (* Prefer the REAL reset values.  The frontend keeps the source's
+               `if (!rst) reg<=RESETVAL else <clocked>` as the body's TOP-LEVEL
+               BIf (its then-branch carries the actual reset values, e.g. mtvec
+               <= 32'd1, mstatus <= its RST_VAL).  Zeroing every register below
+               would clobber those (they reset to 0 instead), breaking
+               reset-state fidelity.  When the body IS that reset-if (condition
+               mentions the reset signal), hoist its then-branch into the reset
+               branch and its else-branch into the clocked branch. *)
+            let hoisted = match body with
+              | [BIf { condition; then_stmts; else_stmts }]
+                  when expr_mentions_name rst condition ->
+                  Some (then_stmts, else_stmts)
+              | _ -> None
+            in
+            (match hoisted with
+             | Some (resets, clocked) ->
+                 (* Safety net: any register the block writes but the source
+                    reset branch doesn't cover still gets `<= '0` (else it would
+                    reset to X in sim — the reason zeroing was added). *)
+                 let covered = collect_targets resets in
+                 let extra = List.filter_map (fun n ->
+                     if List.mem n covered then None
+                     else
+                       let rhs = if List.mem n !current_unpacked then "'{default: '0}" else "'0" in
+                       Some (Printf.sprintf "    %s <= %s;" (sanitize_name n) rhs))
+                     (collect_targets body) in
+                 Printf.sprintf "  if (%s) begin\n%s\n  end else begin\n%s\n  end"
+                   rst_check
+                   (String.concat "\n"
+                      (List.map (verilog_of_stmt ~nb:true 2) resets @ extra))
+                   (String.concat "\n" (List.map (verilog_of_stmt ~nb:true 2) clocked))
+             | None ->
+                 let resets = List.map (fun n ->
+                     (* Unpacked-array reset needs `'{default:'0}` (Vivado rejects
+                        a bare `= '0` packed literal on an unpacked target). *)
+                     let rhs = if List.mem n !current_unpacked then "'{default: '0}" else "'0" in
+                     Printf.sprintf "    %s <= %s;" (sanitize_name n) rhs)
+                                (collect_targets body) in
+                 Printf.sprintf "  if (%s) begin\n%s\n  end else begin\n%s\n  end"
+                   rst_check
+                   (String.concat "\n" resets)
+                   (String.concat "\n" (List.map (verilog_of_stmt ~nb:true 2) body)))
         | _ ->
             String.concat "\n" (List.map (verilog_of_stmt ~nb:true 1) body)
       in
