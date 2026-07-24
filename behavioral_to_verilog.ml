@@ -935,12 +935,31 @@ let generate_library_cell_def_from_spec (module_name, lib_ports) =
 let generate_library_cells prog =
   (* Use actual library cell definitions from the EDIF *)
   let lib_cell_defs = prog.library_cells in
-
+  (* In the behavioral-verilog flow the netlist is always elaborated against the
+     simulator's unisims_ver / Vivado's built-in primitive library, which supply
+     BSCANE2 / MMCME2_ADV / BUFG / IBUFDS / FDRE / RAMB / … .  Emitting our own
+     port-only stubs for them is not just redundant: the instance passes params
+     the stub never declares, so xelab / synth error ("does not have a parameter
+     named …") and every consumer has to strip the stubs again.  We already know
+     which cells are vendor primitives — they were resolved from the Xilinx
+     primitive DB by lookup_xil_primitive_ports — so skip them here and keep only
+     the internal RTL_* cells that no external library provides.  Gated on
+     BEHAV_VERILOG so the EDIF / gate flows (which may genuinely need the stubs)
+     are unaffected. *)
+  let lib_cell_defs, skipped =
+    if Sys.getenv_opt "BEHAV_VERILOG" <> None then
+      List.partition (fun (n, _) -> String.starts_with ~prefix:"RTL_" n) lib_cell_defs
+    else lib_cell_defs, [] in
+  let hdr =
+    if skipped = [] then ""
+    else Printf.sprintf
+      "// Xilinx primitives provided by unisims_ver / Vivado (stubs skipped): %s\n\n"
+      (String.concat ", " (List.map fst skipped)) in
   if List.length lib_cell_defs > 0 then
     let defs = List.map generate_library_cell_def_from_spec lib_cell_defs in
-    Printf.sprintf "// Library cell definitions\n\n%s\n\n" (String.concat "\n\n" defs)
+    hdr ^ Printf.sprintf "// Library cell definitions\n\n%s\n\n" (String.concat "\n\n" defs)
   else
-    ""
+    hdr
 
 (* Generate program *)
 let verilog_of_program prog =
