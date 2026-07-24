@@ -2911,9 +2911,16 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
      the boundary parser for these externally-supplied strings — the internal
      pipeline never re-parses. *)
   let top_params_ov = List.map (fun (k, s) ->
-    match Eval.eval_string [] s with
-    | Some n -> (k, OInt n)
-    | None -> (k, OStr s)) top_params in
+    (* A quoted string parameter value (SRAMInitFile="…/johnson.vmem") is NOT an
+       integer: Eval.eval_string would coerce the path to a junk number, which
+       then mangles the specialised suffix (S1694613367 vs the cleaned path) and
+       corrupts the value propagated to ram_2p.MemInitFile.  Keep quoted strings
+       as OStr; only int-parse a bare numeric literal. *)
+    let st = String.trim s in
+    if String.length st >= 1 && st.[0] = '"' then (k, OStr s)
+    else match Eval.eval_string [] s with
+      | Some n -> (k, OInt n)
+      | None -> (k, OStr s)) top_params in
   visit ~inst_label:None top_name top_params_ov;
   Hashtbl.fold (fun _ v acc -> v :: acc) seen []
   |> List.sort (fun a b -> compare a.s_name b.s_name)
