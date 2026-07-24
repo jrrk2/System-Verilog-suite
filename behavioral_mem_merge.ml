@@ -536,7 +536,7 @@ let rec scrub_slice_writes = function
    - a `cond ? rhs : prior` mux for a bit range a single site writes
    Returns [None] if the sites overlap (last-wins semantics would need
    per-bit muxing — not implemented yet).                            *)
-let merge_target_sites ~width ~base target sites =
+let merge_target_sites ~width ~base ~base_known target sites =
   (* MSB-first (descending hi) so we walk the bit range from top to
      bottom in concat order. *)
   let sorted = List.sort (fun a b -> compare b.hi a.hi) sites in
@@ -545,8 +545,19 @@ let merge_target_sites ~width ~base target sites =
      - combinational target: the DEFAULT assignment (`data_d = data_q`) that
        precedes the slice writes.  Using `BVar target` for a comb signal makes
        the RMW self-referential → a combinational loop (dm_mem's memory-word
-       assembly, dm_csrs' data_d/progbuf_d). *)
-  let prior hi lo = BSlice { signal = base; msb = hi; lsb = lo } in
+       assembly, dm_csrs' data_d/progbuf_d).
+     [base_known] is false when [base] is the zero-fallback (a comb target with
+     no in-process default).  If the sites don't fully cover [target] we would
+     then zero-fill the gap bits — WRONG when those bits are driven by ANOTHER
+     process (ibex_alu drives `shift_amt[5]` by a continuous assign and
+     `shift_amt[4:0]` in a separate always_comb).  Zero-filling [4:0] created a
+     second, constant driver → Vivado multi-driver, GND wins, shifts read 0.
+     [unfillable] flags any gap fill from an unknown base so we skip the merge
+     and leave the partial bit-select assign as its own driver. *)
+  let unfillable = ref false in
+  let prior hi lo =
+    if not base_known then unfillable := true;
+    BSlice { signal = base; msb = hi; lsb = lo } in
   let overlap = ref false in
   let rec walk cur = function
     | [] ->
@@ -566,7 +577,7 @@ let merge_target_sites ~width ~base target sites =
           gap @ [seg] @ walk (s.lo - 1) rest
   in
   let parts = walk (width - 1) sorted in
-  if !overlap then None
+  if !overlap || !unfillable then None
   else
     let rhs = match parts with
       | [single] -> single
@@ -592,8 +603,11 @@ let merge_slice_writes_body ~is_comb widths body =
        the register itself.  Falls back to `BVar target` if no full assign is
        found (a comb signal written only by slices — then it genuinely latches
        and BVar is the least-wrong choice). *)
+    (* Returns (base, base_known): base_known=false means the zero-fallback was
+       used (comb target with no in-process default) — a gap fill from it would
+       be a wrong constant driver, so merge_target_sites declines to merge. *)
     let base_of target w =
-      if not is_comb then BVar target   (* register Q feedback — correct *)
+      if not is_comb then (BVar target, true)   (* register Q feedback — correct *)
       else begin
         let found = ref None in
         let rec scan = function
@@ -609,19 +623,19 @@ let merge_slice_writes_body ~is_comb widths body =
           | _ -> () in
         List.iter scan body;
         match !found with
-        | Some rhs -> rhs
-        (* No default assign for a COMB target: reading `BVar target` for the
-           retention is a self-referential combinational loop (dm_mem's
-           abstract_cmd ROM, built by static per-halfword part-selects with no
-           default).  Use 0 — a comb signal with no default is undefined in HW,
-           so 0 is a safe non-looping choice; fully-covered targets have no
-           gaps and never use it. *)
-        | None -> BConst { value = Z.zero; width = w }
+        | Some rhs -> (rhs, true)
+        (* No default assign for a COMB target: use 0, but flag it not-known so a
+           PARTIAL target (gaps driven by another process, e.g. ibex_alu's
+           `shift_amt[5]` continuous-assign with `shift_amt[4:0]` in a separate
+           always) is NOT reconstructed with a zero-filled gap.  A fully-covered
+           target has no gaps and merges fine (base never read). *)
+        | None -> (BConst { value = Z.zero; width = w }, false)
       end in
     let merges = Hashtbl.fold (fun target ts acc ->
       match Hashtbl.find_opt widths.scalar target with
       | Some w ->
-          (match merge_target_sites ~width:w ~base:(base_of target w) target ts with
+          let (base, base_known) = base_of target w in
+          (match merge_target_sites ~width:w ~base ~base_known target ts with
            | Some bassign -> (target, bassign) :: acc
            | None -> acc)
       | None -> acc) by_target [] in

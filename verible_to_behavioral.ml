@@ -5848,6 +5848,32 @@ let convert_module ~pkgs (mdecl : module_decl)
           index = BConst { value = Z.of_int _k; width = 32 };
         }
       in
+      (* A scalar VECTOR (`logic [W:0] v`, not an array) only PARTIALLY covered
+         by these indexed writes has its other bits driven by ANOTHER process
+         (ibex_alu: `assign amt[5]` here, `always_comb amt[4:0]` elsewhere).
+         Reconstructing the whole vector with a zero filler adds a second,
+         constant driver on those bits — Vivado multi-driven net, GND wins, the
+         low bits read 0.  Emit the collected writes as PARTIAL slice-writes (one
+         driver per covered range), leaving the rest to their own process.  A
+         fully-covered vector (the cell-mapped `assign out[i]` bit-blast this
+         merge was built for) falls through to the whole-vector concat. *)
+      let covered =
+        List.fold_left (fun a (_, data) ->
+          a + (if is_scalar then data_width data else elem_w)) 0 writes in
+      if is_scalar && covered < arr_size then
+        List.map (fun (idx, data) ->
+          let w = data_width data in
+          BCombinational {
+            name = Printf.sprintf "assign_%s_%d" arr idx;
+            sensitivity = [BAny];
+            body = [BCallStmt {
+              func = "@slice_write";
+              args = [BVar arr;
+                      BConst { value = Z.of_int idx; width = 32 };
+                      BConst { value = Z.of_int (idx - w + 1); width = 32 };
+                      truncate_to_elem ~w data] }];
+          }) writes @ acc
+      else begin
       let parts = ref [] in
       let cursor = ref (arr_size - 1) in
       List.iter (fun (idx, data) ->
@@ -5879,6 +5905,7 @@ let convert_module ~pkgs (mdecl : module_decl)
         sensitivity = [BAny];
         body = [BAssign { lhs = arr; rhs }];
       } :: acc
+      end
     ) mem_writes [] in
     other_procs @ merged
   in
