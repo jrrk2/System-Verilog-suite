@@ -2636,8 +2636,14 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
       List.filter_map (fun (n, v) ->
         match int_of_pvalue v with Some i -> Some (n, i) | None -> None)
         p.pkg_params) pkgs in
-  List.iter (fun m -> collect_type_widths ~scope:pkg_scope m.m_body) mods;
+  (* PACKAGES FIRST: a module's packed struct can name a package enum/typedef
+     (`priv_lvl_e mpp` in ibex's status_t, from ibex_pkg), but a package can never
+     reference a module-local type.  Registering module bodies first summed such a
+     struct while the package enum was still unknown — the field took the width-1
+     None fallback (status_t = 5 not 6 → mstatus Width/ResetValue off by a bit).
+     Collect packages, then modules, so every shared type is known downstream. *)
   List.iter (fun p -> collect_type_widths ~scope:pkg_scope p.pkg_body) pkgs;
+  List.iter (fun m -> collect_type_widths ~scope:pkg_scope m.m_body) mods;
   (* second pass: struct-typed signal/port names (needs all typedefs first) *)
   List.iter (fun m -> collect_signal_widths m.m_body) mods;
   List.iter (fun p -> collect_signal_widths p.pkg_body) pkgs;
