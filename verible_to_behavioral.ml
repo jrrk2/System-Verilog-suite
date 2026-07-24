@@ -4363,6 +4363,12 @@ let scalarize_module ~signal_struct ~struct_defs (m : bmodule) : bmodule =
       | None -> ()) m.signals;
   if Hashtbl.length split = 0 then m else begin
     let fvar s f = s ^ "$" ^ f in
+    (* Original-signal width oracle, so a @slice_write whose data spans a WHOLE
+       struct can be recognised as a full-struct copy (see the handler below). *)
+    let sig_widths : (string, int) Hashtbl.t = Hashtbl.create 64 in
+    List.iter (fun (s : bsignal) ->
+      Hashtbl.replace sig_widths s.name (Behavioral_ir.width_of_type s.stype))
+      m.signals;
     (* rewrite reads *)
     let rec re e =
       match e with
@@ -4430,6 +4436,27 @@ let scalarize_module ~signal_struct ~struct_defs (m : bmodule) : bmodule =
       | BAssign { lhs; rhs } -> BAssign { lhs; rhs = re rhs }
       | BCallStmt { func = ("@part_sel_write_up" | "@slice_write") as fn;
                     args = (BVar s) :: rest } when Hashtbl.mem split s ->
+          let layout = Hashtbl.find split s in
+          let tw = List.fold_left (fun a (_, _, _, w) -> a + w) 0 layout in
+          (* FULL-STRUCT COPY: when the write DATA spans the entire struct width,
+             this is a whole-struct assignment — most importantly a packed
+             struct-ARRAY element slice `aligned[i +: 1] = src` (ibex dm's
+             `hartinfo_aligned[NrHarts-1:0] = hartinfo_i`).  Such a write reaches
+             here with ELEMENT-indexed (not bit-indexed) bounds — often left
+             un-folded (`NrHarts-1` = `1-1`) — so the bit-range logic below either
+             mis-read it as a 1-bit write or bailed to a no-op, dropping the
+             constant hartinfo and zeroing every DMI Hartinfo read.  Detect it by
+             the data width and copy each field from the source's bit-range. *)
+          let data_opt = match List.rev rest with d :: _ -> Some d | [] -> None in
+          let full_copy = match data_opt with
+            | Some d -> Behavioral_const.width_of_expr_with sig_widths d = Some tw
+            | None -> false in
+          if full_copy then
+            let data' = re (Option.get data_opt) in
+            BBlock (List.map (fun (f, fm, fl, _) ->
+              BAssign { lhs = fvar s f;
+                        rhs = BSlice { signal = data'; msb = fm; lsb = fl } }) layout)
+          else
           let rng =
             match fn, rest with
             | "@part_sel_write_up", [BConst { value = base; _ }; BConst { value = w; _ }; d] ->
