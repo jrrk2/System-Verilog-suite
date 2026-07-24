@@ -2546,6 +2546,14 @@ let extract_module_internal_params (body : token) : (string * token) list =
 
 (* ─── Specialisation ─────────────────────────────────────────────── *)
 
+(* A resolved parameter override value: kept TYPED end-to-end through the
+   specialisation pipeline so an integer never has to be stringified and
+   re-parsed.  OStr is a genuine string param (VMEM path, a quoted literal, or an
+   as-yet-unresolved reference propagated one level up). *)
+type oval = OInt of int | OStr of string
+
+let string_of_oval = function OInt n -> string_of_int n | OStr s -> s
+
 (* Encode a parameter-value dictionary into a compact suffix that
  * matches the spirit of Verilator's mangling: `__W4_M1_CW3`. *)
 let suffix_of_params params =
@@ -2567,12 +2575,13 @@ let suffix_of_params params =
     "__" ^ String.concat "_"
       (List.map (fun (k, v) ->
         let k' = abbrev k in
+        let vs = string_of_oval v in
         let v' =
           (* Strip leading apostrophe / format prefix from numbers. *)
           try
-            let i = String.index v '\'' in
-            String.sub v (i + 2) (String.length v - i - 2)
-          with Not_found -> v
+            let i = String.index vs '\'' in
+            String.sub vs (i + 2) (String.length vs - i - 2)
+          with Not_found -> vs
         in
         (* keep the mangled name a plain identifier: string param values
            arrive quoted ("GALOIS") — drop any non-alphanumeric chars *)
@@ -2692,14 +2701,12 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
    *   localparam A = 8; localparam B = A * 2;
    * resolve correctly. *)
   let int_scope_of mdecl overrides =
-    let scope = List.filter_map (fun (k, v) ->
-      (* A quoted string parameter value (VMEM path, "TDP", …) is NOT an integer;
-         letting Eval coerce it into the int scope corrupts it (a path folds to a
-         junk number and then propagates as that number).  Keep string params out
-         of the int scope — they travel via the str_env path instead. *)
-      let vt = String.trim v in
-      if String.length vt >= 1 && vt.[0] = '"' then None
-      else Option.map (fun n -> (k, n)) (Eval.eval_string [] v)
+    (* Overrides arrive already TYPED (oval): an OInt is an integer scope entry,
+       an OStr is a string parameter (VMEM path, "TDP", …) that must stay OUT of
+       the int scope — it travels via the str_env path instead.  No re-parsing. *)
+    let scope = List.filter_map (function
+      | (k, OInt n) -> Some (k, n)
+      | (_, OStr _) -> None
     ) overrides in
     (* For every module port-parameter that does NOT have an override,
      * fold its DEFAULT into the scope. Lets a top-level instantiation
@@ -2781,13 +2788,14 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
     let saved = List.map (fun (k, _) -> (k, Hashtbl.find_opt param_vw k)) scope in
     List.iter (fun (k, v) -> Hashtbl.replace param_vw k (v, 32)) scope;
     let result = List.map (fun (name, tok) ->
-      let v =
+      let v : oval =
         (* Evaluate the typed override token DIRECTLY (eval_cw handles sized
            literals `32'd1`/`32'h40101104`, concats and param refs) — NOT the
            fragile stringify→re-parse `Eval.eval_string` round-trip that dropped
-           e.g. `.RV(32'd1)` to empty (mtvec/mstatus/dcsr reset-value loss). *)
+           e.g. `.RV(32'd1)` to empty (mtvec/mstatus/dcsr reset-value loss). The
+           result stays TYPED (OInt), so int_scope_of never re-parses it. *)
         match eval_cw tok with
-        | Some (n, _) -> string_of_int n
+        | Some (n, _) -> OInt n
         | None ->
             if debug then
               Printf.eprintf "[eval_cw-None] override %s = %S\n%!"
@@ -2798,7 +2806,8 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
                couldn't yet fold (e.g. `$clog2(...)` — resolve_value reduces it
                via the type/width tables, so parse that decimal); a token that is
                a pure reference (identifiers only) is a STRING parameter —
-               propagate via str_env, or raw for one-level-up resolution. *)
+               propagate via str_env (carrying the parent's TYPED value), or raw
+               for one-level-up resolution. *)
             let numeric = ref false in
             walk (function
               | TK_DecNumber _ | TK_UnBasedNumber _
@@ -2809,13 +2818,13 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
             let s = String.trim (resolve_value pkgs tok) in
             if !numeric then
               (match int_of_string_opt s with
-               | Some n -> string_of_int n
+               | Some n -> OInt n
                | None ->
                    failwith (Printf.sprintf
                      "resolve_overrides: could not fold numeric override %s=%s \
                       (extend eval_cw)." name s))
             else
-              (match List.assoc_opt s str_env with Some sv -> sv | None -> s)
+              (match List.assoc_opt s str_env with Some sv -> sv | None -> OStr s)
       in
       (name, v)
     ) ovs in
@@ -2834,7 +2843,10 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
         if not (Hashtbl.mem seen sname) then begin
           Hashtbl.add seen sname {
             s_base = base; s_name = sname;
-            s_params = overrides; s_inst = inst_label;
+            (* s_params is the string-valued public interface consumed by
+               convert_module; render the typed overrides at this boundary. *)
+            s_params = List.map (fun (k, v) -> (k, string_of_oval v)) overrides;
+            s_inst = inst_label;
           };
           let scope = int_scope_of mdecl overrides in
           if debug then
@@ -2860,7 +2872,7 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
                 Printf.eprintf "[elab]   inst %s of %s: %s\n%!"
                   inst.i_inst inst.i_module
                   (String.concat ", "
-                    (List.map (fun (k, v) -> k^"="^v) ovs));
+                    (List.map (fun (k, v) -> k^"="^string_of_oval v) ovs));
               let child_suffix = suffix_of_params ovs in
               let child_sname = inst.i_module ^ child_suffix in
               Hashtbl.replace inst_specialised
@@ -2870,7 +2882,15 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
           ) (extract_instantiations ~scope mdecl.m_body)
         end
   in
-  visit ~inst_label:None top_name top_params;
+  (* top_params is the string-valued public interface (pinned from the driver);
+     lift it into the typed domain ONCE here.  Eval.eval_string is used only as
+     the boundary parser for these externally-supplied strings — the internal
+     pipeline never re-parses. *)
+  let top_params_ov = List.map (fun (k, s) ->
+    match Eval.eval_string [] s with
+    | Some n -> (k, OInt n)
+    | None -> (k, OStr s)) top_params in
+  visit ~inst_label:None top_name top_params_ov;
   Hashtbl.fold (fun _ v acc -> v :: acc) seen []
   |> List.sort (fun a b -> compare a.s_name b.s_name)
 
