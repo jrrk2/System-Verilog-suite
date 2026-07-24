@@ -259,7 +259,40 @@ let rec verilog_of_stmt ?(nb=false) indent stmt =
          vector — both legal since arrays are declared unpacked. *)
       let ix = match idx with BConst { value; _ } -> Z.to_string value
                             | _ -> verilog_of_expr idx in
-      Printf.sprintf "%s%s[%s] %s %s;" ind (sanitize_name a) ix op (verilog_of_expr v)
+      (* A memory-element BYTE write `mem[idx][lo +: w] = data` is lowered (by the
+         2-D array-write path) to an RMW `mem[idx] = (mem[idx] & ~(M<<lo)) |
+         ((data & M)<<lo)`, M = (1<<w)-1.  Emitted verbatim that is (a) not
+         inferable as a byte-enabled BRAM and (b) WRONG under non-blocking — four
+         sibling `mem[idx] <= f(mem[idx])` all read the pre-edge value, so only the
+         last byte survives.  Recognise the shape and emit the direct indexed
+         part-select, which is both the Vivado byte-write template and per-lane
+         correct. *)
+      let width_of_mask = function
+        | BBinOp { op = BSub;
+                   lhs = BBinOp { op = BShl; lhs = BConst { value = one; _ };
+                                  rhs = BConst { value = w; _ }; _ };
+                   rhs = BConst { value = one2; _ }; _ }
+          when Z.equal one Z.one && Z.equal one2 Z.one -> Some (Z.to_int w)
+        | _ -> None in
+      let byte_write =
+        match v with
+        | BBinOp { op = BOr;
+            lhs = BBinOp { op = BAnd;
+                           lhs = BSelect { array = BVar m2; _ };
+                           rhs = BUnOp { op = BNot;
+                                         operand = BBinOp { op = BShl; lhs = maskA; rhs = loA; _ }; _ }; _ };
+            rhs = BBinOp { op = BShl;
+                           lhs = BBinOp { op = BAnd; lhs = data; _ };
+                           rhs = loB; _ }; _ }
+          when m2 = a && loA = loB && width_of_mask maskA <> None ->
+            Some (loA, Option.get (width_of_mask maskA), data)
+        | _ -> None in
+      (match byte_write with
+       | Some (lo, w, data) ->
+           Printf.sprintf "%s%s[%s][%s +: %d] %s %s;" ind (sanitize_name a) ix
+             (verilog_of_expr lo) w op (verilog_of_expr data)
+       | None ->
+           Printf.sprintf "%s%s[%s] %s %s;" ind (sanitize_name a) ix op (verilog_of_expr v))
   | BCallStmt { func = "@slice_write"; args = [BVar nm; m; l; v] } ->
       (match m, l with
        | BConst { value = mv; _ }, BConst { value = lv; _ } ->
