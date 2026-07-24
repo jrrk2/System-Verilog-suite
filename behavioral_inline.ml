@@ -128,9 +128,20 @@ let _ = rename_lhs (* silence unused *)
  * (BVar) so we can rewrite assignments. *)
 let bind_params params args =
   try
-    Some (List.map2 (fun (pname, _ptype, dir) actual ->
+    Some (List.map2 (fun (pname, ptype, dir) actual ->
       match dir with
       | `Input ->
+          (* Size an unsized fill (`'0`/`'1`, carried as a width-0 BConst
+             sentinel) to the FORMAL parameter's width at bind time.  Otherwise
+             the fill enters the inlined body still width-0 and a later
+             expand_fills sizes it to the enclosing LHS width — e.g. dm::jal's
+             `rd` formal (logic [4:0]) bound to `'0` became a 64-bit zero inside
+             the JAL concat, corrupting the whereto jump instruction. *)
+          let actual = match actual with
+            | BConst { value; width = 0 } ->
+                let w = width_of_type ptype in
+                if w > 0 then BConst { value; width = w } else actual
+            | _ -> actual in
           (pname, actual, None)
       | `Output | `Inout ->
           (* Output expects a BVar at the call site. *)

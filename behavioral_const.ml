@@ -723,6 +723,16 @@ let normalize_one_arg sig_widths arg formal_w =
       let inner = match strip_signed_marker arg with
         | Some x -> x | None -> arg
       in
+      (match inner with
+       (* An unsized fill (`'0`/`'1`, carried as a width-0 BConst) bound to a
+          sized formal: SET its width to the formal directly.  The generic
+          `actual_w < formal_w` branch below would instead zero-PAD it
+          (`{formal_w'd0, <width-0 fill>}`) and leave the fill for a later
+          expand_fills to size to the enclosing LHS width — e.g. dm::jal's
+          `rd` formal (5-bit) bound to `'0` became `{5'd0, 64'd0}`, corrupting
+          the whereto JAL instruction. *)
+       | BConst { value; width = 0 } -> BConst { value; width = formal_w }
+       | _ ->
       let signed_ext = strip_signed_marker arg <> None in
       match width_of_expr_with sig_widths inner with
       | None -> strip_signed_anywhere inner
@@ -738,7 +748,7 @@ let normalize_one_arg sig_widths arg formal_w =
       | Some actual_w ->
           (* actual_w < formal_w: zero-extend (unsigned actuals). *)
           let pad = BConst { value = Z.zero; width = formal_w - actual_w } in
-          BConcat [pad; strip_signed_anywhere inner]
+          BConcat [pad; strip_signed_anywhere inner])
 
 let normalize_call_args sig_widths formals args =
   let actuals_n = List.length args in
