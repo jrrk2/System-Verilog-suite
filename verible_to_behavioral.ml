@@ -2962,7 +2962,23 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                     dims := `Single e :: !dims
                 | TUPLE6 (STRING dt, _, m, _, l, _)
                   when prefix_is "select_variable_dimension" dt ->
-                    dims := `Rng (m, l) :: !dims
+                    (* Distinguish the TUPLE6 shapes by tag number (as the
+                       single-signal path does): 1 = `[m:l]` range,
+                       3 = `[base +: w]` indexed-up, 4 = `[base -: w]`
+                       indexed-down.  Treating an indexed part-select as a range
+                       (the old behaviour) mis-read `[i*8 +: 8]`'s base/width as
+                       range bounds and, being dynamic, dropped the inner select
+                       entirely — dm_mem's data_bits byte-write vanished, so the
+                       abstract-command result (misa) never reached the DMI. *)
+                    let tag = String.sub dt
+                        (String.length "select_variable_dimension")
+                        (String.length dt
+                         - String.length "select_variable_dimension") in
+                    let d = match tag with
+                      | "3" -> `IdxUp (m, l)
+                      | "4" -> `IdxDown (m, l)
+                      | _   -> `Rng (m, l) in
+                    dims := d :: !dims
                 | TUPLE2 (a, b) -> collect a; collect b
                 | TUPLE3 (a, b, c) -> collect a; collect b; collect c
                 | TUPLE4 (a, b, c, d) -> List.iter collect [a; b; c; d]
@@ -2986,7 +3002,7 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                 } in
               (match dims with
                | [_] | [] -> plain ()
-               | [`Single _ | `Rng _; second] ->
+               | [(`Single _ | `Rng _); second] ->
                    let ei = recurse_e idx_node in
                    let old = BSelect { array = BVar name; index = ei } in
                    let u64 = BInt { width = 64; signed = Unsigned } in
@@ -3010,6 +3026,17 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                      } in
                    (match second with
                     | `Single b -> ins ~lo:(recurse_e b) ~w_expr:None
+                    | `IdxUp (base, w) ->
+                        (* `elem[base +: w]` — base may be DYNAMIC (dm_mem's
+                           `data_bits[dc][i*8 +: 8]`); the RMW mask/shift handle
+                           it directly. *)
+                        ins ~lo:(recurse_e base) ~w_expr:(Some (recurse_e w))
+                    | `IdxDown (base, w) ->
+                        (* `elem[base -: w]` == `[base-w+1 +: w]`. *)
+                        let base_e = recurse_e base and w_e = recurse_e w in
+                        let lo = bop BAdd (bop BSub base_e w_e)
+                                   (BConst { value = Z.one; width = 64 }) in
+                        ins ~lo ~w_expr:(Some w_e)
                     | `Rng (mn, ln) ->
                         let m_e = recurse_e mn and l_e = recurse_e ln in
                         (match m_e, l_e with
@@ -4862,7 +4889,14 @@ let convert_module ~pkgs (mdecl : module_decl)
     | BArray { element = BInt { width; _ }; size } -> width * size
     | _ -> 0 in
   let decl_nodes = collect_by (has_tag (fun t ->
-    prefix_is "data_declaration" t || prefix_is "net_declaration" t)) mdecl.m_body in
+    prefix_is "data_declaration" t || prefix_is "net_declaration" t
+    (* PORTS too: `$bits(be_i)` on an input port (dm_mem's byte-write loop
+       bound `i < $bits(be_i)`) folded to 0 because ports were never
+       registered here — the loop unrolled to zero iterations and the whole
+       data-register write vanished, so the abstract-command result never
+       reached the DMI.  extract_port_decl handles these tags too. *)
+    || prefix_is "module_port_declaration" t
+    || prefix_is "port_declaration_noattr" t)) mdecl.m_body in
   List.iter (fun n ->
     List.iter (fun (s : bsignal) ->
       let w = stype_w s.stype in
