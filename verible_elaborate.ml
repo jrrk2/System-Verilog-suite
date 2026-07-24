@@ -222,31 +222,49 @@ let rec eval_cw tok : (int * int) option =
   | TUPLE4 (STRING tag, _, body, _) when prefix_is "assignment_pattern2" tag ->
       let pair_nodes =
         collect_by (has_tag (prefix_is "structure_or_array_pattern_expression")) body in
+      (* A `default: <val>` clause supplies every field not explicitly named
+         (dcsr's DCSR_RESET_VAL names 3 of 15 fields, `default: '0` the rest).
+         The key of such a pair is the `default` KEYWORD (Default token), not a
+         SymbolIdentifier — detect it structurally and record under "default". *)
       let kv = List.filter_map (fun p -> match p with
         | TUPLE4 (_, key, _, value) ->
-            let kn = ref None in
-            walk (function SymbolIdentifier id when !kn = None -> kn := Some id | _ -> ()) key;
-            (match !kn, eval_cw value with
+            let kn = ref None and is_default = ref false in
+            walk (function
+              | Default -> is_default := true
+              | SymbolIdentifier id when !kn = None -> kn := Some id
+              | _ -> ()) key;
+            let k = if !is_default then Some "default" else !kn in
+            (match k, eval_cw value with
              | Some k, Some (v, _) -> Some (k, v)
              | _ -> None)
         | _ -> None) pair_nodes in
       if kv = [] then None
       else begin
-        let keyset = List.sort_uniq compare (List.map fst kv) in
-        let layout = Hashtbl.fold (fun _ fields acc -> match acc with
-          | Some _ -> acc
-          | None ->
-              if List.sort_uniq compare (List.map fst fields) = keyset
-              then Some fields else None) struct_fields None in
-        match layout with
-        | Some fields when List.for_all (fun (fn, _) -> List.mem_assoc fn kv) fields ->
+        let default_val = List.assoc_opt "default" kv in
+        let named = List.filter (fun (k, _) -> k <> "default") kv in
+        let named_keys = List.sort_uniq compare (List.map fst named) in
+        (* Choose the struct layout.  With no default, the named keys must match
+           a struct's field set EXACTLY.  With a default, the named keys need only
+           be a SUBSET of the fields (default fills the rest); require a UNIQUE
+           such struct so the choice is unambiguous. *)
+        let layouts = Hashtbl.fold (fun _ fields acc ->
+          let fkeys = List.sort_uniq compare (List.map fst fields) in
+          let named_are_fields = List.for_all (fun k -> List.mem k fkeys) named_keys in
+          let ok = match default_val with
+            | Some _ -> named_are_fields
+            | None    -> fkeys = named_keys in
+          if ok then fields :: acc else acc) struct_fields [] in
+        match layouts with
+        | [fields] ->
             let total = List.fold_left (fun a (_, w) -> a + w) 0 fields in
             let v = List.fold_left (fun acc (fn, fw) ->
-                let fv = List.assoc fn kv in
+                let fv = match List.assoc_opt fn named with
+                  | Some x -> x
+                  | None -> (match default_val with Some d -> d | None -> 0) in
                 let mask = if fw >= 62 then -1 else (1 lsl fw) - 1 in
                 (acc lsl fw) lor (fv land mask)) 0 fields in
             Some (v, total)
-        | _ -> None
+        | _ -> None      (* no match, or ambiguous superset *)
       end
   (* structural wrapper (trailing_assign, expression, primary, …): descend to
      the UNIQUE child that folds.  If two children fold (an operator expr a+b)
