@@ -84,6 +84,82 @@ let has_tag p t = match tag_of t with
   | Some s -> p s
   | None -> false
 
+(* name -> (value, bit-width) of already-evaluated params/localparams, populated
+   in SOURCE order as packages/params are extracted, so a concatenation that
+   references an earlier param (e.g. RV_DM_JTAG_IDCODE = {JTAG_VERSION, …}) can
+   place it at the right bit offset. *)
+let param_vw : (string, int * int) Hashtbl.t = Hashtbl.create 256
+
+(* Width-aware constant fold of `{a, b, c}` concatenations and their leaves.
+   Returns (value, bit-width).  Handles sized literals (width from the base
+   prefix), nested concats (widths sum, elements placed MSB→LSB), identifiers
+   (resolved to (value,width) via param_vw), and single-child wrappers.  Returns
+   None if any leaf can't be resolved — the caller then keeps its old behaviour.
+   This is the fix for value_of / extract_pvalue flattening a concat to just one
+   element (dropping JTAG_VERSION/MFG and leaving RV_DM_JTAG_IDCODE = 1). *)
+let cw_children = function
+  | TUPLE2 (a,b) -> [a;b]
+  | TUPLE3 (a,b,c) -> [a;b;c]
+  | TUPLE4 (a,b,c,d) -> [a;b;c;d]
+  | TUPLE5 (a,b,c,d,e) -> [a;b;c;d;e]
+  | TUPLE6 (a,b,c,d,e,f) -> [a;b;c;d;e;f]
+  | TUPLE7 (a,b,c,d,e,f,g) -> [a;b;c;d;e;f;g]
+  | TUPLE8 (a,b,c,d,e,f,g,h) -> [a;b;c;d;e;f;g;h]
+  | TLIST xs -> xs
+  | _ -> []
+
+let rec eval_cw tok : (int * int) option =
+  match tok with
+  | TK_DecNumber n | TK_UnBasedNumber n ->
+      (try Some (int_of_string n, 32) with _ -> None)
+  | TUPLE3 (STRING tag, base_tok, digits)
+    when prefix_is "bin_based_number" tag || prefix_is "hex_based_number" tag
+      || prefix_is "oct_based_number" tag || prefix_is "dec_based_number" tag ->
+      let width = match base_tok with
+        | TK_BinBase s | TK_HexBase s | TK_OctBase s | TK_DecBase s ->
+            (try Some (int_of_string (String.sub s 0 (String.index s '\''))) with _ -> None)
+        | _ -> None in
+      let ds = Buffer.create 16 in
+      walk (function
+        | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n
+        | TK_DecDigits n | TK_DecNumber n -> Buffer.add_string ds n
+        | _ -> ()) digits;
+      let s = Buffer.contents ds in
+      let value =
+        if s = "" then None
+        else (try Some (int_of_string
+               ((if prefix_is "bin_based_number" tag then "0b"
+                 else if prefix_is "hex_based_number" tag then "0x"
+                 else if prefix_is "oct_based_number" tag then "0o"
+                 else "") ^ s)) with _ -> None) in
+      (match width, value with Some w, Some v -> Some (v, w) | _ -> None)
+  | TUPLE4 (STRING tag, _, body, _) when prefix_is "range_list_in_braces" tag ->
+      let elems = match body with
+        | TLIST xs -> List.rev xs          (* TLIST is reverse source order *)
+        | other -> [other] in
+      let r = List.fold_left (fun acc e ->
+        match acc with
+        | None -> None
+        | Some (av, aw) ->
+            (match eval_cw e with
+             | Some (ev, ew) when ew > 0 ->
+                 let mask = if ew >= 62 then -1 else (1 lsl ew) - 1 in
+                 Some (((av lsl ew) lor (ev land mask)), aw + ew)
+             | Some _ -> Some (av, aw)      (* zero-width: skip *)
+             | None -> None)) (Some (0, 0)) elems in
+      (match r with Some (_, 0) -> None | _ -> r)
+  | SymbolIdentifier id -> Hashtbl.find_opt param_vw id
+  | TUPLE4 (STRING tag, _, _, TUPLE3 (STRING tg2, SymbolIdentifier name, _))
+    when prefix_is "qualified_id" tag && prefix_is "unqualified_id" tg2 ->
+      Hashtbl.find_opt param_vw name
+  (* structural wrapper (trailing_assign, expression, primary, …): descend to
+     the UNIQUE child that folds.  If two children fold (an operator expr a+b)
+     it's ambiguous → None, so the legacy reader handles it instead. *)
+  | other ->
+      (match List.filter_map eval_cw (cw_children other) with
+       | [single] -> Some single
+       | _ -> None)
+
 (* Render a token's leaf value as a string. Numbers, identifiers,
  * keywords. For composite trees we recurse into the first child. *)
 let rec value_of = function
@@ -110,6 +186,13 @@ let rec value_of = function
         || prefix_is "oct_based_number" tag
         || prefix_is "dec_based_number" tag ->
       value_of base ^ value_of digits
+  (* Concatenation `{a, b, c}`: fold width-aware to a single integer instead of
+     flattening to one element (the generic TUPLE4->d case below did the latter,
+     dropping all but the last element). *)
+  | TUPLE4 (STRING tag, _, _, d) as concat when prefix_is "range_list_in_braces" tag ->
+      (match eval_cw concat with
+       | Some (v, _) -> string_of_int v
+       | None -> value_of d)
   | TUPLE2 (a, _) | TUPLE3 (_, a, _) -> value_of a
   | TUPLE4 (_, _, _, d) -> value_of d
   | TUPLE6 (_, _, _, _, v, _) -> value_of v   (* parameter_value_byname1 *)
@@ -1150,10 +1233,19 @@ type package_decl = {
   pkg_body: token;
 }
 
-let extract_pvalue_from_param_decl node =
+let extract_pvalue_from_param_decl ?name node =
   let assigns = collect_by (has_tag (prefix_is "trailing_assign")) node in
   match assigns with
   | a :: _ ->
+    (* Width-aware fold first: handles `{a,b,c}` concatenations (including refs
+       to earlier params) correctly, and records this param's (value,width) so
+       LATER concats can place it.  Falls through to the legacy single-leaf
+       reader when the expression isn't a foldable constant. *)
+    (match eval_cw a with
+     | Some (v, w) ->
+         (match name with Some nm -> Hashtbl.replace param_vw nm (v, w) | None -> ());
+         PInt v
+     | None ->
       (* A sized/based literal (`4'b0101`, `64'h800`) must be read in ITS OWN
          base: the flat leaf walk below grabs the digit string and int_of_pvalue
          parses it base-10 (4'b0101 -> 101 not 5, 64'h800 -> 800 not 0x800).
@@ -1199,7 +1291,7 @@ let extract_pvalue_from_param_decl node =
            (match int_of_pvalue (PStr v) with
             | Some n -> PInt n
             | None -> PStr v)
-       | _ -> PExpr a))
+       | _ -> PExpr a)))
   | [] -> PExpr node
 
 (* Walk the root token but stop descending when we hit a node that
@@ -1274,7 +1366,7 @@ let extract_file_scope_params root : (string * pvalue) list =
     in
     match pname with
     | None -> None
-    | Some name -> Some (name, extract_pvalue_from_param_decl node)
+    | Some name -> Some (name, extract_pvalue_from_param_decl ~name node)
   ) param_nodes
 
 let extract_packages root : package_decl list =
@@ -1289,8 +1381,11 @@ let extract_packages root : package_decl list =
     match !pname with
     | None -> None
     | Some n ->
-        let param_nodes = collect_by
-          (has_tag (prefix_is "any_param_declaration")) node in
+        (* SOURCE order (collect_by yields reverse), so an earlier localparam is
+           recorded in param_vw before a later one references it in a concat
+           (e.g. RV_DM_JTAG_IDCODE = {JTAG_VERSION, …, JEDEC_MANUFACTURER_ID, …}). *)
+        let param_nodes = List.rev (collect_by
+          (has_tag (prefix_is "any_param_declaration")) node) in
         let params = List.filter_map (fun pn ->
           let id_subs = collect_by
             (has_tag (prefix_is "param_type_followed_by_id")) pn in
@@ -1311,7 +1406,7 @@ let extract_packages root : package_decl list =
           in
           match pname with
           | None -> None
-          | Some name -> Some (name, extract_pvalue_from_param_decl pn)
+          | Some name -> Some (name, extract_pvalue_from_param_decl ~name pn)
         ) param_nodes in
         Some { pkg_name = n; pkg_params = params; pkg_body = node }
   ) pkg_nodes
