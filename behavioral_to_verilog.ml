@@ -52,6 +52,11 @@ let rec verilog_of_type = function
       Printf.sprintf "%s [0:%d]" (verilog_of_type element) (size - 1)
   | BStruct _ -> "/* struct not supported in Verilog */"
 
+(* Names of unpacked-array signals in the module being emitted (set per module
+   by verilog_of_module); a safety net so a whole-array reset of an unpacked
+   array emits `'{default:'0}` rather than the packed `'0`. *)
+let current_unpacked : string list ref = ref []
+
 (* Generate binary operator *)
 let verilog_of_binop = function
   | BAdd -> "+"
@@ -302,6 +307,14 @@ let rec stmt_reads_var = function
       || List.exists (fun (_, ss) -> List.exists stmt_reads_var ss) cases
       || List.exists stmt_reads_var default
   | BBlock ss -> List.exists stmt_reads_var ss
+  (* mem_write(arr, idx, data): arr is the write TARGET (lhs), not a read —
+     only idx/data are reads.  Counting arr made a per-slot constant write
+     `arr[k] = <const>` look signal-dependent, so it emitted a star-sensitivity
+     always (empty real sensitivity, never fires, X) instead of always_comb.
+     This bit the unpacked bus-config arrays cfg_device_addr_mask/base, which
+     (being merge-skipped) stay as per-slot mem_write blocks. *)
+  | BCallStmt { func = "@mem_write"; args = _ :: rest } ->
+      List.exists expr_reads_var rest
   | BCallStmt { args; _ } -> List.exists expr_reads_var args
   | BReturn (Some e) -> expr_reads_var e
   | BWhile { condition; body } ->
@@ -377,7 +390,11 @@ let verilog_of_process proc =
               | Some `Neg -> Printf.sprintf "!%s" rst
               | None -> rst
             in
-            let resets = List.map (fun n -> Printf.sprintf "    %s = '0;" (sanitize_name n))
+            let resets = List.map (fun n ->
+                (* Unpacked-array reset needs `'{default:'0}` (Vivado rejects a
+                   bare `= '0` packed literal on an unpacked target). *)
+                let rhs = if List.mem n !current_unpacked then "'{default: '0}" else "'0" in
+                Printf.sprintf "    %s = %s;" (sanitize_name n) rhs)
                            (collect_targets body) in
             Printf.sprintf "  if (%s) begin\n%s\n  end else begin\n%s\n  end"
               rst_check
@@ -508,22 +525,34 @@ let verilog_of_instance prog inst =
       inst_name
 
 (* Generate signal declaration *)
+(* Source-UNPACKED array (tagged "unpacked", i.e. per-slot-written only): emit
+   `[W:0] name [0:N-1]` (dim after the name) so each slot is a distinct signal
+   that takes its own driver without a packed multi-driver.  Packed 2-D arrays
+   and any array with a whole-array write stay packed via verilog_of_type. *)
+let unpacked_split sig_ =
+  match sig_.stype with
+  | BArray { element; size } when List.mem_assoc "unpacked" sig_.attrs ->
+      Some (verilog_of_type element, Printf.sprintf " [0:%d]" (size - 1))
+  | _ -> None
+
 let verilog_of_signal sig_ =
-  let { name; stype; direction; initial_value } = sig_ in
+  let { name; stype; direction; initial_value; attrs = _ } = sig_ in
   (* Skip constant signals - they're handled as literals *)
   if name = "<const0>" || name = "<const1>" then
     None
   else
     let sanitized_name = sanitize_name name in
-    let type_str = verilog_of_type stype in
+    let type_str, arr_suffix = match unpacked_split sig_ with
+      | Some (t, suffix) -> (t, suffix)
+      | None -> (verilog_of_type stype, "") in
     let init_str = match initial_value with
       | Some expr -> Printf.sprintf " = %s" (verilog_of_expr expr)
       | None -> ""
     in
     let decl = match direction with
-    | `Input -> Printf.sprintf "input  %s %s%s;" type_str sanitized_name init_str
-    | `Output -> Printf.sprintf "output %s %s%s;" type_str sanitized_name init_str
-    | `Internal -> Printf.sprintf "%s %s%s;" type_str sanitized_name init_str
+    | `Input -> Printf.sprintf "input  %s %s%s%s;" type_str sanitized_name arr_suffix init_str
+    | `Output -> Printf.sprintf "output %s %s%s%s;" type_str sanitized_name arr_suffix init_str
+    | `Internal -> Printf.sprintf "%s %s%s%s;" type_str sanitized_name arr_suffix init_str
     in
     Some decl
 
@@ -576,13 +605,15 @@ let verilog_of_module prog bmod =
     if List.length ports > 0 then
       String.concat ",\n    " (List.map (fun (s : bsignal) ->
         let sanitized_name = sanitize_name s.name in
-        let type_str = verilog_of_type s.stype in
+        let type_str, arr_suffix = match unpacked_split s with
+          | Some (t, suffix) -> (t, suffix)
+          | None -> (verilog_of_type s.stype, "") in
         let dir_str = match s.direction with
           | `Input -> "input"
           | `Output -> "output"
           | `Internal -> "logic"  (* Should not happen in port list *)
         in
-        Printf.sprintf "%s %s %s" dir_str type_str sanitized_name
+        Printf.sprintf "%s %s %s%s" dir_str type_str sanitized_name arr_suffix
       ) ports)
     else ""
   in
@@ -595,6 +626,9 @@ let verilog_of_module prog bmod =
   in
 
   (* Signal declarations - only internal signals *)
+  current_unpacked :=
+    List.filter_map (fun (s : bsignal) ->
+      if List.mem_assoc "unpacked" s.attrs then Some s.name else None) signals;
   let internal_signals = List.filter (fun (s : bsignal) -> s.direction = `Internal) signals in
   let signal_decls = String.concat "\n" (List.filter_map verilog_of_signal internal_signals) in
 

@@ -2429,27 +2429,37 @@ let extract_port_decl ~pkgs ~params tok =
     | [TUPLE4 (STRING tag, _, _, _)]
       when prefix_is "decl_variable_dimension2" tag -> true
     | _ -> false in
-  let stype =
+  (* A SIZE-form dim (`decl_variable_dimension2` = `[N]`) is the after-name
+     UNPACKED dimension -> unpacked array; a port with only range dims
+     (`[A][B] x`) is a genuinely PACKED 2-D (dm_csrs `[DataCount-1:0][31:0]`).
+     Exclude STRUCT-element arrays (scalarised to a packed concat). *)
+  let has_size_form =
+    List.exists (function
+      | TUPLE4 (STRING tag, _, _, _) when prefix_is "decl_variable_dimension2" tag -> true
+      | _ -> false) dim_nodes in
+  let is_struct_arr = !struct_w <> None in
+  let stype, is_unpacked =
     match dims with
     | [(im, il); (om, ol)] ->
-        BArray {
+        (BArray {
           element = BInt { width = abs (im - il) + 1; signed = Unsigned };
           size = abs (om - ol) + 1;
-        }
+        }, has_size_form && not is_struct_arr)
     | [(om, ol)] when lone_size_form ->
-        BArray {
+        (BArray {
           element = BInt { width = 1; signed = Unsigned };
           size = abs (om - ol) + 1;
-        }
+        }, not is_struct_arr)
     | _ ->
-        BInt { width = w; signed = Unsigned }
+        (BInt { width = w; signed = Unsigned }, false)
   in
   List.rev !names |> List.sort_uniq compare |> List.map (fun n ->
     {
       name = n;
       stype;
       direction = !dir;
-      initial_value = None; attrs = [];
+      initial_value = None;
+      attrs = if is_unpacked then [("unpacked", "1")] else [];
     })
 
 (* ─── Continuous assigns ─────────────────────────────────────────── *)
@@ -5277,24 +5287,28 @@ let convert_module ~pkgs (mdecl : module_decl)
          * per-element writes `index_lut[k] = …` collapse into multi-
          * driver writes on a flat 1-D wire and the output is wrong. *)
         let unpacked = extract_range ~pkgs ~params n in
-        let stype = match unpacked, packed_dims with
+        (* is_unpacked_arr: outer dim is an UNPACKED range (after the name) —
+           candidate for unpacked emission (a later pass forces PACKED any array
+           that ever takes a whole-array write, so only per-slot-written arrays
+           like device_rdata stay unpacked). *)
+        let stype, is_unpacked_arr = match unpacked, packed_dims with
           | Some (m, l), _ ->
               let elem_w = match packed_dims with
                 | (mi, li) :: _ -> abs (mi - li) + 1
                 | [] -> 1
               in
-              BArray {
+              (BArray {
                 element = BInt { width = elem_w; signed = Unsigned };
                 size = abs (m - l) + 1;
-              }
+              }, true)
           | None, [(om, ol); (im, il)] ->
-              BArray {
+              (BArray {
                 element = BInt { width = abs (im - il) + 1; signed = Unsigned };
                 size = abs (om - ol) + 1;
-              }
+              }, false)
           | None, _ ->
               let elem_w = width_of ~typedefs ~pkgs ~params inst_type in
-              BInt { width = elem_w; signed = Unsigned }
+              (BInt { width = elem_w; signed = Unsigned }, false)
         in
         (* Capture `reg [W:0] X = expr;` declaration-time initialisers.
          * The SVS Verible parser tags these as
@@ -5335,7 +5349,8 @@ let convert_module ~pkgs (mdecl : module_decl)
             name = id;
             stype;
             direction = `Internal;
-            initial_value = !init_v; attrs = [];
+            initial_value = !init_v;
+            attrs = if is_unpacked_arr then [("unpacked", "1")] else [];
           }
         | None -> None
       ) var_nodes
@@ -5665,6 +5680,41 @@ let convert_module ~pkgs (mdecl : module_decl)
   let assign_procs = assign_procs @ initial_procs in
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params ~arrays:array_names mdecl.m_body in
+  (* RULE: any array that ever takes a WHOLE-array write (`arr = <expr>`, a
+     BAssign with the bare array as lhs — e.g. a combinational `arr = '0`
+     default fill, or `imd_val_d_o = '0`) is forced PACKED, overriding the
+     source-unpacked tag.  Whole-array writes are packed-friendly and, left
+     unpacked, would either be illegal (`arr='0` fill) or lose the merge's
+     0-fill of uncovered slots (→ X in sim).  Only STRICTLY per-slot-written
+     arrays (device_rdata: `arr[k]=…` + instance drivers, no whole write)
+     stay unpacked — exactly the multi-driver case that needs it. *)
+  let signals =
+    let whole_written : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+    let rec ss = function
+      (* A whole-array write forces PACKED.  For a whole-array COPY `arr = src`
+         BOTH sides are packed (keeps them matched, and a copy is a whole-array
+         operation either way).  A constant/expression fill (`arr = '0`) packs
+         the lhs. *)
+      | BAssign { lhs; rhs } ->
+          Hashtbl.replace whole_written lhs ();
+          (match rhs with BVar y -> Hashtbl.replace whole_written y () | _ -> ())
+      | BIf { then_stmts; else_stmts; _ } ->
+          List.iter ss then_stmts; List.iter ss else_stmts
+      | BCase { cases; default; _ } ->
+          List.iter (fun (_, b) -> List.iter ss b) cases; List.iter ss default
+      | BWhile { body; _ } -> List.iter ss body
+      | BFor { init; update; body; _ } -> ss init; ss update; List.iter ss body
+      | BBlock b -> List.iter ss b
+      | BCallStmt _ | BReturn _ -> ()
+    in
+    List.iter (function
+      | BCombinational { body; _ } -> List.iter ss body
+      | BSequential { body; _ } -> List.iter ss body)
+      (assign_procs @ always_procs);
+    List.map (fun (s : bsignal) ->
+      if List.mem_assoc "unpacked" s.attrs && Hashtbl.mem whole_written s.name
+      then { s with attrs = List.remove_assoc "unpacked" s.attrs }
+      else s) signals in
   (* Post-pass: merge combinational @mem_write groups targeting the
    * same array into a single full-array concat assignment. lzc's
    * `for (genvar j…) assign index_lut[j] = …` unrolls to N
@@ -5679,6 +5729,12 @@ let convert_module ~pkgs (mdecl : module_decl)
   let merge_array_writes processes =
     let mem_writes : (string, (int * bexpr) list) Hashtbl.t =
       Hashtbl.create 8 in
+    (* UNPACKED arrays keep per-slot `x[k]=data` assigns (one driver per slot);
+       merging into a whole-array concat is illegal for an unpacked target and
+       collides with instance drivers on other slots. *)
+    let unpacked_arrays =
+      List.filter_map (fun (s : bsignal) ->
+        if List.mem_assoc "unpacked" s.attrs then Some s.name else None) signals in
     (* Constant-fold a small set of arithmetic shapes so addresses
      * like `((32'1 - 32'1) + 32'0)` (the lzc generate-for index
      * expression after genvar-substitution) reduce to BConst, which
@@ -5713,7 +5769,8 @@ let convert_module ~pkgs (mdecl : module_decl)
       | BCombinational { body = [BCallStmt {
           func = "@mem_write";
           args = [BVar arr; addr; data] }]; _ }
-        when List.mem arr array_names ->
+        when List.mem arr array_names
+             && not (List.mem arr unpacked_arrays) ->
           (match fold addr with
            | BConst { value = idx; _ } ->
                let bucket =
@@ -7178,6 +7235,54 @@ let convert_files_inner ~top ?(top_params : (string * string) list = []) files :
   let lib_cells =
     Vhdl_to_behavioral.lookup_xil_primitive_ports unresolved in
   let prog = { modules = bmods; library_cells = lib_cells } in
+  (* CROSS-MODULE PACK PROPAGATION.  The per-module rule (a whole-array write
+     or copy forces PACKED) is inconsistent across a port boundary: `imd_val`
+     is copied in ibex_alu -> packed there, but the connecting wire in ibex_core
+     was never whole-written -> stayed unpacked -> a packed<->unpacked port
+     mismatch.  Union arrays linked by a WHOLE-array port connection
+     (`.port(BVar wire)`), and if ANY member of a group is already PACKED
+     (source-packed 2-D, or un-tagged by the whole-write rule), pack the whole
+     group -> drop "unpacked" from every member.  Only fully-isolated per-slot
+     arrays (device_rdata + its read-only port) stay unpacked. *)
+  let prog =
+    let mods = prog.modules in
+    let modtbl : (string, bmodule) Hashtbl.t = Hashtbl.create 64 in
+    List.iter (fun (m : bmodule) -> Hashtbl.replace modtbl m.name m) mods;
+    let parent : (string * string, string * string) Hashtbl.t = Hashtbl.create 256 in
+    let ensure x = if not (Hashtbl.mem parent x) then Hashtbl.replace parent x x in
+    let rec find x =
+      ensure x;
+      match Hashtbl.find_opt parent x with
+      | Some p when p <> x -> let r = find p in Hashtbl.replace parent x r; r
+      | _ -> x in
+    let union a b = let ra = find a and rb = find b in
+      if ra <> rb then Hashtbl.replace parent ra rb in
+    let is_arr mn sn = match Hashtbl.find_opt modtbl mn with
+      | Some m -> List.exists (fun (s : bsignal) ->
+          s.name = sn && (match s.stype with BArray _ -> true | _ -> false)) m.signals
+      | None -> false in
+    List.iter (fun (caller : bmodule) ->
+      List.iter (fun (i : binstance) ->
+        List.iter (fun (port, e) ->
+          match e with
+          | BVar wire when is_arr caller.name wire && is_arr i.module_name port ->
+              union (i.module_name, port) (caller.name, wire)
+          | _ -> ()) i.port_connections) caller.instances) mods;
+    let must_pack : (string * string, unit) Hashtbl.t = Hashtbl.create 64 in
+    List.iter (fun (m : bmodule) ->
+      List.iter (fun (s : bsignal) ->
+        match s.stype with
+        | BArray _ when not (List.mem_assoc "unpacked" s.attrs) ->
+            Hashtbl.replace must_pack (find (m.name, s.name)) ()
+        | _ -> ()) m.signals) mods;
+    let mods = List.map (fun (m : bmodule) ->
+      { m with signals = List.map (fun (s : bsignal) ->
+          match s.stype with
+          | BArray _ when List.mem_assoc "unpacked" s.attrs
+                          && Hashtbl.mem must_pack (find (m.name, s.name)) ->
+              { s with attrs = List.remove_assoc "unpacked" s.attrs }
+          | _ -> s) m.signals }) mods in
+    { prog with modules = mods } in
   (* Stamp `(* sv_decomp_* *)` attributes from each source file's
    * pre-scan. Sv_attr_extract is a regex-based side pass that runs
    * on the raw SV text — Verible's parse-tree carries attributes in
