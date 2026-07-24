@@ -2792,30 +2792,30 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
             if debug then
               Printf.eprintf "[eval_cw-None] override %s = %S\n%!"
                 name (String.trim (resolve_value pkgs tok));
-            (* eval_cw folds literal/concat/param-ref/arithmetic tokens.  For a
-               type-dependent override like `.Width($bits(dmi_resp_o))`,
-               resolve_value folds it to a plain decimal (type-width table) — so
-               parse THAT, never via the fragile Eval.eval_string re-parse. *)
+            (* Decide int-vs-string from the TYPED token, not by inspecting the
+               resolved string's characters.  A token carrying any numeric leaf,
+               operator or system-function call is an INTEGER expression eval_cw
+               couldn't yet fold (e.g. `$clog2(...)` — resolve_value reduces it
+               via the type/width tables, so parse that decimal); a token that is
+               a pure reference (identifiers only) is a STRING parameter —
+               propagate via str_env, or raw for one-level-up resolution. *)
+            let numeric = ref false in
+            walk (function
+              | TK_DecNumber _ | TK_UnBasedNumber _
+              | TK_BinDigits _ | TK_HexDigits _ | TK_OctDigits _ | TK_DecDigits _
+              | PLUS | HYPHEN | STAR | STAR_STAR | SLASH | PERCENT | LT_LT | GT_GT
+              | SystemTFIdentifier _ -> numeric := true
+              | _ -> ()) tok;
             let s = String.trim (resolve_value pkgs tok) in
-            (match int_of_string_opt s with
-             | Some n -> string_of_int n
-             | None ->
-                 (* Not numeric.  A parent STRING param (`.MemInitFile(
-                    SRAMInitFile)`) resolves via str_env, or a bare-identifier
-                    ref propagates raw to be resolved one level up.  A NON-identifier
-                    that isn't numeric is an unresolved arithmetic/system expr —
-                    a real eval_cw gap: BOMB rather than emit garbage. *)
-                 let is_ident s = s <> "" && String.for_all (fun c ->
-                     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                     || (c >= '0' && c <= '9') || c = '_') s in
-                 (match List.assoc_opt s str_env with
-                  | Some sv -> sv
-                  | None when is_ident s -> s
-                  | None ->
-                      failwith (Printf.sprintf
-                        "resolve_overrides: could not resolve numeric override \
-                         %s=%s (eval_cw gap — extend eval_cw/resolve_value)."
-                        name s)))
+            if !numeric then
+              (match int_of_string_opt s with
+               | Some n -> string_of_int n
+               | None ->
+                   failwith (Printf.sprintf
+                     "resolve_overrides: could not fold numeric override %s=%s \
+                      (extend eval_cw)." name s))
+            else
+              (match List.assoc_opt s str_env with Some sv -> sv | None -> s)
       in
       (name, v)
     ) ovs in
