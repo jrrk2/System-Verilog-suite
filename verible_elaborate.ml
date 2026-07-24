@@ -111,7 +111,11 @@ let cw_children = function
 let rec eval_cw tok : (int * int) option =
   match tok with
   | TK_DecNumber n | TK_UnBasedNumber n ->
-      (try Some (int_of_string n, 32) with _ -> None)
+      (* SV unsized fills `'0`/`'1` carry value 0 / all-ones at width 0 (a
+         "fill at context width" sentinel — the emitter renders `'0`). *)
+      if n = "'0" then Some (0, 0)
+      else if n = "'1" then Some (-1, 0)
+      else (try Some (int_of_string n, 32) with _ -> None)
   | TUPLE3 (STRING tag, base_tok, digits)
     when prefix_is "bin_based_number" tag || prefix_is "hex_based_number" tag
       || prefix_is "oct_based_number" tag || prefix_is "dec_based_number" tag ->
@@ -152,6 +156,43 @@ let rec eval_cw tok : (int * int) option =
   | TUPLE4 (STRING tag, _, _, TUPLE3 (STRING tg2, SymbolIdentifier name, _))
     when prefix_is "qualified_id" tag && prefix_is "unqualified_id" tg2 ->
       Hashtbl.find_opt param_vw name
+  (* Binary arithmetic on the TYPED tree — `add_expr`/`mul_expr`/`shift_expr`/
+     `pow_expr` are `TUPLE4(tag, lhs, op, rhs)`.  Fold directly (dispatching on
+     the operator leaf) so overrides like `.Depth(MEM_SIZE / 4)` resolve without
+     the fragile stringify→re-parse Eval path. *)
+  | TUPLE4 (STRING tag, lhs, op, rhs)
+    when prefix_is "add_expr" tag || prefix_is "mul_expr" tag
+      || prefix_is "shift_expr" tag || prefix_is "pow_expr" tag ->
+      (match eval_cw lhs, eval_cw rhs with
+       | Some (a, wa), Some (b, wb) ->
+           let w = max wa wb in
+           let r = match op with
+             | PLUS -> Some (a + b)
+             | HYPHEN -> Some (a - b)
+             | STAR -> Some (a * b)
+             | SLASH -> Some (if b = 0 then 0 else a / b)
+             | PERCENT -> Some (if b = 0 then 0 else a mod b)
+             | LT_LT -> Some (a lsl b)
+             | GT_GT -> Some (a lsr b)
+             | STAR_STAR when b >= 0 ->
+                 let rec p x e = if e = 0 then 1 else x * p x (e - 1) in Some (p a b)
+             | _ -> None
+           in
+           (match r with Some n -> Some (n, w) | None -> None)
+       | _ -> None)
+  (* Size / sign cast `T'(expr)` — TUPLE6(tag, casting_type, quote, lparen,
+     expr, rparen).  When the casting type folds to a positive width, TRUNCATE
+     the value to that many bits (`RegFileDataWidth'(0x2A00000000)` → the
+     register-file zero word); a non-width cast (`unsigned'(x)`) is
+     value-preserving.  Avoids the Eval string cast-strip hack. *)
+  | TUPLE6 (STRING tag, ct, _, _, expr, _) when prefix_is "cast" tag ->
+      (match eval_cw expr with
+       | None -> None
+       | Some (v, vw) ->
+           (match eval_cw ct with
+            | Some (w, _) when w > 0 && w < 62 -> Some (v land ((1 lsl w) - 1), w)
+            | Some (w, _) when w > 0 -> Some (v, w)
+            | _ -> Some (v, vw)))
   (* structural wrapper (trailing_assign, expression, primary, …): descend to
      the UNIQUE child that folds.  If two children fold (an operator expr a+b)
      it's ambiguous → None, so the legacy reader handles it instead. *)
@@ -2639,18 +2680,54 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
      params (VMEM paths, RAM_MODE, …) down the hierarchy, which the int-only
      Eval path cannot do. *)
   let resolve_overrides_with scope str_env ovs =
-    List.map (fun (name, tok) ->
-      let s = resolve_value pkgs tok in
+    (* Let the TYPED token evaluator see the instance's own param scope, so an
+       override referencing a sibling param resolves. Save/restore the touched
+       keys so this instance's scope doesn't leak into the next. *)
+    let saved = List.map (fun (k, _) -> (k, Hashtbl.find_opt param_vw k)) scope in
+    List.iter (fun (k, v) -> Hashtbl.replace param_vw k (v, 32)) scope;
+    let result = List.map (fun (name, tok) ->
       let v =
-        match Eval.eval_string scope s with
-        | Some n -> string_of_int n
+        (* Evaluate the typed override token DIRECTLY (eval_cw handles sized
+           literals `32'd1`/`32'h40101104`, concats and param refs) — NOT the
+           fragile stringify→re-parse `Eval.eval_string` round-trip that dropped
+           e.g. `.RV(32'd1)` to empty (mtvec/mstatus/dcsr reset-value loss). *)
+        match eval_cw tok with
+        | Some (n, _) -> string_of_int n
         | None ->
-            (match List.assoc_opt (String.trim s) str_env with
-             | Some sv -> sv
-             | None -> s)
+            if debug then
+              Printf.eprintf "[eval_cw-None] override %s = %S\n%!"
+                name (String.trim (resolve_value pkgs tok));
+            (* eval_cw folds literal/concat/param-ref/arithmetic tokens.  For a
+               type-dependent override like `.Width($bits(dmi_resp_o))`,
+               resolve_value folds it to a plain decimal (type-width table) — so
+               parse THAT, never via the fragile Eval.eval_string re-parse. *)
+            let s = String.trim (resolve_value pkgs tok) in
+            (match int_of_string_opt s with
+             | Some n -> string_of_int n
+             | None ->
+                 (* Not numeric.  A parent STRING param (`.MemInitFile(
+                    SRAMInitFile)`) resolves via str_env, or a bare-identifier
+                    ref propagates raw to be resolved one level up.  A NON-identifier
+                    that isn't numeric is an unresolved arithmetic/system expr —
+                    a real eval_cw gap: BOMB rather than emit garbage. *)
+                 let is_ident s = s <> "" && String.for_all (fun c ->
+                     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                     || (c >= '0' && c <= '9') || c = '_') s in
+                 (match List.assoc_opt s str_env with
+                  | Some sv -> sv
+                  | None when is_ident s -> s
+                  | None ->
+                      failwith (Printf.sprintf
+                        "resolve_overrides: could not resolve numeric override \
+                         %s=%s (eval_cw gap — extend eval_cw/resolve_value)."
+                        name s)))
       in
       (name, v)
-    ) ovs
+    ) ovs in
+    List.iter (fun (k, ov) -> match ov with
+      | Some v -> Hashtbl.replace param_vw k v
+      | None -> Hashtbl.remove param_vw k) saved;
+    result
   in
   let seen : (string, specialised) Hashtbl.t = Hashtbl.create 64 in
   let rec visit ?(inst_label = None) base overrides =

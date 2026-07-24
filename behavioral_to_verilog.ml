@@ -425,21 +425,32 @@ let verilog_of_process proc =
               | Some `Neg -> Printf.sprintf "!%s" rst
               | None -> rst
             in
-            (* Prefer the REAL reset values.  The frontend keeps the source's
-               `if (!rst) reg<=RESETVAL else <clocked>` as the body's TOP-LEVEL
-               BIf (its then-branch carries the actual reset values, e.g. mtvec
-               <= 32'd1, mstatus <= its RST_VAL).  Zeroing every register below
-               would clobber those (they reset to 0 instead), breaking
-               reset-state fidelity.  When the body IS that reset-if (condition
-               mentions the reset signal), hoist its then-branch into the reset
-               branch and its else-branch into the clocked branch. *)
-            let hoisted = match body with
-              | [BIf { condition; then_stmts; else_stmts }]
-                  when expr_mentions_name rst condition ->
-                  Some (then_stmts, else_stmts)
-              | _ -> None
+            (* Prefer the REAL reset values.  In an ASYNC-reset always block the
+               reset guard is the body's OUTERMOST if/ternary — the frontend
+               lifts `if(!rst) reg<=RESETVAL else <clocked>` first, so by SHAPE
+               its then-branch is the reset path and its else-branch the clocked
+               path (a register with no source reset lifts to `!rst ? reg : next`,
+               i.e. a hold — still correct).  Recognise that shape and peel it in
+               both forms (top-level BIf, or per-register `reg<=(cond?rv:clk)`
+               BCond after iflift); zeroing every register instead would reset
+               e.g. mtvec/mstatus to 0.  No condition-name matching. *)
+            let split_reset s = match s with
+              | BIf { then_stmts; else_stmts; _ } ->
+                  (then_stmts, else_stmts)
+              | BAssign { lhs; rhs = BCond { then_val; else_val; _ } } ->
+                  ([BAssign { lhs; rhs = then_val }], [BAssign { lhs; rhs = else_val }])
+              | other -> ([], [other])
             in
-            (match hoisted with
+            (* Flatten BBlock wrappers first — the reset guard is often nested
+               inside one, which split_reset would otherwise treat as opaque. *)
+            let rec flatten = function
+              | BBlock ss :: rest -> flatten (ss @ rest)
+              | s :: rest -> s :: flatten rest
+              | [] -> [] in
+            let resets, clocked =
+              List.fold_right (fun s (rs, cs) ->
+                  let r, c = split_reset s in (r @ rs, c @ cs)) (flatten body) ([], []) in
+            (match (if resets <> [] then Some (resets, clocked) else None) with
              | Some (resets, clocked) ->
                  (* Safety net: any register the block writes but the source
                     reset branch doesn't cover still gets `<= '0` (else it would
