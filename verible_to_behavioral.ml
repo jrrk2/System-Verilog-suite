@@ -2175,6 +2175,16 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       (match eval_int ~pkgs ~params ct, inner with
        | Some w, BConst { value; _ } when w > 0 ->
            BConst { value; width = w }
+       | Some w, _ when w > 0 ->
+           (* Size cast `w'(expr)` on a NON-constant.  The cast is NOT a no-op in
+              a width-sensitive context: `{td_i, 31'(idcode_q >> 1)}` must stay
+              32 bits.  Dropping it left a 32-bit shift, making a 33-bit concat
+              whose MSB (td_i) is silently truncated — this broke dmi_jtag_tap's
+              IDCODE/BYPASS shift chain (JTAG chain-validation failed).  Model the
+              cast as the low w bits so the width is preserved for every backend
+              (Z3/gate_map already handle BSlice; the Verilog emitter renders the
+              expression case as a real `w'(...)` size cast). *)
+           BSlice { signal = inner; msb = w - 1; lsb = 0 }
        | _ -> inner)
   | TLIST [single] -> recurse single
   (* Streaming concatenation `{<<N{body}}` / `{>>N{body}}` —
