@@ -95,6 +95,12 @@ let param_vw : (string, int * int) Hashtbl.t = Hashtbl.create 256
    `$bits(<type>)` directly. *)
 let type_widths : (string, int) Hashtbl.t = Hashtbl.create 128
 
+(* struct type name -> ordered [(field_name, packed_width)] in DECLARED order
+   (first field = MSB), so eval_cw can pack a `'{field: value, …}` struct literal
+   to an integer (e.g. status_t's MSTATUS_RST_VAL). Populated alongside
+   type_widths in collect_type_widths. *)
+let struct_fields : (string, (string * int) list) Hashtbl.t = Hashtbl.create 64
+
 (* Width-aware constant fold of `{a, b, c}` concatenations and their leaves.
    Returns (value, bit-width).  Handles sized literals (width from the base
    prefix), nested concats (widths sum, elements placed MSB→LSB), identifiers
@@ -210,6 +216,38 @@ let rec eval_cw tok : (int * int) option =
             | Some (w, _) when w > 0 && w < 62 -> Some (v land ((1 lsl w) - 1), w)
             | Some (w, _) when w > 0 -> Some (v, w)
             | _ -> Some (v, vw)))
+  (* Struct literal `'{field: value, …}` (assignment_pattern2) → pack to an int
+     using the matching typedef's declared field order/widths (struct_fields).
+     Lets `.ResetValue({MSTATUS_RST_VAL})` fold instead of surviving as a symbol. *)
+  | TUPLE4 (STRING tag, _, body, _) when prefix_is "assignment_pattern2" tag ->
+      let pair_nodes =
+        collect_by (has_tag (prefix_is "structure_or_array_pattern_expression")) body in
+      let kv = List.filter_map (fun p -> match p with
+        | TUPLE4 (_, key, _, value) ->
+            let kn = ref None in
+            walk (function SymbolIdentifier id when !kn = None -> kn := Some id | _ -> ()) key;
+            (match !kn, eval_cw value with
+             | Some k, Some (v, _) -> Some (k, v)
+             | _ -> None)
+        | _ -> None) pair_nodes in
+      if kv = [] then None
+      else begin
+        let keyset = List.sort_uniq compare (List.map fst kv) in
+        let layout = Hashtbl.fold (fun _ fields acc -> match acc with
+          | Some _ -> acc
+          | None ->
+              if List.sort_uniq compare (List.map fst fields) = keyset
+              then Some fields else None) struct_fields None in
+        match layout with
+        | Some fields when List.for_all (fun (fn, _) -> List.mem_assoc fn kv) fields ->
+            let total = List.fold_left (fun a (_, w) -> a + w) 0 fields in
+            let v = List.fold_left (fun acc (fn, fw) ->
+                let fv = List.assoc fn kv in
+                let mask = if fw >= 62 then -1 else (1 lsl fw) - 1 in
+                (acc lsl fw) lor (fv land mask)) 0 fields in
+            Some (v, total)
+        | _ -> None
+      end
   (* structural wrapper (trailing_assign, expression, primary, …): descend to
      the UNIQUE child that folds.  If two children fold (an operator expr a+b)
      it's ambiguous → None, so the legacy reader handles it instead. *)
@@ -2383,6 +2421,33 @@ let collect_type_widths ?(scope = []) body =
          | Some old when old >= w -> ()
          | _ -> Hashtbl.replace type_widths nm w)
     | _ -> ()) nodes;
+  (* Pass 3: record per-field layout of each struct (declared order, MSB-first)
+     so eval_cw can pack `'{field: value}` literals. Runs after all widths known. *)
+  let member_field m =
+    let fw = match elab_range_width ~scope m with
+      | Some w -> w
+      | None ->
+          let tw = ref None in
+          walk (function
+            | SymbolIdentifier id when !tw = None ->
+                (match Hashtbl.find_opt type_widths id with Some w -> tw := Some w | None -> ())
+            | _ -> ()) m;
+          (match !tw with Some w -> w | None -> 1) in
+    (* field name = LAST identifier of the member (`<type> <name>`) *)
+    let last = ref None in
+    walk (function SymbolIdentifier id -> last := Some id | _ -> ()) m;
+    match !last with Some nm -> Some (nm, fw) | None -> None
+  in
+  List.iter (fun n -> match n with
+    | TUPLE6 (_, _, data_type, SymbolIdentifier nm, _, _) ->
+        let members = collect_by (has_tag (prefix_is "struct_union_member")) data_type in
+        if members <> [] && not (Hashtbl.mem struct_fields nm) then begin
+          (* collect_by yields REVERSE source order; reverse to declared order
+             (first field = MSB) so packing matches SV's packed-struct layout. *)
+          let fields = List.rev (List.filter_map member_field members) in
+          if fields <> [] then Hashtbl.replace struct_fields nm fields
+        end
+    | _ -> ()) nodes;
   if Sys.getenv_opt "TYPEW_DEBUG" <> None then
     List.iter (fun n -> match width_of_node n with
       | Some (nm, w, m) -> Printf.eprintf "[typew] %s = %d (struct=%b)\n%!" nm w m
@@ -2663,30 +2728,45 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
        params; stop when no new ones bind.  Two passes covers the
        chain depth in real designs (rope: H→ICW). *)
     let lps = extract_module_internal_params mdecl.m_body in
+    (* Package-scoped constants (enum members + localparams) as a low-priority
+     * base, so a generate condition that references a bare imported enum —
+     * ibex_alu's `if (RV32B != RV32BNone)` with `import ibex_pkg::*` — resolves
+     * and the dead RV32B branch is PRUNED.  Module params/localparams keep
+     * priority.  Needed in param_vw too so eval_cw resolves bare enum refs
+     * (e.g. PRIV_LVL_U inside a localparam's struct literal). *)
+    let pkg_consts =
+      List.concat_map (fun (p : package_decl) ->
+        List.filter_map (fun (n, v) ->
+          Option.map (fun i -> (n, i)) (int_of_pvalue v)) p.pkg_params) pkgs in
+    (* eval_cw folds via param_vw; expose pkg consts + scope + each localparam as
+       it binds (so a struct-literal localparam like MSTATUS_RST_VAL packs), then
+       restore so this module's scope doesn't leak. *)
+    let touched = List.sort_uniq compare
+        (List.map fst scope @ List.map fst lps @ List.map fst pkg_consts) in
+    let saved = List.map (fun k -> (k, Hashtbl.find_opt param_vw k)) touched in
+    List.iter (fun (k, v) ->
+      if not (Hashtbl.mem param_vw k) then Hashtbl.replace param_vw k (v, 32)) pkg_consts;
+    List.iter (fun (k, v) -> Hashtbl.replace param_vw k (v, 32)) scope;
     let rec fixed_point sc remaining =
       let sc', remaining' = List.fold_left (fun (sc, rem) (name, rhs_tok) ->
         if List.mem_assoc name sc then (sc, rem)
         else
-          let s = resolve_value pkgs rhs_tok in
-          match Eval.eval_string sc s with
-          | Some n -> ((name, n) :: sc, rem)
-          | None -> (sc, (name, rhs_tok) :: rem)
+          let bind n = Hashtbl.replace param_vw name (n, 32); ((name, n) :: sc, rem) in
+          match eval_cw rhs_tok with
+          | Some (n, _) -> bind n
+          | None ->
+              (match Eval.eval_string sc (resolve_value pkgs rhs_tok) with
+               | Some n -> bind n
+               | None -> (sc, (name, rhs_tok) :: rem))
       ) (sc, []) remaining in
       if List.length sc' > List.length sc && remaining' <> [] then
         fixed_point sc' remaining'
       else sc'
     in
     let scope = fixed_point scope lps in
-    (* Package-scoped constants (enum members + localparams) as a low-priority
-     * base, so a generate condition that references a bare imported enum —
-     * ibex_alu's `if (RV32B != RV32BNone)` with `import ibex_pkg::*` — resolves
-     * and the dead RV32B branch is PRUNED (otherwise walk_live can't decide and
-     * keeps the bitmanip logic, whose shuffle_mode self-writes then loop).
-     * Module params/localparams above keep priority. *)
-    let pkg_consts =
-      List.concat_map (fun (p : package_decl) ->
-        List.filter_map (fun (n, v) ->
-          Option.map (fun i -> (n, i)) (int_of_pvalue v)) p.pkg_params) pkgs in
+    List.iter (fun (k, ov) -> match ov with
+      | Some v -> Hashtbl.replace param_vw k v
+      | None -> Hashtbl.remove param_vw k) saved;
     scope @ List.filter (fun (n, _) -> not (List.mem_assoc n scope)) pkg_consts
   in
   (* [str_env] = the enclosing module's own overrides (its s_params), so a child
