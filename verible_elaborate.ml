@@ -90,6 +90,11 @@ let has_tag p t = match tag_of t with
    place it at the right bit offset. *)
 let param_vw : (string, int * int) Hashtbl.t = Hashtbl.create 256
 
+(* name -> packed bit-width of a declared type; populated during
+   specialise_design (collect_type_widths).  Declared up here so eval_cw can fold
+   `$bits(<type>)` directly. *)
+let type_widths : (string, int) Hashtbl.t = Hashtbl.create 128
+
 (* Width-aware constant fold of `{a, b, c}` concatenations and their leaves.
    Returns (value, bit-width).  Handles sized literals (width from the base
    prefix), nested concats (widths sum, elements placed MSB→LSB), identifiers
@@ -156,6 +161,18 @@ let rec eval_cw tok : (int * int) option =
   | TUPLE4 (STRING tag, _, _, TUPLE3 (STRING tg2, SymbolIdentifier name, _))
     when prefix_is "qualified_id" tag && prefix_is "unqualified_id" tg2 ->
       Hashtbl.find_opt param_vw name
+  (* `$bits(<type>)` → the declared packed width of the type (from type_widths).
+     Folds `.Width($bits(dmi_resp_o))` on the typed tree instead of via
+     resolve_value's string output. *)
+  | TUPLE3 (STRING t, SystemTFIdentifier ("$bits" | "bits"), call_base)
+    when prefix_is "system_tf_call" t ->
+      let last = ref None in
+      walk (function
+        | SymbolIdentifier id when Hashtbl.mem type_widths id -> last := Some id
+        | _ -> ()) call_base;
+      (match !last with
+       | Some id -> Some (Hashtbl.find type_widths id, 32)
+       | None -> None)
   (* Binary arithmetic on the TYPED tree — `add_expr`/`mul_expr`/`shift_expr`/
      `pow_expr` are `TUPLE4(tag, lhs, op, rhs)`.  Fold directly (dispatching on
      the operator leaf) so overrides like `.Depth(MEM_SIZE / 4)` resolve without
@@ -1791,11 +1808,9 @@ let resolve_param_default ~functions ~lookup_int ~pkgs ~tok : sv_value =
            (match lookup_int [] s with
             | Some n -> SVInt n | None -> SVUnknown))
 
-(* Type name -> bit width (summed packed struct / enum / typedef), populated by
- * collect_type_widths at the top of specialise_design; consulted by resolve_value
- * and Eval so `.Width($bits(dcsr_t))` folds to a real width during specialization
- * (else it was captured as the type-name string -> width 1 -> undriven bits). *)
-let type_widths : (string, int) Hashtbl.t = Hashtbl.create 128
+(* type_widths (type name -> packed bit width, populated by collect_type_widths
+   in specialise_design) is declared near the top of this file so eval_cw can
+   fold `$bits(<type>)`.  Consulted by resolve_value / Eval / eval_cw. *)
 
 (* Resolve an override expression to a printable string, folding
  * `pkg::name` references through the package table when possible.
