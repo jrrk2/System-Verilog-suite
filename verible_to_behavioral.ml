@@ -4465,25 +4465,12 @@ let scalarize_module ~signal_struct ~struct_defs (m : bmodule) : bmodule =
                     args = (BVar s) :: rest } when Hashtbl.mem split s ->
           let layout = Hashtbl.find split s in
           let tw = List.fold_left (fun a (_, _, _, w) -> a + w) 0 layout in
-          (* FULL-STRUCT COPY: when the write DATA spans the entire struct width,
-             this is a whole-struct assignment — most importantly a packed
-             struct-ARRAY element slice `aligned[i +: 1] = src` (ibex dm's
-             `hartinfo_aligned[NrHarts-1:0] = hartinfo_i`).  Such a write reaches
-             here with ELEMENT-indexed (not bit-indexed) bounds — often left
-             un-folded (`NrHarts-1` = `1-1`) — so the bit-range logic below either
-             mis-read it as a 1-bit write or bailed to a no-op, dropping the
-             constant hartinfo and zeroing every DMI Hartinfo read.  Detect it by
-             the data width and copy each field from the source's bit-range. *)
-          let data_opt = match List.rev rest with d :: _ -> Some d | [] -> None in
-          let full_copy = match data_opt with
-            | Some d -> Behavioral_const.width_of_expr_with sig_widths d = Some tw
-            | None -> false in
-          if full_copy then
-            let data' = re (Option.get data_opt) in
-            BBlock (List.map (fun (f, fm, fl, _) ->
-              BAssign { lhs = fvar s f;
-                        rhs = BSlice { signal = data'; msb = fm; lsb = fl } }) layout)
-          else
+          (* CONST bit-bounds are authoritative: the write targets exactly that
+             bit-range, so lower it field-by-field.  This MUST be tried before the
+             full-struct heuristic below — a narrow field-write with a wide
+             constant RHS (`acs.progbufsize = 5'(ProgBufSize)` reaches here as
+             @part_sel_write_up(acs,24,5, 32'8), a 32-bit literal) would otherwise
+             be mistaken for a whole-struct copy and land in the wrong field. *)
           let rng =
             match fn, rest with
             | "@part_sel_write_up", [BConst { value = base; _ }; BConst { value = w; _ }; d] ->
@@ -4496,7 +4483,24 @@ let scalarize_module ~signal_struct ~struct_defs (m : bmodule) : bmodule =
                let data' = re data in
                BBlock (List.filter_map (fun fld -> field_upd s fld msb lsb data')
                          (Hashtbl.find split s))
-           | None -> BCallStmt { func = fn; args = List.map re ((BVar s) :: rest) })
+           | None ->
+               (* NON-const bounds only: a packed struct-ARRAY element slice
+                  `aligned[i +: 1] = src` (ibex dm's `hartinfo_aligned[NrHarts-1:0]
+                  = hartinfo_i`) reaches here with ELEMENT-indexed bounds, often
+                  left un-folded (`NrHarts-1` = `1-1`).  If the DATA spans the whole
+                  struct it's a full-struct copy — assign each field from the
+                  source's bit-range.  (Bounds were const above, so this can't
+                  swallow a narrow wide-constant field-write.) *)
+               let data_opt = match List.rev rest with d :: _ -> Some d | [] -> None in
+               let full_copy = match data_opt with
+                 | Some d -> Behavioral_const.width_of_expr_with sig_widths d = Some tw
+                 | None -> false in
+               if full_copy then
+                 let data' = re (Option.get data_opt) in
+                 BBlock (List.map (fun (f, fm, fl, _) ->
+                   BAssign { lhs = fvar s f;
+                             rhs = BSlice { signal = data'; msb = fm; lsb = fl } }) layout)
+               else BCallStmt { func = fn; args = List.map re ((BVar s) :: rest) })
       | BCallStmt r -> BCallStmt { r with args = List.map re r.args }
       | BIf r -> BIf { condition = re r.condition;
                        then_stmts = List.map rs r.then_stmts;
