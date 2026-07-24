@@ -56,6 +56,10 @@ let rec verilog_of_type = function
    by verilog_of_module); a safety net so a whole-array reset of an unpacked
    array emits `'{default:'0}` rather than the packed `'0`. *)
 let current_unpacked : string list ref = ref []
+(* Declared width of each signal in the module being emitted — used to detect a
+   WIDENING size-cast `N'(v)` that was lowered to an out-of-range BSlice
+   `v[N-1:0]` (Verilator tolerates it as zero-extend, Vivado rejects it). *)
+let current_widths : (string, int) Hashtbl.t = Hashtbl.create 64
 
 (* Generate binary operator *)
 let verilog_of_binop = function
@@ -147,6 +151,13 @@ let rec verilog_of_expr = function
            let mask = Z.sub (Z.shift_left Z.one w) Z.one in
            let v = Z.logand (Z.shift_right value lo) mask in
            Printf.sprintf "%d'd%s" w (Z.to_string v)
+       | BVar v when (match Hashtbl.find_opt current_widths v with
+                      | Some wv -> hi >= wv | None -> false) ->
+           (* A WIDENING cast `w'(v)` (w > width v) lowered to an out-of-range
+              slice `v[w-1:0]`.  Emit a real SV size cast — legal and equal to a
+              zero-extend for an unsigned operand — instead of the illegal
+              out-of-range part-select (Vivado 8-524). *)
+           Printf.sprintf "%d'(%s)" w (verilog_of_expr sig_)
        | _ when (let rec sliceable = function
                    | BVar _ -> true
                    (* `arr[idx][hi:lo]` is legal only when arr is a real (array)
@@ -639,6 +650,9 @@ let verilog_of_module prog bmod =
   current_unpacked :=
     List.filter_map (fun (s : bsignal) ->
       if List.mem_assoc "unpacked" s.attrs then Some s.name else None) signals;
+  Hashtbl.reset current_widths;
+  List.iter (fun (s : bsignal) ->
+    Hashtbl.replace current_widths s.name (width_of_type s.stype)) signals;
   let internal_signals = List.filter (fun (s : bsignal) -> s.direction = `Internal) signals in
   let signal_decls = String.concat "\n" (List.filter_map verilog_of_signal internal_signals) in
 
