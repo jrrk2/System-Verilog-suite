@@ -2450,11 +2450,31 @@ let extract_port_decl ~pkgs ~params tok =
   let is_struct_arr = !struct_w <> None in
   let stype, is_unpacked =
     match dims with
-    | [(im, il); (om, ol)] ->
-        (BArray {
-          element = BInt { width = abs (im - il) + 1; signed = Unsigned };
-          size = abs (om - ol) + 1;
-        }, has_size_form && not is_struct_arr)
+    | [(a_m, a_l); (b_m, b_l)] ->
+        (* Two dimensions in source (left-to-right) order.  Which one is the
+           element width and which is the array size depends on whether the
+           SECOND dim is UNPACKED:
+             - `[W] name [N]` (packed W then unpacked N, e.g. device_rdata_i
+               `[31:0] x [0:2]`): element = FIRST (packed W), size = SECOND (N),
+               emitted as an unpacked array.
+             - `[OUTER][INNER] name` (fully-packed 2-D, e.g. dm's
+               `[DataCount-1:0][31:0]`): the leftmost dim is the array SIZE and the
+               rightmost is the element WIDTH — matching the internal-signal path.
+           This branch used to assume the first form unconditionally, so a packed
+           2-D port `[1:0][31:0]` became uint<2>[32] (32 two-bit elements) instead
+           of uint<32>[2]; indexing `data_i[k]` then read a 2-bit slice, corrupting
+           dm_mem's data-register read and dropping the ebreakm bit openocd writes
+           to dcsr (progbuf startup then fails on every debug session). *)
+        if has_size_form then
+          (BArray {
+            element = BInt { width = abs (a_m - a_l) + 1; signed = Unsigned };
+            size = abs (b_m - b_l) + 1;
+          }, not is_struct_arr)
+        else
+          (BArray {
+            element = BInt { width = abs (b_m - b_l) + 1; signed = Unsigned };
+            size = abs (a_m - a_l) + 1;
+          }, false)
     | [(om, ol)] when lone_size_form ->
         (BArray {
           element = BInt { width = 1; signed = Unsigned };
