@@ -5689,15 +5689,31 @@ let convert_module ~pkgs (mdecl : module_decl)
      arrays (device_rdata: `arr[k]=…` + instance drivers, no whole write)
      stay unpacked — exactly the multi-driver case that needs it. *)
   let signals =
-    let whole_written : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+    (* A whole-array COPY (`a = b`) must be PACKED on both sides: it survives to
+       emit as a whole-array assign and the two sides must match.  A whole-array
+       FILL / init concat (`arr = '0`, `mem = {…}`, non-BVar RHS) also forces
+       packed — UNLESS the array is a genuine MEMORY (written per-element via
+       indexed `@mem_write`, e.g. `mem[a] = …`).  A memory's whole assigns are
+       the `$readmemh` boot-image loader (`mem = {word_{d-1},…,word_0}`, which
+       Behavioral_meminfer.is_mem_init_driver lifts into the BRAM INIT and strips
+       for any array with write ports) or a byte-slice read-modify-write
+       (`mem = {…mem[a]…}`) — both re-lowered to a per-element `initial` block or
+       indexed writes before emit.  So a RAM must stay UNPACKED (`reg [W] mem [D]`)
+       for Vivado to infer BRAM.  A write-less constant ROM (`mem = {const,…}`,
+       no @mem_write) keeps its concat as its value and stays packed, emitting a
+       legal whole-array assign.  (A real `initial $readmemh(...)` is a BCallStmt,
+       not a BAssign, so it never registers as a whole-write here anyway.) *)
+    let whole_copied : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+    let whole_filled : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+    let mem_written : (string, unit) Hashtbl.t = Hashtbl.create 16 in
     let rec ss = function
-      (* A whole-array write forces PACKED.  For a whole-array COPY `arr = src`
-         BOTH sides are packed (keeps them matched, and a copy is a whole-array
-         operation either way).  A constant/expression fill (`arr = '0`) packs
-         the lhs. *)
-      | BAssign { lhs; rhs } ->
-          Hashtbl.replace whole_written lhs ();
-          (match rhs with BVar y -> Hashtbl.replace whole_written y () | _ -> ())
+      | BAssign { lhs; rhs = BVar y } ->
+          Hashtbl.replace whole_copied lhs ();
+          Hashtbl.replace whole_copied y ()
+      | BAssign { lhs; _ } ->
+          Hashtbl.replace whole_filled lhs ()
+      | BCallStmt { func = "@mem_write"; args = BVar arr :: _ } ->
+          Hashtbl.replace mem_written arr ()
       | BIf { then_stmts; else_stmts; _ } ->
           List.iter ss then_stmts; List.iter ss else_stmts
       | BCase { cases; default; _ } ->
@@ -5712,7 +5728,11 @@ let convert_module ~pkgs (mdecl : module_decl)
       | BSequential { body; _ } -> List.iter ss body)
       (assign_procs @ always_procs);
     List.map (fun (s : bsignal) ->
-      if List.mem_assoc "unpacked" s.attrs && Hashtbl.mem whole_written s.name
+      let force_pack =
+        Hashtbl.mem whole_copied s.name
+        || (Hashtbl.mem whole_filled s.name
+            && not (Hashtbl.mem mem_written s.name)) in
+      if List.mem_assoc "unpacked" s.attrs && force_pack
       then { s with attrs = List.remove_assoc "unpacked" s.attrs }
       else s) signals in
   (* Post-pass: merge combinational @mem_write groups targeting the
