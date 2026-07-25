@@ -604,6 +604,39 @@ let fold_ffs_program (prog : bprogram) : bprogram =
 (* here — this pass only equalises bit widths.                               *)
 (* ========================================================================= *)
 
+(* The 2-D array-write lowering turns a memory byte-write
+   `mem[idx][lo +: w] <- data` into the read-modify-write
+   `(mem[idx] & ~(M<<lo)) | ((data & M)<<lo)`, with M = (1<<w)-1.  Recognise
+   that shape and recover (lo_expr, w, data).  SHARED between
+   behavioral_to_verilog (emits the indexed part-select `mem[idx][lo+:w]`) and
+   behavioral_memlower.build_tdp_port (recovers the per-byte write strobe for
+   the RAMB WEA): the two used to recognise this independently and DISAGREED —
+   the emitter matched, memlower did not, so the gate-map RAM degraded to
+   read-only (WEA=0) and any program that writes memory broke.  One recogniser
+   keeps them in lock-step. *)
+let match_byte_write_rmw ~(mem : string) (v : bexpr) : (bexpr * int * bexpr) option =
+  let width_of_mask = function
+    | BBinOp { op = BSub;
+               lhs = BBinOp { op = BShl; lhs = BConst { value = one; _ };
+                              rhs = BConst { value = w; _ }; _ };
+               rhs = BConst { value = one2; _ }; _ }
+      when Z.equal one Z.one && Z.equal one2 Z.one -> Some (Z.to_int w)
+    | _ -> None in
+  match v with
+  | BBinOp { op = BOr;
+      lhs = BBinOp { op = BAnd;
+                     lhs = BSelect { array = BVar m2; _ };
+                     rhs = BUnOp { op = BNot;
+                                   operand = BBinOp { op = BShl; lhs = maskA; rhs = loA; _ }; _ }; _ };
+      rhs = BBinOp { op = BShl;
+                     lhs = BBinOp { op = BAnd; lhs = data; _ };
+                     rhs = loB; _ }; _ }
+    when m2 = mem && loA = loB ->
+      (match width_of_mask maskA with
+       | Some w -> Some (loA, w, data)
+       | None -> None)
+  | _ -> None
+
 let rec width_of_btype_full = function
   | BInt { width; _ } -> width
   | BBool -> 1

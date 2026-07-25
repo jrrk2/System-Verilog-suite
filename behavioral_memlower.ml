@@ -689,6 +689,14 @@ let build_tdp_port m_name ~read_pin ~dw (p : bprocess) =
        source), or the indexed part-select `base[i*8 +: 8]` which unroll+lower
        leave as [(base >> i*8) & 8'hFF].  Both mean "byte k <= base's byte k". *)
     let byte_of_data data =
+      (* Strip the read-modify-write wrapper `(mem[idx] & ~(M<<lo)) |
+         ((d & M)<<lo)` down to the written value `d` — the SAME shape
+         behavioral_to_verilog recognises (Behavioral_const.match_byte_write_rmw).
+         Without this the byte-write never matched here and the RAM port fell
+         through to the read-only fallback below (WEA=0). *)
+      let data = match Behavioral_const.match_byte_write_rmw ~mem:m_name data with
+        | Some (_lo, _w, inner) -> inner
+        | None -> data in
       match data with
       | BSlice { signal; msb; lsb } when msb - lsb = 7 && lsb mod 8 = 0 ->
         Some (lsb / 8, signal)

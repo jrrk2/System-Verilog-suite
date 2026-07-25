@@ -302,26 +302,9 @@ let rec verilog_of_stmt ?(nb=false) indent stmt =
          last byte survives.  Recognise the shape and emit the direct indexed
          part-select, which is both the Vivado byte-write template and per-lane
          correct. *)
-      let width_of_mask = function
-        | BBinOp { op = BSub;
-                   lhs = BBinOp { op = BShl; lhs = BConst { value = one; _ };
-                                  rhs = BConst { value = w; _ }; _ };
-                   rhs = BConst { value = one2; _ }; _ }
-          when Z.equal one Z.one && Z.equal one2 Z.one -> Some (Z.to_int w)
-        | _ -> None in
-      let byte_write =
-        match v with
-        | BBinOp { op = BOr;
-            lhs = BBinOp { op = BAnd;
-                           lhs = BSelect { array = BVar m2; _ };
-                           rhs = BUnOp { op = BNot;
-                                         operand = BBinOp { op = BShl; lhs = maskA; rhs = loA; _ }; _ }; _ };
-            rhs = BBinOp { op = BShl;
-                           lhs = BBinOp { op = BAnd; lhs = data; _ };
-                           rhs = loB; _ }; _ }
-          when m2 = a && loA = loB && width_of_mask maskA <> None ->
-            Some (loA, Option.get (width_of_mask maskA), data)
-        | _ -> None in
+      (* Shared with behavioral_memlower.build_tdp_port via Behavioral_const so
+         the emit and the RAMB write-strobe extraction never disagree. *)
+      let byte_write = Behavioral_const.match_byte_write_rmw ~mem:a v in
       (match byte_write with
        | Some (lo, w, data) ->
            Printf.sprintf "%s%s[%s][%s +: %d] %s %s;" ind (sanitize_name a) ix
