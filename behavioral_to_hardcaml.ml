@@ -1771,7 +1771,86 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
                 Hashtbl.replace partial base ((lsb, msb, wire) :: prev);
                 box_out_nets := base :: !box_out_nets;
                 Some (port, wire)
-            | _ -> None) outs in
+            | BSelect { array = BVar base; index = BConst { value = k; _ } } ->
+                (* A box output driving one constant-indexed ARRAY element,
+                   `arr[k]` — how each master/device drives its lane of a
+                   multi-port bus array (host_addr[0] from ibex_top, host_addr[1]
+                   from dm_top) or a CSR array element (mhpmcounter[0],
+                   tmatch_value_q[k]).  Element k occupies bits
+                   [k*elem_w +: elem_w] (matches BSelect read lowering), so this
+                   is just a slice driver: route it through the same [partial]
+                   bus-assembly path that reassembles the array from its lanes. *)
+                let k = Z.to_int k in
+                let ew =
+                  match List.find_opt
+                          (fun (s : Behavioral_ir.bsignal) -> s.name = base)
+                          bmod.signals with
+                  | Some { stype = BArray { element; _ }; _ } -> width_of_btype element
+                  | _ -> 1 (* packed bit-select arr[k]: single bit *) in
+                let lsb = k * ew in
+                let msb = lsb + ew - 1 in
+                let wire = Signal.wire ew in
+                let prev = try Hashtbl.find partial base with Not_found -> [] in
+                Hashtbl.replace partial base ((lsb, msb, wire) :: prev);
+                box_out_nets := base :: !box_out_nets;
+                Some (port, wire)
+            | BConcat parts ->
+                (* A struct-typed instance OUTPUT scalarized into per-field
+                   nets: `{f1,f2,f3}` is MSB-first (f1 = high bits).  How a
+                   struct-typed output like ibex id_stage's exc_cause_o
+                   (`{exc_cause$irq_int, exc_cause$irq_ext, exc_cause$lower_cause}`)
+                   or dmi_jtag's dmi_req_o arrives.  Silently dropping it lost
+                   the instance's driver — the sink net defaulted to 0 and the
+                   port was misnamed after the net — which is what zeroed
+                   `mcause`.  Instead create one output wire spanning all fields
+                   and drive each field net from its slice, so downstream reads
+                   of the fields resolve to the box output. *)
+                let elem_width = function
+                  | BVar v -> sig_decl_width v
+                  | BSlice { msb; lsb; _ } -> msb - lsb + 1
+                  | BConst { width; _ } -> width
+                  | e -> failwith (Printf.sprintf
+                      "create_circuit: instance %S (module %S) output port %S: \
+                       concat element %s is not a net/slice/const\nJSON: %s"
+                      i.inst_name i.module_name port
+                      (Behavioral_ir.string_of_bexpr e)
+                      (Behavioral_ir.json_string_of_bexpr e)) in
+                let total = List.fold_left (fun a e -> a + elem_width e) 0 parts in
+                let owire = Signal.wire total in
+                let hi = ref (total - 1) in
+                List.iter (fun e ->
+                  let w = elem_width e in
+                  let lo = !hi - w + 1 in
+                  (match e with
+                   | BVar v ->
+                       let named = Signal.(Signal.select owire !hi lo -- v) in
+                       ctx.signals <- (v, named) :: ctx.signals;
+                       box_out_nets := v :: !box_out_nets
+                   | BSlice { signal = BVar base; msb; lsb } ->
+                       let slice = Signal.select owire !hi lo in
+                       let prev = try Hashtbl.find partial base with Not_found -> [] in
+                       Hashtbl.replace partial base ((lsb, msb, slice) :: prev);
+                       box_out_nets := base :: !box_out_nets
+                   | BConst _ -> ()  (* constant padding bits: nothing to drive *)
+                   | _ -> ());
+                  hi := lo - 1) parts;
+                Some (port, owire)
+            | _ ->
+                (* An instance OUTPUT port must connect to a net (BVar), a
+                   bus-slice of one (BSlice), or a scalarized-struct concat
+                   (BConcat, handled above).  Any other shape is not handled;
+                   silently dropping it loses the instance's driver and yields
+                   a silently-wrong netlist.  Bomb loudly instead. *)
+                let msg = Printf.sprintf
+                  "create_circuit: instance %S (module %S) output port %S \
+                   connects to an unsupported expression shape %s — expected \
+                   a net, bus-slice, or scalarized-struct concat\nJSON: %s"
+                  i.inst_name i.module_name port
+                  (Behavioral_ir.string_of_bexpr e)
+                  (Behavioral_ir.json_string_of_bexpr e) in
+                if Sys.getenv_opt "SVS_SURVEY_UNHANDLED" <> None then
+                  (Printf.eprintf "[SURVEY] %s\n" msg; None)
+                else failwith msg) outs in
         (i, out_wires, ins)) bmod.instances in
       (* Assemble each bus that several boxes drive slices of into one signal
          (LSB..MSB, gaps tied 0) and register it so processes reading the bus

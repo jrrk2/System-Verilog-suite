@@ -249,6 +249,42 @@ let rec string_of_bexpr = function
   | BCall { func; args } ->
       Printf.sprintf "%s(%s)" func (String.concat ", " (List.map string_of_bexpr args))
 
+(* Self-contained JSON serialization of a [bexpr] (ppx_deriving_yojson can't
+   derive it: the [BConst.value : Z.t] field has no Z.to_yojson).  Used to dump
+   the offending expression, in full fidelity, in error messages that report an
+   unsupported/unhandled expression shape. *)
+let rec json_of_bexpr : bexpr -> Yojson.Safe.t = function
+  | BVar name -> `Assoc [ "BVar", `String name ]
+  | BConst { value; width } ->
+      `Assoc [ "BConst", `Assoc [ "value", `String (Z.to_string value);
+                                  "width", `Int width ] ]
+  | BBinOp { op; lhs; rhs; _ } ->
+      `Assoc [ "BBinOp", `Assoc [ "op", `String (string_of_binop op);
+                                  "lhs", json_of_bexpr lhs;
+                                  "rhs", json_of_bexpr rhs ] ]
+  | BUnOp { op; operand; _ } ->
+      `Assoc [ "BUnOp", `Assoc [ "op", `String (string_of_unop op);
+                                 "operand", json_of_bexpr operand ] ]
+  | BSelect { array; index } ->
+      `Assoc [ "BSelect", `Assoc [ "array", json_of_bexpr array;
+                                   "index", json_of_bexpr index ] ]
+  | BSlice { signal; msb; lsb } ->
+      `Assoc [ "BSlice", `Assoc [ "signal", json_of_bexpr signal;
+                                  "msb", `Int msb; "lsb", `Int lsb ] ]
+  | BConcat exprs -> `Assoc [ "BConcat", `List (List.map json_of_bexpr exprs) ]
+  | BReplicate { count; value } ->
+      `Assoc [ "BReplicate", `Assoc [ "count", `Int count;
+                                      "value", json_of_bexpr value ] ]
+  | BCond { condition; then_val; else_val } ->
+      `Assoc [ "BCond", `Assoc [ "condition", json_of_bexpr condition;
+                                 "then", json_of_bexpr then_val;
+                                 "else", json_of_bexpr else_val ] ]
+  | BCall { func; args } ->
+      `Assoc [ "BCall", `Assoc [ "func", `String func;
+                                 "args", `List (List.map json_of_bexpr args) ] ]
+
+let json_string_of_bexpr e = Yojson.Safe.to_string (json_of_bexpr e)
+
 let rec string_of_bstmt indent stmt =
   let ind = String.make indent ' ' in
   match stmt with
