@@ -2984,7 +2984,25 @@ let parse_files_full files =
   let file_scope = ref [] in
   List.iter (fun f ->
     match Sv_verible_to_ir.parse_verible_file f with
-    | None -> Printf.eprintf "[verible] parse failed for %s\n" f
+    | None ->
+        (* BOMB by default: a parse failure silently DROPS every module in the
+           file.  A dropped module that is instantiated elsewhere leaves the
+           instance with no port list — its `.*` / by-name connections vanish and
+           Vivado later reports "module not found" with no hint at the real cause
+           (e.g. prim_generic_clock_mux2's SVA `ASSERT failed to parse until
+           SYNTHESIS was defined).  Fail loudly instead.  Escape hatch
+           SVS_ALLOW_PARSE_FAIL=1 for a file that is genuinely unused (an
+           unreferenced vendor .sv left in the file list). *)
+        if Sys.getenv_opt "SVS_ALLOW_PARSE_FAIL" <> None then
+          Printf.eprintf "[verible] WARNING: parse failed for %s (skipped; \
+                          its modules are dropped)\n%!" f
+        else
+          failwith (Printf.sprintf
+            "[verible] parse failed for %s — every module it defines is dropped, \
+             so any instance of them gets empty ports / 'module not found' \
+             downstream.  Fix the parse error (a missing define like SYNTHESIS \
+             for SVA `ASSERT is a common cause), or set SVS_ALLOW_PARSE_FAIL=1 \
+             if the file is genuinely unused." f)
     | Some root ->
         mods := extract_modules root @ !mods;
         pkgs := extract_packages root @ !pkgs;

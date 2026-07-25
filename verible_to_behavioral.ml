@@ -7165,10 +7165,26 @@ let name_positional_ports (bmods : bmodule list) : bmodule list =
       let pc =
         if not has_ds then pc
         else if formals = [] then begin
-          Printf.eprintf
-            "[verible_to_bir] %s: `.*` on %s but no formal port order known\n"
-            i.inst_name i.module_name;
-          pc
+          (* `.*` REQUIRES the instantiated module's port list to expand — an
+             UNDEFINED module (parse failure, missing file, typo; NOT a blackbox
+             primitive, which never uses `.*`) leaves formals empty and the
+             connection silently vanishes, emitting `mod ()` with no ports that
+             Vivado later rejects as "module not found" with no root-cause hint
+             (this is exactly how prim_generic_clock_mux2's dropped SVA parse
+             surfaced).  BOMB instead.  Escape hatch SVS_ALLOW_UNDEF_MODULE=1. *)
+          if Sys.getenv_opt "SVS_ALLOW_UNDEF_MODULE" <> None then begin
+            Printf.eprintf
+              "[verible_to_bir] WARNING: %s: `.*` on undefined module %s — ports \
+               dropped\n%!" i.inst_name i.module_name;
+            pc
+          end else
+            failwith (Printf.sprintf
+              "[verible_to_bir] instance %s uses `.*` on module %s, but %s is not \
+               defined (no port list) — its connections are dropped and Vivado \
+               will report 'module not found'.  The module's source likely failed \
+               to parse or is missing from the file list.  Set \
+               SVS_ALLOW_UNDEF_MODULE=1 to force empty ports."
+              i.inst_name i.module_name i.module_name)
         end else
           let connected = List.map fst pc in
           let extra = List.filter_map (fun f ->
