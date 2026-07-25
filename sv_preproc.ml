@@ -318,8 +318,26 @@ let process_directive ifdef_stk line =
       in
       (match resolved with
        | None ->
-           Printf.sprintf "// [sv_preproc] include not resolved: %s\n"
-             target
+           (* BOMB by default: a missing `include silently dropped whole
+              constructs (e.g. prim_util_memload.svh carries the RAM
+              `initial $readmemh(MemInitFile, mem)` — without it the program
+              image never gets baked and the SoC boots an empty RAM, with NO
+              diagnostic).  Fail loudly and name the search path so the caller
+              fixes SVS_INCDIR.  Set SVS_ALLOW_MISSING_INCLUDE=1 for the rare
+              genuinely-optional vendor `definitions.svh` the source is designed
+              to compile without. *)
+           if Sys.getenv_opt "SVS_ALLOW_MISSING_INCLUDE" <> None then begin
+             Printf.eprintf
+               "[sv_preproc] WARNING: `include \"%s\" not found (searched: %s)\n%!"
+               target (String.concat ":" !include_dirs);
+             Printf.sprintf "// [sv_preproc] include not resolved: %s\n" target
+           end else
+             failwith (Printf.sprintf
+               "[sv_preproc] `include \"%s\" not found — searched [%s]. \
+                Set SVS_INCDIR to the directory containing it (colon-separated), \
+                or set SVS_ALLOW_MISSING_INCLUDE=1 if it is genuinely optional."
+               target
+               (match !include_dirs with [] -> "<empty>" | ds -> String.concat ":" ds))
        | Some path when Hashtbl.mem included_files path ->
            Printf.sprintf "// [sv_preproc] include (already-seen): %s\n"
              path
