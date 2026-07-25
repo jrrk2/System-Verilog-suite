@@ -312,20 +312,6 @@ let rec expr_to_signal ctx = function
          literal in flattened picorv32) would crash hardcaml's of_int. *)
       signal_of_z ~width value
 
-  | BBinOp { op = BAnd;
-             lhs = (BBinOp { op = BShr; _ } as inner);
-             rhs = BConst { value; width = 1 };
-             _ } when Z.equal (Z.logand value Z.one) Z.one ->
-      (* Lowered dynamic single-bit select `(sig >> i) & 1'b1`: 1 bit in the IR
-         but sig-width if lowered as a plain AND (common_w = max operand width),
-         which mis-sizes every enclosing concat/replication — `{8{be[i]}}`
-         became 0x11111111 (dropped RAM byte-writes → sb/sh/sw fail) and the
-         ibex divider's `{1'b0, rem, (numer>>cnt)&1'b1}` grew to 65 bits (broke
-         div/rem/mulh).  Pin to 1 bit here, matching behavioral_to_verilog's
-         `1'(inner & 1'b1)`. *)
-      let s = expr_to_signal ctx inner in
-      Signal.select s 0 0
-
   | BBinOp { op; lhs; rhs; result_type } ->
       let s_lhs0 = expr_to_signal ctx lhs in
       let s_rhs0 = expr_to_signal ctx rhs in
@@ -648,11 +634,22 @@ let rec expr_to_signal ctx = function
         Signal.select s hi lo
 
   | BConcat exprs ->
-      let signals = List.map (expr_to_signal ctx) exprs in
+      (* In a concat every field's WIDTH matters, so a lowered dynamic single-bit
+         select `(sig >> i) & 1'b1` (1 bit in the IR, but sig-width if lowered as
+         a plain AND) must be pinned to 1 bit here — otherwise it mis-sizes every
+         field above it (the ibex divider's `{1'b0, rem, (numer>>cnt)&1'b1}` grew
+         past 32 bits).  Matches behavioral_to_verilog's `1'(inner & 1'b1)`.
+         Pinning is scoped to concat/replicate: a bare `(sig>>i)&1` used as a
+         slice-write RHS (`rev[i] = sig[31-i]`) must keep its generic width so the
+         write truncates to bit 0 as SystemVerilog does. *)
+      let signals = List.map (bitsel1 ctx) exprs in
       Signal.concat_msb signals
 
   | BReplicate { count; value } ->
-      let s_value = expr_to_signal ctx value in
+      (* Replication width depends on the operand width — pin a single-bit
+         select to 1 bit (`{8{a_be_i[i]}}` else became 0x11111111, giving a
+         1-bit-per-lane RAM byte-write mask → sb/sh/sw stored one bit). *)
+      let s_value = bitsel1 ctx value in
       let replicated = List.init count (fun _ -> s_value) in
       Signal.concat_msb replicated
 
@@ -673,6 +670,18 @@ let rec expr_to_signal ctx = function
            func (List.length args)
            (Behavioral_ir.string_of_bexpr (BCall { func; args })));
       Signal.zero 32
+
+(* Lower an expr, pinning a lowered dynamic single-bit select
+   `(sig >> i) & 1'b1` to exactly 1 bit (bit 0 of `sig >> i`).  Used only in
+   width-sensitive contexts (BConcat / BReplicate); everywhere else the generic
+   [expr_to_signal] keeps the IR width. *)
+and bitsel1 ctx e =
+  match e with
+  | BBinOp { op = BAnd; lhs = (BBinOp { op = BShr; _ } as inner);
+             rhs = BConst { value; width = 1 }; _ }
+    when Z.equal (Z.logand value Z.one) Z.one ->
+      Signal.select (expr_to_signal ctx inner) 0 0
+  | _ -> expr_to_signal ctx e
 
 (* Convert behavioral statement to Always assignment.
    [is_reg] tells [get_or_create_var] whether new variables here
