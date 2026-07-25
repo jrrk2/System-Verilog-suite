@@ -2115,8 +2115,74 @@ let comb_nba_to_blocking (s : string) : string =
     line') lines in
   String.concat "\n" out
 
-let lgate_map mod_h k_lut io_flag =
-  let _, m, prog = find_mod mod_h in
+(* Emit ONE module's create_circuit output as Verilog into [dir]/<name>.v, with
+   the OCaml netlist fixups (strip param overrides, comb NBA->blocking, re-declare
+   create_circuit-pruned input ports).  This is the "debug right after
+   create_circuit" emit — no bir_to_aig / LUT cover involved. *)
+let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
+    (circ : Hardcaml.Circuit.t) : unit =
+  (try Unix.mkdir dir 0o755 with _ -> ());
+  let buf = Buffer.create 4096 in
+  (try
+     Hardcaml.Rtl.output
+       ~output_mode:(Hardcaml.Rtl.Output_mode.To_buffer buf)
+       Hardcaml.Rtl.Language.Verilog circ
+   with e ->
+     Buffer.add_string buf
+       (Printf.sprintf "// create_circuit RTL emit failed for %s: %s\n"
+          m.Behavioral_ir.name (Printexc.to_string e)));
+  let text = Buffer.contents buf in
+  let text = strip_inst_params text in
+  let text = comb_nba_to_blocking text in
+  (* re-declare pruned input ports so parent connections never dangle
+     (Verilator 5.050 SIGSEGVs on a non-existent child pin). *)
+  let emitted : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun line ->
+    let l = String.trim line in
+    let chk kw =
+      let kl = String.length kw in
+      if String.length l > kl && String.sub l 0 kl = kw && l.[kl] = ' '
+      then begin
+        let body = String.trim (String.sub l kl (String.length l - kl)) in
+        let body = if body <> "" && body.[String.length body - 1] = ';'
+                   then String.sub body 0 (String.length body - 1) else body in
+        match List.rev (List.filter (fun s -> s <> "")
+                          (String.split_on_char ' ' body)) with
+        | nm :: _ -> Hashtbl.replace emitted nm ()
+        | [] -> ()
+      end in
+    chk "input"; chk "output"; chk "inout")
+    (String.split_on_char '\n' text);
+  let seen = Hashtbl.create 16 in
+  let missing = List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+    match s.direction with
+    | `Input when s.name <> "" && not (Hashtbl.mem emitted s.name)
+                && not (Hashtbl.mem seen s.name) ->
+        Hashtbl.replace seen s.name ();
+        Some (s.name, Behavioral_boundary.width_of_btype s.stype)
+    | _ -> None) m.Behavioral_ir.signals in
+  let text =
+    if missing = [] then text
+    else
+      let names = String.concat ""
+        (List.map (fun (n, _) -> Printf.sprintf ",\n    %s" n) missing) in
+      let decls = String.concat ""
+        (List.map (fun (n, w) ->
+           if w <= 1 then Printf.sprintf "    input %s;\n" n
+           else Printf.sprintf "    input [%d:0] %s;\n" (w - 1) n) missing) in
+      (try
+         let idx = Str.search_forward (Str.regexp_string "\n);") text 0 in
+         String.sub text 0 idx ^ names ^ "\n);\n" ^ decls
+         ^ String.sub text (idx + 3) (String.length text - idx - 3)
+       with Not_found -> text) in
+  let oc = open_out (Filename.concat dir (m.Behavioral_ir.name ^ ".v")) in
+  output_string oc text; close_out oc
+
+(* Build a (module,port)->direction lookup + the unresolved-primitive check,
+   factored from lgate_map so both gate_map and the gate-map-free
+   create_circuit emit share it. *)
+let build_port_dir (m : Behavioral_ir.bmodule) (prog : Behavioral_ir.bprogram)
+    : string -> string -> [ `Input | `Output ] option =
   (* snapshot originals (first-seen) before any pruning of these modules *)
   List.iter (fun (mm : Behavioral_ir.bmodule) ->
     if not (Hashtbl.mem orig_port_dirs mm.Behavioral_ir.name) then
@@ -2211,80 +2277,18 @@ let lgate_map mod_h k_lut io_flag =
        net heuristic would misclassify these and drop the cell; add the \
        primitive's port interface."
       m.Behavioral_ir.name (String.concat ", " unresolved));
-  let port_dir mn port = Hashtbl.find_opt pd_tbl (mn, port) in
+  fun mn port -> Hashtbl.find_opt pd_tbl (mn, port)
+
+let lgate_map mod_h k_lut io_flag =
+  let _, m, prog = find_mod mod_h in
+  let port_dir = build_port_dir m prog in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
-  (* GATE_MAP_EMIT_CIRCUIT=<dir>: dump the Hardcaml circuit IMMEDIATELY after
-     create_circuit (before bir_to_aig / LUT cover / reconstruction) as Verilog,
-     one file per module, so a hierarchical pre-mapping netlist can be simulated
-     to bisect whether a bug is in create_circuit or downstream. Side-effect only. *)
+  (* GATE_MAP_EMIT_CIRCUIT=<dir>: dump the create_circuit output (pre bir_to_aig /
+     LUT cover) as Verilog via [write_circ_verilog], to bisect create_circuit vs
+     downstream.  Side-effect only. *)
   (match Sys.getenv_opt "GATE_MAP_EMIT_CIRCUIT" with
    | None -> ()
-   | Some d ->
-       let dir = if d = "1" then "/tmp/svs_circuit" else d in
-       (try Unix.mkdir dir 0o755 with _ -> ());
-       let buf = Buffer.create 4096 in
-       (try
-          Hardcaml.Rtl.output
-            ~output_mode:(Hardcaml.Rtl.Output_mode.To_buffer buf)
-            Hardcaml.Rtl.Language.Verilog circ
-        with e ->
-          Buffer.add_string buf
-            (Printf.sprintf "// create_circuit RTL emit failed for %s: %s\n"
-               m.Behavioral_ir.name (Printexc.to_string e)));
-       (* RE-DECLARE pruned input ports.  Hardcaml keeps only inputs reachable
-          from an output, so a wholly-unused declared input is DROPPED from the
-          emitted module — yet parent instantiations still wire it.  A parent
-          connecting a non-existent child pin is tolerated by xsim (warn+tie)
-          but SEGFAULTS Verilator 5.050 (cellInterfaceCleanup, even under
-          -Wno-PINNOTFOUND).  Add every declared input the buffer didn't emit
-          back as a dead input port so no connection ever dangles. *)
-       (* OCaml netlist post-processing (no external sed/python): drop redundant
-          instantiation param overrides, convert comb-block NBA to blocking. *)
-       let text = Buffer.contents buf in
-       let text = strip_inst_params text in
-       let text = comb_nba_to_blocking text in
-       let emitted : (string, unit) Hashtbl.t = Hashtbl.create 64 in
-       List.iter (fun line ->
-         let l = String.trim line in
-         let chk kw =
-           let kl = String.length kw in
-           if String.length l > kl && String.sub l 0 kl = kw && l.[kl] = ' '
-           then begin
-             let body = String.trim (String.sub l kl (String.length l - kl)) in
-             let body = if body <> "" && body.[String.length body - 1] = ';'
-                        then String.sub body 0 (String.length body - 1) else body in
-             match List.rev (List.filter (fun s -> s <> "")
-                               (String.split_on_char ' ' body)) with
-             | nm :: _ -> Hashtbl.replace emitted nm ()
-             | [] -> ()
-           end in
-         chk "input"; chk "output"; chk "inout")
-         (String.split_on_char '\n' text);
-       let seen = Hashtbl.create 16 in
-       let missing = List.filter_map (fun (s : Behavioral_ir.bsignal) ->
-         match s.direction with
-         | `Input when s.name <> "" && not (Hashtbl.mem emitted s.name)
-                     && not (Hashtbl.mem seen s.name) ->
-             Hashtbl.replace seen s.name ();
-             Some (s.name, Behavioral_boundary.width_of_btype s.stype)
-         | _ -> None) m.Behavioral_ir.signals in
-       let text =
-         if missing = [] then text
-         else
-           let names = String.concat ""
-             (List.map (fun (n, _) -> Printf.sprintf ",\n    %s" n) missing) in
-           let decls = String.concat ""
-             (List.map (fun (n, w) ->
-                if w <= 1 then Printf.sprintf "    input %s;\n" n
-                else Printf.sprintf "    input [%d:0] %s;\n" (w - 1) n) missing) in
-           (* splice at the first "\n);" — the (non-ANSI) port-list close *)
-           (try
-              let idx = Str.search_forward (Str.regexp_string "\n);") text 0 in
-              String.sub text 0 idx ^ names ^ "\n);\n" ^ decls
-              ^ String.sub text (idx + 3) (String.length text - idx - 3)
-            with Not_found -> text) in
-       let oc = open_out (Filename.concat dir (m.Behavioral_ir.name ^ ".v")) in
-       output_string oc text; close_out oc);
+   | Some d -> write_circ_verilog ~dir:(if d = "1" then "/tmp/svs_circuit" else d) m circ);
   let l = Fpga_synth.Bir_to_aig.lower_circuit circ in
   (* Cost mode for the LUT cover, selectable via env so the timing-driven
      mapping can be exercised without recompiling.  Default `Area keeps the
@@ -2315,6 +2319,23 @@ let lgate_map mod_h k_lut io_flag =
     ~io:(io_flag <> 0) ~k:k_lut ~name:m.name
     ~mode ~lutpack ~mfs2_var_elim:mfs2_var ~mfs2_odc ~aig_balance l in
   hadd (Mapped (m.name, mapped))
+
+(* Emit EVERY module's create_circuit output as Verilog into [dir], one file per
+   module, WITHOUT running gate_map (no bir_to_aig / LUT cover).  This is the
+   "debug right after create_circuit" path: it exercises exactly the Hardcaml
+   lowering under test at a fraction of the cost of the full gate-map flow, and
+   applies the OCaml netlist fixups via [write_circ_verilog].  Reuses
+   [build_port_dir] so instance-port directions (RAMB, etc.) resolve. *)
+let lwrite_create_circuit_v prog_h dir =
+  let _, p = find_prog prog_h in
+  (try Unix.mkdir dir 0o755 with _ -> ());
+  List.iter (fun (m : Behavioral_ir.bmodule) ->
+    let port_dir = build_port_dir m p in
+    let circ =
+      Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
+    write_circ_verilog ~dir m circ) p.Behavioral_ir.modules;
+  Printf.sprintf "wrote %d create_circuit module(s) to %s"
+    (List.length p.Behavioral_ir.modules) dir
 
 (* Dump a Mapped circuit as cell-mapped Verilog via Hardcaml.Rtl,
  * suitable for ver_front to re-parse into structural BIR. *)
@@ -3084,6 +3105,9 @@ module MakeLib
         "miter_regcorr", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lmiter_regcorr);
         "bmc_sim",     V.efunc (V.string **-> V.string **->> V.string) (wrap2 lbmc_sim);
         "cyclesim",    V.efunc (V.string **-> V.string **->> V.string) (wrap2 lcyclesim);
+        "emit_create_circuit",
+                       V.efunc (V.string **-> V.string **->> V.string)
+                       (wrap2 lwrite_create_circuit_v);
         "splice",         V.efunc (V.string **-> V.string **-> V.string
                                    **->> V.string)
                            (wrap3 lsplice);
