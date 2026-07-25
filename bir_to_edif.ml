@@ -110,10 +110,10 @@ let const_net = function
 
 let populate_widths ctx (m : bmodule) =
   List.iter (fun (s : bsignal) ->
-    let w = match s.stype with
-      | BInt { width; _ } -> width
-      | BBool             -> 1
-      | _                 -> 1 in
+    (* Use the canonical width so an array/struct-typed signal keeps its full
+       width — a `_ -> 1` fallback here silently collapsed buses to one net and
+       dropped the upper bits' pin connections. *)
+    let w = width_of_btype s.stype in
     Hashtbl.replace ctx.widths s.name w;
     Hashtbl.replace ctx.declw s.name w) m.signals
 

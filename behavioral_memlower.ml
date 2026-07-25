@@ -747,7 +747,16 @@ let build_tdp_port m_name ~read_pin ~dw (p : bprocess) =
           ; p_addr = BCond { condition = we_any; then_val = w_addr; else_val = r_addr }
           ; p_we = we_any; p_wdata = base; p_wstrb = Some wstrb })
       | None ->
-        (* read-only port: no writes, address = read address. *)
+        (* read-only port: address = read address.  If there were NO write sites
+           this is genuinely read-only; but if writes exist and merely failed the
+           byte-write pattern match, forcing the port read-only silently drops
+           them (a RAM that never gets written) — surface that. *)
+        (if w_sites <> [] then
+           lossage_warn "memlower:tdp_readonly"
+             (Printf.sprintf
+                "RAM %s: %d write site(s) but no recognized byte-write pattern — \
+                 port forced READ-ONLY, writes dropped"
+                m_name (List.length w_sites)));
         Fpga_bram_resolve.(
           { p_clk = BVar clk; p_addr = r_addr
           ; p_we = zero_lit 1; p_wdata = zero_lit dw; p_wstrb = None })

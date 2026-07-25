@@ -285,6 +285,37 @@ let rec json_of_bexpr : bexpr -> Yojson.Safe.t = function
 
 let json_string_of_bexpr e = Yojson.Safe.to_string (json_of_bexpr e)
 
+(* Beta hardening (shared across passes): a default/catch-all match arm that
+   would otherwise silently drop or mis-lower real design content must surface
+   itself.  [lossage_warn where msg] logs the drop to stderr (deduped by
+   site+message) so it can never happen silently; with SVS_STRICT_LOWERING set
+   it becomes a hard failure.  Use for "should generally not reach here, but a
+   stray shape could" arms; use a plain failwith for true should-never-happen
+   invariants. *)
+let lossage_strict = lazy (Sys.getenv_opt "SVS_STRICT_LOWERING" <> None)
+let lossage_seen : (string, unit) Hashtbl.t = Hashtbl.create 64
+let lossage_warn (where : string) (msg : string) =
+  if Lazy.force lossage_strict then
+    failwith (Printf.sprintf "SVS lossage [%s]: %s" where msg)
+  else begin
+    let key = where ^ "|" ^ msg in
+    if not (Hashtbl.mem lossage_seen key) then begin
+      Hashtbl.add lossage_seen key ();
+      Printf.eprintf "[LOSSAGE %s] %s\n%!" where msg
+    end
+  end
+
+(* Canonical bit-width of a btype, shared by the netlist emitters so an
+   array/struct-typed signal is never silently collapsed to 1 bit (which drops
+   the upper bus bits' pin connections).  [width_of_btype_warn] additionally
+   surfaces any genuinely-unknown type instead of guessing 1. *)
+let rec width_of_btype = function
+  | BInt { width; _ } -> width
+  | BBool -> 1
+  | BArray { element; size } -> size * width_of_btype element
+  | BStruct { fields } ->
+      List.fold_left (fun a (_, ty) -> a + width_of_btype ty) 0 fields
+
 let rec string_of_bstmt indent stmt =
   let ind = String.make indent ' ' in
   match stmt with

@@ -46,10 +46,9 @@ let const_net = function
 
 let populate_widths ctx (m : bmodule) =
   List.iter (fun (s : bsignal) ->
-    let w = match s.stype with
-      | BInt { width; _ } -> width
-      | BBool             -> 1
-      | _                 -> 1 in
+    (* Canonical width: a `_ -> 1` fallback silently collapsed an array/struct
+       bus to one net, dropping upper bus bits from wire decls and pin conns. *)
+    let w = width_of_btype s.stype in
     Hashtbl.replace ctx.widths s.name w) m.signals
 
 let rec nets_of_conn ctx (e : bexpr) : string list =

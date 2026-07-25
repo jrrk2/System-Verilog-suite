@@ -3109,7 +3109,12 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                       write %s — inner selects dropped\n" name;
                    plain ())
           | Some (name, _), `None -> BAssign { lhs = name; rhs = recurse_e rhs }
-          | None, _ -> BBlock []))
+          | None, _ ->
+              (* LHS name could not be extracted — the whole assignment (a
+                 register/signal write) would vanish silently.  Surface it. *)
+              lossage_warn "verible:assign"
+                "assignment with unresolvable l-value dropped";
+              BBlock []))
   in
   match tok with
   (* Blocking assignment: lhs = rhs *)
@@ -3548,7 +3553,16 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
        | EMPTY_TOKEN -> BReturn None
        | e -> BReturn (Some (recurse_e e)))
   | TLIST [single] -> recurse_s single
-  | _ -> BBlock []
+  | _ ->
+      (* Master statement catch-all: an unhandled procedural statement shape
+         (a while/repeat/forever loop, break/continue, wait, …) becomes an
+         empty block, silently losing its logic.  Surface the shape — except a
+         bare null statement (`;`), which genuinely carries no logic. *)
+      let shape = shape_of_tok tok in
+      if shape <> "SEMICOLON" then
+        lossage_warn "verible:stmt"
+          (Printf.sprintf "unhandled statement shape %s dropped to empty block" shape);
+      BBlock []
 
 (* ─── always blocks ──────────────────────────────────────────────── *)
 

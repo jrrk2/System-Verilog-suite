@@ -136,7 +136,15 @@ let writes_for ~lookup_module (i : binstance)
                         msb = max msb lsb;
                         lsb = min msb lsb;
                         rhs = bcall }
-             | _ -> None)
+             | other ->
+                 (* A child OUTPUT wired to a BConcat/BSelect (struct/array
+                    shape) yields no driver here, leaving the parent net free in
+                    the miter — the same silent-drop class as the fixed
+                    instance-output bug.  Surface it. *)
+                 lossage_warn "boundary:writes_for"
+                   (Printf.sprintf "child output connection %s not a net/slice — driver dropped"
+                      (string_of_bexpr other));
+                 None)
       ) outputs
 
 (* Group writes by parent_var.  When a parent_var has only slice

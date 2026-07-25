@@ -50,7 +50,16 @@ let rec verilog_of_type = function
       Printf.sprintf "logic [%d:0][%d:0]" (size - 1) (width - 1)
   | BArray { element; size } ->
       Printf.sprintf "%s [0:%d]" (verilog_of_type element) (size - 1)
-  | BStruct _ -> "/* struct not supported in Verilog */"
+  | BStruct { fields } ->
+      (* A struct type must be scalarized before Verilog emit; one reaching here
+         would emit a comment in place of the declaration's width, silently
+         losing it.  Warn and emit a best-effort packed vector of the summed
+         member width so the net is at least declared. *)
+      let w = List.fold_left (fun a (_, ty) ->
+        a + (match ty with BInt { width; _ } -> width | BBool -> 1 | _ -> 1)) 0 fields in
+      lossage_warn "verilog:BStruct"
+        (Printf.sprintf "un-scalarized struct type emitted as [%d:0] vector" (max 0 (w - 1)));
+      Printf.sprintf "[%d:0]" (max 0 (w - 1))
 
 (* Names of unpacked-array signals in the module being emitted (set per module
    by verilog_of_module); a safety net so a whole-array reset of an unpacked
@@ -333,12 +342,16 @@ let rec verilog_of_stmt ?(nb=false) indent stmt =
       let bs = match base with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr base in
       Printf.sprintf "%s%s[%s -: %s] %s %s;" ind (sanitize_name nm) bs ws op (verilog_of_expr v)
   | BCallStmt { func; args } ->
-      if String.length func > 0 && func.[0] = '@' then
+      if String.length func > 0 && func.[0] = '@' then begin
         (* A write pseudo-op whose l-value is NOT a plain signal (constant- or
            field-concat destination): typically a folded-away dead write (hartinfo
            / halted / hartsel array writes).  Emit a no-op so the behavioral
-           netlist simulates; these do not touch the dmcontrol/dmstatus path. *)
+           netlist simulates.  This is asserted-dead, not proven — surface it so a
+           real dropped write can't hide. *)
+        lossage_warn "verilog:BCallStmt"
+          (Printf.sprintf "write pseudo-op %s with non-scalar l-value emitted as no-op" func);
         Printf.sprintf "%s/* skipped %s (non-scalar lvalue) */" ind func
+      end
       else
         Printf.sprintf "%s%s(%s);" ind func (String.concat ", " (List.map verilog_of_expr args))
 
