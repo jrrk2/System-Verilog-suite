@@ -130,11 +130,33 @@ let collect_roms (bmod : Behavioral_ir.bmodule) =
   t
 
 (* Get width from behavioral IR type *)
+(* Beta hardening: a default/catch-all match arm that would otherwise silently
+   drop or mis-lower real design content must surface itself.  [lossage_warn]
+   logs the drop to stderr (deduped by site+message) so it can never happen
+   silently; with SVS_STRICT_LOWERING set it becomes a hard failure.  Use it for
+   "should generally not reach here, but a stray shape could" arms; use a plain
+   failwith for true should-never-happen invariants. *)
+let lossage_strict = lazy (Sys.getenv_opt "SVS_STRICT_LOWERING" <> None)
+let lossage_seen : (string, unit) Hashtbl.t = Hashtbl.create 64
+let lossage_warn where msg =
+  if Lazy.force lossage_strict then
+    failwith (Printf.sprintf "create_circuit lossage [%s]: %s" where msg)
+  else begin
+    let key = where ^ "|" ^ msg in
+    if not (Hashtbl.mem lossage_seen key) then begin
+      Hashtbl.add lossage_seen key ();
+      Printf.eprintf "[LOSSAGE %s] %s\n%!" where msg
+    end
+  end
+
 let rec width_of_btype = function
   | BInt { width; _ } -> width
   | BBool -> 1
   | BArray { element; size } -> size * (width_of_btype element)
-  | BStruct _ -> 32  (* Default *)
+  (* Sum member widths rather than guessing 32 — a struct that reaches here
+     un-scalarized would otherwise get a silently-wrong port/signal width. *)
+  | BStruct { fields } ->
+      List.fold_left (fun a (_, ty) -> a + width_of_btype ty) 0 fields
 
 (* Get signal from context *)
 let get_signal ctx name =
@@ -628,8 +650,14 @@ let rec expr_to_signal ctx = function
      decoded_imm := $signed(mem_rdata_q[31:20])) and propagated as a
      reg_op2 = 0 divergence at cyc 129 of the xsim co-sim. *)
   | BCall { func = "@signed"; args = [x] } -> expr_to_signal ctx x
-  | BCall _ ->
-      (* Unsupported for now *)
+  | BCall { func; args } ->
+      (* Unsupported function/system call: lowering it to 0 silently corrupts
+         the data path (the expression twin of the dropped-instance-output
+         bug).  Surface it loudly; SVS_STRICT_LOWERING makes it fatal. *)
+      lossage_warn "expr:BCall"
+        (Printf.sprintf "unsupported call %s/%d lowered to 0: %s"
+           func (List.length args)
+           (Behavioral_ir.string_of_bexpr (BCall { func; args })));
       Signal.zero 32
 
 (* Convert behavioral statement to Always assignment.
@@ -751,7 +779,11 @@ let rec stmt_to_always ~is_reg ctx alw = function
        else build_priority case_list) @ alw
 
   | BWhile _ | BFor _ ->
-      (* Loops need to be unrolled by behavioral_unroll.ml first. *)
+      (* Loops must be unrolled by behavioral_unroll.ml before this pass.  One
+         reaching here means the unroll missed it, and dropping it silently
+         loses the entire loop body's logic. *)
+      lossage_warn "stmt:loop"
+        "un-unrolled BWhile/BFor reached create_circuit — whole loop body dropped";
       alw
 
   | BBlock stmts ->
@@ -837,7 +869,17 @@ let rec stmt_to_always ~is_reg ctx alw = function
              let new_val = Signal.concat_msb (List.rev slots) in
              Always.(var <-- new_val) :: alw
        | _ -> alw)
-  | BCallStmt _ | BReturn _ ->
+  | BCallStmt { func; _ } ->
+      (* A `@`-prefixed write pseudo-op (@mem_write / @slice_write /
+         @part_sel_write) reaching here means it survived the folding passes and
+         its state update is being dropped — surface it.  Non-`@` calls
+         ($display, assertions, …) carry no synthesizable state and are dropped
+         quietly. *)
+      (if String.length func > 0 && func.[0] = '@' then
+         lossage_warn "stmt:BCallStmt"
+           (Printf.sprintf "write pseudo-op %s survived folding; state update dropped" func));
+      alw
+  | BReturn _ ->
       alw
 
 (* Thread Verilog blocking-assignment semantics over a process body.
