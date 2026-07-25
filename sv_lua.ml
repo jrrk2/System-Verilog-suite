@@ -187,10 +187,20 @@ let run_synlig_to_rtlil ~top ~files ~out =
  * fill literal lands as a `BConst { value=0; width=0 }` and Z3
  * rejects it with "bit-vector size must be greater than zero". *)
 let post_load (p : bprogram) =
-  p
-  |> Behavioral_const.normalize_bcall_args_program
-  |> Behavioral_const.expand_fills_program
-  |> Behavioral_const.strip_signed_program
+  let p =
+    p
+    |> Behavioral_const.normalize_bcall_args_program
+    |> Behavioral_const.expand_fills_program
+  in
+  (* strip_signed removes the `@signed(x)` markers because the Z3/gate_map
+     encoders can't interpret a foreign uninterpreted-function call in the
+     middle of an arithmetic tree.  But the BEHAVIORAL VERILOG emitter CAN
+     render them as `$signed(...)`, and it NEEDS them: without the cast a
+     signed multiply/shift silently becomes unsigned (e.g. the ibex fast
+     multiplier's `$signed({sign,op})*$signed({sign,op})` → wrong mulh for
+     negative operands).  Keep the markers for the behav-verilog path. *)
+  if Sys.getenv_opt "BEHAV_VERILOG" <> None then p
+  else Behavioral_const.strip_signed_program p
 
 (* Guard against a stale Verilator.  Versions < 5.048 mis-emit packed-struct
  * ports in --json-only (the self-reference dtype collapse that flattened

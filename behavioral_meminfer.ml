@@ -228,11 +228,40 @@ let rewrite_body_for_rom ~is_seq body =
      path is byte-for-byte unchanged. *)
   let fpga = Sys.getenv_opt "MEMLOWER_FPGA" = Some "1" in
   let mems = ref [] in
+  (* ROMs used to be named `rom_<lhs>` — keyed only by the assigned
+     signal.  A process with several DISTINCT `case(sel)` tables all
+     assigning the same signal (e.g. ibex LSU's data_be: word=1111.. ,
+     half=0011.. , byte=0001..) then collapsed onto one name, and every
+     read picked up whichever table happened to be declared last (the
+     byte decoder {1,2,4,8}).  That silently turned word stores into
+     single-byte stores.  Key the name by table CONTENT instead:
+     identical tables share one ROM (harmless dedup); distinct tables
+     that target the same signal get a `_<n>` suffix so each keeps its
+     own init.  `fresh` gates the mem-list push so shared tables aren't
+     declared twice. *)
+  let rom_sig_names :
+        (string * (int * int * int) list * (int * int) option, string)
+          Hashtbl.t = Hashtbl.create 8 in
+  let rom_name_next : (string, int) Hashtbl.t = Hashtbl.create 8 in
+  let unique_rom_name lhs pairs def =
+    match Hashtbl.find_opt rom_sig_names (lhs, pairs, def) with
+    | Some n -> (n, false)
+    | None ->
+        let name =
+          match Hashtbl.find_opt rom_name_next lhs with
+          | None -> Hashtbl.replace rom_name_next lhs 1; "rom_" ^ lhs
+          | Some i ->
+              Hashtbl.replace rom_name_next lhs (i + 1);
+              Printf.sprintf "rom_%s_%d" lhs i
+        in
+        Hashtbl.replace rom_sig_names (lhs, pairs, def) name;
+        (name, true)
+  in
   let rec walk_s = function
     | BCase { selector; cases; default } as orig ->
         (match try_extract_const_rom selector cases default with
          | Some (lhs, sel, pairs, def) ->
-             let rom_name = "rom_" ^ lhs in
+             let (rom_name, fresh) = unique_rom_name lhs pairs def in
              let data_w =
                match pairs with (_, _, w) :: _ -> w | _ -> 1
              in
@@ -251,29 +280,31 @@ let rewrite_body_for_rom ~is_seq body =
                let init = Array.make depth def_val in
                List.iter (fun (k, v, _) ->
                  if k >= 0 && k < depth then init.(k) <- v) pairs;
-               mems := { mname = rom_name;
-                         data_width = data_w;
-                         addr_width = addr_w;
-                         depth;
-                         kind = BRom;
-                         init_values = Array.to_list init;
-                         n_write_ports = 0;
-                         n_read_ports = 1;
-                         read_is_sync = is_seq } :: !mems;
+               if fresh then
+                 mems := { mname = rom_name;
+                           data_width = data_w;
+                           addr_width = addr_w;
+                           depth;
+                           kind = BRom;
+                           init_values = Array.to_list init;
+                           n_write_ports = 0;
+                           n_read_ports = 1;
+                           read_is_sync = is_seq } :: !mems;
                BAssign { lhs; rhs = BSelect { array = BVar rom_name; index = sel } }
              end else begin
                let depth = List.length pairs in
                let addr_w = bits_needed (depth - 1) in
                let init_values = List.map (fun (_, v, _) -> v) pairs in
-               mems := { mname = rom_name;
-                         data_width = data_w;
-                         addr_width = addr_w;
-                         depth;
-                         kind = BRom;
-                         init_values;
-                         n_write_ports = 0;
-                         n_read_ports = 1;
-                         read_is_sync = false } :: !mems;
+               if fresh then
+                 mems := { mname = rom_name;
+                           data_width = data_w;
+                           addr_width = addr_w;
+                           depth;
+                           kind = BRom;
+                           init_values;
+                           n_write_ports = 0;
+                           n_read_ports = 1;
+                           read_is_sync = false } :: !mems;
                BAssign { lhs; rhs = build_rom_lookup sel pairs def }
              end
          | None ->

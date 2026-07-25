@@ -106,6 +106,31 @@ let rec verilog_of_expr = function
         Printf.sprintf "1'b%s" (Z.to_string v)
       else
         Printf.sprintf "%d'd%s" width (Z.to_string v)
+  | BBinOp { op = BAnd;
+             lhs = (BBinOp { op = BShr; _ } as inner);
+             rhs = (BConst { value; width = 1 });
+             _ } when Z.equal (Z.logand value Z.one) Z.one ->
+      (* Lowered dynamic single-bit select `(sig >> i) & 1'b1` (see
+         verible_to_behavioral).  It is 1 bit in the IR but sig-width in
+         Verilog (`32'hXXXX & 1'b1` is 32-bit), so in a concat or replication
+         it mis-sizes every field above it — `{8{be[i]}}` became 0x11111111
+         (dropped RAM byte-writes) and the ibex divider's
+         `{1'b0, rem, (numer>>cnt)&1'b1}` became 65 bits (broke division).
+         Pin it to 1 bit at the source so EVERY context is correct, without
+         casting other operands (whose IR widths are not always reliable,
+         e.g. a bitwise `~op_b` is typed 1 but must stay 32). *)
+      Printf.sprintf "(1'(%s & 1'b1))" (verilog_of_expr inner)
+  | BBinOp { op = BAshr; lhs; rhs; _ } ->
+      (* Verilog `>>>` is an ARITHMETIC shift only when its left operand is
+         signed.  The behavioral emitter produces unsigned expressions (no
+         signed decls, no `$signed`), so a bare `x >>> n` silently degrades
+         to a logical shift — breaking srai/sra (e.g. the ibex ALU emitted
+         `{sign,operand} >>> amt`, dropping the source's `$signed(...)`).
+         BAshr is only ever generated for genuine arithmetic shifts (logical
+         right-shift is BShr), so force the shiftee signed here. *)
+      Printf.sprintf "($signed(%s) >>> %s)"
+        (verilog_of_expr lhs)
+        (verilog_of_expr rhs)
   | BBinOp { op; lhs; rhs; _ } ->
       Printf.sprintf "(%s %s %s)"
         (verilog_of_expr lhs)
@@ -188,6 +213,11 @@ let rec verilog_of_expr = function
         (verilog_of_expr condition)
         (verilog_of_expr then_val)
         (verilog_of_expr else_val)
+  | BCall { func = "@signed"; args = [x] } ->
+      (* Verible's $signed-cast marker (kept for the behav-verilog path — see
+         sv_lua.post_load).  Render as a real Verilog signed cast so signed
+         multiplies/shifts/comparisons don't degrade to unsigned. *)
+      Printf.sprintf "$signed(%s)" (verilog_of_expr x)
   | BCall { func; args } ->
       Printf.sprintf "%s(%s)"
         func
