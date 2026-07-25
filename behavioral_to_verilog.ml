@@ -92,9 +92,14 @@ let verilog_of_unop = function
 (* Generate expression *)
 let rec verilog_of_expr = function
   | BVar name ->
-      (* Convert special constant signals *)
-      if name = "<const0>" then "1'b0"
-      else if name = "<const1>" then "1'b1"
+      (* Convert special constant signals.  Gate-mapped BIR ties constant pins
+         to the net names `VCC`/`GND` (the tie-cell convention), not the
+         `<const1>`/`<const0>` sentinels; leaving them as bare net names emits
+         an UNDRIVEN wire, so e.g. a reset sync's `.d_i(VCC)` floated its
+         downstream LUT input and opt_design pruned it (Opt 31-67).  Resolve
+         VCC/GND to literals here too. *)
+      if name = "<const0>" || name = "GND" then "1'b0"
+      else if name = "<const1>" || name = "VCC" then "1'b1"
       else sanitize_name name
   | BConst { value; width } ->
       (* Mask to width so a negative IR constant (e.g. `-1` all-ones) emits as a
@@ -812,8 +817,44 @@ let verilog_of_module prog bmod =
   (* Instances *)
   let instance_strs = String.concat "\n\n" (List.map (verilog_of_instance prog) instances) in
 
+  (* Bridge input-port bits to the scalarized nets the gate cells read.
+     For a gate-mapped module, of_circuit ties a cell OUTPUT to an output-port
+     slice (`out[N:N]`) but a cell INPUT to a bare scalar net `port__N`, leaving
+     every multi-bit INPUT port's bits unconnected — they float to X and kill
+     the whole netlist (bir_to_verilog_netlist does this bridge via `assign
+     {nets}=port`; behavioral_to_verilog did not).  Emit `assign port__N =
+     port[N]` for each input-port bit the instances actually reference. *)
+  let port_bit_bridges =
+    let used : (string, unit) Hashtbl.t = Hashtbl.create 256 in
+    let rec collect = function
+      | BVar n -> Hashtbl.replace used n ()
+      | BSlice { signal; _ } -> collect signal
+      | BConcat es -> List.iter collect es
+      | BSelect { array; index } -> collect array; collect index
+      | BBinOp { lhs; rhs; _ } -> collect lhs; collect rhs
+      | BUnOp { operand; _ } -> collect operand
+      | BReplicate { value; _ } -> collect value
+      | BCond { condition; then_val; else_val } ->
+          collect condition; collect then_val; collect else_val
+      | BCall { args; _ } -> List.iter collect args
+      | _ -> () in
+    List.iter (fun (i : binstance) ->
+      List.iter (fun (_p, e) -> collect e) i.port_connections) instances;
+    let lines = List.concat_map (fun (s : bsignal) ->
+      let w = width_of_type s.stype in
+      if s.direction = `Input && w > 1 then
+        List.filter_map (fun i ->
+          let bit = Printf.sprintf "%s__%d" s.name i in
+          if Hashtbl.mem used bit then
+            Some (Printf.sprintf "  assign %s = %s[%d];"
+                    (sanitize_name bit) (sanitize_name s.name) i)
+          else None) (List.init w (fun i -> i))
+      else []) signals in
+    String.concat "\n" lines
+  in
+
   (* Combine all *)
-  let body_parts = [signal_decls; mem_decls; process_strs; instance_strs]
+  let body_parts = [signal_decls; mem_decls; port_bit_bridges; process_strs; instance_strs]
     |> List.filter (fun s -> s <> "")
     |> String.concat "\n\n"
   in

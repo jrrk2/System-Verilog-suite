@@ -82,6 +82,12 @@ type conv_context = {
      resolves any such name straight to a hardcaml constant. Value: true =
      one (VCC), false = zero (GND). *)
   const_nets: (string, bool) Hashtbl.t;
+  (* Inferred ROMs (meminfer's `rom_<lhs>` decode tables + any BRom with an
+     init image), keyed by name → (data_width, init_values).  behavioral_to_
+     verilog emits these as `reg rom_x[]` + init block; the Hardcaml gate-map
+     path has no memory model, so a `x = rom_x[sel]` BSelect is lowered to a
+     combinational Signal.mux over the init constants (ROM-as-case). *)
+  roms: (string, int * int list) Hashtbl.t;
 }
 
 (* Collect net names that a GND/VCC primitive instance ties to a constant,
@@ -99,6 +105,16 @@ let collect_const_nets (bmod : Behavioral_ir.bmodule) =
       List.iter (fun (_port, e) -> match e with
         | Behavioral_ir.BVar nm -> Hashtbl.replace t nm v
         | _ -> ()) i.port_connections) bmod.instances;
+  t
+
+(* Collect inferred ROMs (name -> data_width, init_values) so a
+   `BSelect { array = BVar rom; index }` can be lowered to a Signal.mux
+   over the init constants instead of hitting the unbound-identifier bomb. *)
+let collect_roms (bmod : Behavioral_ir.bmodule) =
+  let t = Hashtbl.create 8 in
+  List.iter (fun (m : Behavioral_ir.bmem) ->
+    if m.init_values <> [] then
+      Hashtbl.replace t m.mname (m.data_width, m.init_values)) bmod.mems;
   t
 
 (* Get width from behavioral IR type *)
@@ -146,15 +162,35 @@ let get_signal ctx name =
          design is almost certainly wrong wherever this fires, but at
          least layout proceeds and the diagnostic below names the
          identifier).                                                *)
+      (* An unbound identifier here means create_circuit is about to build a
+         SILENTLY WRONG gate netlist (the name reads as constant 0 wherever it
+         fires).  That masked a real gate_map gap: inferred ROMs (`rom_*` from
+         meminfer) and the program RAM are emitted by behavioral_to_verilog
+         (verilog_of_mem) but create_circuit never consults bmod.mems, so every
+         `x = rom_data_be[sel]` collapsed to 0 and the whole decode path went
+         dead — with only a warning.  BOMB by default so the gap is caught, not
+         shipped.  SVS_ALLOW_UNBOUND=1 restores the tie-to-zero fallback. *)
       let width = 32 in
       let z = Signal.zero width in
       let _ = Signal.(--) z ("__unbound_" ^ name) in
-      Printf.eprintf
-        "[expr_to_signal] unbound identifier %s — tied to %d-bit zero \
-         (upstream BIR is missing a declaration or driver)\n%!"
-        name width;
       ctx.signals <- (name, z) :: ctx.signals;
-      z
+      if Sys.getenv_opt "SVS_ALLOW_UNBOUND" <> None then begin
+        Printf.eprintf
+          "[expr_to_signal] unbound identifier %s — tied to %d-bit zero \
+           (SVS_ALLOW_UNBOUND; upstream BIR is missing a declaration or \
+           driver — the gate netlist is WRONG wherever this fires)\n%!"
+          name width;
+        z
+      end else
+        failwith (Printf.sprintf
+          "[behavioral_to_hardcaml] unbound identifier '%s' — create_circuit \
+           has no signal/variable for it, so it would tie to constant 0 and \
+           build a silently-wrong gate netlist.  Common cause: an inferred \
+           ROM/RAM (rom_*/mem from meminfer) that the Hardcaml gate-map path \
+           does not build (behavioral_to_verilog emits it via verilog_of_mem; \
+           create_circuit must too), or a genuinely missing driver.  Set \
+           SVS_ALLOW_UNBOUND=1 to tie to 32-bit zero and proceed anyway."
+          name)
 
 (* Get or create variable from context *)
 let get_or_create_var ctx name width is_reg =
@@ -424,6 +460,31 @@ let rec expr_to_signal ctx = function
           let bits = List.init cond_w (fun i -> Signal.bit s_cond i) in
           Signal.reduce ~f:(Signal.(|:)) bits in
       Signal.mux2 s_cond1 (coerce s_then) (coerce s_else)
+
+  | BSelect { array = BVar rom_name; index }
+      when Hashtbl.mem ctx.roms rom_name ->
+      (* Inferred ROM read `rom[sel]` — the Hardcaml gate-map path has no
+         memory model, so encode it as a combinational Signal.mux over the
+         init constants (ROM-as-case), mirroring meminfer.build_rom_lookup and
+         verilog_of_mem's reg-array + $readmemh on the behavioral side. *)
+      let (dw, init) = Hashtbl.find ctx.roms rom_name in
+      let dw = max 1 dw in
+      let size = List.length init in
+      let mask = if dw >= 62 then -1 else (1 lsl dw) - 1 in
+      let cases = List.map (fun v -> Signal.of_int ~width:dw (v land mask)) init in
+      if size <= 1 then (match cases with c :: _ -> c | [] -> Signal.zero dw)
+      else begin
+        let s_index = expr_to_signal ctx index in
+        let need_w =
+          let rec lg n = if n <= 1 then 0 else 1 + lg ((n + 1) / 2) in
+          max 1 (lg size) in
+        let s_index =
+          let iw = Signal.width s_index in
+          if iw = need_w then s_index
+          else if iw > need_w then Signal.select s_index (need_w - 1) 0
+          else Signal.uresize s_index need_w in
+        Signal.mux s_index cases
+      end
 
   | BSelect { array; index } ->
       let s_array = expr_to_signal ctx array in
@@ -1252,6 +1313,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
     array_elem_w = Hashtbl.create 8; reset_falling = false;
     initial_values = Hashtbl.create 16;
     const_nets = collect_const_nets bmod;
+    roms = collect_roms bmod;
   } in
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
@@ -1296,6 +1358,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     array_elem_w = Hashtbl.create 8; reset_falling = false;
     initial_values = Hashtbl.create 16;
     const_nets = collect_const_nets bmod;
+    roms = collect_roms bmod;
   } in
 
   (* Clock/reset get bound by [process_to_always] when each
