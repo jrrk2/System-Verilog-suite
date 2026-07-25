@@ -807,9 +807,20 @@ let rec normalize_expr sig_widths func_sigs = function
            BCall { func; args = normalize_call_args sig_widths formals args }
        | None -> BCall { func; args })
   | BBinOp r ->
-      BBinOp { r with
-        lhs = normalize_expr sig_widths func_sigs r.lhs;
-        rhs = normalize_expr sig_widths func_sigs r.rhs }
+      let lhs = normalize_expr sig_widths func_sigs r.lhs in
+      let rhs = normalize_expr sig_widths func_sigs r.rhs in
+      (* Record signedness on the result_type when an operand carries the
+         `@signed(x)` marker: a later pass strips the marker before the gate
+         lowering, so `result_type.signed` is the only surviving signal that a
+         `$signed(a) * $signed(b)` must be a SIGNED multiply (otherwise the low
+         MUL is fine but MULH/MULHSU get the wrong high bits). *)
+      let result_type =
+        if strip_signed_marker lhs <> None || strip_signed_marker rhs <> None
+        then (match r.result_type with
+              | BInt { width; _ } -> BInt { width; signed = Signed }
+              | t -> t)
+        else r.result_type in
+      BBinOp { r with lhs; rhs; result_type }
   | BUnOp r ->
       BUnOp { r with operand = normalize_expr sig_widths func_sigs r.operand }
   | BSlice r ->

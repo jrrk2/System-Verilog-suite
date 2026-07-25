@@ -379,9 +379,33 @@ let rec expr_to_signal ctx = function
                   ~input2:Signal.(~: (uresize s_rhs add_w)) ~carry_in:Signal.vdd in
                 Signal.select s_full (add_w - 1) 0)
        | BMul ->
-           (match mul_config () with
-            | None -> Signal.(s_lhs *: s_rhs)
-            | Some config ->
+           (* A `$signed(a) * $signed(b)` must use a SIGNED multiply: the [@signed]
+              cast is otherwise a no-op, so a plain unsigned `*:` gives the wrong
+              high bits for negative operands (the ibex multiplier's
+              `$signed({sign,op}) * $signed({sign,op})` — breaks mulh/mulhsu; the
+              low half MUL and unsigned MULHU are unaffected).  For a signed
+              multiply the operands must be SIGN-extended to the common width, not
+              zero-extended. *)
+           (* A `$signed(a) * $signed(b)` must be a SIGNED multiply.  The
+              @signed markers are usually stripped before this point, so also
+              trust result_type = Signed (set by normalize_expr from the
+              surviving markers). *)
+           let is_signed_operand = function
+             | BCall { func = "@signed"; _ } -> true | _ -> false in
+           let rt_signed = match result_type with
+             | BInt { signed = Signed; _ } -> true | _ -> false in
+           let signed_mul = is_signed_operand lhs || is_signed_operand rhs || rt_signed in
+           let spad s =
+             let sw = Signal.width s in
+             if sw = common_w then s
+             else if sw > common_w then Signal.select s (common_w - 1) 0
+             else Signal.sresize s common_w in
+           let ml = if signed_mul then spad s_lhs0 else s_lhs
+           and mr = if signed_mul then spad s_rhs0 else s_rhs in
+           (match mul_config (), signed_mul with
+            | None, true  -> Signal.(ml *+ mr)
+            | None, false -> Signal.(s_lhs *: s_rhs)
+            | Some config, _ ->
                 let s_full = Hardcaml_circuits.Mul.create ~config
                   (module Signal) s_lhs s_rhs in
                 Signal.select s_full (common_w - 1) 0)
@@ -671,17 +695,30 @@ let rec expr_to_signal ctx = function
            (Behavioral_ir.string_of_bexpr (BCall { func; args })));
       Signal.zero 32
 
-(* Lower an expr, pinning a lowered dynamic single-bit select
-   `(sig >> i) & 1'b1` to exactly 1 bit (bit 0 of `sig >> i`).  Used only in
-   width-sensitive contexts (BConcat / BReplicate); everywhere else the generic
-   [expr_to_signal] keeps the IR width. *)
-and bitsel1 ctx e =
+(* Rewrite an expr for a width-sensitive context (BConcat / BReplicate operand):
+   pin every lowered dynamic single-bit select `(sig >> i) & 1'b1` (1 bit in the
+   IR, sig-width if lowered as a plain AND) to exactly 1 bit by wrapping it in a
+   `[0:0]` slice.  Recurse through the enclosing operators so a NESTED select
+   (the multiplier's `{16{signed_mult & imd_val_q_i[0][33]}}` sign fill) is
+   pinned too — otherwise the AND with a wide select mis-sizes the replication.
+   Scoped to concat/replicate: a bare `(sig>>i)&1` used as a slice-write RHS
+   (`rev[i] = sig[31-i]`) is NOT rewritten, so it keeps its width and the write
+   truncates to bit 0 as SystemVerilog does. *)
+and pin_bitsel_deep e =
   match e with
-  | BBinOp { op = BAnd; lhs = (BBinOp { op = BShr; _ } as inner);
-             rhs = BConst { value; width = 1 }; _ }
+  | BBinOp { op = BAnd; lhs = (BBinOp { op = BShr; _ }); rhs = BConst { value; width = 1 }; _ }
     when Z.equal (Z.logand value Z.one) Z.one ->
-      Signal.select (expr_to_signal ctx inner) 0 0
-  | _ -> expr_to_signal ctx e
+      Behavioral_ir.BSlice { signal = e; msb = 0; lsb = 0 }
+  | BBinOp r -> BBinOp { r with lhs = pin_bitsel_deep r.lhs; rhs = pin_bitsel_deep r.rhs }
+  | BUnOp r -> BUnOp { r with operand = pin_bitsel_deep r.operand }
+  | BCond r -> BCond { condition = pin_bitsel_deep r.condition;
+                       then_val = pin_bitsel_deep r.then_val;
+                       else_val = pin_bitsel_deep r.else_val }
+  | BConcat es -> BConcat (List.map pin_bitsel_deep es)
+  | BReplicate r -> BReplicate { r with value = pin_bitsel_deep r.value }
+  | e -> e
+
+and bitsel1 ctx e = expr_to_signal ctx (pin_bitsel_deep e)
 
 (* Convert behavioral statement to Always assignment.
    [is_reg] tells [get_or_create_var] whether new variables here
