@@ -2178,6 +2178,21 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
       (fun (sg : Behavioral_ir.bsignal) -> sg.name = arr) bmod.signals with
       | Some { stype = BArray { element = BInt _; _ }; _ } -> true
       | _ -> false in
+    let arr_size arr = match List.find_opt
+      (fun (sg : Behavioral_ir.bsignal) -> sg.name = arr) bmod.signals with
+      | Some { stype = BArray { size; _ }; _ } -> Some size
+      | _ -> None in
+    (* Element-k projection of a whole-array RHS: distribute the index into a
+       ternary and turn any array-valued read into `read[k]`, so a whole-array
+       assign `arr = cond ? other : arr` folds per slot (the self-read `arr`
+       becomes `arr[k]`, which subst_self resolves to the fold accumulator). *)
+    let rec select_slot kc e =
+      match e with
+      | Behavioral_ir.BCond { condition; then_val; else_val } ->
+          Behavioral_ir.BCond { condition;
+            then_val = select_slot kc then_val;
+            else_val = select_slot kc else_val }
+      | e -> Behavioral_ir.BSelect { array = e; index = kc } in
     let bool1 = BInt { width = 1; signed = Unsigned } in
     let order = ref [] in
     (* per array: ordered (guard option, idx, data). *)
@@ -2188,6 +2203,20 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
       | None -> Some c
       | Some g0 -> Some (Behavioral_ir.BBinOp { op = BAnd; lhs = g0; rhs = c;
                                                 result_type = bool1 }) in
+    (* Pre-scan: which arrays have at least one @mem_write element write in this
+       block.  ONLY those need their whole-array assigns folded in too (to avoid
+       the element-rebuild clobbering them) — an array with only whole-array
+       assigns is handled fine by the normal path and must NOT be forced through
+       coalesce. *)
+    let has_memwrite = Hashtbl.create 8 in
+    let rec scan_mw = function
+      | Behavioral_ir.BBlock b -> List.iter scan_mw b
+      | BCallStmt { func = "@mem_write"; args = [BVar arr; _; _] } when is_arr arr ->
+          Hashtbl.replace has_memwrite arr ()
+      | BIf { then_stmts; else_stmts; _ } ->
+          List.iter scan_mw then_stmts; List.iter scan_mw else_stmts
+      | _ -> () in
+    List.iter scan_mw stmts;
     let rec collect guard = function
       | Behavioral_ir.BBlock b -> List.iter (collect guard) b
       | BCallStmt { func = "@mem_write"; args = [BVar arr; idx; data] }
@@ -2195,6 +2224,24 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
           if not (Hashtbl.mem writes arr) then order := arr :: !order;
           let cur = try Hashtbl.find writes arr with Not_found -> [] in
           Hashtbl.replace writes arr (cur @ [(guard, idx, data)])
+      | BAssign { lhs = arr; rhs } when is_arr arr && Hashtbl.mem has_memwrite arr ->
+          (* A WHOLE-array assign `arr = rhs` (a default `arr = arr_q` or a
+             conditional capture `arr = valid ? data_i : arr`) must participate
+             in the per-slot fold — otherwise it survives in the body while the
+             element-write rebuild (placed last) clobbers it, dropping the
+             assign entirely (this is what stopped the ibex debug module's
+             `data_d = data_i` from ever capturing the hart's abstract-command
+             result → misa read as 0, program-load over JTAG failed).  Expand it
+             to one constant-index write per slot, in source order. *)
+          (match arr_size arr with
+           | Some size when size > 0 ->
+               if not (Hashtbl.mem writes arr) then order := arr :: !order;
+               let cur = try Hashtbl.find writes arr with Not_found -> [] in
+               let ws = List.init size (fun k ->
+                 let kc = Behavioral_ir.BConst { value = Z.of_int k; width = 32 } in
+                 (guard, kc, select_slot kc rhs)) in
+               Hashtbl.replace writes arr (cur @ ws)
+           | _ -> ())
       | BIf { condition; then_stmts; else_stmts } ->
           let notc = Behavioral_ir.BUnOp { op = BNot; operand = condition;
                                            result_type = bool1 } in
@@ -2295,6 +2342,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
       let rec strip ss = List.filter_map (fun s -> match s with
         | Behavioral_ir.BCallStmt { func = "@mem_write"; args = [BVar arr; _; _] }
           when Hashtbl.mem folded arr -> None
+        | Behavioral_ir.BAssign { lhs = arr; _ } when Hashtbl.mem folded arr -> None
         | BBlock b -> (match strip b with [] -> None | b' -> Some (BBlock b'))
         | BIf { condition; then_stmts; else_stmts } ->
             let t = strip then_stmts and e = strip else_stmts in
