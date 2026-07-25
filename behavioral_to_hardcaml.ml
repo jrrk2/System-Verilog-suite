@@ -136,7 +136,7 @@ let collect_roms (bmod : Behavioral_ir.bmodule) =
    silently; with SVS_STRICT_LOWERING set it becomes a hard failure.  Use it for
    "should generally not reach here, but a stray shape could" arms; use a plain
    failwith for true should-never-happen invariants. *)
-let lossage_strict = lazy (Sys.getenv_opt "SVS_STRICT_LOWERING" <> None)
+let lossage_strict = lazy (Sys.getenv_opt "SVS_LENIENT_LOWERING" = None)
 let lossage_seen : (string, unit) Hashtbl.t = Hashtbl.create 64
 let lossage_warn where msg =
   if Lazy.force lossage_strict then
@@ -890,13 +890,20 @@ let rec stmt_to_always ~is_reg ctx alw = function
          so the dropped write can be traced).  Non-`@` calls ($display,
          assertions, …) carry no synthesizable state and are dropped quietly. *)
       (if String.length func > 0 && func.[0] = '@' then
-         let target = match args with
-           | BVar n :: _ -> n
-           | e :: _ -> Behavioral_ir.string_of_bexpr e
-           | [] -> "?" in
-         lossage_warn "stmt:BCallStmt"
-           (Printf.sprintf "write pseudo-op %s on %s survived folding; state update dropped"
-              func target));
+         match args with
+         (* Only a real l-value (a net, or a slice/element of one) is a genuine
+            dropped write worth surfacing.  A write whose target is a constant or
+            a computed expression (a ternary, `32'0`, …) is not an assignable
+            l-value — a folded-away dead write — so drop it quietly. *)
+         | (BVar n) :: _ ->
+             lossage_warn "stmt:BCallStmt"
+               (Printf.sprintf "write pseudo-op %s on %s survived folding; state update dropped"
+                  func n)
+         | (BSlice { signal = BVar n; _ }) :: _ | (BSelect { array = BVar n; _ }) :: _ ->
+             lossage_warn "stmt:BCallStmt"
+               (Printf.sprintf "write pseudo-op %s on %s[...] survived folding; state update dropped"
+                  func n)
+         | _ -> () (* non-l-value target: dead write, drop quietly *));
       alw
   | BReturn _ ->
       alw

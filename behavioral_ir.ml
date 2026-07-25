@@ -292,7 +292,7 @@ let json_string_of_bexpr e = Yojson.Safe.to_string (json_of_bexpr e)
    it becomes a hard failure.  Use for "should generally not reach here, but a
    stray shape could" arms; use a plain failwith for true should-never-happen
    invariants. *)
-let lossage_strict = lazy (Sys.getenv_opt "SVS_STRICT_LOWERING" <> None)
+let lossage_strict = lazy (Sys.getenv_opt "SVS_LENIENT_LOWERING" = None)
 let lossage_seen : (string, unit) Hashtbl.t = Hashtbl.create 64
 let lossage_warn (where : string) (msg : string) =
   if Lazy.force lossage_strict then
