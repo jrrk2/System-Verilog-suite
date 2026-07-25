@@ -884,7 +884,14 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
        For RAM32M: ceil(width/2) instances in quad-port mode — port A holds
        the rs1 view, B holds rs2, D drives writes; ADDR* mux toggles the
        3 ports between write-broadcast (WE=1) and per-port read (WE=0). *)
-    if mm.n_write_ports = 1 && mm.n_read_ports = 2 && mm.depth <= 32 then
+    if Sys.getenv_opt "MEMLOWER_NO_LUTRAM" <> None then
+      (* Keep async-read memories bit-blasted (FFs+muxes) instead of inferring
+         distributed LUT-RAM primitives (RAM32X1D/RAM32M/…).  Small FIFO/queue
+         storage (e.g. the depth-2 sync FIFO) is trivial as regs, and the
+         resulting netlist is pure behavioural RTL — Verilatable with no unisim
+         library.  Used by the "after Hardcaml in Verilator" sim flow. *)
+      skip "MEMLOWER_NO_LUTRAM — async-read RAM kept bit-blasted (no LUTRAM primitive)"
+    else if mm.n_write_ports = 1 && mm.n_read_ports = 2 && mm.depth <= 32 then
       ram_m_lower_dual_port ~prim:"RAM32M" ~pb:2 ~depth_cap:32 ~addr_w:5
         ~m ~mm ~mname ~skip
     else if mm.n_write_ports = 1 && mm.n_read_ports = 2 && mm.depth <= 64 then

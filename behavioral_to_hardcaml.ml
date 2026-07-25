@@ -192,6 +192,26 @@ let get_signal ctx name =
            SVS_ALLOW_UNBOUND=1 to tie to 32-bit zero and proceed anyway."
           name)
 
+(* Non-bombing sibling of [get_signal]: resolve [name] to its Signal if one
+   already exists (const-net sentinel / ctx.signals / ctx.variables), else
+   None — no zero-stub, no failwith.  Used to detect a FORWARD REFERENCE when
+   binding a register's clock/reset in the pre-pass: a clock/reset net can be
+   declared AFTER the register that uses it (a flattened SoC's comb reset
+   `rst_core_n = rst_sys_ni & ~ndmreset_req`), so its Always.Variable doesn't
+   exist yet.  The caller then substitutes a placeholder Signal.wire and
+   connects it once every variable has been created. *)
+let get_signal_opt ctx name =
+  match Hashtbl.find_opt ctx.const_nets name with
+  | Some true  -> Some Signal.vdd
+  | Some false -> Some Signal.gnd
+  | None ->
+  match List.assoc_opt name ctx.signals with
+  | Some s -> Some s
+  | None ->
+  match List.assoc_opt name ctx.variables with
+  | Some v -> Some (Always.Variable.value v)
+  | None -> None
+
 (* Get or create variable from context *)
 let get_or_create_var ctx name width is_reg =
   match List.assoc_opt name ctx.variables with
@@ -1195,6 +1215,124 @@ let rec merge_slice_writes_deep ctx body =
     | BBlock ss -> BBlock (merge_slice_writes_deep ctx ss)
     | s -> s) body
 
+(* Coalesce guarded, multi-bit ARRAY element writes inside a SEQUENTIAL
+   (clocked) process body into one full-array [BAssign] per array — the
+   [lower_mem_writes_in_seq] the comb path's [coalesce_comb_mem_writes]
+   comment refers to.  Without this, several `if(en_i) arr[i] <= data_i`
+   statements each lower (in stmt_to_always) to an INDEPENDENT full-bus
+   `arr <-- {other slots = arr's block-entry Q, slot i = data_i}` guarded
+   by en_i.  Hardcaml/Always then chains them as last-wins muxes whose
+   NON-target slots all read Q — so when two enables fire in the SAME
+   cycle (ibex_fetch_fifo pushes a new word while shifting the queue:
+   entry_en can be 0b011/0b110) the lower-priority slot's write is
+   CLOBBERED and its data freezes.  (thread_body already folds elem_w=1
+   packed-vector writes correctly via set_field; only real multi-bit
+   unpacked arrays fall through here.)
+
+   Fix: rebuild each written array as ONE `arr := {slot_{n-1}..slot_0}`
+   where slot k folds its writes in source order (later = higher
+   priority) with the ELSE leg = self-read `arr[k]` (register keep-old).
+   Every slot is therefore INDEPENDENT — simultaneous enables to
+   different slots no longer interfere.  Single-write arrays reduce to
+   the identical logic the old path produced, so silicon-validated
+   sequential netlists are unchanged. *)
+let coalesce_seq_mem_writes ctx body =
+  let bool1 = BInt { width = 1; signed = Unsigned } in
+  (* elem-width + slot-count of an array target, from the pre-pass
+     array_elem_w and the (already-created) Always.Variable width. *)
+  let arr_ew_size arr =
+    match Hashtbl.find_opt ctx.array_elem_w arr,
+          List.assoc_opt arr ctx.variables with
+    | Some ew, Some v when ew > 0 ->
+        let t = Signal.width (Always.Variable.value v) in
+        if t > 0 && t mod ew = 0 then Some (ew, t / ew) else None
+    | _ -> None in
+  let order = ref [] in
+  let writes : (string, (bexpr option * bexpr * bexpr) list) Hashtbl.t =
+    Hashtbl.create 8 in
+  let and_g g c = match g with
+    | None -> Some c
+    | Some g0 -> Some (BBinOp { op = BAnd; lhs = g0; rhs = c; result_type = bool1 }) in
+  let rec collect guard = function
+    | BBlock b -> List.iter (collect guard) b
+    | BCallStmt { func = "@mem_write"; args = [BVar arr; idx; data] }
+      when arr_ew_size arr <> None ->
+        if not (Hashtbl.mem writes arr) then order := arr :: !order;
+        let cur = try Hashtbl.find writes arr with Not_found -> [] in
+        Hashtbl.replace writes arr (cur @ [(guard, idx, data)])
+    | BIf { condition; then_stmts; else_stmts } ->
+        let notc = BUnOp { op = BNot; operand = condition; result_type = bool1 } in
+        List.iter (collect (and_g guard condition)) then_stmts;
+        List.iter (collect (and_g guard notc)) else_stmts
+    | _ -> () in
+  List.iter (collect None) body;
+  if Hashtbl.length writes = 0 then body
+  else begin
+    let const_idx = function
+      | BConst { value; _ } -> Some (Z.to_int value) | _ -> None in
+    let folded = Hashtbl.create 8 in
+    let coalesced = List.filter_map (fun arr ->
+      match arr_ew_size arr with
+      | Some (ew, size) when size > 0 ->
+          Hashtbl.replace folded arr ();
+          let pairs = Hashtbl.find writes arr in
+          (* self-read of slot idx (register keep-old) resolves an RMW
+             `arr[i] <= f(arr[i])` write to the slot's value-so-far. *)
+          let rec subst_self idx acc e = match e with
+            | BSelect { array = BVar a; index } when a = arr && index = idx -> acc
+            | BSelect { array; index } ->
+                BSelect { array = subst_self idx acc array;
+                          index = subst_self idx acc index }
+            | BBinOp r -> BBinOp { r with lhs = subst_self idx acc r.lhs;
+                                          rhs = subst_self idx acc r.rhs }
+            | BUnOp r -> BUnOp { r with operand = subst_self idx acc r.operand }
+            | BCond r -> BCond { condition = subst_self idx acc r.condition;
+                                 then_val = subst_self idx acc r.then_val;
+                                 else_val = subst_self idx acc r.else_val }
+            | BConcat es -> BConcat (List.map (subst_self idx acc) es)
+            | BSlice r -> BSlice { r with signal = subst_self idx acc r.signal }
+            | BReplicate r -> BReplicate { r with value = subst_self idx acc r.value }
+            | BCall r -> BCall { r with args = List.map (subst_self idx acc) r.args }
+            | e -> e in
+          let parts = List.init size (fun j ->
+            let k = size - 1 - j in
+            let kc = BConst { value = Z.of_int k; width = 32 } in
+            (* ELSE default = self-read arr[k] (register hold). *)
+            let init = BSelect { array = BVar arr; index = kc } in
+            List.fold_left (fun acc (guard, idx, data) ->
+              match const_idx idx with
+              | Some ci when ci <> k -> acc      (* other slot — no effect *)
+              | Some _ ->                         (* this slot; idx == k *)
+                  let d = BSlice { signal = subst_self idx acc data;
+                                   msb = ew - 1; lsb = 0 } in
+                  (match guard with
+                   | None -> d
+                   | Some g -> BCond { condition = g; then_val = d; else_val = acc })
+              | None ->                           (* dynamic index *)
+                  let eq = BBinOp { op = BEq; lhs = idx; rhs = kc; result_type = bool1 } in
+                  let cond = match guard with
+                    | None -> eq
+                    | Some g -> BBinOp { op = BAnd; lhs = g; rhs = eq; result_type = bool1 } in
+                  BCond { condition = cond;
+                          then_val = BSlice { signal = subst_self idx acc data;
+                                              msb = ew - 1; lsb = 0 };
+                          else_val = acc }) init pairs) in
+          Some (BAssign { lhs = arr; rhs = BConcat parts })
+      | _ -> None) (List.rev !order) in
+    (* Strip the coalesced arrays' @mem_writes wherever nested, keeping
+       BIf structure that still holds other (scalar / non-folded) writes. *)
+    let rec strip ss = List.filter_map (fun s -> match s with
+      | BCallStmt { func = "@mem_write"; args = [BVar arr; _; _] }
+        when Hashtbl.mem folded arr -> None
+      | BBlock b -> (match strip b with [] -> None | b' -> Some (BBlock b'))
+      | BIf { condition; then_stmts; else_stmts } ->
+          let t = strip then_stmts and e = strip else_stmts in
+          if t = [] && e = [] then None
+          else Some (BIf { condition; then_stmts = t; else_stmts = e })
+      | other -> Some other) ss in
+    strip body @ coalesced
+  end
+
 (* Convert behavioral process to HardCaml Always block.
    Returns the compiled Always.t so the caller can keep a list
    of all the always-blocks that make up the module. *)
@@ -1268,6 +1406,10 @@ let process_to_always ctx = function
       let elem_w_of name = Hashtbl.find_opt ctx.array_elem_w name in
       let body = thread_body ~blocking_vars ~width_of ~elem_w_of body in
       let body = merge_slice_writes_deep ctx body in
+      (* Coalesce guarded multi-bit array element writes per array so
+         simultaneous entry-enables (ibex_fetch_fifo push+shift) do not
+         clobber each other — see [coalesce_seq_mem_writes]. *)
+      let body = coalesce_seq_mem_writes ctx body in
       let alw = List.fold_left (stmt_to_always ~is_reg:true ctx) [] body in
       Always.compile (List.rev alw)
 
@@ -1364,6 +1506,49 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
   (* Clock/reset get bound by [process_to_always] when each
      BSequential block names them via its [clock] / [reset] fields.
      Pattern, not name, is the source of truth. *)
+
+  (* FORWARD-REFERENCE placeholders for clock/reset nets.  The register
+     pre-pass below builds each FF's Reg_spec while iterating signals, and a
+     clock/reset net may be declared/created LATER (a flattened SoC's comb
+     reset `rst_core_n`).  When [resolve_clkrst] can't yet see the net it hands
+     back a fresh Signal.wire recorded here, and [connect_deferred_clkrst]
+     drives every such wire from the net's real signal once all variables and
+     processes exist — so binding is independent of declaration order and of
+     whether the net turns out to be a wire or a register.  Nets that resolve
+     immediately (inputs, already-created wires) never enter this table, so
+     conflict-free designs are byte-for-byte unchanged. *)
+  let deferred_clkrst : (string, Signal.t) Hashtbl.t = Hashtbl.create 8 in
+  let sig_width name =
+    match List.find_opt (fun (s : Behavioral_ir.bsignal) -> s.name = name)
+            bmod.signals with
+    | Some s -> max 1 (width_of_btype s.stype) | None -> 1 in
+  let resolve_clkrst name =
+    match Hashtbl.find_opt deferred_clkrst name with
+    | Some ph -> ph
+    | None ->
+      (match get_signal_opt ctx name with
+       | Some s -> s
+       | None ->
+           let ph = Signal.wire (sig_width name) in
+           Hashtbl.replace deferred_clkrst name ph;
+           ignore (Signal.(--) ph ("__deferred_clkrst_" ^ name));
+           ph) in
+  let connect_deferred_clkrst () =
+    Hashtbl.iter (fun name ph ->
+      match get_signal_opt ctx name with
+      | Some s ->
+          let s =
+            if Signal.width s = Signal.width ph then s
+            else if Signal.width s > Signal.width ph
+            then Signal.select s (Signal.width ph - 1) 0
+            else Signal.uresize s (Signal.width ph) in
+          Signal.(ph <== s)
+      | None ->
+          failwith (Printf.sprintf
+            "[behavioral_to_hardcaml] clock/reset net '%s' is used by a \
+             register but has no driver anywhere in the module — genuinely \
+             undriven (not just a forward reference)." name))
+      deferred_clkrst in
 
   (* Collect BIR-level initial_value per signal.  Used in
      [get_or_create_var] to thread an init through Reg_spec.            *)
@@ -1698,10 +1883,13 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
       let is_reg, var =
         match Hashtbl.find_opt driver_proc s.name with
         | Some (Some (clock, reset, rst_falling)) when not (is_ssa_version s.name) ->
-            let clk = get_signal ctx clock in
+            (* [resolve_clkrst], not [get_signal]: the clock/reset net may be
+               declared after this register (forward reference) — placeholder
+               now, connected by [connect_deferred_clkrst] at the end. *)
+            let clk = resolve_clkrst clock in
             let spec = match reset with
               | Some rst ->
-                  let s = Reg_spec.create ~clock:clk ~reset:(get_signal ctx rst) () in
+                  let s = Reg_spec.create ~clock:clk ~reset:(resolve_clkrst rst) () in
                   if rst_falling then Reg_spec.override s ~reset_edge:Falling else s
               | None     -> Reg_spec.create ~clock:clk () in
             let spec = apply_init_pre spec in
@@ -2042,6 +2230,11 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
   let _always_blocks =
     List.map (process_to_always ctx) processes_to_run in
   let _ = _always_blocks in    (* compiled side-effects are in ctx *)
+
+  (* Every variable and process now exists, so every clock/reset net's real
+     signal is resolvable — connect the forward-reference placeholders that the
+     register pre-pass created for nets declared after their FFs. *)
+  connect_deferred_clkrst ();
 
   (* Build each opt-in instance now that the processes have computed its
      input drivers; drive the pre-created output wires from the Inst. *)

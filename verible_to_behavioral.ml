@@ -2321,6 +2321,15 @@ let extract_port_decl ~pkgs ~params tok =
     | TUPLE4 (STRING t', _, _, _)
       when prefix_is "decl_variable_dimension" t'
         || prefix_is "select_variable_dimension" t' -> ()
+    (* Skip the port's TYPE subtree (user type / `pkg::type` qualifier) so the
+       type identifier isn't grabbed as a port name — see the inherited-port
+       walk_skip for the crash_dump_t / ram_2p_cfg_t / ibex_pkg leak. *)
+    | TUPLE2 (STRING t', _)
+    | TUPLE3 (STRING t', _, _)
+    | TUPLE4 (STRING t', _, _, _)
+    | TUPLE5 (STRING t', _, _, _, _)
+      when prefix_is "type_reference" t' || prefix_is "local_root" t'
+        || prefix_is "qualified_id" t' -> ()
     (* `wire [W:0] foo = expr;` parses as net_declaration2 holding a
        net_decl_assign1 whose first SymbolIdentifier is the LHS name
        and whose third slot is the RHS expression.  Take the LHS,
@@ -2370,6 +2379,14 @@ let extract_port_decl ~pkgs ~params tok =
     | TUPLE4 (STRING t', SymbolIdentifier id, _, _)
       when prefix_is "net_decl_assign" t' ->
         names := id :: !names
+    (* Skip the port's TYPE subtree so a user type / `pkg::type` qualifier isn't
+       swept up as a bare port name (crash_dump_t / ram_2p_cfg_t / ibex_pkg). *)
+    | TUPLE2 (STRING t', _)
+    | TUPLE3 (STRING t', _, _)
+    | TUPLE4 (STRING t', _, _, _)
+    | TUPLE5 (STRING t', _, _, _, _)
+      when prefix_is "type_reference" t' || prefix_is "local_root" t'
+        || prefix_is "qualified_id" t' -> ()
     | SymbolIdentifier id -> names := id :: !names
     | TUPLE2 (a, b) -> walk_loose a; walk_loose b
     | TUPLE3 (a, b, c) -> walk_loose a; walk_loose b; walk_loose c
@@ -2417,6 +2434,22 @@ let extract_port_decl ~pkgs ~params tok =
   (* a `pkg::type` qualifier the AST shape above didn't wrap in qualified_id
      still leaks the bare package name — exclude every known package name. *)
   List.iter (fun p -> Hashtbl.replace type_ids p.pkg_name ()) pkgs;
+  (* A `type_identifier_followed_by_id` port names the PORT in its LAST
+     identifier; every earlier identifier is a TYPE or PACKAGE qualifier
+     (`crash_dump_t crash_dump_o`, `ram_2p_cfg_t cfg_i`, `pkg::foo_t p`).  A
+     PACKAGE-defined type is not in the module-local [type_widths], so it slips
+     past both exclusions above and leaks as a bogus 1-bit port — harmless in
+     xsim/silicon (dead output) but fatal to Verilator, which misreads it as an
+     interface reference (cellInterfaceCleanup SIGSEGV).  Exclude every
+     qualifier (all-but-last) of each such node. *)
+  List.iter (fun node ->
+    let ids = ref [] in
+    walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) node;
+    let all = List.rev !ids in
+    let n = List.length all in
+    if n >= 2 then
+      List.iteri (fun i id -> if i < n - 1 then Hashtbl.replace type_ids id ()) all)
+    (collect_by (has_tag (prefix_is "type_identifier_followed_by_id")) tok);
   names := List.filter (fun n -> not (Hashtbl.mem type_ids n)) !names;
   let w = match !struct_w with Some sw -> sw | None -> width_of ~pkgs ~params tok in
   (* Detect unpacked-array net decls (`wire [W:0] arr[D:0]`):
@@ -5235,8 +5268,27 @@ let convert_module ~pkgs (mdecl : module_decl)
         | TUPLE4 (STRING t', _, _, _)
           when prefix_is "decl_variable_dimension" t'
             || prefix_is "select_variable_dimension" t' -> ()
+        (* Skip the port's TYPE subtree: a user-defined type (`crash_dump_t
+           crash_dump_o`, `ram_2p_cfg_t cfg_i`) or a `pkg::type` qualifier sits
+           in a data_type/type_reference/qualified_id node BEFORE the port name.
+           Without skipping, the FIRST unqualified_id grabbed is the TYPE, which
+           then leaks as a bogus port (fatal to Verilator).  The real port name
+           is a SIBLING of the type node, so it stays reachable. *)
+        | TUPLE2 (STRING t', _)
+        | TUPLE3 (STRING t', _, _)
+        | TUPLE4 (STRING t', _, _, _)
+        | TUPLE5 (STRING t', _, _, _, _)
+          when prefix_is "type_reference" t' || prefix_is "local_root" t'
+            || prefix_is "qualified_id" t' -> ()
         | TUPLE3 (STRING t', SymbolIdentifier id, _)
-          when prefix_is "unqualified_id" t' && !n = None ->
+          when prefix_is "unqualified_id" t' && !n = None
+            (* A bare user-defined type used as the port type (`crash_dump_t
+               crash_dump_o`) is an unqualified_id NOT wrapped in a skipped
+               type node, so it would be grabbed as the port name.  The type is
+               registered in the GLOBAL [type_widths] (struct/enum typedefs from
+               every module + package); the actual port name is not — so skip a
+               known type and keep scanning for the real name. *)
+            && not (Hashtbl.mem type_widths id) ->
             n := Some id
         | TUPLE2 (a, b) -> walk_skip a; walk_skip b
         | TUPLE3 (a, b, c) -> walk_skip a; walk_skip b; walk_skip c

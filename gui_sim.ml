@@ -231,6 +231,103 @@ let format_value ts cyc =
     Buffer.contents buf
   end
 
+(* ── Scripted single-module Cyclesim (portable; no verilog sim) ──────────
+   Build a Cyclesim from [create_circuit bmod] — i.e. EXACTLY what gate_map
+   feeds to bir_to_aig — and drive it with an explicit per-port stimulus,
+   dumping a per-cycle hex trace.  This is the in-process replacement for
+   "emit create_circuit as verilog then run it in xsim/iverilog": it exercises
+   the create_circuit lowering directly on any platform (pure Hardcaml), so a
+   lowering bug (e.g. the fetch_fifo multi-slot array-write clobber) shows up
+   as a wrong output stream with no external simulator.  Leaf modules only
+   (a module with sub-instances needs the whole hierarchy in the circuit). *)
+
+let bits_hex (b : Bits.t) =
+  let w = Bits.width b in
+  if w = 1 then (if Bits.is_vdd b then "1" else "0")
+  else begin
+    let s = Bits.to_string b in
+    let nbits = String.length s in
+    let n_nib = (nbits + 3) / 4 in
+    let pad = (4 - nbits mod 4) mod 4 in
+    let s = String.make pad '0' ^ s in
+    let buf = Buffer.create (n_nib + 2) in
+    Buffer.add_string buf "0x";
+    for i = 0 to n_nib - 1 do
+      let d j = Char.code s.[i*4+j] - Char.code '0' in
+      let nib = (d 0)*8 + (d 1)*4 + (d 2)*2 + (d 3) in
+      Buffer.add_char buf
+        (if nib < 10 then Char.chr (nib + Char.code '0')
+         else Char.chr (nib - 10 + Char.code 'a'))
+    done;
+    Buffer.contents buf
+  end
+
+(* Per-input drive modes.  Everything is explicit (default [DZero]) so the
+   trace is reproducible with no name-based reset guessing. *)
+type drive_mode =
+  | DZero            (* hold 0 *)
+  | DOne             (* hold all-ones *)
+  | DConst of int    (* hold a constant *)
+  | DHex of string   (* hold a wide constant given as a hex string (any width) *)
+  | DCount of int    (* value = base + cycle (a walking counter) *)
+  | DPulse of int    (* all-ones for the first N cycles, then 0 *)
+  | DPulseLow of int (* 0 for the first N cycles, then all-ones (active-low reset) *)
+
+(* LSB-aligned hex string -> Bits.t of exactly [w] bits (pad/truncate). *)
+let hex_to_bits w hexstr =
+  let b = Buffer.create (String.length hexstr * 4) in
+  String.iter (fun c ->
+    let v = match c with
+      | '0'..'9' -> Char.code c - Char.code '0'
+      | 'a'..'f' -> Char.code c - Char.code 'a' + 10
+      | 'A'..'F' -> Char.code c - Char.code 'A' + 10
+      | _ -> 0 in
+    for k = 3 downto 0 do
+      Buffer.add_char b (if (v lsr k) land 1 = 1 then '1' else '0') done) hexstr;
+  let s = Buffer.contents b in
+  let ls = String.length s in
+  let s = if ls >= w then String.sub s (ls - w) w
+          else String.make (w - ls) '0' ^ s in
+  Bits.of_constant (Constant.of_binary_string s)
+
+let run_spec ?(n_cycles = 48) (modes : (string * drive_mode) list) (bmod : bmodule) : string =
+  let circuit =
+    try Behavioral_to_hardcaml.create_circuit bmod
+    with _ -> Behavioral_to_hardcaml.create_circuit ~detect_loops:false bmod in
+  let sim =
+    try Cyclesim.create circuit
+    with _ -> Cyclesim.create (Behavioral_to_hardcaml.create_circuit ~detect_loops:false bmod) in
+  let in_ports = Cyclesim.in_ports sim and out_ports = Cyclesim.out_ports sim in
+  let buf = Buffer.create 4096 in
+  Buffer.add_string buf
+    (Printf.sprintf "# cyclesim %s: %d inputs, %d outputs, %d cycles\n"
+       bmod.name (List.length in_ports) (List.length out_ports) n_cycles);
+  for cyc = 0 to n_cycles - 1 do
+    List.iter (fun (name, b) ->
+      let w = Bits.width !b in
+      if is_clock_name name then ()   (* Cyclesim drives the clock itself *)
+      else
+        let mode = try List.assoc name modes with Not_found -> DZero in
+        b := (match mode with
+          | DZero -> Bits.zero w
+          | DOne -> Bits.ones w
+          | DConst v -> Bits.of_int ~width:w v
+          | DHex h -> hex_to_bits w h
+          | DCount base -> Bits.of_int ~width:w (base + cyc)
+          | DPulse n -> if cyc < n then Bits.ones w else Bits.zero w
+          | DPulseLow n -> if cyc < n then Bits.zero w else Bits.ones w))
+      in_ports;
+    Cyclesim.cycle sim;
+    Buffer.add_string buf (Printf.sprintf "c%-3d |" cyc);
+    List.iter (fun (n, b) -> Buffer.add_string buf (Printf.sprintf " %s=%s" n (bits_hex !b)))
+      in_ports;
+    Buffer.add_string buf "  |";
+    List.iter (fun (n, b) -> Buffer.add_string buf (Printf.sprintf " %s=%s" n (bits_hex !b)))
+      out_ports;
+    Buffer.add_char buf '\n'
+  done;
+  Buffer.contents buf
+
 (* Same value over two adjacent cycles? *)
 let same_at ts c1 c2 =
   Bits.equal ts.ts_values.(c1) ts.ts_values.(c2)

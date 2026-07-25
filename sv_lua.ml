@@ -1828,6 +1828,101 @@ let lbmc_sim a_h b_h =
       Printf.sprintf "DIFFER @cyc %d: %s\n%s" c port (String.concat "\n" trace)
   | Gui_sim.Bmc_error e -> Printf.sprintf "ERROR — %s" e
 
+(* In-process, scripted Cyclesim of ONE module's create_circuit output — the
+ * portable replacement for GATE_MAP_EMIT_CIRCUIT + xsim/iverilog.  Feeds the
+ * picked module straight to create_circuit (exactly what gate_map lowers) and
+ * drives it per a stimulus spec, so a create_circuit lowering bug shows as a
+ * wrong output stream on any platform.
+ *   svd.cyclesim(prog, "MODULE;cycles=32;rst_ni=pulselow:2;clear_i=pulse:5;
+ *                       in_valid_i=1;out_ready_i=1;in_rdata_i=count:256")
+ * The FIRST ';'-token is the module name (base or __-specialised); the rest are
+ * name=mode drives — mode ∈ 0 | 1 | const:N | count[:base] | pulse:N | pulselow:N
+ * (default 0).  Leaf modules only. *)
+let lcyclesim prog_h spec =
+  let toks = String.split_on_char ';' spec |> List.map String.trim
+             |> List.filter (fun s -> s <> "") in
+  match toks with
+  | [] -> "cyclesim ERROR: spec must start with a module name"
+  | modname :: rest ->
+      let _, p = find_prog prog_h in
+      let want_flatten =
+        List.exists (fun t -> t = "flatten" || t = "flatten=1") rest in
+      let base_module () =
+        match List.find_opt (fun (m : bmodule) -> m.name = modname) p.modules with
+        | Some m -> Some m
+        | None ->
+            let pfx = modname ^ "__" in
+            List.find_opt (fun (m : bmodule) ->
+              String.length m.name >= String.length pfx
+              && String.sub m.name 0 (String.length pfx) = pfx) p.modules in
+      let m =
+        if want_flatten then
+          (* whole-SoC: flatten the hierarchy into ONE bmodule so create_circuit
+             yields a single Circuit.t (Cyclesim needs a complete circuit).
+             Requires memlower to have been SKIPPED so the RAM stays a
+             behavioural array, not a RAMB black box. *)
+          let top = (match base_module () with Some m -> m.name | None -> modname) in
+          let flat = Behavioral_hier.flatten_for_z3 p ~top in
+          (* flatten_for_z3 returns an EMPTY module for any instance it can't
+             resolve (miter behaviour: cut black boxes into free I/O).  For a
+             SIMULATION that is a silent hole — every leaf must be a real module
+             or a known primitive with port directions.  BOMB on any drop. *)
+          (match Behavioral_hier.take_unresolved () with
+           | [] -> flat
+           | us ->
+               let lines = List.map (fun (parent, inst, mn) ->
+                 Printf.sprintf "    %s.%s : %s" parent inst mn) us in
+               failwith (Printf.sprintf
+                 "cyclesim flatten: %d unresolved leaf module(s) — every leaf \
+                  must be a real module or known primitive, not a dropped \
+                  black box:\n%s" (List.length us) (String.concat "\n" lines)))
+        else
+        match List.find_opt (fun (m : bmodule) -> m.name = modname) p.modules with
+        | Some m -> m
+        | None ->
+            (* accept a base name -> the __-specialised module *)
+            let pfx = modname ^ "__" in
+            (match List.find_opt (fun (m : bmodule) ->
+                     String.length m.name >= String.length pfx
+                     && String.sub m.name 0 (String.length pfx) = pfx) p.modules with
+             | Some m -> m
+             | None -> failwith (Printf.sprintf "no module '%s' in program" modname)) in
+      (match Sys.getenv_opt "CYCLESIM_BIR_DUMP" with
+       | Some path ->
+           let oc = open_out path in
+           output_string oc (Behavioral_ir.string_of_bmodule m); close_out oc
+       | None -> ());
+      let n_cycles = ref 48 in
+      let modes = List.filter_map (fun tok ->
+        match String.index_opt tok '=' with
+        | None -> None
+        | Some i ->
+            let k = String.trim (String.sub tok 0 i) in
+            let v = String.trim (String.sub tok (i+1) (String.length tok - i - 1)) in
+            if k = "cycles" then (n_cycles := (try int_of_string v with _ -> 48); None)
+            else
+              let arg default = match String.index_opt v ':' with
+                | Some j -> (try int_of_string (String.sub v (j+1) (String.length v - j - 1))
+                             with _ -> default)
+                | None -> default in
+              let mode =
+                if v = "0" then Gui_sim.DZero
+                else if v = "1" then Gui_sim.DOne
+                else if v = "count" || String.length v >= 5 && String.sub v 0 5 = "count"
+                     then Gui_sim.DCount (arg 0)
+                else if String.length v >= 8 && String.sub v 0 8 = "pulselow"
+                     then Gui_sim.DPulseLow (arg 1)
+                else if String.length v >= 5 && String.sub v 0 5 = "pulse"
+                     then Gui_sim.DPulse (arg 1)
+                else if String.length v >= 5 && String.sub v 0 5 = "const"
+                     then Gui_sim.DConst (arg 0)
+                else if String.length v >= 4 && String.sub v 0 4 = "hex:"
+                     then Gui_sim.DHex (String.sub v 4 (String.length v - 4))
+                else Gui_sim.DZero in
+              Some (k, mode)) rest in
+      (try Gui_sim.run_spec ~n_cycles:!n_cycles modes m
+       with e -> Printf.sprintf "cyclesim ERROR: %s" (Printexc.to_string e))
+
 let lreg_correspond tgt_h ref_h =
   let n, tm, tp = find_mod tgt_h in
   let _, rm, _ = find_mod ref_h in
@@ -2045,8 +2140,56 @@ let lgate_map mod_h k_lut io_flag =
           Buffer.add_string buf
             (Printf.sprintf "// create_circuit RTL emit failed for %s: %s\n"
                m.Behavioral_ir.name (Printexc.to_string e)));
+       (* RE-DECLARE pruned input ports.  Hardcaml keeps only inputs reachable
+          from an output, so a wholly-unused declared input is DROPPED from the
+          emitted module — yet parent instantiations still wire it.  A parent
+          connecting a non-existent child pin is tolerated by xsim (warn+tie)
+          but SEGFAULTS Verilator 5.050 (cellInterfaceCleanup, even under
+          -Wno-PINNOTFOUND).  Add every declared input the buffer didn't emit
+          back as a dead input port so no connection ever dangles. *)
+       let text = Buffer.contents buf in
+       let emitted : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+       List.iter (fun line ->
+         let l = String.trim line in
+         let chk kw =
+           let kl = String.length kw in
+           if String.length l > kl && String.sub l 0 kl = kw && l.[kl] = ' '
+           then begin
+             let body = String.trim (String.sub l kl (String.length l - kl)) in
+             let body = if body <> "" && body.[String.length body - 1] = ';'
+                        then String.sub body 0 (String.length body - 1) else body in
+             match List.rev (List.filter (fun s -> s <> "")
+                               (String.split_on_char ' ' body)) with
+             | nm :: _ -> Hashtbl.replace emitted nm ()
+             | [] -> ()
+           end in
+         chk "input"; chk "output"; chk "inout")
+         (String.split_on_char '\n' text);
+       let seen = Hashtbl.create 16 in
+       let missing = List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+         match s.direction with
+         | `Input when s.name <> "" && not (Hashtbl.mem emitted s.name)
+                     && not (Hashtbl.mem seen s.name) ->
+             Hashtbl.replace seen s.name ();
+             Some (s.name, Behavioral_boundary.width_of_btype s.stype)
+         | _ -> None) m.Behavioral_ir.signals in
+       let text =
+         if missing = [] then text
+         else
+           let names = String.concat ""
+             (List.map (fun (n, _) -> Printf.sprintf ",\n    %s" n) missing) in
+           let decls = String.concat ""
+             (List.map (fun (n, w) ->
+                if w <= 1 then Printf.sprintf "    input %s;\n" n
+                else Printf.sprintf "    input [%d:0] %s;\n" (w - 1) n) missing) in
+           (* splice at the first "\n);" — the (non-ANSI) port-list close *)
+           (try
+              let idx = Str.search_forward (Str.regexp_string "\n);") text 0 in
+              String.sub text 0 idx ^ names ^ "\n);\n" ^ decls
+              ^ String.sub text (idx + 3) (String.length text - idx - 3)
+            with Not_found -> text) in
        let oc = open_out (Filename.concat dir (m.Behavioral_ir.name ^ ".v")) in
-       Buffer.output_buffer oc buf; close_out oc);
+       output_string oc text; close_out oc);
   let l = Fpga_synth.Bir_to_aig.lower_circuit circ in
   (* Cost mode for the LUT cover, selectable via env so the timing-driven
      mapping can be exercised without recompiling.  Default `Area keeps the
@@ -2845,6 +2988,7 @@ module MakeLib
         "reg_correspond", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lreg_correspond);
         "miter_regcorr", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lmiter_regcorr);
         "bmc_sim",     V.efunc (V.string **-> V.string **->> V.string) (wrap2 lbmc_sim);
+        "cyclesim",    V.efunc (V.string **-> V.string **->> V.string) (wrap2 lcyclesim);
         "splice",         V.efunc (V.string **-> V.string **-> V.string
                                    **->> V.string)
                            (wrap3 lsplice);
