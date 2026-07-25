@@ -88,6 +88,18 @@ type conv_context = {
      path has no memory model, so a `x = rom_x[sel]` BSelect is lowered to a
      combinational Signal.mux over the init constants (ROM-as-case). *)
   roms: (string, int * int list) Hashtbl.t;
+  (* Net names that are driven (whole or per-slice) by a black-box instance
+     output — the [box_out_nets] built in [create_circuit]'s emit_instances
+     pre-pass, mirrored here so the combinational partial-write fold
+     ([thread_body]'s set_field) can tell that an unwritten bit of such a net
+     is NOT undriven: it carries the box-output driver, so the fold must
+     self-read (`BVar name`) to PRESERVE those bits instead of defaulting them
+     to comb-ZERO.  Without this a process that writes ONE element of a
+     mixed-driver array (e.g. ibex_mini_system's
+     `device_rvalid[DbgDev] = dbg_device_rvalid`, where [Ram]/[Gpio] come from
+     instance outputs) rebuilds the whole array with the instance-driven
+     elements zeroed — which stranded the RAM's rvalid and wedged every load. *)
+  mutable box_out_nets: string list;
 }
 
 (* Collect net names that a GND/VCC primitive instance ties to a constant,
@@ -860,6 +872,7 @@ let rec stmt_to_always ~is_reg ctx alw = function
 let thread_body ?(blocking_vars = [])
     ?(width_of = (fun (_ : string) -> (None : int option)))
     ?(elem_w_of = (fun (_ : string) -> (None : int option)))
+    ?(is_box_out = (fun (_ : string) -> false))
     ?(is_comb = false)
     body =
   let is_blocking name = List.mem name blocking_vars in
@@ -1067,8 +1080,18 @@ let thread_body ?(blocking_vars = [])
                 let cur =
                   match Hashtbl.find_opt env name with
                   | Some v -> v
-                  | None -> if is_comb then BConst { value = Z.zero; width = w }
-                            else BVar name in
+                  | None ->
+                      (* Combinational unwritten target defaults to ZERO to
+                         avoid a structural self-reference loop — EXCEPT when
+                         the net is also driven (on other bits) by a black-box
+                         instance output: those bits are NOT undriven, so a
+                         self-read [BVar name] resolves to the box-output
+                         partial-assembly signal (a distinct net, hence no
+                         loop) and PRESERVES them.  Sequential targets always
+                         self-read (register keep-old). *)
+                      if is_comb && not (is_box_out name)
+                      then BConst { value = Z.zero; width = w }
+                      else BVar name in
                 let mask = BConst {
                   value = Z.sub (Z.shift_left Z.one fw) Z.one; width = w } in
                 let mask_sh = BBinOp { op = BShl; lhs = mask;
@@ -1370,6 +1393,7 @@ let process_to_always ctx = function
         List.iter go body; !acc in
       let body =
         thread_body ~blocking_vars:partial_targets ~width_of ~elem_w_of
+          ~is_box_out:(fun n -> List.mem n ctx.box_out_nets)
           ~is_comb:true body in
       (* shallow only: the merged assign SELF-READS uncovered bits, which
          is FF-old-value semantics — valid for NBA registers, a
@@ -1456,6 +1480,7 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
     initial_values = Hashtbl.create 16;
     const_nets = collect_const_nets bmod;
     roms = collect_roms bmod;
+    box_out_nets = [];
   } in
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
@@ -1501,6 +1526,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     initial_values = Hashtbl.create 16;
     const_nets = collect_const_nets bmod;
     roms = collect_roms bmod;
+    box_out_nets = [];
   } in
 
   (* Clock/reset get bound by [process_to_always] when each
@@ -1871,6 +1897,11 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
       infos
     end in
 
+  (* Publish the box-output net set so the combinational partial-write fold
+     ([thread_body]) preserves instance-driven bits of a mixed-driver array
+     instead of zeroing them. *)
+  ctx.box_out_nets <- !box_out_nets;
+
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     (* Record per-element width for BArray signals so [BSelect] can
        slice the flat representation correctly when index is dynamic. *)
@@ -2106,10 +2137,22 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
             let const_idx = function
               | Behavioral_ir.BConst { value; _ } -> Some (Z.to_int value)
               | _ -> None in
+            let arr_is_box_out = List.mem arr !box_out_nets in
             let parts = List.init size (fun j ->
               let k = size - 1 - j in
               let kc = Behavioral_ir.BConst { value = Z.of_int k; width = 32 } in
-              let init = Behavioral_ir.BConst { value = Z.zero; width = ew } in
+              (* A slot with no write defaults to ZERO — EXCEPT when this array
+                 is also driven (on other elements) by black-box instance
+                 outputs: those slots are NOT undriven, so self-read `arr[k]`
+                 (which resolves to the box-output partial assembly, a distinct
+                 net — no comb loop) to PRESERVE the instance driver.  Without
+                 this, a comb write to ONE element (ibex_mini_system's
+                 `device_rvalid[DbgDev]=dbg`) zeroes the RAM/GPIO rvalid lanes
+                 and wedges every load. *)
+              let init =
+                if arr_is_box_out
+                then Behavioral_ir.BSelect { array = BVar arr; index = kc }
+                else Behavioral_ir.BConst { value = Z.zero; width = ew } in
               List.fold_left (fun acc (guard, idx, data) ->
                 match const_idx idx with
                 | Some ci when ci <> k -> acc   (* different slot — no effect *)
