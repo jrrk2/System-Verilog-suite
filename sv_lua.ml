@@ -2024,6 +2024,97 @@ let lread_nextpnr_json path =
 let orig_port_dirs :
   (string, (string * [ `Input | `Output ]) list) Hashtbl.t = Hashtbl.create 128
 
+(* ── OCaml netlist post-processors for the GATE_MAP_EMIT_CIRCUIT dump ──────
+   The user's rule: substantive netlist work is done in OCaml, never with an
+   external perl/python/sed script.  These operate on the Hardcaml Rtl buffer
+   text (of_circuit can't lift a pre-LUT create_circuit output — it raises on
+   Op2/Mux/Reg/Memory — so a structural BIR round-trip isn't available here). *)
+
+(* Remove instantiation parameter overrides `#( ... )` (balanced parens).  The
+   modules are name-specialised, so the overrides are redundant AND name params
+   the specialised module no longer declares — which Verilator rejects. *)
+let strip_inst_params (s : string) : string =
+  let b = Buffer.create (String.length s) in
+  let n = String.length s in
+  let i = ref 0 in
+  while !i < n do
+    (* a '#' that begins a param list: '#' then optional ws then '(' *)
+    if s.[!i] = '#' then begin
+      let j = ref (!i + 1) in
+      while !j < n && (s.[!j] = ' ' || s.[!j] = '\n' || s.[!j] = '\t') do incr j done;
+      if !j < n && s.[!j] = '(' then begin
+        (* skip the balanced-paren group *)
+        let depth = ref 0 in
+        let k = ref !j in
+        let stop = ref false in
+        while not !stop && !k < n do
+          (if s.[!k] = '(' then incr depth
+           else if s.[!k] = ')' then (decr depth; if !depth = 0 then stop := true));
+          incr k
+        done;
+        i := !k                (* drop '#' .. matching ')' entirely *)
+      end else (Buffer.add_char b s.[!i]; incr i)
+    end else (Buffer.add_char b s.[!i]; incr i)
+  done;
+  Buffer.contents b
+
+(* Convert non-blocking `<=` to blocking `=` inside combinational `always @*`
+   blocks (Hardcaml emits comb muxes/cases with NBA).  Sequential
+   `always @(posedge/negedge)` blocks keep `<=`.  Tracks begin/end nesting. *)
+let comb_nba_to_blocking (s : string) : string =
+  let lines = String.split_on_char '\n' s in
+  let contains sub line =
+    let ls = String.length line and sl = String.length sub in
+    let rec go k = if k + sl > ls then false
+      else if String.sub line k sl = sub then true else go (k+1) in
+    sl > 0 && go 0 in
+  let count_word w line =            (* count \bword\b occurrences *)
+    let ls = String.length line and wl = String.length w in
+    let is_id c = (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c='_' in
+    let c = ref 0 in
+    let k = ref 0 in
+    while !k + wl <= ls do
+      if String.sub line !k wl = w
+         && (!k = 0 || not (is_id line.[!k-1]))
+         && (!k+wl >= ls || not (is_id line.[!k+wl]))
+      then (incr c; k := !k + wl) else incr k
+    done; !c in
+  (* replace assignment "<=" (not "<=" of a comparison; Hardcaml uses "<=" only
+     for assignment here) with "=" *)
+  let nba_to_blocking line =
+    let ls = String.length line in
+    let b = Buffer.create ls in
+    let k = ref 0 in
+    while !k < ls do
+      if !k+1 < ls && line.[!k]='<' && line.[!k+1]='='
+         && not (!k+2 < ls && line.[!k+2]='=')     (* not <== (n/a) *)
+      then (Buffer.add_char b '='; k := !k + 2)
+      else (Buffer.add_char b line.[!k]; incr k)
+    done; Buffer.contents b in
+  let mode = ref `None in         (* `Comb | `Seq | `None *)
+  let depth = ref 0 in
+  let pending = ref false in
+  let out = List.map (fun line ->
+    (if !mode = `None then begin
+       if contains "always @*" line || contains "always @ *" line
+          || contains "always@*" line
+       then (mode := `Comb; depth := 0; pending := true)
+       else if contains "always @(posedge" line || contains "always @ (posedge" line
+            || contains "always @(negedge" line
+       then (mode := `Seq; depth := 0; pending := true)
+     end);
+    let line' = if !mode = `Comb then nba_to_blocking line else line in
+    (if !mode <> `None then begin
+       let bd = count_word "begin" line and ed = count_word "end" line in
+       depth := !depth + bd - ed;
+       if !pending && bd > 0 then pending := false
+       else if !pending && bd = 0 && contains ";" line then
+         (mode := `None; pending := false);
+       if not !pending && !depth <= 0 && (bd > 0 || ed > 0) then mode := `None
+     end);
+    line') lines in
+  String.concat "\n" out
+
 let lgate_map mod_h k_lut io_flag =
   let _, m, prog = find_mod mod_h in
   (* snapshot originals (first-seen) before any pruning of these modules *)
@@ -2147,7 +2238,11 @@ let lgate_map mod_h k_lut io_flag =
           but SEGFAULTS Verilator 5.050 (cellInterfaceCleanup, even under
           -Wno-PINNOTFOUND).  Add every declared input the buffer didn't emit
           back as a dead input port so no connection ever dangles. *)
+       (* OCaml netlist post-processing (no external sed/python): drop redundant
+          instantiation param overrides, convert comb-block NBA to blocking. *)
        let text = Buffer.contents buf in
+       let text = strip_inst_params text in
+       let text = comb_nba_to_blocking text in
        let emitted : (string, unit) Hashtbl.t = Hashtbl.create 64 in
        List.iter (fun line ->
          let l = String.trim line in
