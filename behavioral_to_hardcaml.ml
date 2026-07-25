@@ -312,6 +312,20 @@ let rec expr_to_signal ctx = function
          literal in flattened picorv32) would crash hardcaml's of_int. *)
       signal_of_z ~width value
 
+  | BBinOp { op = BAnd;
+             lhs = (BBinOp { op = BShr; _ } as inner);
+             rhs = BConst { value; width = 1 };
+             _ } when Z.equal (Z.logand value Z.one) Z.one ->
+      (* Lowered dynamic single-bit select `(sig >> i) & 1'b1`: 1 bit in the IR
+         but sig-width if lowered as a plain AND (common_w = max operand width),
+         which mis-sizes every enclosing concat/replication — `{8{be[i]}}`
+         became 0x11111111 (dropped RAM byte-writes → sb/sh/sw fail) and the
+         ibex divider's `{1'b0, rem, (numer>>cnt)&1'b1}` grew to 65 bits (broke
+         div/rem/mulh).  Pin to 1 bit here, matching behavioral_to_verilog's
+         `1'(inner & 1'b1)`. *)
+      let s = expr_to_signal ctx inner in
+      Signal.select s 0 0
+
   | BBinOp { op; lhs; rhs; result_type } ->
       let s_lhs0 = expr_to_signal ctx lhs in
       let s_rhs0 = expr_to_signal ctx rhs in
@@ -869,15 +883,20 @@ let rec stmt_to_always ~is_reg ctx alw = function
              let new_val = Signal.concat_msb (List.rev slots) in
              Always.(var <-- new_val) :: alw
        | _ -> alw)
-  | BCallStmt { func; _ } ->
+  | BCallStmt { func; args } ->
       (* A `@`-prefixed write pseudo-op (@mem_write / @slice_write /
          @part_sel_write) reaching here means it survived the folding passes and
-         its state update is being dropped — surface it.  Non-`@` calls
-         ($display, assertions, …) carry no synthesizable state and are dropped
-         quietly. *)
+         its state update is being dropped — surface it (with the target l-value
+         so the dropped write can be traced).  Non-`@` calls ($display,
+         assertions, …) carry no synthesizable state and are dropped quietly. *)
       (if String.length func > 0 && func.[0] = '@' then
+         let target = match args with
+           | BVar n :: _ -> n
+           | e :: _ -> Behavioral_ir.string_of_bexpr e
+           | [] -> "?" in
          lossage_warn "stmt:BCallStmt"
-           (Printf.sprintf "write pseudo-op %s survived folding; state update dropped" func));
+           (Printf.sprintf "write pseudo-op %s on %s survived folding; state update dropped"
+              func target));
       alw
   | BReturn _ ->
       alw
