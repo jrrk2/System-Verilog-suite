@@ -1770,9 +1770,31 @@ let bmodule_to_library_ports (m : Behavioral_ir.bmodule) :
  * caller decides whether an unresolved name is fatal — for the
  * Verible hook it isn't, since the user may have a non-Xilinx
  * primitive name).  Memoised across calls. *)
+(* Builtin port interfaces for the non-clock-enable flip-flop variants
+   (FD/FDC/FDP/FDS): Vivado ships FDCE/FDPE/FDRE/FDSE .vhd but NOT these, yet the
+   Xilinx PCS/PMA transceiver source instantiates FDP (async preset, no CE) in
+   its reset synchronisers.  All ports are 1-bit; yosys knows these cells, so
+   SVS only needs the directions to wire them. *)
+let builtin_prim_ports : (string * (string * [`Input|`Output]) list) list = [
+  "FD",  [ "Q",`Output; "D",`Input; "C",`Input ];
+  "FDC", [ "Q",`Output; "D",`Input; "C",`Input; "CLR",`Input ];
+  "FDP", [ "Q",`Output; "D",`Input; "C",`Input; "PRE",`Input ];
+  "FDS", [ "Q",`Output; "D",`Input; "C",`Input; "S",`Input ];
+]
+
 let lookup_xil_primitive_ports names :
     (string * Behavioral_ir.library_port list) list =
   let dedup = List.sort_uniq compare names in
+  (* seed the cache with the builtin FF variants that have no Vivado .vhd *)
+  List.iter (fun n ->
+    if not (Hashtbl.mem xil_primitive_cache n) then
+      match List.assoc_opt n builtin_prim_ports with
+      | Some ps ->
+          Hashtbl.replace xil_primitive_cache n
+            (List.map (fun (pn, d) ->
+               { Behavioral_ir.port_name = pn; port_direction = d;
+                 port_width = 1 }) ps)
+      | None -> ()) dedup;
   let need = List.filter (fun n ->
     not (Hashtbl.mem xil_primitive_cache n
          || Hashtbl.mem xil_primitive_missing n)) dedup in

@@ -3606,6 +3606,25 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
        | EMPTY_TOKEN -> BReturn None
        | e -> BReturn (Some (recurse_e e)))
   | TLIST [single] -> recurse_s single
+  | TUPLE3 (STRING t, inner, _)
+    when prefix_is "block_item_or_statement_or_null" t ->
+      (* Verible wraps a block item / statement / null in this node inside a
+         begin/end; the middle child is the real content — recurse into it. *)
+      recurse_s inner
+  | TUPLE3 (STRING t, _, _) when prefix_is "unqualified_id" t ->
+      (* A bare identifier in statement position (a label / macro-expansion
+         artifact in the Xilinx PCS source) — no procedural effect. *)
+      BBlock []
+  | TUPLE3 (STRING t, _, _)
+    when prefix_is "data_declaration_or_module_instantiation" t ->
+      (* Module-scope net/var declaration or module instantiation that Verible
+         parsed as a statement-ambiguous node (seen in the Xilinx PCS/PMA
+         transceiver source).  BOTH forms are captured by separate scans over
+         m_body — module instantiations by the `instantiation_base` collect,
+         net/var declarations by the signal-width extraction — so this carries
+         no PROCEDURAL logic and is a no-op here.  (Must precede the catch-all,
+         which would otherwise hard-fail on it in strict mode.) *)
+      BBlock []
   | _ ->
       (* Master statement catch-all: an unhandled procedural statement shape
          (a while/repeat/forever loop, break/continue, wait, …) becomes an
