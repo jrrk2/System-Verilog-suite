@@ -1622,6 +1622,39 @@ let module_to_create (bmod : Behavioral_ir.bmodule) inputs =
         Some (s.name, driver)
     | _ -> None) bmod.signals
 
+(* Hardcaml's Rtl.add_port_name rejects a circuit port whose name is not a legal
+   Verilog identifier — but Vivado gate-netlist net names carry '[' ']' (bus
+   bits) and '.'/'/' (hierarchy), and create_circuit can promote such a net to a
+   port (a declared output, or a `__keep_<net>` clock/box-retention output).
+   For an illegal name, 8-to-6 (base64) encode the whole string into a
+   Verilog-legal identifier: reversible and collision-free, so distinct nets
+   never alias.  Legal names pass through unchanged. *)
+let legalize_port_name (s : string) : string =
+  let is_legal c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+    || (c >= '0' && c <= '9') || c = '_' in
+  if s <> "" && String.for_all is_legal s then s
+  else begin
+    let alpha =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$" in
+    let b = Buffer.create (String.length s * 2 + 4) in
+    Buffer.add_string b "Z8_";               (* legal leading marker *)
+    let n = String.length s in
+    let i = ref 0 in
+    while !i < n do
+      let b0 = Char.code s.[!i] in
+      let b1 = if !i+1 < n then Char.code s.[!i+1] else 0 in
+      let b2 = if !i+2 < n then Char.code s.[!i+2] else 0 in
+      let t = (b0 lsl 16) lor (b1 lsl 8) lor b2 in
+      Buffer.add_char b alpha.[(t lsr 18) land 63];
+      Buffer.add_char b alpha.[(t lsr 12) land 63];
+      if !i+1 < n then Buffer.add_char b alpha.[(t lsr 6) land 63];
+      if !i+2 < n then Buffer.add_char b alpha.[t land 63];
+      i := !i + 3
+    done;
+    Buffer.contents b
+  end
+
 (* Convert a bmodule into a hardcaml [Circuit.t].  Produces a
    real circuit that can be passed to [Rtl.print] for Verilog
    emission and [Lib_map.map_bexpr] for technology mapping. *)
@@ -2602,7 +2635,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
                | Some sig_ -> sig_
                | None -> Signal.zero w)
         in
-        Some (Signal.output s.name driver)
+        Some (Signal.output (legalize_port_name s.name) driver)
     | _ -> None) bmod.signals in
 
   (* Retain instance-boundary outputs that no declared output reaches — the
@@ -2667,7 +2700,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
         else begin
           Hashtbl.add seen name ();
           match List.assoc_opt name ctx.signals with
-          | Some sig_ -> Some (Signal.output ("__keep_" ^ name) sig_)
+          | Some sig_ -> Some (Signal.output (legalize_port_name ("__keep_" ^ name)) sig_)
           | None -> None
         end) !box_out_nets in
       outputs @ extra
