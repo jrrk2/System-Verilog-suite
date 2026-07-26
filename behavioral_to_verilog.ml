@@ -1128,7 +1128,17 @@ let generate_library_cells prog =
      BEHAV_VERILOG so the EDIF / gate flows (which may genuinely need the stubs)
      are unaffected. *)
   let lib_cell_defs, skipped =
-    if Sys.getenv_opt "BEHAV_VERILOG" <> None then
+    if Sys.getenv_opt "SVS_KEEP_PRIM_STUBS" = None then
+      (* Xilinx primitives (BSCANE2 / MMCME2_ADV / BUFG / IBUFDS / LUT* / FD* /
+         CARRY4 / RAMB / … — every non-RTL_ library cell) are ALWAYS supplied by
+         unisims_ver / Vivado.  Our port-only stubs lack the params the instance
+         passes, so xelab / synth error ("does not have a parameter named …") and
+         Vivado also refuses to overwrite its built-in primitive definitions.
+         Skip them for EVERY verilog emit — BEHAV_VERILOG and the HIER gate flow
+         alike (the HIER netlist previously leaked BSCANE2/MMCME2_ADV/BUFG/IBUFDS
+         stubs that broke read into Vivado).  Keep only the internal RTL_* cells
+         no external library provides.  SVS_KEEP_PRIM_STUBS=1 restores the old
+         emit-everything behaviour. *)
       List.partition (fun (n, _) -> String.starts_with ~prefix:"RTL_" n) lib_cell_defs
     else lib_cell_defs, [] in
   let hdr =

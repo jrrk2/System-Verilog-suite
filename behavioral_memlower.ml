@@ -726,10 +726,31 @@ let build_tdp_port m_name ~read_pin ~dw (p : bprocess) =
         end else None
     in
     let read_reg =
+      (* Find the registered read `lhs <= mem[...]` so it can be absorbed into
+         the RAMB's own output register (dropped from the process + re-driven
+         combinationally from read_pin).  The read lives INSIDE `if (a_req_i)`
+         in prim_generic_ram_2p, so we must recurse through BIf/BCase/loops —
+         a top-level-only search leaves the register in place and the RAMB adds
+         a SECOND one -> 2-cycle read latency -> the CPU prefetch misaligns. *)
       let rec find_uncond = function
         | [] -> None
         | BAssign { lhs; rhs = BSelect { array = BVar n; _ } } :: _ when n = m_name -> Some lhs
         | BBlock b :: rest -> (match find_uncond b with Some r -> Some r | None -> find_uncond rest)
+        | BIf { then_stmts; else_stmts; _ } :: rest ->
+            (match find_uncond then_stmts with
+             | Some r -> Some r
+             | None -> (match find_uncond else_stmts with
+                        | Some r -> Some r | None -> find_uncond rest))
+        | BCase { cases; default; _ } :: rest ->
+            let from_cases =
+              List.fold_left (fun acc (_, ss) ->
+                match acc with Some _ -> acc | None -> find_uncond ss) None cases in
+            (match from_cases with
+             | Some r -> Some r
+             | None -> (match find_uncond default with
+                        | Some r -> Some r | None -> find_uncond rest))
+        | (BWhile { body; _ } | BFor { body; _ }) :: rest ->
+            (match find_uncond body with Some r -> Some r | None -> find_uncond rest)
         | _ :: rest -> find_uncond rest
       in find_uncond body
     in
@@ -1145,10 +1166,20 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
           let body = List.map (rewrite_reads_s mname pin) (strip_mem_writes mname body) in
           match rreg with
           | Some rd ->
+            (* Drop the registered read `rd <= read_pin` wherever it sits — it is
+               inside `if (a_req_i)`, so recurse through BIf/BCase/loops too, or
+               the register survives and doubles the RAMB read latency. *)
             let rec drop bb =
               List.filter_map (function
                 | BAssign { lhs; rhs = BVar n } when lhs = rd && n = pin -> None
                 | BBlock b -> Some (BBlock (drop b))
+                | BIf i -> Some (BIf { i with then_stmts = drop i.then_stmts;
+                                              else_stmts = drop i.else_stmts })
+                | BCase c -> Some (BCase { c with
+                    cases = List.map (fun (k, ss) -> (k, drop ss)) c.cases;
+                    default = drop c.default })
+                | BWhile w -> Some (BWhile { w with body = drop w.body })
+                | BFor f -> Some (BFor { f with body = drop f.body })
                 | s -> Some s) bb
             in drop body
           | None -> body

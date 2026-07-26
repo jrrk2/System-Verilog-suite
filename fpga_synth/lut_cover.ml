@@ -477,7 +477,13 @@ let emit_cut_signal
   : Hardcaml.Signal.t =
   let k = List.length ins in
   let tt = if complement then Tt.bit_not tt else tt in
-  if k <= 6 then
+  if k = 0 then
+    (* A 0-input cut is a constant (lutpack/mfs2 can eliminate every leaf).
+       There is no LUT0 primitive — tie to VCC/GND per the single truth value. *)
+    (match Tt.to_bool_list ~k:0 tt with
+     | true :: _ -> Hardcaml.Signal.vdd
+     | _ -> Hardcaml.Signal.gnd)
+  else if k <= 6 then
     Xil_prim.lutk ~truth:(Tt.to_bool_list ~k tt) ins
   else if k = 7 then begin
     let lo, hi = Tt.halves tt in
