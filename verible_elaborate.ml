@@ -2982,6 +2982,7 @@ let parse_files_full files =
   let mods = ref [] in
   let pkgs = ref [] in
   let file_scope = ref [] in
+  let file_types = ref [] in
   List.iter (fun f ->
     match Sv_verible_to_ir.parse_verible_file f with
     | None ->
@@ -3006,7 +3007,16 @@ let parse_files_full files =
     | Some root ->
         mods := extract_modules root @ !mods;
         pkgs := extract_packages root @ !pkgs;
-        file_scope := extract_file_scope_params root @ !file_scope
+        file_scope := extract_file_scope_params root @ !file_scope;
+        (* $unit-scope `typedef`s (e.g. `typedef int unsigned count_t;` above a
+           `module`, as in debounce.sv).  These are visible to every module in
+           the compilation unit but were captured nowhere, so a `count_t'(x)`
+           cast fell back to eval_int(count_t) -> the parameter value, blowing a
+           compare out to a 500-bit CARRY4 chain.  Fold them into the $unit
+           package body so convert_files_inner's per-package extract_typedefs
+           registers their widths in type_widths. *)
+        file_types := collect_outside_module_or_package
+          (has_tag (prefix_is "type_declaration")) root @ !file_types
   ) files;
   (* Collapse all file-scope localparams (from `.svh` headers and the
      `.sv` files themselves outside their `module ... endmodule`
@@ -3015,10 +3025,10 @@ let parse_files_full files =
      the module-local scope, so wrapping these in a pkg is enough —
      no eval_int change needed.                                     *)
   let unit_pkg =
-    if !file_scope = [] then []
+    if !file_scope = [] && !file_types = [] then []
     else [{ pkg_name  = "$unit";
             pkg_params = List.rev !file_scope;
-            pkg_body   = EMPTY_TOKEN }] in
+            pkg_body   = TLIST (List.rev !file_types) }] in
   (List.rev !mods, resolve_pkg_param_chains (List.rev !pkgs) @ unit_pkg)
 
 let parse_files files = fst (parse_files_full files)

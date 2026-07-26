@@ -735,6 +735,33 @@ let extract_packed_dims ~pkgs ~params tok =
     | _ -> None
   ) pairs
 
+(* Implicit width of a built-in integer atom type (`int`, `byte`, …), which
+ * carries no explicit packed `[m:l]` range.  Verible wraps the atom token in
+ * `data_type_primitive_scalar5`.  Shared by extract_typedefs (so
+ * `typedef int unsigned count_t` registers width 32 in type_widths, not being
+ * dropped) and width_of below. *)
+let atom_width tok =
+  let atom_w = ref None in
+  let rec scan = function
+    | TUPLE3 (STRING t, atom, _)
+      when prefix_is "data_type_primitive_scalar5" t && !atom_w = None ->
+        (match atom with
+         | Byte -> atom_w := Some 8
+         | Shortint -> atom_w := Some 16
+         | Int | Integer | Time -> atom_w := Some 32
+         | Longint -> atom_w := Some 64
+         | _ -> ())
+    | TUPLE2 (a, b) -> scan a; scan b
+    | TUPLE3 (a, b, c) -> scan a; scan b; scan c
+    | TUPLE4 (a, b, c, d) -> scan a; scan b; scan c; scan d
+    | TUPLE5 (a, b, c, d, e) -> List.iter scan [a; b; c; d; e]
+    | TUPLE6 (a, b, c, d, e, f) -> List.iter scan [a; b; c; d; e; f]
+    | TUPLE7 (a, b, c, d, e, f, g) -> List.iter scan [a; b; c; d; e; f; g]
+    | TLIST xs -> List.iter scan xs
+    | _ -> ()
+  in
+  scan tok; !atom_w
+
 (* Extract every `typedef <data_type> <name>;` from the module body and
  * return [(name, width)]. Verible parses these as `type_declaration1`
  * = TUPLE6(tag, Typedef, data_type, GenericIdentifier, decl_dimensions_opt, ;).
@@ -776,7 +803,15 @@ let extract_typedefs ~pkgs ~params tok =
         else
           (match extract_range ~pkgs ~params data_type with
            | Some (m, l) -> Some (nm, abs (m - l) + 1)
-           | None -> None)
+           | None ->
+               (* Built-in integer atom (`typedef int unsigned count_t`): no
+                  packed range, but a well-defined implicit width.  Without this
+                  count_t was dropped from type_widths, so `count_t'(cnt_q)`
+                  fell back to eval_int(count_t) -> the parameter value 500,
+                  widening the debounce compare to 500 bits (125 CARRY4). *)
+               (match atom_width data_type with
+                | Some w -> Some (nm, w)
+                | None -> None))
     | _ -> None in
   (* Pass 1: populate `local` (enums/scalars resolve immediately; structs whose
      enum fields aren't in `local` yet get a provisional width). *)
@@ -2172,7 +2207,25 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
    * naturally and no manual masking is needed. *)
   | TUPLE6 (STRING tag, ct, _quote, _lp, expr, _rp) when prefix_is "cast" tag ->
       let inner = recurse expr in
-      (match eval_int ~pkgs ~params ct, inner with
+      (* A TYPE cast (`count_t'(x)`) must take the cast type's DECLARED width,
+         not eval_int of the type node.  eval_int resolves an identifier through
+         `params`, and a typed parameter declaration (`parameter count_t
+         ClkCount = 500`) can leave the TYPE name bound in params to the
+         parameter's value — so eval_int("count_t") returned 500, widening
+         `count_t'(cnt_q)` to 500 bits and turning every debounce compare into a
+         500-bit (125-CARRY4) monster (~2000 spurious carries across 8 gpio
+         debounces).  Consult type_widths first; only fall back to eval_int for
+         genuine numeric size casts (`64'(x)`, `LfsrWidth'(x)`). *)
+      let cast_w =
+        let ty_w = ref None in
+        walk (function
+          | SymbolIdentifier tn
+            when !ty_w = None && Hashtbl.mem type_widths tn ->
+              ty_w := Hashtbl.find_opt type_widths tn
+          | _ -> ()) ct;
+        match !ty_w with Some _ -> !ty_w | None -> eval_int ~pkgs ~params ct
+      in
+      (match cast_w, inner with
        | Some w, BConst { value; _ } when w > 0 ->
            BConst { value; width = w }
        | Some w, _ when w > 0 ->
