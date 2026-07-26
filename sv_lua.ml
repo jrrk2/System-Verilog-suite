@@ -2132,7 +2132,14 @@ let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
        (Printf.sprintf "// create_circuit RTL emit failed for %s: %s\n"
           m.Behavioral_ir.name (Printexc.to_string e)));
   let text = Buffer.contents buf in
-  let text = strip_inst_params text in
+  (* strip_inst_params drops every `#(...)` override — fine for the Verilator sim
+     variant (no parameterised primitives) but FATAL for the FPGA/synth emit: it
+     erases RAMB36E1 INIT (the program), MMCME2_ADV clock config, and BSCANE2
+     JTAG_CHAIN (nextpnr then bins both taps to BSCAN_X0Y0 and placement fails).
+     SVS_CIRC_KEEP_PARAMS=1 (set by the yosys open flow) preserves them. *)
+  let text =
+    if Sys.getenv_opt "SVS_CIRC_KEEP_PARAMS" <> None then text
+    else strip_inst_params text in
   let text = comb_nba_to_blocking text in
   (* re-declare pruned input ports so parent connections never dangle
      (Verilator 5.050 SIGSEGVs on a non-existent child pin). *)
@@ -2562,6 +2569,17 @@ let lwrite_nextpnr_json net_h path =
     ~library_cells:lc
     ~path m;
   path
+
+(* svd.place(net, floorplan): topographical place the flattened netlist IN
+ * MEMORY — gate-map BIR -> Bir_to_nextpnr_json.yosys_json (in-memory tree) ->
+ * Pack_to_lef.bmodule_of_yosys_tree -> place_lef_core, with NO json file round
+ * trip.  Same placer the place_lef.exe CLI / sv_suite place verb use; config
+ * via TOPO_* env (writes BELS_OUT / TOPO_STAMPED_JSON for carry_stamp + nextpnr). *)
+let lplace net_h floorplan =
+  let _, m, lc = find_netlist net_h in
+  let j = Bir_to_nextpnr_json.yosys_json ~library_cells:lc m in
+  Place_lef_core.run_inmem floorplan j;
+  "ok"
 
 (* Strip the SVS parameter-specialization suffix (`base__P1_D32_…`) from every
  * module whose BASE (text before the first `__`) is unique in the program, and
@@ -3142,6 +3160,8 @@ module MakeLib
                                (wrap2 lwrite_mapped_json);
         "write_nextpnr_json", V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_nextpnr_json);
+        "place",       V.efunc (V.string **-> V.string **->> V.string)
+                        (wrap2 lplace);
         "write_edif",         V.efunc (V.string **-> V.string **->> V.string)
                                (wrap2 lwrite_edif);
         "write_mod_edif",     V.efunc (V.string **-> V.string **->> V.string)

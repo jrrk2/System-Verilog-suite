@@ -87,14 +87,12 @@ let load_floorplan path =
     (j |> U.member "sites" |> U.to_list);
   by_kind
 
-let () =
-  if Array.length Sys.argv < 3 then
-    (prerr_endline "usage: place_lef <floorplan.json> <netlist.json>"; exit 1);
+let run_gen floorplan_json ~get_bmod ~get_j =
   let mode = getenv_default "TOPO_PLACE" "sa" in
   let fill = getenv_float "TOPO_REGION_FILL" 0.65 in
   let seed = getenv_int "TOPO_SEED" 1 in
   Random.init seed;
-  let fp = load_floorplan Sys.argv.(1) in
+  let fp = load_floorplan floorplan_json in
   (* TOPO_RESERVED_SITES: a placement file (name<TAB>site<TAB>...) whose sites are
      occupied by a frozen macro -- mark them used so our placement avoids them. *)
   (match Sys.getenv_opt "TOPO_RESERVED_SITES" with
@@ -113,7 +111,7 @@ let () =
        Printf.eprintf "reserved %d sites (%d in floorplan) from %s\n"
          (Hashtbl.length reserved) !n path
    | None -> ());
-  let bmod = Pack_to_lef.bmodule_of_yosys_json Sys.argv.(2) in
+  let bmod = get_bmod () in
   (* TOPO_EXCLUDE_SUBSTR: drop cells whose name contains this substring (used to
      hold a Vivado-frozen hard-IP macro, e.g. eth.eth_macro1., out of our
      topographical placement -- the macro is placed + routed separately). *)
@@ -1073,7 +1071,7 @@ let () =
      Array.iteri (fun i c -> if is_placed i then
          List.iter (fun (raw, _bel) -> Hashtbl.replace inst2pos raw (pos_x.(i), pos_y.(i)))
            c.Pack_to_lef.pc_bels) cells;
-     let j = Y.from_file Sys.argv.(2) in
+     let j = get_j () in
      let mods = (match member "modules" j with `Assoc a -> a | _ -> []) in
      let ncells_of m = (match member "cells" m with `Assoc a -> List.length a | _ -> 0) in
      let topname, _, topm = List.fold_left (fun (bnm, bn, bm) (nm, m) ->
@@ -1888,3 +1886,18 @@ let () =
      Y.to_file outst j_st;
      Printf.eprintf "carry-stamp: %d S-buffers, %d S-LUTs, %d sum-FFs, %d DI-5LUTs, %d fb-relays -> %s\n"
        !n_sbuf !n_slut !n_sff !n_dil !n_fb outst)
+
+(* CLI / file entry: read floorplan + netlist json from disk. *)
+let run floorplan_json netlist_json =
+  run_gen floorplan_json
+    ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_json netlist_json)
+    ~get_j:(fun () -> Y.from_file netlist_json)
+
+(* In-memory entry: the gate-mapped netlist's nextpnr-json tree already in RAM
+   (SVS flow: Bir_to_nextpnr_json.yosys_json), placed with NO file round-trip.
+   Packing goes through bmodule_of_yosys_tree so the placer sees EXACTLY the
+   same netlist it would from the on-disk json. *)
+let run_inmem floorplan_json (j : Y.t) =
+  run_gen floorplan_json
+    ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
+    ~get_j:(fun () -> j)

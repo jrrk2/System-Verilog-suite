@@ -576,6 +576,16 @@ let cmd_emit_arch args =
         \  the substitution pass picks it up via the verify-arch cert.";
       exit 2
 
+(* Topographical placer (svs_place_core) as a standalone verb — same core the
+   place_lef.exe CLI and the Lua svd.place_lef binding call.  All tuning via
+   TOPO_* env (TOPO_PLACE, TOPO_SEED, BELS_OUT, TOPO_STAMPED_JSON, …). *)
+let cmd_place = function
+  | floorplan :: netlist :: _ -> Place_lef_core.run floorplan netlist
+  | _ ->
+      prerr_endline
+        "usage: sv_suite place <floorplan.json> <netlist.json>  (config via TOPO_* env)";
+      exit 2
+
 let usage () =
   print_endline {|sv_suite — SV decompiler / miter toolchain
 
@@ -595,6 +605,7 @@ Verbs:
                                                        svd.emit_verilog / emit_vhdl       (BIR → text)
                                                        svd.write_verilog / write_vhdl     (BIR → file)
                                                        svd.convert_hdl(in, out)           (cross-translate, header-preserving)
+  place       <floorplan.json> <netlist.json>       topographical place (TOPO_* env) → BELs/stamped json
   verify-arch <adder|mul> <arch> [--width N]        prove arch ≡ `+` / `*`, cache cert
   emit-arch   <adder|mul> <arch> <out.sv> [--width N]  write certified arch block as SV
   timing      <top> <files…> [--target-depth N]     critical-path report + cert-gated upgrade hints
@@ -653,6 +664,7 @@ let () =
           p.pos_lnum (p.pos_cnum - p.pos_bol) (Lexing.lexeme lexbuf)
           (Printexc.to_string e))
   | "script"     :: rest -> cmd_script rest
+  | "place"      :: rest -> cmd_place rest
   | "verify-arch":: rest -> cmd_verify_arch rest
   | "emit-arch"  :: rest -> cmd_emit_arch rest
   | "timing"     :: rest -> cmd_timing rest

@@ -6,7 +6,7 @@
 (library
  (name svs_place_core)
  (wrapped false)
- (modules behavioral_ir pack_to_lef)
+ (modules behavioral_ir pack_to_lef place_lef_core)
  (libraries str yojson zarith))
 
 (executables

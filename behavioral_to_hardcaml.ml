@@ -2526,20 +2526,52 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     if out_wires <> [] then begin
       let inputs = List.map (fun (port, e) -> port, expr_to_signal ctx e) ins in
       let outputs = List.map (fun (port, w) -> port, Signal.width w) out_wires in
+      (* Only Xilinx PRIMITIVE instances carry meaningful `#(...)` overrides
+         (BSCANE2 JTAG_CHAIN, MMCME2_ADV clock config, RAMB36E1 INIT).  A USER
+         module in the SVS netlist is already specialised (params baked into its
+         mangled name) and declares no parameters, so an override like
+         prim_fifo_sync__W34_P0_D2 #(.Pass("1'b0")) is spurious and makes yosys
+         fail ("Can't find object for defparam Pass").  Primitives are ALL-CAPS;
+         specialised user modules contain lowercase — use that to discriminate. *)
+      let is_prim_name s =
+        String.length s > 0
+        && not (String.exists (fun c -> c >= 'a' && c <= 'z') s) in
+      let keep_params = is_prim_name i.module_name in
+      (* Dedup by name (int wins over string) so a param listed in both
+         param_values and param_strs isn't emitted twice — Hardcaml Rtl.output
+         would otherwise write e.g. two `.DIVCLK_DIVIDE(1)` / two STARTUP_WAIT
+         entries into the instance, which yosys rejects. *)
+      let seen = Hashtbl.create 16 in
+      let take n = if Hashtbl.mem seen n then false
+                   else (Hashtbl.replace seen n (); true) in
       let int_params =
-        List.map (fun (n, v) ->
-          Parameter.create ~name:n ~value:(Parameter.Value.Int v)) i.param_values in
+        if not keep_params then [] else
+        List.filter_map (fun (n, v) ->
+          if take n then
+            Some (Parameter.create ~name:n ~value:(Parameter.Value.Int v))
+          else None) i.param_values in
       (* string params: an all-0/1 value is a bit-vector (RAMB INIT_xx),
-         anything else a Verilog string (RAM_MODE="TDP", …). *)
+         anything else a Verilog string (RAM_MODE="TDP", …).  Strip one layer of
+         surrounding quotes if the frontend stored them: Hardcaml re-quotes a
+         String value, so a stored `"FALSE"` would emit as `""FALSE""` (a syntax
+         error in the MMCM/BSCANE2 instance). *)
       let str_params =
-        List.map (fun (n, s) ->
-          let is_bits =
-            String.length s > 0 && String.for_all (fun c -> c = '0' || c = '1') s in
-          let value =
-            if is_bits then
-              Parameter.Value.Std_logic_vector (Logic.Std_logic_vector.of_string s)
-            else Parameter.Value.String s in
-          Parameter.create ~name:n ~value) i.param_strs in
+        if not keep_params then [] else
+        List.filter_map (fun (n, s) ->
+          if not (take n) then None
+          else begin
+            let s =
+              let l = String.length s in
+              if l >= 2 && s.[0] = '"' && s.[l-1] = '"'
+              then String.sub s 1 (l - 2) else s in
+            let is_bits =
+              String.length s > 0 && String.for_all (fun c -> c = '0' || c = '1') s in
+            let value =
+              if is_bits then
+                Parameter.Value.Std_logic_vector (Logic.Std_logic_vector.of_string s)
+              else Parameter.Value.String s in
+            Some (Parameter.create ~name:n ~value)
+          end) i.param_strs in
       let parameters = int_params @ str_params in
       (* Hardcaml instance/module names may only contain alphanumerics or
          `_ $ . [ ]`; flattened Xilinx-IP hierarchy names carry '/' path

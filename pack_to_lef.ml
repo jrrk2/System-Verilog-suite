@@ -542,10 +542,11 @@ let print_result (r : result) =
    to a width-1 signal "n<b>"; a port's LSB-first bits become an MSB-first
    BConcat so net_bits reverses back to LSB-first.  The real SVS caller passes a
    bmodule straight to [pack]; this is only for the CLI regression. *)
-let bmodule_of_yosys_json path : bmodule =
-  let module Y = Yojson.Safe in
+(* Build a BIR bmodule from an already-parsed yosys/nextpnr JSON tree.  Lets the
+   in-SVS flow (gate-map -> Bir_to_nextpnr_json.yosys_json -> this) reach the
+   placer with NO file round-trip; bmodule_of_yosys_json is the file wrapper. *)
+let bmodule_of_yosys_tree (j : Yojson.Safe.t) : bmodule =
   let module U = Yojson.Safe.Util in
-  let j = Y.from_file path in
   let mods = j |> U.member "modules" |> U.to_assoc in
   (* pick the real top: the module with the most instantiated cells (blackbox
      library defs and $specify2-only stubs have few/none). *)
@@ -569,3 +570,7 @@ let bmodule_of_yosys_json path : bmodule =
         param_strs = []; port_connections = pcs }) cells in
   { name = "top"; params = []; signals = []; processes = [];
     instances; funcs = []; mems = []; attrs = [] }
+
+(* File wrapper: parse the JSON then delegate to the in-memory tree builder. *)
+let bmodule_of_yosys_json path : bmodule =
+  bmodule_of_yosys_tree (Yojson.Safe.from_file path)
