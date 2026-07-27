@@ -2033,6 +2033,35 @@ let orig_port_dirs :
 (* Remove instantiation parameter overrides `#( ... )` (balanced parens).  The
    modules are name-specialised, so the overrides are redundant AND name params
    the specialised module no longer declares — which Verilator rejects. *)
+(* Strip create_circuit's `__keep_<net>` retention OUTPUT ports from the emitted
+   Verilog.  create_circuit exposes them so Hardcaml's data-output-only DCE
+   can't prune the clock/reset/manually-instantiated-FF boxes during Circuit
+   construction; by emit time those boxes are already in the netlist, so the
+   ports are dangling.  SVS's own emitters (bir_to_nextpnr_json, bir_to_edif)
+   drop them — but the yosys path uses yosys's writers, so strip here too, else
+   a __keep_ (e.g. __keep_cpu_clk) reaches the top as a SPURIOUS UNCONSTRAINED
+   I/O pad (a real board hazard) or a dangling OBUF.  Parents never connect a
+   submodule's __keep_ port (leaf retention) and all connections are named, so
+   per-module line removal is safe. *)
+let strip_keep_ports (s : string) : string =
+  let has_keep line =
+    let n = String.length line and kl = 7 in
+    let rec go i = if i + kl > n then false
+      else if String.sub line i kl = "__keep_" then true else go (i + 1) in
+    go 0 in
+  let lines = String.split_on_char '\n' s in
+  let kept = List.filter (fun line ->
+    if not (has_keep line) then true
+    else begin
+      let t = String.trim line in
+      not (String.starts_with ~prefix:"__keep_" t                  (* header port entry *)
+           || String.starts_with ~prefix:"assign __keep_" t        (* driver *)
+           || List.exists (fun p -> String.starts_with ~prefix:p t) (* decl *)
+                [ "output __keep_"; "input __keep_"; "wire __keep_"; "reg __keep_" ])
+    end) lines in
+  (* dropping a trailing port leaves a dangling comma before the header ')' *)
+  Str.global_replace (Str.regexp ",[ \t\r\n]*)") "\n)" (String.concat "\n" kept)
+
 let strip_inst_params (s : string) : string =
   let b = Buffer.create (String.length s) in
   let n = String.length s in
@@ -2140,6 +2169,9 @@ let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
   let text =
     if Sys.getenv_opt "SVS_CIRC_KEEP_PARAMS" <> None then text
     else strip_inst_params text in
+  (* remove __keep_ retention ports here (pre-yosys), matching bir_to_*; keeps
+     spurious unconstrained pads / dangling OBUFs out of every downstream P&R. *)
+  let text = strip_keep_ports text in
   let text = comb_nba_to_blocking text in
   (* re-declare pruned input ports so parent connections never dangle
      (Verilator 5.050 SIGSEGVs on a non-existent child pin). *)
