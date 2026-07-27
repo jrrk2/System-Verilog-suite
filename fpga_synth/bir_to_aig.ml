@@ -333,6 +333,17 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
      pad — the mmcm_locked boundary break. *)
   let boundary_of_lit : (int, string) Hashtbl.t = Hashtbl.create (module Int) in
   let carry4_counter = ref 0 in
+  (* Minimum operand width to map an add / sub / compare onto a dedicated
+     CARRY4 chain; narrower ops lower to plain AIG (ripple) so the LUT cover
+     packs them into ordinary LUTs — exactly what Vivado does.  Unconditional
+     CARRY4 (the old behaviour) produced ~2822 carries for ibex-mini vs Vivado's
+     76: a carry per tiny compare/increment, each burning a whole slice + S/DI
+     LUTs and fighting the placer/router (and Vivado's opt_design can't un-map a
+     carry).  Threshold via CARRY4_MIN (default 8). *)
+  let carry4_min =
+    match Sys.getenv "CARRY4_MIN" with
+    | Some s -> (try Int.of_string s with _ -> 8)
+    | None -> 8 in
   (* Decompose a + b + carry_in (low w bits) into ceil(w/4) chained
      CARRY4 instances.  S = a XOR b is still a 1-LUT per bit (LUT2),
      but the carry propagates through Xilinx's dedicated carry chain
@@ -461,14 +472,16 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
              | Signal_or -> Array.init w ~f:(fun i -> aig_or b (vbit a i) (vbit bb i))
              | Signal_xor -> Array.init w ~f:(fun i -> aig_xor b (vbit a i) (vbit bb i))
              | Signal_eq -> v_eq b a bb ~n
-             | Signal_lt -> v_lt_carry4 a bb ~w:n
-             | Signal_add -> v_add_carry4 ~carry_in:const_false a bb ~w
+             | Signal_lt ->
+               if n >= carry4_min then v_lt_carry4 a bb ~w:n
+               else v_lt b a bb ~n
+             | Signal_add ->
+               if w >= carry4_min then v_add_carry4 ~carry_in:const_false a bb ~w
+               else v_add b a bb ~carry_in:const_false ~n:w
              | Signal_sub ->
-               v_add_carry4
-                 ~carry_in:const_true
-                 a
-                 (Array.map bb ~f:lit_not)
-                 ~w
+               let nb = Array.map bb ~f:lit_not in
+               if w >= carry4_min then v_add_carry4 ~carry_in:const_true a nb ~w
+               else v_add b a nb ~carry_in:const_true ~n:w
              | Signal_mulu -> fit (v_mul b a bb) w
              | Signal_muls ->
                Stdlib.prerr_endline
