@@ -7,6 +7,8 @@
 .qmake.stash
 Info.plist
 *.json
+# but DO track the committed Xilinx primitive-port cache (Vivado-free fallback)
+!xilinx_lef/xil_primitive_ports.json
 _build/
 json_to_verilog
 json_to_verilog.dSYM/

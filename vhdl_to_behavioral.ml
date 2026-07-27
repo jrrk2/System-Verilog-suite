@@ -1782,6 +1782,52 @@ let builtin_prim_ports : (string * (string * [`Input|`Output]) list) list = [
   "FDS", [ "Q",`Output; "D",`Input; "C",`Input; "S",`Input ];
 ]
 
+(* Write the resolved primitive-interface cache back to the JSON fallback so a
+ * Vivado machine can produce the file that a Vivado-free machine (no unisim
+ * .vhd) then reads.  Opt-in via XIL_PRIM_PORTS_WRITE to avoid surprise writes;
+ * format matches json_cache's reader above.
+ *   XIL_PRIM_PORTS_WRITE=1    dump whatever the run resolved (per-flow subset)
+ *   XIL_PRIM_PORTS_WRITE=all  first parse EVERY unisim <NAME>.vhd interface so
+ *                             the cache is complete regardless of this flow. *)
+let full_dump_done = ref false
+let maybe_write_ports_cache () =
+  match Sys.getenv_opt "XIL_PRIM_PORTS_WRITE" with
+  | None -> ()
+  | Some mode ->
+    if mode = "all" && not !full_dump_done then begin
+      full_dump_done := true;
+      let vhd_paths =
+        List.concat_map (fun d ->
+          if (try Sys.is_directory d with _ -> false) then
+            Array.to_list (Sys.readdir d)
+            |> List.filter (fun f -> Filename.check_suffix f ".vhd")
+            |> List.map (fun f -> Filename.concat d f)
+          else []) xil_unisims_dirs in
+      (* Parse each interface on its own so one unparseable secureip body does
+         not abort the batch; skip cells already cached. *)
+      List.iter (fun p ->
+        match (try convert_vhdl_files_to_behavioral [p] with _ -> None) with
+        | Some prog ->
+            List.iter (fun (m : Behavioral_ir.bmodule) ->
+              if not (Hashtbl.mem xil_primitive_cache m.name) then
+                Hashtbl.replace xil_primitive_cache m.name
+                  (bmodule_to_library_ports m)) prog.modules
+        | None -> ()) vhd_paths
+    end;
+    let path = xil_ports_cache_path () in
+    let dir_str = function `Input -> "input" | `Output -> "output" in
+    let entries =
+      Hashtbl.fold (fun cell ports acc ->
+        (cell, `List (List.map (fun (p : Behavioral_ir.library_port) ->
+           `Assoc [ "name",  `String p.port_name;
+                    "dir",   `String (dir_str p.port_direction);
+                    "width", `Int p.port_width ]) ports)) :: acc)
+        xil_primitive_cache [] in
+    let entries = List.sort (fun (a,_) (b,_) -> compare a b) entries in
+    (try Yojson.Safe.to_file path (`Assoc entries)
+     with e -> Printf.eprintf "[xil-ports] cache write to %s failed: %s\n"
+                 path (Printexc.to_string e))
+
 let lookup_xil_primitive_ports names :
     (string * Behavioral_ir.library_port list) list =
   let dedup = List.sort_uniq compare names in
@@ -1823,10 +1869,12 @@ let lookup_xil_primitive_ports names :
          List.iter (fun (n, _) ->
            Hashtbl.add xil_primitive_missing n ()) to_parse)
   end;
-  List.filter_map (fun n ->
+  let result = List.filter_map (fun n ->
     match Hashtbl.find_opt xil_primitive_cache n with
     | Some ports -> Some (n, ports)
-    | None -> None) dedup
+    | None -> None) dedup in
+  maybe_write_ports_cache ();
+  result
 
 (* ====================================================================== *)
 (* Xilinx unisim primitive IMPLEMENTATION bodies                          *)
