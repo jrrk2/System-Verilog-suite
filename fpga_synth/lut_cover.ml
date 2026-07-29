@@ -70,6 +70,13 @@ let prune ~cap cuts =
     Int.compare (List.length a.leaves) (List.length b.leaves))
   |> fun sorted -> List.take sorted cap
 
+(* Priority-cut cap: how many cuts to keep per node.  8 (delay-biased small
+   cuts) starves the area cost function on tall cones; override to explore. *)
+let cut_cap =
+  match Stdlib.Sys.getenv_opt "LUTCOVER_CAP" with
+  | Some s -> (try Int.of_string s with _ -> 32)
+  | None -> 32
+
 (* All k-feasible cuts per node (priority-cut style). *)
 let enumerate_cuts ~(k : int) (g : graph) : cut list array =
   let n = Array.length g.nodes in
@@ -86,7 +93,7 @@ let enumerate_cuts ~(k : int) (g : graph) : cut list array =
              if List.length leaves <= k then Some { root = i; leaves } else None))
        in
        (* trivial cut kept so parents can use [i] as a leaf. *)
-       cuts.(i) <- prune ~cap:8 (trivial :: merged))
+       cuts.(i) <- prune ~cap:cut_cap (trivial :: merged))
   done;
   cuts
 
@@ -359,21 +366,21 @@ type cost_mode =
 let cover ?(mode : cost_mode = `Area) ~(k : int) (g : graph) : cut list =
   let cuts = enumerate_cuts ~k g in
   let n = Array.length g.nodes in
-  let fanout = Array.create ~len:n 0 in
+  let static_fanout = Array.create ~len:n 0 in
   Array.iter g.nodes ~f:(fun nd ->
     match nd.gate with
     | And2 { a; b; _ } ->
-      fanout.(a) <- fanout.(a) + 1;
-      fanout.(b) <- fanout.(b) + 1
+      static_fanout.(a) <- static_fanout.(a) + 1;
+      static_fanout.(b) <- static_fanout.(b) + 1
     | _ -> ());
-  List.iter g.outputs ~f:(fun (_, id, _) -> fanout.(id) <- fanout.(id) + 1);
+  List.iter g.outputs ~f:(fun (_, id, _) -> static_fanout.(id) <- static_fanout.(id) + 1);
   let depth = Array.create ~len:n 0 in
   let area_flow = Array.create ~len:n 0.0 in
   let best = Array.create ~len:n None in
   (* Cost comparator for a single forward pass given a `critical : int
      option array` that says, per node, "use depth-priority here".  None
      means the node isn't critical so use area-priority. *)
-  let do_pass ~critical =
+  let do_pass ~critical ~fanout =
     for i = 0 to n - 1 do
       match g.nodes.(i).gate with
       | Input _ | Const _ ->
@@ -417,7 +424,7 @@ let cover ?(mode : cost_mode = `Area) ~(k : int) (g : graph) : cut list =
            best.(i) <- Some c)
     done
   in
-  do_pass ~critical:None;
+  do_pass ~critical:None ~fanout:static_fanout;
   (* Mixed mode: run a second pass with depth-priority on critical-path
      nodes.  Critical = "slack ≤ slack_tol".  Slack is computed against
      the max depth observed at any required output. *)
@@ -441,26 +448,104 @@ let cover ?(mode : cost_mode = `Area) ~(k : int) (g : graph) : cut list =
      let critical = Array.init n ~f:(fun i ->
        let slack = required.(i) - depth.(i) in
        if slack <= slack_tol then 1 else 0) in
-     do_pass ~critical:(Some critical)
+     do_pass ~critical:(Some critical) ~fanout:static_fanout
    | _ -> ());
-  let required = Array.create ~len:n false in
-  List.iter g.outputs ~f:(fun (_, id, _) -> required.(id) <- true);
-  let chosen = ref [] in
-  for i = n - 1 downto 0 do
-    if required.(i) then
-      match g.nodes.(i).gate with
-      | And2 _ ->
+  (* Collect the used LUTs: one chosen cut per required node, walked back
+     from the outputs. *)
+  let collect () =
+    let required = Array.create ~len:n false in
+    List.iter g.outputs ~f:(fun (_, id, _) -> required.(id) <- true);
+    let chosen = ref [] in
+    for i = n - 1 downto 0 do
+      if required.(i) then
+        match g.nodes.(i).gate with
+        | And2 _ ->
+          (match best.(i) with
+           | Some c ->
+             chosen := c :: !chosen;
+             List.iter c.leaves ~f:(fun l ->
+               match g.nodes.(l).gate with
+               | And2 _ -> required.(l) <- true
+               | _ -> ())
+           | None -> ())
+        | _ -> ()
+    done;
+    !chosen
+  in
+  let is_and i = match g.nodes.(i).gate with And2 _ -> true | _ -> false in
+  let result = ref (collect ()) in
+  (* --- reference-counting EXACT-AREA recovery (abc `if -a` style) ---------
+     Area-flow amortises a node's area over its STATIC fanout — only an
+     estimate.  Exact area measures a cut's TRUE marginal cost: how many new
+     LUTs it adds given the current mapping's reference counts (a leaf that
+     becomes referenced for the first time drags in its own cone).  A global
+     refcount is maintained; for each referenced AND node we deref its current
+     cone, cost every candidate cut by ref/deref, and re-select the cheapest.
+     It only ever chooses among VALID cuts, so it cannot change the function —
+     only the LUT count — and keeping the smallest cover makes it never worse. *)
+  let refc = Array.create ~len:n 0 in
+  let rec ref_cut c =
+    List.fold c.leaves ~init:1 ~f:(fun acc l ->
+      refc.(l) <- refc.(l) + 1;
+      acc + (if refc.(l) = 1 && is_and l
+             then (match best.(l) with Some bc -> ref_cut bc | None -> 0)
+             else 0))
+  and deref_cut c =
+    List.fold c.leaves ~init:1 ~f:(fun acc l ->
+      refc.(l) <- refc.(l) - 1;
+      acc + (if refc.(l) = 0 && is_and l
+             then (match best.(l) with Some bc -> deref_cut bc | None -> 0)
+             else 0))
+  in
+  let exact_pass () =
+    (* seed [best] from the best-known cover, rebuild refcounts to match *)
+    List.iter !result ~f:(fun c -> best.(c.root) <- Some c);
+    Array.fill refc ~pos:0 ~len:n 0;
+    List.iter !result ~f:(fun c ->
+      List.iter c.leaves ~f:(fun l -> refc.(l) <- refc.(l) + 1));
+    List.iter g.outputs ~f:(fun (_, id, _) -> refc.(id) <- refc.(id) + 1);
+    for i = 0 to n - 1 do
+      if is_and i && refc.(i) > 0 then
         (match best.(i) with
-         | Some c ->
-           chosen := c :: !chosen;
-           List.iter c.leaves ~f:(fun l ->
-             match g.nodes.(l).gate with
-             | And2 _ -> required.(l) <- true
-             | _ -> ())
-         | None -> ())
-      | _ -> ()
-  done;
-  !chosen
+         | None -> ()
+         | Some cur ->
+           ignore (deref_cut cur : int);
+           let cand =
+             List.filter cuts.(i) ~f:(fun c -> not (List.equal Int.equal c.leaves [ i ]))
+           in
+           let best_c = ref cur and best_a = ref Int.max_value in
+           List.iter cand ~f:(fun c ->
+             let a = ref_cut c in
+             ignore (deref_cut c : int);
+             if a < !best_a then (best_a := a; best_c := c));
+           ignore (ref_cut !best_c : int);
+           best.(i) <- Some !best_c)
+    done
+  in
+  (match mode with
+   | `Area ->
+     (* (1) area-flow recovery: re-map dividing by MAPPED (not static) fanout. *)
+     let iter = ref 0 in
+     while !iter < 2 do
+       let fo = Array.create ~len:n 0 in
+       List.iter !result ~f:(fun c ->
+         List.iter c.leaves ~f:(fun l -> fo.(l) <- fo.(l) + 1));
+       List.iter g.outputs ~f:(fun (_, id, _) -> fo.(id) <- fo.(id) + 1);
+       do_pass ~critical:None ~fanout:fo;
+       let c = collect () in
+       if List.length c < List.length !result then result := c;
+       Int.incr iter
+     done;
+     (* (2) exact-area recovery passes. *)
+     let iter = ref 0 in
+     while !iter < 3 do
+       exact_pass ();
+       let c = collect () in
+       if List.length c < List.length !result then result := c;
+       Int.incr iter
+     done
+   | _ -> ());
+  !result
 
 (* ---- cut emission helper -----------------------------------------
  * Shared between map_to_luts and fpga_map.  Turns a cut's truth table
@@ -542,3 +627,50 @@ let map_to_luts ?(mode : cost_mode = `Area) ~(k : int) ~(name : string) (g : gra
       Signal.output nm s)
   in
   Circuit.create_exn ~name outs
+
+(* ---- AIGER (.aag) export -------------------------------------------------
+ * The subject graph IS an And-Inverter graph, so this is a direct dump for
+ * external tools (abc) — used to benchmark this native cover against abc's
+ * `if`, and as the interface for an optional abc cover backend.  Variables
+ * are numbered contiguously (AIGER requires vars 1..M each defined once):
+ * inputs 1..I in node order, AND gates I+1..M in topological node order
+ * (children precede parents, so an AND's lhs var exceeds its input vars).
+ * Const nodes fold to literals 0/1 and consume no variable. *)
+let write_aag (g : graph) (path : string) : unit =
+  let n = Array.length g.nodes in
+  let var_of = Array.create ~len:n 0 in
+  let n_in = ref 0 in
+  Array.iter g.nodes ~f:(fun nd ->
+    match nd.gate with Input _ -> Int.incr n_in; var_of.(nd.id) <- !n_in | _ -> ());
+  let m = ref !n_in in
+  Array.iter g.nodes ~f:(fun nd ->
+    match nd.gate with And2 _ -> Int.incr m; var_of.(nd.id) <- !m | _ -> ());
+  let lit_of id inv =
+    match g.nodes.(id).gate with
+    | Const b -> (if b then 1 else 0) lxor (if inv then 1 else 0)
+    | _ -> (var_of.(id) * 2) lor (if inv then 1 else 0)
+  in
+  let n_and = !m - !n_in and n_out = List.length g.outputs in
+  let buf = Buffer.create 4096 in
+  Buffer.add_string buf (Printf.sprintf "aag %d %d 0 %d %d\n" !m !n_in n_out n_and);
+  Array.iter g.nodes ~f:(fun nd ->
+    match nd.gate with
+    | Input _ -> Buffer.add_string buf (Printf.sprintf "%d\n" (var_of.(nd.id) * 2))
+    | _ -> ());
+  List.iter g.outputs ~f:(fun (_, id, inv) ->
+    Buffer.add_string buf (Printf.sprintf "%d\n" (lit_of id inv)));
+  Array.iter g.nodes ~f:(fun nd ->
+    match nd.gate with
+    | And2 { a; b; a_inv; b_inv } ->
+      Buffer.add_string buf
+        (Printf.sprintf "%d %d %d\n" (var_of.(nd.id) * 2) (lit_of a a_inv) (lit_of b b_inv))
+    | _ -> ());
+  (* AIGER symbol table: name inputs/outputs (round-trip + debugging). *)
+  let ii = ref 0 in
+  Array.iter g.nodes ~f:(fun nd ->
+    match nd.gate with
+    | Input nm -> Buffer.add_string buf (Printf.sprintf "i%d %s\n" !ii nm); Int.incr ii
+    | _ -> ());
+  List.iteri g.outputs ~f:(fun idx (nm, _, _) ->
+    Buffer.add_string buf (Printf.sprintf "o%d %s\n" idx nm));
+  Stdio.Out_channel.write_all path ~data:(Buffer.contents buf)
