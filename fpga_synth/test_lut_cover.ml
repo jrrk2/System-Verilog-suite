@@ -40,4 +40,6 @@ let () =
       (String.concat ~sep:";" (List.map c.leaves ~f:Int.to_string))
       (bits_to_string (Tt.to_bool_list ~k:k_c truth)));
   Stdio.print_endline "---- netlist ----";
-  Fpga_emit.emit_verilog (map_to_luts ~k ~name:"and_or" g)
+  Fpga_emit.emit_verilog (map_to_luts ~k ~name:"and_or" g);
+  write_aag g "/tmp/and_or.aag";
+  Stdio.print_endline "---- wrote /tmp/and_or.aag ----"
