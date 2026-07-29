@@ -2319,7 +2319,32 @@ let build_port_dir (m : Behavioral_ir.bmodule) (prog : Behavioral_ir.bprogram)
   fun mn port -> Hashtbl.find_opt pd_tbl (mn, port)
 
 let lgate_map mod_h k_lut io_flag =
-  let _, m, prog = find_mod mod_h in
+  let _, m0, prog = find_mod mod_h in
+  (* GATE_MAP_BIR_OPT=1: run the intra-module BIR cleanup (const-prop -> DCE ->
+     CSE) on the module BEFORE create_circuit.  Without it the create_circuit /
+     bir_to_aig lowering sees unoptimised BIR and produces a bloated AIG (the
+     "front-end" half of the LUT gap vs yosys: 20x LUT1 buffers, redundant
+     cones).  These passes exist (behavioral_optimize pipeline) but were only
+     wired into the interactive/Z3 flows, not gate_map. *)
+  let m =
+    if Sys.getenv_opt "GATE_MAP_BIR_OPT" = Some "1" then begin
+      let on v = Sys.getenv_opt v = Some "1" in
+      let single = { prog with modules = [ m0 ] } in
+      (* const-prop and DCE are safe; CSE is opt-in (GATE_MAP_BIR_CSE) because it
+         injects _cse_temp signals create_circuit can't bind yet. *)
+      let single =
+        if on "GATE_MAP_BIR_NOCP" then single
+        else fst (Behavioral_const.propagate_to_fixpoint single) in
+      let single =
+        if on "GATE_MAP_BIR_NODCE" then single
+        else Behavioral_dce.eliminate_dead_program single in
+      let single =
+        if on "GATE_MAP_BIR_CSE" then fst (Behavioral_cse.apply_cse_program single)
+        else single in
+      (match single.Behavioral_ir.modules with m' :: _ -> m' | [] -> m0)
+    end
+    else m0
+  in
   let port_dir = build_port_dir m prog in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
   (* GATE_MAP_EMIT_CIRCUIT=<dir>: dump the create_circuit output (pre bir_to_aig /

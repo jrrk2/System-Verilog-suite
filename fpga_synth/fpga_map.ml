@@ -100,47 +100,6 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
         Xil_prim.ibuf pad)
   in
   (* ---- LUT-map the combinational logic ---- *)
-  let chosen = Lut_cover.cover ~mode ~k g in
-  (* Convert chosen cuts to packed_luts and optionally lutpack-fuse
-     single-fanout parent-child pairs.  Boundary consumers (register Q
-     wires, top outputs, instance pins) pin the parent's fanout so we
-     don't accidentally absorb a LUT that drives them. *)
-  let packed_init = List.map chosen ~f:(fun c -> Lut_cover.cut_to_packed g c) in
-  let packed =
-    if not lutpack then packed_init
-    else begin
-      (* Extra consumers per root: register D-cone outputs and instance
-         input bits that pass through cover.  These are graph outputs;
-         already counted via graph_outputs.                              *)
-      let extra_consumers _ = 0 in
-      Lut_cover.lutpack ~k ~graph_outputs:g.Lut_cover.outputs ~extra_consumers
-        packed_init
-    end
-  in
-  let packed =
-    if mfs2_var_elim || mfs2_odc
-    then Mfs2.run ~enable_var_elim:mfs2_var_elim ~enable_odc:mfs2_odc packed
-    else packed
-  in
-  (* Inverter folding: an output / FF-D that needs ~root can absorb the
-     inversion into the driving LUT's INIT instead of spending a LUT1 —
-     but only when [root] is a LUT root with NO positive consumer (LUT
-     inputs are always positive references; a positive output ref would
-     break if we flipped the INIT). *)
-  let pos_ref = Hash_set.create (module Int) in
-  List.iter packed ~f:(fun p ->
-    List.iter p.Lut_cover.pl_leaves ~f:(Hash_set.add pos_ref));
-  let out_pos = Hash_set.create (module Int) in
-  let out_inv = Hash_set.create (module Int) in
-  List.iter g.Lut_cover.outputs ~f:(fun (_, id, inv) ->
-    if inv then Hash_set.add out_inv id else Hash_set.add out_pos id);
-  let complement = Hash_set.create (module Int) in
-  List.iter packed ~f:(fun p ->
-    let r = p.Lut_cover.pl_root in
-    if (not (Hash_set.mem pos_ref r))
-       && (not (Hash_set.mem out_pos r))
-       && Hash_set.mem out_inv r
-    then Hash_set.add complement r);
   let n = Array.length g.Lut_cover.nodes in
   let sig_of = Array.create ~len:n None in
   let signal_of_node id =
@@ -159,24 +118,92 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
       sig_of.(id) <- Some s;
       s
   in
-  (* Emit each packed LUT in topological order of root id.  After lutpack
-     this is still safe: a fused LUT's leaves are unions of the original
-     leaves, all of which have lower AIG ids than the root.              *)
-  let packed_sorted =
-    List.sort packed ~compare:(fun a b ->
-      Int.compare a.Lut_cover.pl_root b.Lut_cover.pl_root) in
-  List.iter packed_sorted ~f:(fun p ->
-    let ins = List.map p.Lut_cover.pl_leaves ~f:signal_of_node in
-    let comp = Hash_set.mem complement p.Lut_cover.pl_root in
-    sig_of.(p.Lut_cover.pl_root) <-
-      Some (Lut_cover.emit_cut_signal ~complement:comp ~ins p.Lut_cover.pl_tt));
+  (* Inverter-folding set: filled by the native path (an output/FF-D needing
+     ~root absorbs the inversion into the driving LUT's INIT); empty for abc,
+     which folds output inversion into the po literal itself. *)
+  let complement = Hash_set.create (module Int) in
+  (* LUT-cover backend.  Default = native Lut_cover (emits packed LUTs into
+     sig_of).  LUTCOVER_BACKEND=abc routes the SAME subject graph through abc's
+     `if` mapper (Abc_cover) and returns one signal per g.outputs entry, with
+     any output inversion already folded — used where abc's exact-area beats
+     the native cover (register/CSR-heavy cones). *)
+  let abc_outs =
+    match Stdlib.Sys.getenv_opt "LUTCOVER_BACKEND" with
+    | Some "abc" ->
+      let input_nodes =
+        Array.filter_map g.Lut_cover.nodes ~f:(fun nd ->
+          match nd.Lut_cover.gate with
+          | Lut_cover.Input _ -> Some nd.Lut_cover.id
+          | _ -> None)
+      in
+      Some (Abc_cover.map_graph g ~k ~name ~input_nodes ~resolve_input:signal_of_node)
+    | _ ->
+      let chosen = Lut_cover.cover ~mode ~k g in
+      (* Convert chosen cuts to packed_luts and optionally lutpack-fuse
+         single-fanout parent-child pairs. *)
+      let packed_init = List.map chosen ~f:(fun c -> Lut_cover.cut_to_packed g c) in
+      let packed =
+        if not lutpack then packed_init
+        else begin
+          let extra_consumers _ = 0 in
+          Lut_cover.lutpack ~k ~graph_outputs:g.Lut_cover.outputs ~extra_consumers
+            packed_init
+        end
+      in
+      let packed =
+        if mfs2_var_elim || mfs2_odc
+        then Mfs2.run ~enable_var_elim:mfs2_var_elim ~enable_odc:mfs2_odc packed
+        else packed
+      in
+      (* Optional AIG dump + native-cover LUT tally (FPGA_AIG_DUMP=<dir>). *)
+      (match Stdlib.Sys.getenv_opt "FPGA_AIG_DUMP" with
+       | Some dir when String.length dir > 0 ->
+         Lut_cover.write_aag g (Printf.sprintf "%s/%s.aag" dir name);
+         Stdio.Out_channel.with_file ~append:true (Printf.sprintf "%s/native.tsv" dir)
+           ~f:(fun oc ->
+             Stdio.Out_channel.output_string oc
+               (Printf.sprintf "%s\t%d\t%d\n" name
+                  (List.length packed) (Array.length g.Lut_cover.nodes)))
+       | _ -> ());
+      (* Inverter folding: an output/FF-D that needs ~root absorbs the
+         inversion into the driving LUT's INIT (only when root has no positive
+         consumer). *)
+      let pos_ref = Hash_set.create (module Int) in
+      List.iter packed ~f:(fun p ->
+        List.iter p.Lut_cover.pl_leaves ~f:(Hash_set.add pos_ref));
+      let out_pos = Hash_set.create (module Int) in
+      let out_inv = Hash_set.create (module Int) in
+      List.iter g.Lut_cover.outputs ~f:(fun (_, id, inv) ->
+        if inv then Hash_set.add out_inv id else Hash_set.add out_pos id);
+      List.iter packed ~f:(fun p ->
+        let r = p.Lut_cover.pl_root in
+        if (not (Hash_set.mem pos_ref r))
+           && (not (Hash_set.mem out_pos r))
+           && Hash_set.mem out_inv r
+        then Hash_set.add complement r);
+      (* Emit each packed LUT in topological order of root id. *)
+      let packed_sorted =
+        List.sort packed ~compare:(fun a b ->
+          Int.compare a.Lut_cover.pl_root b.Lut_cover.pl_root) in
+      List.iter packed_sorted ~f:(fun p ->
+        let ins = List.map p.Lut_cover.pl_leaves ~f:signal_of_node in
+        let comp = Hash_set.mem complement p.Lut_cover.pl_root in
+        sig_of.(p.Lut_cover.pl_root) <-
+          Some (Lut_cover.emit_cut_signal ~complement:comp ~ins p.Lut_cover.pl_tt));
+      None
+  in
   (* ---- route outputs: register D-cones vs real outputs ---- *)
   let d_sig = Hashtbl.create (module String) in
   let real_outs = ref [] in
-  List.iter g.Lut_cover.outputs ~f:(fun (nm, id, inv) ->
-    let base = signal_of_node id in
-    (* if the driving LUT was complemented, it already yields ~node. *)
-    let s = if inv && not (Hash_set.mem complement id) then Signal.( ~: ) base else base in
+  List.iteri g.Lut_cover.outputs ~f:(fun oi (nm, id, inv) ->
+    let s =
+      match abc_outs with
+      | Some arr -> arr.(oi)   (* abc already folded any output inversion *)
+      | None ->
+        let base = signal_of_node id in
+        (* if the driving LUT was complemented, it already yields ~node. *)
+        if inv && not (Hash_set.mem complement id) then Signal.( ~: ) base else base
+    in
     if Hash_set.mem d_names nm then Hashtbl.set d_sig ~key:nm ~data:s
     else
       (* A `__keep_<clk>` retention output whose <clk> is a register clock is
