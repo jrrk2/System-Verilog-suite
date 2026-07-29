@@ -339,16 +339,17 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
      CARRY4 (the old behaviour) produced ~2822 carries for ibex-mini vs Vivado's
      76: a carry per tiny compare/increment, each burning a whole slice + S/DI
      LUTs and fighting the placer/router (and Vivado's opt_design can't un-map a
-     carry).  Threshold via CARRY4_MIN (default 16).  16 (was 8) keeps only the
-     wide adders on carries and lets the LUT cover — abc especially — pack the
-     short ones: on ibex-mini + abc this drops CARRY4 842->318 AND LUTs
-     16421->16058 (plus ~1.7k fewer carry_stamp routethru LUT1 downstream), with
-     conformance preserved.  Long adders still benefit from CARRY4 (all-AIG is
-     worse), so a threshold — not "abc everything" — is the right policy. *)
+     carry).  Threshold via CARRY4_MIN (default 8).  Raising it to 16 lets the
+     LUT cover (abc especially) pack the short adders — on ibex-mini + abc it
+     drops CARRY4 842->318 and LUTs 16421->16058 (plus ~1.7k fewer carry_stamp
+     routethru LUT1) with SIM conformance preserved (22/22) — BUT the extra
+     LUT-ripple adders BROKE THE CORE ON SILICON (no LEDs / conformance gp=0):
+     a timing/realization Fmax regression the functional sim can't see.  So 16
+     is OPT-IN only, pending an STA/Fmax check; the default stays 8. *)
   let carry4_min =
     match Sys.getenv "CARRY4_MIN" with
-    | Some s -> (try Int.of_string s with _ -> 16)
-    | None -> 16 in
+    | Some s -> (try Int.of_string s with _ -> 8)
+    | None -> 8 in
   (* Decompose a + b + carry_in (low w bits) into ceil(w/4) chained
      CARRY4 instances.  S = a XOR b is still a 1-LUT per bit (LUT2),
      but the carry propagates through Xilinx's dedicated carry chain
