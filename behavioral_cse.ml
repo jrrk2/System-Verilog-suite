@@ -88,9 +88,14 @@ let create_cse_context () = {
   eliminations = 0;
 }
 
+(* Monotonic across ALL processes/modules: a per-process counter reused
+   "_cse_temp0" in every process, so a comb-process temp and a seq-process temp
+   collided on the same name (multiple-driver / seq-wins). *)
+let global_temp_counter = ref 0
 let fresh_temp ctx =
-  let name = Printf.sprintf "_cse_temp%d" ctx.next_temp in
-  ctx.next_temp <- ctx.next_temp + 1;
+  ignore ctx.next_temp;
+  let name = Printf.sprintf "_cse_temp%d" !global_temp_counter in
+  incr global_temp_counter;
   name
 
 (* Check if expression is worth extracting *)
@@ -311,29 +316,59 @@ let rec apply_cse_stmt ctx = function
 
   | BReturn None -> [BReturn None]
 
-(* Apply CSE to process *)
+(* Width of a btype (for declaring the CSE temps + resolving BVar widths). *)
+let rec bwidth = function
+  | BInt { width; _ } -> width
+  | BBool -> 1
+  | BArray { element; size } -> size * bwidth element
+  | BStruct { fields } -> List.fold_left (fun a (_, t) -> a + bwidth t) 0 fields
+
+(* Type of a CSE temp = the extracted expression's own type.  BBinOp/BUnOp
+   carry it in result_type; others get an unsigned vector of the computed
+   width (via the shared width evaluator over the module's signal widths). *)
+let btype_of_temp sig_widths = function
+  | BBinOp { result_type; _ } | BUnOp { result_type; _ } -> result_type
+  | e ->
+    (match Behavioral_const.width_of_expr_with sig_widths e with
+     | Some w -> BInt { width = w; signed = Unsigned }
+     | None -> BInt { width = 32; signed = Unsigned })
+
+(* Apply CSE to process.  Also returns the (temp, expr) pairs it created so the
+   module level can DECLARE them (previously missing -> create_circuit hit
+   "unbound identifier _cse_tempN").  In a clocked (BSequential) block the temp
+   is a blocking `=` in-cycle wire, so it must join blocking_vars, else
+   behavioral_to_hardcaml would infer it as a register and add a cycle. *)
 let apply_cse_process = function
   | BCombinational { name; sensitivity; body } ->
       let ctx = create_cse_context () in
       let body' = List.concat (List.map (apply_cse_stmt ctx) body) in
-      (BCombinational { name; sensitivity; body = body' }, ctx.eliminations)
+      let temps = ExprHashtbl.fold (fun e t acc -> (t, e) :: acc) ctx.expr_to_temp [] in
+      (BCombinational { name; sensitivity; body = body' }, ctx.eliminations, temps)
 
-  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
-      let ctx = create_cse_context () in
-      let body' = List.concat (List.map (apply_cse_stmt ctx) body) in
-      (BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body'; blocking_vars },
-       ctx.eliminations)
+  | BSequential _ as proc ->
+      (* Skip CSE on clocked blocks: extracting a subexpression there tangles
+         with blocking-var feedback (register inference + combinational loops).
+         Combinational-process CSE captures the bulk of the sharing safely. *)
+      (proc, 0, [])
 
 (* Apply CSE to module *)
 let apply_cse_module bmod =
   let total_elims = ref 0 in
+  let all_temps = ref [] in
   let processes' = List.map (fun proc ->
-    let (proc', elims) = apply_cse_process proc in
+    let (proc', elims, temps) = apply_cse_process proc in
     total_elims := !total_elims + elims;
+    all_temps := temps @ !all_temps;
     proc'
   ) bmod.processes in
-
-  ({ bmod with processes = processes' }, !total_elims)
+  (* declare each CSE temp as an internal signal (fixes the unbound-identifier). *)
+  let sig_widths = Hashtbl.create 128 in
+  List.iter (fun (s : bsignal) -> Hashtbl.replace sig_widths s.name (bwidth s.stype)) bmod.signals;
+  let temp_sigs =
+    List.map (fun (name, expr) ->
+      { name; stype = btype_of_temp sig_widths expr; direction = `Internal;
+        initial_value = None; attrs = [] }) !all_temps in
+  ({ bmod with signals = bmod.signals @ temp_sigs; processes = processes' }, !total_elims)
 
 (* Apply CSE to program *)
 let apply_cse_program prog =

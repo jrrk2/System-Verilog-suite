@@ -119,11 +119,24 @@ let rec collect_uses_defs_stmt stmt =
 
 (* Collect uses and defs in process *)
 let collect_uses_defs_process = function
-  | BCombinational { body; _ } | BSequential { body; _ } ->
+  | BCombinational { body; _ } ->
       List.fold_left (fun (u, d) stmt ->
         let (su, sd) = collect_uses_defs_stmt stmt in
         (StringSet.union u su, StringSet.union d sd)
       ) (StringSet.empty, StringSet.empty) body
+  | BSequential { body; clock; reset; _ } ->
+      let (u, d) =
+        List.fold_left (fun (u, d) stmt ->
+          let (su, sd) = collect_uses_defs_stmt stmt in
+          (StringSet.union u su, StringSet.union d sd)
+        ) (StringSet.empty, StringSet.empty) body in
+      (* A register's CLOCK and (async/sync) RESET are signal names in the
+         process header, NOT in the body statements — so they must be counted
+         as uses, else DCE deletes a signal that only serves as a clock/reset
+         driver and the whole clock domain dies (sim hangs). *)
+      let u = StringSet.add clock u in
+      let u = match reset with Some r -> StringSet.add r u | None -> u in
+      (u, d)
 
 (* NEW: Collect module-level signal usage across ALL processes *)
 let collect_module_live_signals bmod =
@@ -146,6 +159,20 @@ let collect_module_live_signals bmod =
 
   (* Combine: signals used anywhere + output signals *)
   let module_live = StringSet.union cross_process_live output_signals in
+
+  (* CRITICAL: signals connected to SUBMODULE INSTANCE ports are live too.
+     collect_uses_defs_process only walks processes, so without this DCE
+     removed any signal that only drives an instance input (e.g. the ibex
+     core's alu/regfile/decoder feeds) — breaking the design.  Every net on
+     every instance port is marked live (conservative = safe: over-keeping
+     never removes something live). *)
+  let instance_uses =
+    List.fold_left (fun acc (inst : binstance) ->
+      List.fold_left (fun acc (_port, expr) ->
+        StringSet.union acc (collect_uses_expr expr))
+        acc inst.port_connections)
+      StringSet.empty bmod.instances in
+  let module_live = StringSet.union module_live instance_uses in
 
   (* Also include signals that are defined in one process and used in another *)
   (* This catches cases like: process1: iQ := ..., process2: Q := iQ *)
@@ -184,8 +211,11 @@ let rec eliminate_dead_stmt live_vars = function
       let original_name = strip_ssa_suffix lhs in
       if StringSet.mem lhs live_vars || StringSet.mem original_name live_vars then
         Some stmt
-      else
+      else begin
+        (if Sys.getenv_opt "DCE_DEBUG" <> None then
+           Printf.eprintf "[dce-remove] %s\n%!" lhs);
         None  (* Dead assignment *)
+      end
 
   | BIf { condition; then_stmts; else_stmts } ->
       let then_stmts' = List.filter_map (eliminate_dead_stmt live_vars) then_stmts in
