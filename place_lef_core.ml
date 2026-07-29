@@ -1887,17 +1887,107 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      Printf.eprintf "carry-stamp: %d S-buffers, %d S-LUTs, %d sum-FFs, %d DI-5LUTs, %d fb-relays -> %s\n"
        !n_sbuf !n_slut !n_sff !n_dil !n_fb outst)
 
+(* ---- automatic hold buffering (FPGA_HOLD_LUT1=1) ------------------------------
+   Insert an identity LUT1 (INIT="10") on every DIRECT FF->FF net — a register Q
+   driving a register D with no cell between.  These zero-logic paths have no
+   propagation delay to absorb clock skew, so on a skewed clock tree they violate
+   hold, and nextpnr does NO hold fixing (this is the JTAG tck DMI-shift-register
+   failure: dr_q/address_q).  The buffer adds a LUT delay -> hold margin.  Runs at
+   the START of place_lef, on the netlist tree that feeds BOTH the placer and the
+   emitted ft.json, so the buffers are placed + routed and nothing folds them
+   (of_circuit's identity-collapse is upstream).  One shared buffer per source Q
+   bit (its D fanout all reroute through it); non-FF sinks of that Q stay direct. *)
+let insert_hold_buffers (j : Y.t) : Y.t =
+  if (try Sys.getenv "FPGA_HOLD_LUT1" with Not_found -> "") <> "1" then j
+  else begin
+    let module U = Yojson.Safe.Util in
+    let is_ff t = List.mem t [ "FDRE"; "FDCE"; "FDPE"; "FDSE" ] in
+    let bit1 conn = match conn with `List [ b ] -> Some b | _ -> None in
+    let modules = j |> U.member "modules" |> U.to_assoc in
+    let ncells (_, mj) = try List.length (mj |> U.member "cells" |> U.to_assoc) with _ -> 0 in
+    let topname, _ =
+      List.fold_left (fun best m -> if ncells m > ncells best then m else best)
+        (List.hd modules) (List.tl modules) in
+    let remap modname mj =
+      if modname <> topname then mj else begin
+        let cells = mj |> U.member "cells" |> U.to_assoc in
+        (* Don't hardcode LUT1's port directions — copy them from an existing
+           LUT1 already in the netlist (bir_to_nextpnr_json populated those from
+           the central cell-port DB / XIL_PRIM_PORTS_JSON), so a $holdbuf matches
+           exactly what the flow emits.  Fall back only if the design has none. *)
+        let lut1_pd =
+          let found = ref None in
+          List.iter (fun (_, cj) ->
+            if !found = None
+               && (try cj |> U.member "type" |> U.to_string with _ -> "") = "LUT1"
+            then match cj |> U.member "port_directions" with
+              | `Null -> () | v -> found := Some v)
+            cells;
+          match !found with
+          | Some v -> v
+          | None -> `Assoc [ "I0", `String "input"; "O", `String "output" ]
+        in
+        (* highest int bit id + set of FF-Q output bits *)
+        let maxbit = ref 0 and ff_q = Hashtbl.create 4096 in
+        List.iter (fun (_, cj) ->
+          let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
+          List.iter (fun (_, conn) ->
+            List.iter (function `Int i -> if i > !maxbit then maxbit := i | _ -> ())
+              (match conn with `List l -> l | _ -> []))
+            (try cj |> U.member "connections" |> U.to_assoc with _ -> []);
+          if is_ff t then
+            match bit1 (cj |> U.member "connections" |> U.member "Q") with
+            | Some (`Int b) -> Hashtbl.replace ff_q b () | _ -> ())
+          cells;
+        let buf_bit : (int, int) Hashtbl.t = Hashtbl.create 1024 in
+        let new_cells = ref [] and cnt = ref 0 in
+        let get_buf src =
+          match Hashtbl.find_opt buf_bit src with
+          | Some n -> n
+          | None ->
+            incr maxbit; let n = !maxbit in
+            Hashtbl.replace buf_bit src n;
+            new_cells := (Printf.sprintf "$holdbuf$%d" src,
+              `Assoc [ "type", `String "LUT1";
+                       "parameters", `Assoc [ "INIT", `String "10" ];
+                       "port_directions", lut1_pd;
+                       "connections", `Assoc [ "I0", `List [ `Int src ];
+                                               "O",  `List [ `Int n ] ] ]) :: !new_cells;
+            incr cnt; n
+        in
+        let cells' = List.map (fun (cn, cj) ->
+          let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
+          if not (is_ff t) then (cn, cj)
+          else match bit1 (cj |> U.member "connections" |> U.member "D") with
+            | Some (`Int b) when Hashtbl.mem ff_q b ->
+              let n = get_buf b in
+              let conns' = List.map (fun (p, v) -> if p = "D" then (p, `List [ `Int n ]) else (p, v))
+                             (cj |> U.member "connections" |> U.to_assoc) in
+              (cn, `Assoc (List.map (fun (k, v) -> if k = "connections" then (k, `Assoc conns') else (k, v))
+                             (U.to_assoc cj)))
+            | _ -> (cn, cj)) cells in
+        Printf.eprintf "[hold_lut1] inserted %d FF->FF hold buffers in %s\n%!" !cnt modname;
+        `Assoc (List.map (fun (k, v) -> if k = "cells" then (k, `Assoc (cells' @ List.rev !new_cells)) else (k, v))
+                  (U.to_assoc mj))
+      end
+    in
+    let modules' = List.map (fun (mn, mj) -> (mn, remap mn mj)) modules in
+    `Assoc (List.map (fun (k, v) -> if k = "modules" then (k, `Assoc modules') else (k, v)) (U.to_assoc j))
+  end
+
 (* CLI / file entry: read floorplan + netlist json from disk. *)
 let run floorplan_json netlist_json =
+  let j = insert_hold_buffers (Y.from_file netlist_json) in
   run_gen floorplan_json
-    ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_json netlist_json)
-    ~get_j:(fun () -> Y.from_file netlist_json)
+    ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
+    ~get_j:(fun () -> j)
 
 (* In-memory entry: the gate-mapped netlist's nextpnr-json tree already in RAM
    (SVS flow: Bir_to_nextpnr_json.yosys_json), placed with NO file round-trip.
    Packing goes through bmodule_of_yosys_tree so the placer sees EXACTLY the
    same netlist it would from the on-disk json. *)
 let run_inmem floorplan_json (j : Y.t) =
+  let j = insert_hold_buffers j in
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
     ~get_j:(fun () -> j)
