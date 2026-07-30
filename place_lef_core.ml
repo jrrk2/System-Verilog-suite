@@ -1903,6 +1903,30 @@ let insert_hold_buffers (j : Y.t) : Y.t =
     let module U = Yojson.Safe.Util in
     let is_ff t = List.mem t [ "FDRE"; "FDCE"; "FDPE"; "FDSE" ] in
     let bit1 conn = match conn with `List [ b ] -> Some b | _ -> None in
+    (* TARGETED buffering (Phase 2c): if NEXTPNR_HOLD_TARGETS points at nextpnr's
+       exported hold-target list (net<TAB>capture_cell.port<TAB>slack), buffer ONLY
+       those capture FFs instead of blanket every FF->FF.  None -> blanket (old). *)
+    let targets =
+      match Sys.getenv_opt "NEXTPNR_HOLD_TARGETS" with
+      | Some f when Sys.file_exists f ->
+        let h = Hashtbl.create 512 in
+        (try let ic = open_in f in
+           (try while true do
+              let line = input_line ic in
+              (match String.split_on_char '\t' line with
+               | _ :: pin :: _ ->
+                 let cell = match String.rindex_opt pin '.' with
+                   | Some i -> String.sub pin 0 i | None -> pin in
+                 Hashtbl.replace h cell ()
+               | _ -> ())
+            done with End_of_file -> ()); close_in ic
+         with _ -> ());
+        Printf.eprintf "[hold_lut1] targeting %d hold endpoint(s) from %s\n%!"
+          (Hashtbl.length h) f;
+        Some h
+      | _ -> None
+    in
+    let want cn = match targets with None -> true | Some h -> Hashtbl.mem h cn in
     let modules = j |> U.member "modules" |> U.to_assoc in
     let ncells (_, mj) = try List.length (mj |> U.member "cells" |> U.to_assoc) with _ -> 0 in
     let topname, _ =
@@ -1959,7 +1983,7 @@ let insert_hold_buffers (j : Y.t) : Y.t =
           let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
           if not (is_ff t) then (cn, cj)
           else match bit1 (cj |> U.member "connections" |> U.member "D") with
-            | Some (`Int b) when Hashtbl.mem ff_q b ->
+            | Some (`Int b) when Hashtbl.mem ff_q b && want cn ->
               let n = get_buf b in
               let conns' = List.map (fun (p, v) -> if p = "D" then (p, `List [ `Int n ]) else (p, v))
                              (cj |> U.member "connections" |> U.to_assoc) in
