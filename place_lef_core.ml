@@ -1926,7 +1926,10 @@ let insert_hold_buffers (j : Y.t) : Y.t =
         Some h
       | _ -> None
     in
-    let want cn = match targets with None -> true | Some h -> Hashtbl.mem h cn in
+    (* blanket mode (no targets): buffer only DIRECT FF->FF (D bit == some Q bit).
+       targeted mode: nextpnr already picked the hold-critical FFs (their D may be
+       driven by logic, not a raw Q), so buffer each listed FF's D directly. *)
+    let want_ff cn is_ff2ff = match targets with None -> is_ff2ff | Some h -> Hashtbl.mem h cn in
     let modules = j |> U.member "modules" |> U.to_assoc in
     let ncells (_, mj) = try List.length (mj |> U.member "cells" |> U.to_assoc) with _ -> 0 in
     let topname, _ =
@@ -1983,7 +1986,7 @@ let insert_hold_buffers (j : Y.t) : Y.t =
           let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
           if not (is_ff t) then (cn, cj)
           else match bit1 (cj |> U.member "connections" |> U.member "D") with
-            | Some (`Int b) when Hashtbl.mem ff_q b && want cn ->
+            | Some (`Int b) when want_ff cn (Hashtbl.mem ff_q b) ->
               let n = get_buf b in
               let conns' = List.map (fun (p, v) -> if p = "D" then (p, `List [ `Int n ]) else (p, v))
                              (cj |> U.member "connections" |> U.to_assoc) in
