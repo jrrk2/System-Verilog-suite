@@ -1887,6 +1887,41 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      Printf.eprintf "carry-stamp: %d S-buffers, %d S-LUTs, %d sum-FFs, %d DI-5LUTs, %d fb-relays -> %s\n"
        !n_sbuf !n_slut !n_sff !n_dil !n_fb outst)
 
+(* ---- inert-cell cleanup -------------------------------------------------------
+   The yosys netlist goes STRAIGHT into place_lef, so scrub non-physical yosys
+   metadata cells here instead of needing a separate yosys pass.  Rule: a
+   $-prefixed cell with NO connections (e.g. $scopeinfo -- 102 in the ibex top)
+   has no bel and cannot affect the netlist, so drop it.  Real cells, and
+   connected $-cells like $specify in blackbox sim models, are left untouched
+   (the DSP must still be removed at synth time via -nodsp; that's not a cleanup). *)
+let cleanup_netlist (j : Y.t) : Y.t =
+  let module U = Yojson.Safe.Util in
+  let inert (_, cj) =
+    let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
+    let noconn = match cj |> U.member "connections" with `Assoc [] | `Null -> true | _ -> false in
+    String.length t > 0 && t.[0] = '$' && noconn
+  in
+  let ndrop = ref 0 in
+  let clean_mod mj =
+    match mj |> U.member "cells" with
+    | `Assoc cells ->
+      let kept = List.filter (fun c -> if inert c then (incr ndrop; false) else true) cells in
+      `Assoc (List.map (fun (k, v) -> if k = "cells" then (k, `Assoc kept) else (k, v)) (U.to_assoc mj))
+    | _ -> mj
+  in
+  let r =
+    match j |> U.member "modules" with
+    | `Assoc mods ->
+      `Assoc (List.map (fun (k, v) ->
+                  if k = "modules"
+                  then (k, `Assoc (List.map (fun (mn, mj) -> (mn, clean_mod mj)) mods))
+                  else (k, v))
+                (U.to_assoc j))
+    | _ -> j
+  in
+  if !ndrop > 0 then Printf.eprintf "[cleanup] dropped %d inert ($-no-conn) cell(s)\n%!" !ndrop;
+  r
+
 (* ---- automatic hold buffering (FPGA_HOLD_LUT1=1) ------------------------------
    Insert an identity LUT1 (INIT="10") on every DIRECT FF->FF net — a register Q
    driving a register D with no cell between.  These zero-logic paths have no
@@ -2004,7 +2039,7 @@ let insert_hold_buffers (j : Y.t) : Y.t =
 
 (* CLI / file entry: read floorplan + netlist json from disk. *)
 let run floorplan_json netlist_json =
-  let j = insert_hold_buffers (Y.from_file netlist_json) in
+  let j = insert_hold_buffers (cleanup_netlist (Y.from_file netlist_json)) in
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
     ~get_j:(fun () -> j)
@@ -2014,7 +2049,7 @@ let run floorplan_json netlist_json =
    Packing goes through bmodule_of_yosys_tree so the placer sees EXACTLY the
    same netlist it would from the on-disk json. *)
 let run_inmem floorplan_json (j : Y.t) =
-  let j = insert_hold_buffers j in
+  let j = insert_hold_buffers (cleanup_netlist j) in
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
     ~get_j:(fun () -> j)
