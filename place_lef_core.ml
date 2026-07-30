@@ -289,6 +289,32 @@ let run_gen floorplan_json ~get_bmod ~get_j =
        !matched !lines k
    | _ -> ());
 
+  (* SR CO-LOCATION: yosys maps async set/reset to native FF PRE/CLR pins fed by
+     PER-FF inverters (abc replicates them, fanout-1).  If the placer strands that
+     inverter columns from its FF, the SLICE's shared SR input can't route (86/92
+     skips on the yosys eth-arp netlist).  Weight each LOW-FANOUT net on an FF SR
+     pin (PRE/CLR/S/R) so the annealer keeps the SR driver adjacent to its FF ->
+     the SR reaches the slice on local interconnect.  Enable with PLACE_SR_K>0.
+     NOTE: OFF by default -- soft HPWL weighting proved INSUFFICIENT on the yosys
+     eth-arp netlist (failing SR nets stayed ~11 tiles apart; a fanout-1 SR pair is
+     out-voted by the FF's data net + the inverter's reset-source net, and even a
+     distance-1 SR arc failed to route).  Kept as an option for hard-colocation
+     experiments; the robust fix is to avoid native FF SR at synthesis. *)
+  let sr_k = try float_of_string (Sys.getenv "PLACE_SR_K") with _ -> 0.0 in
+  if sr_k > 0.0 then begin
+    let sr_ports = [ "PRE"; "CLR"; "S"; "R"; "SR" ] in
+    let w = 1.0 +. sr_k and srn = ref 0 in
+    Array.iter (fun c ->
+      List.iter (fun (port, nk) ->
+        if List.mem port sr_ports then
+          match Hashtbl.find_opt net_of_key nk with
+          | Some nid when Array.length net_cells.(nid) <= 5 && net_w.(nid) < w ->
+            net_w.(nid) <- w; incr srn
+          | _ -> ()) c.Pack_to_lef.pc_conns) cells;
+    Printf.eprintf "[place_lef] SR co-location: weighted %d low-fanout set/reset nets (K=%.1f)\n%!"
+      !srn sr_k
+  end;
+
   (* HPWL of a net over currently-placed cells (bbox half-perimeter). *)
   let net_hpwl nid =
     let cs = net_cells.(nid) in
