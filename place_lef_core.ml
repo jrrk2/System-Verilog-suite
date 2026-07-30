@@ -247,37 +247,47 @@ let run_gen floorplan_json ~get_bmod ~get_j =
           | _ -> ()) c.Pack_to_lef.pc_conns) cells;
   let net_cells = Array.make !nnets [||] in
   Hashtbl.iter (fun nid lst -> net_cells.(nid) <- Array.of_list !lst) net_lists;
-  (* TIMING-DRIVEN PLACEMENT: per-net criticality weight (default 1.0).  Loaded
-     from PLACE_CRIT_FILE (nextpnr's NEXTPNR_CRIT_EXPORT: "<netname>\t<crit>").
-     eval_delta then minimises SUM (net_w.(n) * hpwl n), so the annealer keeps
-     near-critical nets short.  net names follow bir_to_nextpnr_json's
-     convention, same as nextpnr's, so match on the netkey base and base[i]. *)
-  let net_w = Array.make !nnets 1.0 in
-  (match Sys.getenv_opt "PLACE_CRIT_FILE" with
-   | Some cf when Sys.file_exists cf ->
-     let crit = Hashtbl.create 8192 in
-     let ic = open_in cf in
-     (try while true do
-         match String.split_on_char '\t' (input_line ic) with
-         | name :: v :: _ -> (try Hashtbl.replace crit name (float_of_string v) with _ -> ())
-         | _ -> ()
-       done with End_of_file -> ()); close_in ic;
-     let k = try float_of_string (Sys.getenv "PLACE_CRIT_K") with _ -> 8.0 in
-     let matched = ref 0 in
-     Hashtbl.iter (fun nk nid ->
-       match nk with
-       | Pack_to_lef.Net (b, i) ->
-         let c = match Hashtbl.find_opt crit b with
-           | Some c -> Some c
-           | None -> Hashtbl.find_opt crit (Printf.sprintf "%s[%d]" b i) in
-         (match c with Some c when c > 0.0 -> net_w.(nid) <- 1.0 +. k *. c; incr matched | _ -> ())
-       | _ -> ()) net_of_key;
-     Printf.eprintf "[place_lef] timing-driven: %d/%d nets matched criticality (K=%.1f)\n%!"
-       !matched !nnets k
-   | _ -> ());
   (* cell -> net ids *)
   let cell_nets = Array.make ncells [] in
   Array.iteri (fun nid cs -> Array.iter (fun i -> cell_nets.(i) <- nid :: cell_nets.(i)) cs) net_cells;
+  (* TIMING-DRIVEN PLACEMENT: per-net criticality weight (default 1.0).  Loaded
+     from PLACE_CRIT_FILE (nextpnr NEXTPNR_CRIT_EXPORT: "<driver-cell>\t<crit>").
+     eval_delta minimises SUM (net_w.(n) * hpwl n) so the SA annealer keeps near-
+     critical nets short.  Keyed by DRIVER-CELL name: net names don't survive
+     bir_to_nextpnr_json flattening, but cell names do.  A nextpnr cell name lacks
+     place_lef's packing suffix ($carry/$mux/...), so match full pc_name then the
+     base (strip at '$'); a base may fracture into several packed cells. *)
+  let net_w = Array.make !nnets 1.0 in
+  (match Sys.getenv_opt "PLACE_CRIT_FILE" with
+   | Some cf when Sys.file_exists cf ->
+     let strip n = match String.index_opt n '$' with Some i -> String.sub n 0 i | None -> n in
+     let base2ids = Hashtbl.create (ncells * 2) in
+     Array.iteri (fun i c ->
+       let b = strip c.Pack_to_lef.pc_name in
+       Hashtbl.replace base2ids b (i :: (try Hashtbl.find base2ids b with Not_found -> []))) cells;
+     let k = try float_of_string (Sys.getenv "PLACE_CRIT_K") with _ -> 8.0 in
+     let ic = open_in cf in
+     let matched = ref 0 and lines = ref 0 in
+     (try while true do
+        (match String.split_on_char '\t' (input_line ic) with
+         | cname :: v :: _ ->
+           incr lines;
+           let c = try float_of_string v with _ -> 0.0 in
+           if c > 0.0 then begin
+             let ids = match Hashtbl.find_opt name2id cname with
+               | Some i -> [ i ]
+               | None -> (try Hashtbl.find base2ids cname with Not_found -> []) in
+             if ids <> [] then incr matched;
+             let w = 1.0 +. k *. c in
+             List.iter (fun idx ->
+               List.iter (fun nid -> if net_w.(nid) < w then net_w.(nid) <- w)
+                 cell_nets.(idx)) ids
+           end
+         | _ -> ())
+       done with End_of_file -> ()); close_in ic;
+     Printf.eprintf "[place_lef] timing-driven: %d/%d crit cells matched (K=%.1f)\n%!"
+       !matched !lines k
+   | _ -> ());
 
   (* HPWL of a net over currently-placed cells (bbox half-perimeter). *)
   let net_hpwl nid =
