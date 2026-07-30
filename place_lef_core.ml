@@ -247,6 +247,34 @@ let run_gen floorplan_json ~get_bmod ~get_j =
           | _ -> ()) c.Pack_to_lef.pc_conns) cells;
   let net_cells = Array.make !nnets [||] in
   Hashtbl.iter (fun nid lst -> net_cells.(nid) <- Array.of_list !lst) net_lists;
+  (* TIMING-DRIVEN PLACEMENT: per-net criticality weight (default 1.0).  Loaded
+     from PLACE_CRIT_FILE (nextpnr's NEXTPNR_CRIT_EXPORT: "<netname>\t<crit>").
+     eval_delta then minimises SUM (net_w.(n) * hpwl n), so the annealer keeps
+     near-critical nets short.  net names follow bir_to_nextpnr_json's
+     convention, same as nextpnr's, so match on the netkey base and base[i]. *)
+  let net_w = Array.make !nnets 1.0 in
+  (match Sys.getenv_opt "PLACE_CRIT_FILE" with
+   | Some cf when Sys.file_exists cf ->
+     let crit = Hashtbl.create 8192 in
+     let ic = open_in cf in
+     (try while true do
+         match String.split_on_char '\t' (input_line ic) with
+         | name :: v :: _ -> (try Hashtbl.replace crit name (float_of_string v) with _ -> ())
+         | _ -> ()
+       done with End_of_file -> ()); close_in ic;
+     let k = try float_of_string (Sys.getenv "PLACE_CRIT_K") with _ -> 8.0 in
+     let matched = ref 0 in
+     Hashtbl.iter (fun nk nid ->
+       match nk with
+       | Pack_to_lef.Net (b, i) ->
+         let c = match Hashtbl.find_opt crit b with
+           | Some c -> Some c
+           | None -> Hashtbl.find_opt crit (Printf.sprintf "%s[%d]" b i) in
+         (match c with Some c when c > 0.0 -> net_w.(nid) <- 1.0 +. k *. c; incr matched | _ -> ())
+       | _ -> ()) net_of_key;
+     Printf.eprintf "[place_lef] timing-driven: %d/%d nets matched criticality (K=%.1f)\n%!"
+       !matched !nnets k
+   | _ -> ());
   (* cell -> net ids *)
   let cell_nets = Array.make ncells [] in
   Array.iteri (fun nid cs -> Array.iter (fun i -> cell_nets.(i) <- nid :: cell_nets.(i)) cs) net_cells;
@@ -801,7 +829,7 @@ let run_gen floorplan_json ~get_bmod ~get_j =
         List.iter (fun i -> List.iter (fun nid ->
             if net_stamp.(nid) <> st then (net_stamp.(nid) <- st; nets := nid :: !nets))
             cell_nets.(i)) moved;
-        let before = List.fold_left (fun a n -> a + net_hpwl n) 0 !nets in
+        let before = List.fold_left (fun a n -> a +. net_w.(n) *. float (net_hpwl n)) 0.0 !nets in
         (* congestion: accumulate the affected nets' OLD RUDY (negated) *)
         let cmap = Hashtbl.create 32 in
         let acc b a = Hashtbl.replace cmap b ((try Hashtbl.find cmap b with Not_found -> 0.0) +. a) in
@@ -812,7 +840,7 @@ let run_gen floorplan_json ~get_bmod ~get_j =
         if ll_on then List.iter (fun n -> net_track_acc n (-1.0) hacc vacc) !nets;
         let olds = List.map (fun i -> (pos_x.(i), pos_y.(i))) moved in
         List.iter2 (fun i (nx, ny) -> pos_x.(i) <- nx; pos_y.(i) <- ny) moved newpos;
-        let after = List.fold_left (fun a n -> a + net_hpwl n) 0 !nets in
+        let after = List.fold_left (fun a n -> a +. net_w.(n) *. float (net_hpwl n)) 0.0 !nets in
         (* add the NEW RUDY -> cmap now holds per-bin demand delta *)
         if cong_on then List.iter (fun n -> net_rudy_acc n (1.0) acc) !nets;
         if ll_on then List.iter (fun n -> net_track_acc n (1.0) hacc vacc) !nets;
@@ -844,7 +872,7 @@ let run_gen floorplan_json ~get_bmod ~get_j =
               go (acc +. float d) mt ot
             | _ -> acc in
           go 0.0 moved olds in
-        (float (after - before) +. cong_w *. dcong +. site_w *. sdelta +. ll_w *. dtrack
+        ((after -. before) +. cong_w *. dcong +. site_w *. sdelta +. ll_w *. dtrack
            +. coh_w *. dcoh,
          olds, cmap, omap, hmap, vmap) in
       let accepted = ref 0 in
