@@ -1192,6 +1192,20 @@ let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmo
 
 (* One module's cross-design verdict, with [trusted] submodules black-boxed
  * (not flattened) on both sides. *)
+(* REGISTER CORRESPONDENCE hook.  The miter lifts each flop to a free state
+   variable and ties the two sides together BY NAME.  Two frontends that name
+   the same flop differently -- verilator's `wr_gray_rsync1` against verible's
+   D/Q-split `wr_gray_rsync1__D` -- leave that state UNTIED, so Z3 may pick
+   0b100001 on one side and 0b000100 on the other and report a counterexample
+   about nothing.  That explained 6 of the 11 DIFFERs in the verilator-vs-
+   verible run, on modules whose two sides were otherwise identical (97
+   signals / 88 constraints each).
+
+   [reg_correspond] and [rename_module] are defined further down (they need
+   rn_expr/rn_proc), so miter_core reaches them through this ref, which is
+   filled in immediately after they exist.  Identity until then. *)
+let regcorr_hook : (bmodule -> bmodule -> bmodule) ref = ref (fun _ b -> b)
+
 let miter_core ?(trusted : string list = [])
                ?(input_consts : (string * Z.t) list = [])
                ?(output_masks : (string * Z.t) list = [])
@@ -1208,6 +1222,7 @@ let miter_core ?(trusted : string list = [])
     Printf.sprintf "INCONCLUSIVE — %d unresolved primitive bodies: %s"
       (List.length unres) summary
   end else
+    let mb' = !regcorr_hook ma' mb' in
     (try if Z3_miter.check_miter_equivalence ~input_consts ~output_masks ma' mb'
          then "EQUIVALENT" else "DIFFER"
      with
@@ -1879,6 +1894,35 @@ let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list 
       end) byc;
     !map
   end
+
+(* Install the register-correspondence hook declared above miter_core.  Only
+   runs when the two sides' state names actually DISAGREE, so the common case
+   costs one set comparison.  SVS_NO_REGCORR=1 disables it; REGCORR_MAX bounds
+   the simulation work and says so out loud when it declines. *)
+let () =
+  regcorr_hook := (fun ma' mb' ->
+    if Sys.getenv_opt "SVS_NO_REGCORR" <> None then mb'
+    else
+      (* [reg_correspond] rips the flops itself, so there is no cheap way to
+         pre-check whether the two sides' register names already agree -- an
+         earlier attempt tested for `__D` outputs on the PREPPED module, found
+         none (prep_for_z3 does not rip), and silently skipped every module.
+         Just ask it, then rename only the pairs whose names actually differ:
+         when the naming already corresponds the filter is empty and nothing
+         is touched.  Any failure degrades to "leave B alone" rather than
+         taking the whole miter down. *)
+      match (try reg_correspond ma' mb' with _ -> []) with
+      | [] -> mb'
+      | map ->
+        (match List.filter (fun (a, b) -> a <> b) map with
+         | [] -> mb'
+         | diff ->
+           Printf.eprintf
+             "[regcorr] %s: renamed %d of %d register(s) to match %s\n%!"
+             mb'.name (List.length diff) (List.length map) ma'.name;
+           rename_module
+             (fun x -> match List.assoc_opt x diff with
+                       | Some r -> r | None -> x) mb'))
 
 (* Miter with simulation-based register correspondence: prep BOTH modules ONCE
  * (prep_for_z3 lowers always-blocks so ffrip can see registers), match b's
