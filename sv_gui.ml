@@ -1367,9 +1367,17 @@ type placed = {
 (* a net for the nextpnr-JSON routing overlay: driver + sink positions
    pre-resolved to placement coords (empty for DEF layouts). *)
 type lnet = {
-  ln_name : string;
-  ln_drv  : int * int;
-  ln_snks : (int * int) list;
+  ln_name   : string;
+  ln_drv    : int * int;
+  ln_snks   : (int * int) list;
+  (* Sites the net actually reaches, read from the routed net's pip list rather
+     than from connectivity: the LOAD PIPS.  For a global buffer the root is one
+     BUFGCTRL in a corner and the driver->sink star says nothing -- what matters
+     is where the clock spine taps down into fabric, and which loads it never
+     reached.  A skipped arc leaves its load with no tap pip, so (snks - taps)
+     IS the unrouted set. *)
+  ln_taps   : (int * int) list;
+  ln_tracks : string list;                (* distinct GCLK_* tracks used *)
 }
 
 type layout = {
@@ -1712,6 +1720,36 @@ let parse_nextpnr_json path =
       if y < !miny then miny := y;  if y > !maxy then maxy := y
     end) pos;
   let netnames = jassoc (jmem "netnames" tm) in
+  (* nextpnr writes each routed net as an ROUTING attribute: repeating triples
+     "wire;src->dst;strength".  A pip whose DESTINATION is a site wire
+     (SITEWIRE/SLICE_XxYy/PIN) is the last hop into a load, so its coordinates
+     are that load's own site -- those are the tap points.  Also collect the
+     distinct global tracks -- GCLK_... -- the net rides, which runs out when
+     a clock or high-fanout CE fails to reach the far corners. *)
+  let parse_routing s =
+    if s = "" then ([], []) else begin
+      let taps = ref [] and tracks = Hashtbl.create 8 in
+      List.iteri (fun i e ->
+        if i mod 3 = 1 then
+          match String.index_opt e '>' with
+          | Some k when k > 0 && e.[k-1] = '-' ->
+              let src = String.sub e 0 (k-1)
+              and dst = String.sub e (k+1) (String.length e - k - 1) in
+              let is_site w =
+                String.length w > 9 && String.sub w 0 9 = "SITEWIRE/" in
+              if is_site dst && not (is_site src) then
+                (match bel_xy dst with Some xy -> taps := xy :: !taps | None -> ());
+              List.iter (fun w ->
+                match String.index_opt w '/' with
+                | Some j ->
+                    let base = String.sub w (j+1) (String.length w - j - 1) in
+                    let is_gclk =
+                      String.length base > 4 && String.sub base 0 4 = "GCLK" in
+                    if is_gclk then Hashtbl.replace tracks base ()
+                | None -> ()) [ src; dst ]
+          | _ -> ()) (String.split_on_char ';' s);
+      (!taps, Hashtbl.fold (fun k () a -> k :: a) tracks [])
+    end in
   let nets = ref [] in
   List.iter (fun (nn, nv) ->
     match jlist (jmem "bits" nv) with
@@ -1721,8 +1759,13 @@ let parse_nextpnr_json path =
              let sxys =
                List.filter_map (fun sc -> Hashtbl.find_opt pos sc)
                  (try Hashtbl.find snk b with Not_found -> []) in
-             if sxys <> [] then
-               nets := { ln_name = nn; ln_drv = Hashtbl.find pos dc; ln_snks = sxys } :: !nets
+             if sxys <> [] then begin
+               let (taps, tracks) =
+                 parse_routing (jstr (jmem "ROUTING" (jmem "attributes" nv))) in
+               nets := { ln_name = nn; ln_drv = Hashtbl.find pos dc;
+                         ln_snks = sxys; ln_taps = taps;
+                         ln_tracks = List.sort compare tracks } :: !nets
+             end
          | _ -> ())
     | _ -> ()) netnames;
   let pad = 4 in
@@ -1737,24 +1780,44 @@ let parse_nextpnr_json path =
     l_nets       = List.rev !nets;
     l_hi         = Hashtbl.create 256 }
 
-(* union the SKIP_FAILED_ARCS net names from every route*.log beside the JSON
-   so the viewer opens with the unroutable nets already lit up. *)
+(* Pre-light the unroutable nets from the route log that produced THIS JSON.
+   A build dir accumulates route*.log from earlier experiments (route_sr.log,
+   route_bufh.log, ...); unioning them all lit up nets that later runs had
+   already fixed.  nextpnr writes the routed JSON at the end of the run, so the
+   matching log is the one whose mtime is closest to the JSON's — pick that one
+   alone.  Returns the log basename used (for the status line). *)
 let skip_re = Str.regexp "SKIP_FAILED_ARCS.*net '\\([^']+\\)'"
-let load_skips_into hi dir =
+let load_skips_into hi json_path =
+  let dir = Filename.dirname json_path in
   let files = try Sys.readdir dir with _ -> [||] in
+  let mtime p = try (Unix.stat p).Unix.st_mtime with _ -> nan in
+  let json_t = mtime json_path in
+  (* closest mtime to the JSON; on a tie or missing stat, newest wins *)
+  let best = ref None in
   Array.iter (fun f ->
-    if String.length f >= 5 && String.sub f 0 5 = "route" && Filename.check_suffix f ".log"
-    then
-      try
-        let ic = open_in (Filename.concat dir f) in
-        (try while true do
-           let l = input_line ic in
-           (try ignore (Str.search_forward skip_re l 0);
-                Hashtbl.replace hi (Str.matched_group 1 l) ()
-            with Not_found -> ())
-         done with End_of_file -> ());
-        close_in ic
-      with _ -> ()) files
+    if String.length f >= 5 && String.sub f 0 5 = "route"
+       && Filename.check_suffix f ".log" then begin
+      let t = mtime (Filename.concat dir f) in
+      let d = if Float.is_nan t || Float.is_nan json_t then infinity
+              else Float.abs (t -. json_t) in
+      match !best with
+      | Some (_, bd, bt) when not (d < bd || (d = bd && t > bt)) -> ()
+      | _ -> best := Some (f, d, t)
+    end) files;
+  match !best with
+  | None -> None
+  | Some (f, _, _) ->
+      (try
+         let ic = open_in (Filename.concat dir f) in
+         (try while true do
+            let l = input_line ic in
+            (try ignore (Str.search_forward skip_re l 0);
+                 Hashtbl.replace hi (Str.matched_group 1 l) ()
+             with Not_found -> ())
+          done with End_of_file -> ());
+         close_in ic
+       with _ -> ());
+      Some f
 
 let render_layout cr ~width ~height ?path layout =
   let (x1, y1, x2, y2) = layout.l_die in
@@ -1801,28 +1864,65 @@ let render_layout cr ~width ~height ?path layout =
       Cairo.rectangle cr rx ry ~w:(w_dbu *. scale) ~h:(h_dbu *. scale)
     ) layout.l_components;
     Cairo.fill cr;
-    (* nextpnr routing overlay: highlighted nets (driver -> each sink) *)
+    (* nextpnr routing overlay.  Small nets keep the driver->sink star.  A
+       global buffer's star is useless -- 149 lines from one corner BUFGCTRL
+       tell you nothing -- so above WIDE_FANOUT we drop the lines and plot the
+       LOAD PIPS instead: where the spine actually taps down.  Loads with no tap
+       pip (the skipped arcs) are crossed in magenta, which is the whole point:
+       you see WHICH corners the buffer failed to reach. *)
     if Hashtbl.length layout.l_hi > 0 && layout.l_nets <> [] then begin
-      let n_hi = ref 0 in
+      let wide_fanout = 32 in
+      let n_hi = ref 0 and n_dead = ref 0 and tracks = Hashtbl.create 8 in
       List.iter (fun ln ->
         if Hashtbl.mem layout.l_hi ln.ln_name then begin
           incr n_hi;
+          List.iter (fun t -> Hashtbl.replace tracks t ()) ln.ln_tracks;
+          let wide = List.length ln.ln_snks > wide_fanout in
+          let tapped = Hashtbl.create 64 in
+          List.iter (fun xy -> Hashtbl.replace tapped xy ()) ln.ln_taps;
           let (dx, dy) = xform (fst ln.ln_drv) (snd ln.ln_drv) in
-          Cairo.set_source_rgba cr 0.95 0.15 0.15 0.80;
-          Cairo.set_line_width cr 1.2;
+          if not wide then begin
+            Cairo.set_source_rgba cr 0.95 0.15 0.15 0.80;
+            Cairo.set_line_width cr 1.2;
+            List.iter (fun (sx, sy) ->
+              let (qx, qy) = xform sx sy in
+              Cairo.move_to cr dx dy; Cairo.line_to cr qx qy) ln.ln_snks;
+            Cairo.stroke cr
+          end;
+          (* root: filled when it carries the story, hollow when it doesn't *)
+          Cairo.set_source_rgb cr 0.95 0.80 0.10;
+          Cairo.rectangle cr (dx -. 3.0) (dy -. 3.0) ~w:6.0 ~h:6.0;
+          if wide then (Cairo.set_line_width cr 1.5; Cairo.stroke cr)
+          else Cairo.fill cr;
+          (* reached loads: red dots at the tap pips (fall back to sink sites
+             for an unrouted JSON, which carries no ROUTING at all) *)
+          Cairo.set_source_rgb cr 0.95 0.15 0.15;
           List.iter (fun (sx, sy) ->
             let (qx, qy) = xform sx sy in
-            Cairo.move_to cr dx dy; Cairo.line_to cr qx qy) ln.ln_snks;
-          Cairo.stroke cr;
-          Cairo.set_source_rgb cr 0.95 0.80 0.10;              (* driver = yellow box *)
-          Cairo.rectangle cr (dx -. 3.0) (dy -. 3.0) ~w:6.0 ~h:6.0; Cairo.fill cr;
-          Cairo.set_source_rgb cr 0.95 0.15 0.15;              (* sinks = red dots *)
-          List.iter (fun (sx, sy) ->
-            let (qx, qy) = xform sx sy in
-            Cairo.arc cr qx qy ~r:2.5 ~a1:0.0 ~a2:6.2831853; Cairo.fill cr) ln.ln_snks
+            Cairo.arc cr qx qy ~r:2.5 ~a1:0.0 ~a2:6.2831853; Cairo.fill cr)
+            (if ln.ln_taps = [] then ln.ln_snks else ln.ln_taps);
+          (* loads the net never reached *)
+          if ln.ln_taps <> [] then
+            List.iter (fun (sx, sy) ->
+              if not (Hashtbl.mem tapped (sx, sy)) then begin
+                incr n_dead;
+                let (qx, qy) = xform sx sy in
+                Cairo.set_source_rgb cr 1.0 0.20 0.90;
+                Cairo.set_line_width cr 2.0;
+                Cairo.move_to cr (qx -. 4.0) (qy -. 4.0);
+                Cairo.line_to cr (qx +. 4.0) (qy +. 4.0);
+                Cairo.move_to cr (qx +. 4.0) (qy -. 4.0);
+                Cairo.line_to cr (qx -. 4.0) (qy +. 4.0);
+                Cairo.stroke cr
+              end) ln.ln_snks
         end) layout.l_nets;
-      set_status (Printf.sprintf "%s — %d instances · %d highlighted net(s)"
-                    layout.l_design (List.length layout.l_components) !n_hi)
+      let tl = Hashtbl.fold (fun k () a -> k :: a) tracks [] in
+      set_status (Printf.sprintf
+        "%s — %d instances · %d highlighted net(s)%s%s"
+        layout.l_design (List.length layout.l_components) !n_hi
+        (if !n_dead = 0 then "" else Printf.sprintf " · %d UNREACHED load(s)" !n_dead)
+        (if tl = [] then ""
+         else Printf.sprintf " · tracks %s" (String.concat "," (List.sort compare tl))))
     end;
     (* Critical-path overlay *)
     (match path with
@@ -1919,16 +2019,56 @@ let open_layout_window ?critical_path layout =
   let path_ref = ref critical_path in
   let da = GMisc.drawing_area () in
   hpane#pack1 ~resize:true ~shrink:true da#coerce;
+  (* view transform on top of render_layout's fit-to-window: scroll wheel zooms
+     around the cursor, left-drag pans, 'f' resets to fit. *)
+  let zoom = ref 1.0 and pan_x = ref 0.0 and pan_y = ref 0.0 in
+  let drag = ref None in
+  da#misc#set_can_focus true;
+  da#event#add [ `SCROLL; `BUTTON_PRESS; `BUTTON_RELEASE; `POINTER_MOTION; `BUTTON1_MOTION ];
   ignore (da#misc#connect#draw ~callback:(fun cr ->
     let alloc = da#misc#allocation in
     (try
+       Cairo.save cr;
+       Cairo.translate cr !pan_x !pan_y;
+       Cairo.scale cr !zoom !zoom;
        render_layout cr
          ~width:alloc.Gtk.width ~height:alloc.Gtk.height
-         ?path:!path_ref layout
+         ?path:!path_ref layout;
+       Cairo.restore cr
      with e ->
        Printf.eprintf "[layout] render failed: %s\n%!"
          (Printexc.to_string e));
     true));
+  ignore (da#event#connect#scroll ~callback:(fun ev ->
+    let mx = GdkEvent.Scroll.x ev and my = GdkEvent.Scroll.y ev in
+    let f = match GdkEvent.Scroll.direction ev with
+      | `UP -> 1.15 | `DOWN -> 1.0 /. 1.15 | _ -> 1.0 in
+    if f <> 1.0 then begin
+      zoom := !zoom *. f;
+      (* keep the point under the cursor fixed *)
+      pan_x := mx -. f *. (mx -. !pan_x);
+      pan_y := my -. f *. (my -. !pan_y);
+      da#misc#queue_draw ()
+    end;
+    true));
+  ignore (da#event#connect#button_press ~callback:(fun ev ->
+    if GdkEvent.Button.button ev = 1 then
+      drag := Some (GdkEvent.Button.x ev -. !pan_x, GdkEvent.Button.y ev -. !pan_y);
+    true));
+  ignore (da#event#connect#button_release ~callback:(fun _ -> drag := None; true));
+  ignore (da#event#connect#motion_notify ~callback:(fun ev ->
+    (match !drag with
+     | Some (ox, oy) ->
+         pan_x := GdkEvent.Motion.x ev -. ox;
+         pan_y := GdkEvent.Motion.y ev -. oy;
+         da#misc#queue_draw ()
+     | None -> ());
+    true));
+  ignore (win#event#connect#key_press ~callback:(fun ev ->
+    if GdkEvent.Key.keyval ev = GdkKeysyms._f then begin
+      zoom := 1.0; pan_x := 0.0; pan_y := 0.0; da#misc#queue_draw ()
+    end;
+    false));
 
   (* Right pane: critical path side panel. *)
   let side = GPack.vbox ~spacing:4 ~border_width:6 () in
@@ -1941,7 +2081,7 @@ let open_layout_window ?critical_path layout =
     | None when layout.l_nets <> [] ->
         Printf.sprintf
           "nextpnr placement / routing\n%d placed cells · %d nets\n\
-           %d net(s) pre-lit from route*.log skips.\n\
+           %d net(s) pre-lit from the matching route log.\n\
            Type a net name / substring below to highlight\n\
            its driver (yellow) → sinks (red)."
           (List.length layout.l_components) (List.length layout.l_nets)
@@ -2332,7 +2472,7 @@ let do_open_nextpnr_json () =
   if path <> "" then
     try
       let layout = parse_nextpnr_json path in
-      load_skips_into layout.l_hi (Filename.dirname path);
+      let skip_log = load_skips_into layout.l_hi path in
       if layout.l_components = [] then
         info_dialog
           "No placed cells (NEXTPNR_BEL) in this JSON.\n\
@@ -2341,9 +2481,10 @@ let do_open_nextpnr_json () =
       else begin
         open_layout_window layout;
         set_status (Printf.sprintf
-          "nextpnr JSON: %d cells · %d nets · %d skip-net(s) highlighted"
+          "nextpnr JSON: %d cells · %d nets · %d skip-net(s) highlighted from %s"
           (List.length layout.l_components) (List.length layout.l_nets)
-          (Hashtbl.length layout.l_hi))
+          (Hashtbl.length layout.l_hi)
+          (match skip_log with Some f -> f | None -> "(no route log found)"))
       end
     with e ->
       error_dialog (Printf.sprintf "Failed to read nextpnr JSON:\n%s"
