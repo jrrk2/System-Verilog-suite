@@ -63,6 +63,16 @@ let bv_var name width suffix =
       v
 
 (* Clear the signal cache *)
+(* A miter that shares NO input with the other side, or no output, compares
+   nothing: every "common input" constraint is vacuous and Z3 is free to pick
+   contradictory values for the two designs' unshared inputs.  The old code
+   printed "constraining common inputs only" and then reported a confident
+   DIFFER -- a false negative indistinguishable from a real one.  In a
+   Vivado-netlist-vs-emission run that fired on 11 of 23 DIFFERs (synthesis had
+   simply renamed the ports).  Raise instead, so the caller can say
+   UNCOMPARABLE. *)
+exception Vacuous_comparison of string
+
 let clear_cache () = Hashtbl.clear signal_cache
 
 (* Clear caches that are scoped to a single miter so a decl created
@@ -898,6 +908,13 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
   if input_names1 <> input_names2 then
     Printf.printf "⚠ Input interfaces differ (constraining common inputs only)\n  D1: [%s]\n  D2: [%s]\n"
       (String.concat ", " input_names1) (String.concat ", " input_names2);
+  (* Nothing shared => nothing constrained => the result is meaningless. *)
+  let common_inputs =
+    List.filter (fun n -> List.mem n input_names2) input_names1 in
+  if common_inputs = [] && (input_names1 <> [] || input_names2 <> []) then
+    raise (Vacuous_comparison
+      (Printf.sprintf "no input name in common (D1: [%s] vs D2: [%s])"
+         (String.concat ", " input_names1) (String.concat ", " input_names2)));
   (* Output interfaces may differ when synthesis optimises away registers
      (their `Q__D` boundary outputs vanish on one side).  Don't bail — compare
      only the COMMON outputs (the miter loop below filters).  A real primary-
@@ -1384,6 +1401,10 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
 
     let common_outputs =
       List.filter (fun (n, _) -> List.mem_assoc n outputs2) outputs1 in
+    if common_outputs = [] then
+      raise (Vacuous_comparison
+        (Printf.sprintf "no output name in common (D1: [%s] vs D2: [%s])"
+           (String.concat ", " output_names1) (String.concat ", " output_names2)));
     let common_outputs =
       if output_masks = [] then common_outputs
       else begin

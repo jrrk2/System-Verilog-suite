@@ -1210,7 +1210,13 @@ let miter_core ?(trusted : string list = [])
   end else
     (try if Z3_miter.check_miter_equivalence ~input_consts ~output_masks ma' mb'
          then "EQUIVALENT" else "DIFFER"
-     with e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
+     with
+     | Z3_miter.Vacuous_comparison why ->
+         (* NOT a difference: the two sides share no comparable port, so the
+            miter constrained nothing.  Reporting DIFFER here manufactures
+            exactly the false counterexamples this flow keeps chasing. *)
+         Printf.sprintf "UNCOMPARABLE — %s" why
+     | e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
 
 let lmiter a_h b_h =
   let (_, ma, pa) = find_mod a_h in
@@ -1455,6 +1461,7 @@ let lmiter_hier a_prog_h b_prog_h top =
       end) p_raw.modules;
     used in
   let n_eq = ref 0 in
+  let n_unc = ref 0 in
   let buf = Buffer.create 256 in
   List.iter (fun n ->
     match by_name pa n, by_name pb (bname n) with
@@ -1489,15 +1496,21 @@ let lmiter_hier a_prog_h b_prog_h top =
            hierarchical walk is watchable as it runs; stdout still receives the
            full buffered report once, on return. *)
         Printf.eprintf "HIER %-34s %s\n%!" n verdict;
-        if verdict = "EQUIVALENT" then incr n_eq;
+        if verdict = "EQUIVALENT" then incr n_eq
+        else if String.length verdict >= 12
+                && String.sub verdict 0 12 = "UNCOMPARABLE" then incr n_unc;
         Buffer.add_string buf
           (Printf.sprintf "HIER %-34s %s%s\n" n verdict
              (if kids = [] then ""
               else "  [children abstracted: " ^ String.concat "," kids ^ "]"))
     | _ -> ()) ordered;
+  (* Report UNCOMPARABLE separately.  Folding it into the DIFFER remainder
+     overstates how much actually differs — in the Vivado-netlist-vs-emission
+     run, 11 of 23 "DIFFER" verdicts were modules sharing no port at all. *)
   Buffer.add_string buf
-    (Printf.sprintf "HIER-SUMMARY %d/%d modules EQUIVALENT%s"
+    (Printf.sprintf "HIER-SUMMARY %d/%d modules EQUIVALENT, %d DIFFER, %d UNCOMPARABLE%s"
        !n_eq (List.length ordered)
+       (List.length ordered - !n_eq - !n_unc) !n_unc
        (if !n_eq = List.length ordered && ordered <> []
         then " → whole design EQUIVALENT (assume-guarantee)" else ""));
   Buffer.contents buf
