@@ -372,6 +372,56 @@ let ram64m_body ~inits =
   empty_mod name signals [seq; comb]
 
 (* ---------------------------------------------------------------------- *)
+(* RAM32X1D: 32x1 dual-port distributed RAM (Vivado unisim RAM32X1D.v).     *)
+(*   posedge WCLK, WE:  mem[{A4..A0}] <= D                                  *)
+(*   SPO = mem[{A4..A0}]      DPO = mem[{DPRA4..DPRA0}]     (async reads)    *)
+(* Same shape as ram64m_body -- mem is one 32-bit register, the read a       *)
+(* dynamic bit-select and the write a mask/shift update -- but the address   *)
+(* arrives as five SCALAR pins rather than a bus, so it is concatenated      *)
+(* MSB-first here.  Without this model every module built on RAM32X1D (the   *)
+(* open flow's async FIFOs and elastic buffers) was UNPROVABLE: augment_xil_ *)
+(* models left it uninterpreted, its internal state read as zero, and        *)
+(* miter_hier reported a spurious DIFFER that looks exactly like a real bug. *)
+(* ---------------------------------------------------------------------- *)
+let ram32x1d_body ~init =
+  let w32 = BInt { width = 32; signed = Unsigned } in
+  let bnot e = BUnOp  { op = BNot; operand = e; result_type = w32 } in
+  let band a b = BBinOp { op = BAnd; lhs = a; rhs = b; result_type = w32 } in
+  let bor  a b = BBinOp { op = BOr;  lhs = a; rhs = b; result_type = w32 } in
+  let bshl a b = BBinOp { op = BShl; lhs = a; rhs = b; result_type = w32 } in
+  let k32 z = BConst { value = z; width = 32 } in
+  let zext1 e = BConcat [ BConst { value = Z.zero; width = 31 }; e ] in
+  (* MSB-first, so bit i of the index is pin i -- {A4,A3,A2,A1,A0}. *)
+  let addr_of pfx =
+    BConcat (List.map (fun i -> v (Printf.sprintf "%s%d" pfx i)) [4; 3; 2; 1; 0]) in
+  let wa = addr_of "A" and ra = addr_of "DPRA" in
+  let set_bit mem idx di =
+    bor (band mem (bnot (bshl (k32 Z.one) idx))) (bshl (zext1 di) idx) in
+  let mem_init =
+    if only_binary init then (try Z.of_string ("0b" ^ init) with _ -> Z.zero)
+    else Z.zero in
+  let seq = BSequential
+    { name = "seq"; clock = "WCLK"; clock_edge = `Pos;
+      reset = None; reset_edge = None; reset_async = false;
+      body = [ BAssign { lhs = "mem";
+                         rhs = BCond { condition = v "WE";
+                                       then_val = set_bit (v "mem") wa (v "D");
+                                       else_val = v "mem" } } ];
+      blocking_vars = [] } in
+  let comb = BCombinational
+    { name = "comb"; sensitivity = [BAny];
+      body = [ BAssign { lhs = "SPO"; rhs = BSelect { array = v "mem"; index = wa } };
+               BAssign { lhs = "DPO"; rhs = BSelect { array = v "mem"; index = ra } } ] } in
+  let addr_pins pfx = List.init 5 (fun i -> sig_ (Printf.sprintf "%s%d" pfx i) `Input ()) in
+  let signals =
+    [ sig_ "WCLK" `Input (); sig_ "WE" `Input (); sig_ "D" `Input ();
+      sig_ "SPO" `Output (); sig_ "DPO" `Output ();
+      { name = "mem"; stype = w32; direction = `Internal;
+        initial_value = Some (k32 mem_init); attrs = [] } ]
+    @ addr_pins "A" @ addr_pins "DPRA" in
+  empty_mod ("RAM32X1D__" ^ name_frag init) signals [seq; comb]
+
+(* ---------------------------------------------------------------------- *)
 (* Dispatch: binstance -> specialised body bmodule (or None if unknown).   *)
 (* ---------------------------------------------------------------------- *)
 let lut_arity = function
@@ -431,6 +481,12 @@ let synth (i : binstance) : bmodule option =
           | Some s -> normalize_init ~k:6 s | None -> String.make 64 '0' in
         Some (ram64m_body ~inits:[ ("INIT_A", ini "INIT_A"); ("INIT_B", ini "INIT_B")
                                  ; ("INIT_C", ini "INIT_C"); ("INIT_D", ini "INIT_D") ])
+    | "RAM32X1D" ->
+        (* INIT is 32-bit; normalize_init ~k:5 renders 2^5 = 32 bits MSB-first,
+           so INIT[0] (address 0) is the last character -- same convention as
+           RAM64M/SRLC32E above. *)
+        let raw = match param_lookup i "INIT" with Some s -> s | None -> "0" in
+        Some (ram32x1d_body ~init:(normalize_init ~k:5 raw))
     | "SRL16E" | "SRL16" ->
         (* INIT is 16-bit; normalize_init ~k:4 renders 2^4 = 16 bits MSB-first *)
         let raw = match param_lookup i "INIT" with Some s -> s | None -> "0" in

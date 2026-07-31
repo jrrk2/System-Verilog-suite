@@ -1267,6 +1267,37 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
         match Hashtbl.find_opt u2 n with Some w2 -> w2 = w | None -> false)
         undriven1
     in
+    (* Why a blackbox output can escape the tie: this set requires
+       direction = `Internal AND the same name+width on both sides.  A net
+       driven only by an UNMODELLED primitive instance (MMCME2_ADV.LOCKED,
+       GTXE2_CHANNEL outputs, ...) is undriven by processes, so it belongs
+       here -- but if either frontend gives it a different direction or a
+       different name after flattening, it silently becomes two independent
+       free variables and Z3 manufactures a counterexample.  Set
+       Z3_MITER_DEBUG_TIES=<name> to see which side drops it. *)
+    (match Sys.getenv_opt "Z3_MITER_DEBUG_TIES" with
+     | Some pat ->
+         let show tag l =
+           let hits = List.filter (fun (n,_) ->
+             let re = Str.regexp_string pat in
+             (try ignore (Str.search_forward re n 0); true with Not_found -> false)) l in
+           Printf.printf "[ties] %s: %d match(es) for '%s': %s\n" tag
+             (List.length hits) pat
+             (String.concat ", " (List.map (fun (n,w) -> Printf.sprintf "%s/%d" n w)
+                                    (List.filteri (fun i _ -> i < 6) hits))) in
+         show "undriven-d1" undriven1;
+         show "undriven-d2" undriven2;
+         show "tied" shared_undriven;
+         let sig_dir tag (m : bmodule) =
+           List.iter (fun (s : bsignal) ->
+             if (try ignore (Str.search_forward (Str.regexp_string pat) s.name 0); true
+                 with Not_found -> false) then
+               Printf.printf "[ties] %s signal %s dir=%s width=%d\n" tag s.name
+                 (match s.direction with `Internal -> "Internal" | `Input -> "Input"
+                  | `Output -> "Output" | _ -> "other")
+                 (width_of_btype s.stype)) m.signals in
+         sig_dir "d1" bmod1; sig_dir "d2" bmod2
+     | None -> ());
     if shared_undriven <> [] then begin
       Printf.printf "Matching %d undriven internal signal(s) across designs\n"
         (List.length shared_undriven);

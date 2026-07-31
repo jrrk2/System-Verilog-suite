@@ -415,15 +415,41 @@ let run_gen floorplan_json ~get_bmod ~get_j =
              Hashtbl.replace colcount s.sx ((try Hashtbl.find colcount s.sx with Not_found -> 0) + 1)
          | None -> ()) (List.rev !dram);
      Printf.eprintf "DRAM spread: fixed %d DRAM across SLICEM cols (<=%d/col)\n" !nplaced percol);
+  (* REGION SHAPE.  "K nearest sites to the anchor" -- the METRIC picks the
+     shape, and the SA only ever moves/swaps within the region, so this is the
+     final outline of the design.  Ranking by L1 (|dx|+|dy|) yields a DIAMOND:
+     it minimises the worst-case Manhattan span, but it wastes half its
+     bounding box on the four corner triangles (an L1 ball of radius R holds
+     2R^2 sites inside a 2Rx2R box), so it reaches ~41% further along each axis
+     than the rectangle holding the same K.  The SA cost here IS bbox
+     half-perimeter, so the diamond fights its own objective; worse, column x
+     of a diamond offers only 2(R-|dx|) rows, tapering to ~1 at the tips, which
+     is too few consecutive rows for the CARRY4 columns to legalise into.
+     Default to a RECTANGLE (Chebyshev), with L1 as tiebreak so the outermost
+     ring -- where the K cut lands mid-ring -- fills evenly instead of raggedly.
+     Measured on the eth-arp floorplan (K=7737 of 75900 SLICE sites):
+       L1 diamond   bbox 128x133 (45% used), min 1 row/col
+       rect asp 1.0 bbox  95x 95 (86% used), min 11 rows/col
+       rect asp 2.0 bbox  67x135 (86% used), min 33 rows/col
+     TOPO_REGION_ASPECT weights dx, so the region is 2R/aspect wide by 2R tall:
+     1.0 is square in SLICE-index units, 0.5 square in CLB-TILE counts (SLICE_X
+     advances 2 per CLB column), 2.0 roughly square in microns.  Which one wins
+     is a routing-delay question, not a geometric one -- sweep it against Fmax.
+     TOPO_REGION_SHAPE=diamond restores the old L1 ball. *)
+  let region_shape  = getenv_default "TOPO_REGION_SHAPE" "rect" in
+  let region_aspect = getenv_float "TOPO_REGION_ASPECT" 1.0 in
+  let region_rank s =
+    let dx = float_of_int (abs (s.sx - anchor_cx)) *. region_aspect
+    and dy = float_of_int (abs (s.sy - anchor_cy)) in
+    if region_shape = "diamond" then (dx +. dy, 0.0)
+    else (Stdlib.max dx dy, dx +. dy) in
   let region_sites =
     if mode = "greedy" then all_slices
     else begin
       let k = int_of_float (ceil (float n_slice /. fill)) in
       (* only free sites are eligible (reserved macro sites are already used) *)
       let arr = Array.of_list (List.filter (fun s -> not s.used) all_slices) in
-      Array.sort (fun a b ->
-          compare (abs (a.sx - anchor_cx) + abs (a.sy - anchor_cy))
-                  (abs (b.sx - anchor_cx) + abs (b.sy - anchor_cy))) arr;
+      Array.sort (fun a b -> compare (region_rank a) (region_rank b)) arr;
       let k = min k (Array.length arr) in
       Array.to_list (Array.sub arr 0 k)
     end in
@@ -1067,6 +1093,17 @@ let run_gen floorplan_json ~get_bmod ~get_j =
   (* ======================================================================= *)
   Printf.printf "mode=%s  region=%d sites (fill target %.2f, n_slice=%d)\n"
     mode (Array.length region_arr) fill n_slice;
+  if region_arr <> [||] then begin
+    let rx0 = Array.fold_left (fun a s -> min a s.sx) max_int region_arr
+    and rx1 = Array.fold_left (fun a s -> max a s.sx) min_int region_arr
+    and ry0 = Array.fold_left (fun a s -> min a s.sy) max_int region_arr
+    and ry1 = Array.fold_left (fun a s -> max a s.sy) min_int region_arr in
+    let w = rx1 - rx0 + 1 and h = ry1 - ry0 + 1 in
+    Printf.printf "region shape=%s aspect=%.2f anchor=(%d,%d) \
+                   bbox X[%d..%d] Y[%d..%d] = %dx%d, %.0f%% of bbox used\n"
+      region_shape region_aspect anchor_cx anchor_cy rx0 rx1 ry0 ry1 w h
+      (100. *. float_of_int (Array.length region_arr) /. float_of_int (w * h))
+  end;
   (match mode with
    | "analytic" -> analytic (); anneal_multi ()
    | "sa"       -> constructive (); let h0, _ = total_hpwl () in

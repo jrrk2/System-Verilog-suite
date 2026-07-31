@@ -25,10 +25,50 @@ open Behavioral_ir
 let xil_json_ports : (string, (string * [`Input|`Output] * int) list) Hashtbl.t Lazy.t =
   lazy (
     let tbl = Hashtbl.create 64 in
+    (* The default USED to be a hardcoded $HOME/System-Verilog-suite path.  That
+       directory does not exist when the suite is vendored as a submodule
+       (deps/System-Verilog-suite), so the oracle silently loaded NOTHING and
+       every Xilinx hard primitive lost its port list -- which degrades quietly
+       rather than failing: box_ports returns [], the canonical ufo__ cut is
+       skipped, and miter boundaries around MMCM/GT/BRAM stop pairing across
+       flows.  Resolve relative to the running executable first, then the old
+       path, and honour XIL_PRIM_PORTS_JSON above both. *)
+    let candidates =
+      let exe_dir = Filename.dirname Sys.executable_name in
+      let rel = Filename.concat "xilinx_lef" "xil_primitive_ports.json" in
+      [ (* _build/default/<exe> -> repo root is ../.. *)
+        Filename.concat (Filename.concat exe_dir "../..") rel;
+        Filename.concat exe_dir rel;
+        Filename.concat (Sys.getcwd ()) rel;
+        "/home/jonathan/System-Verilog-suite/xilinx_lef/xil_primitive_ports.json" ] in
     let path =
       try Sys.getenv "XIL_PRIM_PORTS_JSON"
       with Not_found ->
-        "/home/jonathan/System-Verilog-suite/xilinx_lef/xil_primitive_ports.json" in
+        (try List.find Sys.file_exists candidates
+         with Not_found -> List.hd candidates) in
+    (* BOMB rather than degrade.  A missing oracle is invisible at the call
+       sites -- box_ports just returns [], so no Xilinx primitive gets a
+       canonical key, none gets the ufo__/ufi__ boundary cut, and every miter
+       around an MMCM/GT/BRAM silently compares unpaired free variables and
+       manufactures counterexamples.  That cost a whole day of chasing five
+       "divergences" that were all this one dead path.  Set
+       XIL_PRIM_PORTS_OPTIONAL=1 for a flow that genuinely has no Xilinx
+       primitives. *)
+    if not (Sys.file_exists path) then begin
+      if Sys.getenv_opt "XIL_PRIM_PORTS_OPTIONAL" = None then
+        failwith (Printf.sprintf
+          "xil_primitive_ports.json NOT FOUND (tried: %s).  Without it every \
+           Xilinx hard primitive (MMCME2_ADV, GTXE2_*, RAMB36E1, ...) loses \
+           its port list, so miter boundaries around them stop pairing and \
+           equivalence results become meaningless.  Set XIL_PRIM_PORTS_JSON \
+           to the file, or XIL_PRIM_PORTS_OPTIONAL=1 if this design has no \
+           Xilinx primitives."
+          (String.concat ", " candidates))
+      else
+        Printf.eprintf
+          "WARNING: xil_primitive_ports.json not found (%s); Xilinx primitive \
+           port lists unavailable (XIL_PRIM_PORTS_OPTIONAL=1)\n%!" path
+    end;
     (try
        (match Yojson.Safe.from_file path with
         | `Assoc cells ->
@@ -46,7 +86,17 @@ let xil_json_ports : (string, (string * [`Input|`Output] * int) list) Hashtbl.t 
                   Hashtbl.replace tbl cn plist
               | _ -> ()) cells
         | _ -> ())
-     with _ -> ());
+     with e ->
+       (* Also bomb on a malformed/unreadable oracle: a parse failure here used
+          to be swallowed, leaving the same silently-empty table. *)
+       if Sys.getenv_opt "XIL_PRIM_PORTS_OPTIONAL" = None then
+         failwith (Printf.sprintf
+           "xil_primitive_ports.json at %s failed to parse: %s"
+           path (Printexc.to_string e)));
+    if Hashtbl.length tbl = 0 && Sys.getenv_opt "XIL_PRIM_PORTS_OPTIONAL" = None
+    then failwith (Printf.sprintf
+      "xil_primitive_ports.json at %s parsed to ZERO cells -- the oracle is \
+       empty, which silently disables every primitive port lookup." path);
     tbl)
 
 (* -------------- EDIF identifier safety -------------- *)

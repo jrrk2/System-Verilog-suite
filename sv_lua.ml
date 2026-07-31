@@ -259,7 +259,54 @@ let load_frontend ~frontend ~top ~files : bprogram =
       (match files with
        | [j] ->
            (match Verilator_to_behavioral.convert_verilator_json_to_behavioral j with
-            | Some p -> post_load p
+            | Some p ->
+                (* DROP any module that is a known Xilinx PRIMITIVE.  Verilator
+                   cannot elaborate without a definition for every instantiated
+                   module, so a verilator-frontend run must be given cell
+                   models (or stubs) that the verible frontend never reads.
+                   Keeping them makes the two sides asymmetric in BOTH
+                   directions: with real bodies verilator has behaviour verible
+                   lacks; with empty stubs verilator has an empty module where
+                   verible gets an augment_xil_models MODEL.  Either way every
+                   primitive-bearing module miters as DIFFER for setup reasons.
+                   Dropping them here leaves the instances UNRESOLVED, exactly
+                   as the verible parse does, so augment_xil_models supplies the
+                   SAME model to both sides and the boundary cut pairs.
+                   SVS_VERILATOR_KEEP_PRIMS=1 restores the old behaviour. *)
+                let p =
+                  if Sys.getenv_opt "SVS_VERILATOR_KEEP_PRIMS" <> None then p
+                  else begin
+                    let prims = Lazy.force Bir_to_edif.xil_json_ports in
+                    (* Verilator specialises parameterised primitives
+                       (FDPE__Iz153, IBUFDS__pi1), which miss an exact oracle
+                       lookup while still being primitives.  Strip only the
+                       LAST "__" suffix and require the remainder to be a real
+                       oracle entry -- Fpga_prim_expand.norm_clone cuts at the
+                       FIRST "__", which mangles design module names into
+                       spurious oracle hits (it dropped 207 modules instead of
+                       the ~11 primitives and regressed clocking/gt_common). *)
+                    let base n =
+                      let rec last i acc =
+                        if i + 1 >= String.length n then acc
+                        else last (i + 1)
+                               (if n.[i] = '_' && n.[i+1] = '_' then Some i else acc) in
+                      match last 1 None with
+                      | Some i -> String.sub n 0 i
+                      | None -> n in
+                    let keep (m : Behavioral_ir.bmodule) =
+                      not (Hashtbl.mem prims m.name)
+                      && not (Hashtbl.mem prims (base m.name)) in
+                    let kept = List.filter keep p.Behavioral_ir.modules in
+                    let dropped =
+                      List.length p.Behavioral_ir.modules - List.length kept in
+                    if dropped > 0 then
+                      Printf.eprintf
+                        "[verilator] dropped %d primitive module definition(s) \
+                         so they stay unresolved (matches the verible frontend; \
+                         SVS_VERILATOR_KEEP_PRIMS=1 to keep)\n%!" dropped;
+                    { p with Behavioral_ir.modules = kept }
+                  end in
+                post_load p
             | None -> failwith "verilator JSON parse failed")
        | _ -> failwith "verilator frontend takes a single .json")
   | "synlig" ->
@@ -1193,9 +1240,40 @@ let lmiter_hier a_prog_h b_prog_h top =
   let _, pa_raw = find_prog a_prog_h in
   let _, pb_raw = find_prog b_prog_h in
   let names p = List.map (fun (m : bmodule) -> m.name) p.modules in
-  let common =
-    let nb = names pb_raw in
-    List.filter (fun n -> List.mem n nb) (names pa_raw) in
+  (* NAME MAPPING across flows.  Exact-name intersection only pairs the
+     UNPARAMETERISED modules: verible emits SVS specialisations
+     (`eth_mac_1g__EP1_MFL64`, `async_fifo_wr__DW72_AW5`) while another
+     frontend/flow names its elaborated clones differently, so everything
+     below the top of the design silently drops out of the comparison --
+     precisely the levels where a real divergence would show.  Pair on
+     Fpga_prim_expand.norm_clone (strips the variant suffix at the first
+     "__", the same key the canonical boundary cut uses), but ONLY when the
+     normalised key is unambiguous on both sides; an exact match always wins
+     so unparameterised modules are unaffected. *)
+  let b_of : (string, string) Hashtbl.t = Hashtbl.create 64 in
+  let nb = names pb_raw in
+  let group l =
+    let h : (string, string list ref) Hashtbl.t = Hashtbl.create 64 in
+    List.iter (fun n ->
+      let k = Fpga_prim_expand.norm_clone n in
+      match Hashtbl.find_opt h k with
+      | Some r -> r := n :: !r
+      | None -> Hashtbl.add h k (ref [ n ])) l;
+    h in
+  let gb = group nb in
+  let n_mapped = ref 0 in
+  List.iter (fun na ->
+    if List.mem na nb then Hashtbl.replace b_of na na
+    else
+      match Hashtbl.find_opt gb (Fpga_prim_expand.norm_clone na) with
+      | Some { contents = [ nb1 ] } ->
+          Hashtbl.replace b_of na nb1; incr n_mapped
+      | _ -> ()) (names pa_raw);
+  if !n_mapped > 0 then
+    Printf.eprintf "HIER name-mapping: %d module(s) paired by normalised name\n%!"
+      !n_mapped;
+  let bname n = match Hashtbl.find_opt b_of n with Some m -> m | None -> n in
+  let common = List.filter (Hashtbl.mem b_of) (names pa_raw) in
   let by_name p n = List.find_opt (fun (m : bmodule) -> m.name = n) p.modules in
   (* leaves-first topo order over the RAW common-module instance DAG *)
   let order = ref [] and visited = Hashtbl.create 32 in
@@ -1379,19 +1457,19 @@ let lmiter_hier a_prog_h b_prog_h top =
   let n_eq = ref 0 in
   let buf = Buffer.create 256 in
   List.iter (fun n ->
-    match by_name pa n, by_name pb n with
+    match by_name pa n, by_name pb (bname n) with
     | Some ma, Some mb ->
         let kids = List.sort_uniq compare
           (List.filter_map (fun (i : binstance) ->
              if List.mem i.module_name common then Some i.module_name else None)
              (match by_name pa_raw n with Some m -> m.instances | None -> [])) in
-        let ca = const_binds pa_raw n and cb = const_binds pb_raw n in
+        let ca = const_binds pa_raw n and cb = const_binds pb_raw (bname n) in
         let input_consts =
           List.filter_map (fun (pin, v) ->
             match List.assoc_opt pin cb with
             | Some v' when Z.equal v v' -> Some (pin, v)
             | _ -> None) ca in
-        let ua = used_outputs pa_raw n and ub = used_outputs pb_raw n in
+        let ua = used_outputs pa_raw n and ub = used_outputs pb_raw (bname n) in
         (* per-BIT context masks, intersected: a bit dead on EITHER side is
            masked — a flow that proved it redundant in context (rx_clk ≡
            eth_clk; pcspma_status[15:2] unread by the LED logic) rewires or

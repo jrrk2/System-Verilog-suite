@@ -865,6 +865,12 @@ incs = rwlst attr incs;}
       (* `a += 1` used as an expression — SV permits it but
        * synthesisers reject; safer to stub than crash. *)
       "EXPRSTMT";
+      (* Verilator's AstCReset: the C-level "zero this variable" node it emits
+       * for static/initial initialisation.  It carries no expression, only a
+       * target, and BIR signals already hold their initial_value — so a
+       * stand-in is exactly right.  Without this the whole verilator-frontend
+       * import of the eth-arp sources aborts with Failure("othrw"). *)
+      "CRESET";
       (* `s.field` — proper handling needs a dtype map on the
        * Verilator side. Stub for now so other modules in the same
        * file still convert. TODO: add real STRUCTSEL handler. *)
