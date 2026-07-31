@@ -163,6 +163,28 @@ let rec eval_cw tok : (int * int) option =
              | Some _ -> Some (av, aw)      (* zero-width: skip *)
              | None -> None)) (Some (0, 0)) elems in
       (match r with Some (_, 0) -> None | _ -> r)
+  (* `PARAM[i]` as a constant override value.  Xilinx's reset_sync/sync_block
+     write `FDP #(.INIT(INITIALISE[0]))`; folding the base but ignoring the
+     bit-select silently substitutes the WHOLE parameter (INITIALISE = 2'b11
+     -> INIT=3 on a 1-bit FF).  Yield the selected bit, width 1. *)
+  | TUPLE3 (STRING t, ref_node, TUPLE4 (STRING dt, _, idx, _))
+    when prefix_is "reference" t && t <> "reference1"
+      && prefix_is "select_variable_dimension" dt ->
+      let base =
+        match eval_cw ref_node with
+        | Some vw -> Some vw
+        | None ->
+            let nm = ref None in
+            walk (function
+              | SymbolIdentifier id when !nm = None -> nm := Some id
+              | _ -> ()) ref_node;
+            (match !nm with
+             | Some id -> Hashtbl.find_opt param_vw id
+             | None -> None) in
+      (match base, eval_cw idx with
+       | Some (v, _), Some (i, _) when i >= 0 && i < Sys.int_size ->
+           Some ((v lsr i) land 1, 1)
+       | _ -> None)
   | SymbolIdentifier id -> Hashtbl.find_opt param_vw id
   | TUPLE4 (STRING tag, _, _, TUPLE3 (STRING tg2, SymbolIdentifier name, _))
     when prefix_is "qualified_id" tag && prefix_is "unqualified_id" tg2 ->

@@ -209,6 +209,30 @@ let rec eval_int ~pkgs ~params tok =
         | TK_OctDigits n -> s := !s ^ n
         | _ -> ()) digits;
       (try Some (int_of_string ("0o" ^ !s)) with _ -> None)
+  (* `PARAM[i]` in a CONSTANT expression.  Xilinx's reset_sync / sync_block
+     instantiate `FDP #(.INIT(INITIALISE[0]))` / `INITIALISE[1]`; without this
+     case the bit-select was ignored and the WHOLE parameter became the value,
+     so `INITIALISE = 2'b11` emitted `.INIT(3)` on a 1-bit FDP where the source
+     means 1.  (Benign only while the selected bit happens to equal the whole
+     value -- sync_block's 2'b00 was correct by luck.)  Extract the bit. *)
+  | TUPLE3 (STRING t, ref_node, TUPLE4 (STRING dt, _, idx, _))
+    when prefix_is "reference" t && t <> "reference1"
+      && prefix_is "select_variable_dimension" dt ->
+      let base =
+        match eval_int ~pkgs ~params ref_node with
+        | Some b -> Some b
+        | None ->
+            (* the base may be wrapped (reference_or_call_base ...) -- take the
+               first identifier under it and resolve that. *)
+            let nm = ref None in
+            walk (function
+              | SymbolIdentifier id when !nm = None -> nm := Some id
+              | _ -> ()) ref_node;
+            (match !nm with Some id -> lookup id | None -> None) in
+      (match base, eval_int ~pkgs ~params idx with
+       | Some b, Some i when i >= 0 && i < Sys.int_size ->
+           Some ((b lsr i) land 1)
+       | _ -> None)
   | SymbolIdentifier id -> lookup id
   (* `pkg::name` — a package-scoped constant (e.g. dm::Idle, an enum member
    * now in the package's params via convert_files_inner's augmentation).
