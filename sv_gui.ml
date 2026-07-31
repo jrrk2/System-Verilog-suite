@@ -1647,6 +1647,31 @@ let bel_xy s =
             int_of_string (Str.matched_group 2 s))
   with Not_found -> None
 
+(* place_lef/carry_stamp always emit a bels.txt sibling (cellname<TAB>BEL);
+   pull placement from it when the JSON carries no NEXTPNR_BEL -- an aborted or
+   incomplete route never writes the routed JSON.  bels.txt names may carry a
+   place_lef packing suffix ($carry/$mux/...) absent from the JSON connectivity,
+   so index each position under BOTH the full and the $-stripped name. *)
+let read_bels_txt dir pos =
+  let f = Filename.concat dir "bels.txt" in
+  if Sys.file_exists f then
+    (try
+       let ic = open_in f in
+       (try while true do
+          match String.split_on_char '\t' (input_line ic) with
+          | cn :: bel :: _ ->
+              (match bel_xy bel with
+               | Some xy ->
+                   Hashtbl.replace pos cn xy;
+                   (match String.rindex_opt cn '$' with
+                    | Some i when i > 0 -> Hashtbl.replace pos (String.sub cn 0 i) xy
+                    | _ -> ())
+               | None -> ())
+          | _ -> ()
+        done with End_of_file -> ());
+       close_in ic
+     with _ -> ())
+
 let parse_nextpnr_json path =
   let j = Yojson.Safe.from_file path in
   let modules = jassoc (jmem "modules" j) in
@@ -1657,24 +1682,14 @@ let parse_nextpnr_json path =
     with Not_found -> (match modules with x :: _ -> x | [] -> ("", `Null)) in
   let cells = jassoc (jmem "cells" tm) in
   let pos   = Hashtbl.create 8192 in
-  let comps = ref [] in
-  let minx = ref max_int and maxx = ref min_int
-  and miny = ref max_int and maxy = ref min_int in
+  let ctype = Hashtbl.create 8192 in
+  let drv   = Hashtbl.create 16384 and snk = Hashtbl.create 16384 in
   List.iter (fun (cn, cv) ->
-    let ctype = jstr (jmem "type" cv) in
+    Hashtbl.replace ctype cn (jstr (jmem "type" cv));
     let attrs = jmem "attributes" cv in
     let bel   = jstr (jmem "NEXTPNR_BEL" attrs) in
     let bel   = if bel = "" then jstr (jmem "BEL" attrs) else bel in
-    match bel_xy bel with
-    | Some (x, y) ->
-        Hashtbl.replace pos cn (x, y);
-        comps := { p_inst = cn; p_cell = ctype; p_x = x; p_y = y; p_orient = "N" } :: !comps;
-        if x < !minx then minx := x;  if x > !maxx then maxx := x;
-        if y < !miny then miny := y;  if y > !maxy then maxy := y
-    | None -> ()) cells;
-  (* bit -> driver cell, bit -> sink cells *)
-  let drv = Hashtbl.create 16384 and snk = Hashtbl.create 16384 in
-  List.iter (fun (cn, cv) ->
+    (match bel_xy bel with Some xy -> Hashtbl.replace pos cn xy | None -> ());
     let conns = jassoc (jmem "connections" cv) in
     let dirs  = jassoc (jmem "port_directions" cv) in
     List.iter (fun (port, bits) ->
@@ -1685,6 +1700,17 @@ let parse_nextpnr_json path =
             else Hashtbl.replace snk b
                    (cn :: (try Hashtbl.find snk b with Not_found -> []))
         | _ -> ()) (jlist bits)) conns) cells;
+  if Hashtbl.length pos = 0 then read_bels_txt (Filename.dirname path) pos;
+  let comps = ref [] in
+  let minx = ref max_int and maxx = ref min_int
+  and miny = ref max_int and maxy = ref min_int in
+  Hashtbl.iter (fun cn (x, y) ->
+    if Hashtbl.mem ctype cn then begin
+      comps := { p_inst = cn; p_cell = Hashtbl.find ctype cn;
+                 p_x = x; p_y = y; p_orient = "N" } :: !comps;
+      if x < !minx then minx := x;  if x > !maxx then maxx := x;
+      if y < !miny then miny := y;  if y > !maxy then maxy := y
+    end) pos;
   let netnames = jassoc (jmem "netnames" tm) in
   let nets = ref [] in
   List.iter (fun (nn, nv) ->
