@@ -2054,25 +2054,31 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
    * PLING → logical NOT (= reduce-OR + NOT), PLUS → no-op. *)
   | TUPLE3 (STRING tag, op_tok, operand) when prefix_is "unary_prefix_expr" tag ->
       let inner = recurse operand in
-      let result_t = dummy_bool in
-      let red op = BUnOp { op; operand = inner; result_type = result_t } in
+      (* Unary result WIDTH.  A reduction (&, |, ^ and the ~-prefixed forms,
+         and !) yields 1 bit, but `~x` and `-x` keep the OPERAND's width.
+         This site stamped dummy_bool -- 1 bit -- on every unary op, so
+         `~b[5:4]` claimed width 1.  Inside a concat that made
+         `{~b[5:4], b[3:0]}` 5 bits instead of 6, and the enclosing
+         comparison then silently returned the wrong answer: async_fifo_wr's
+         `wr_full = (wr_gray == {~rd_gray_wsync2[5:4], rd_gray_wsync2[3:0]})`
+         evaluated to the exact INVERSE of the correct value, which is a full
+         FIFO reported as not-full and vice versa.  [result_type_for_un]
+         already encodes the right rule; use it instead of a constant. *)
+      let un op operand =
+        BUnOp { op; operand; result_type = result_type_for_un op operand } in
+      let red op = un op inner in
       (match op_tok with
-       | TILDE                -> BUnOp { op = BNot; operand = inner; result_type = result_t }
-       | HYPHEN               -> BUnOp { op = BNeg; operand = inner; result_type = result_t }
+       | TILDE                -> un BNot inner
+       | HYPHEN               -> un BNeg inner
        | PLUS                 -> inner
        | AMPERSAND            -> red BRedAnd
        | VBAR                 -> red BRedOr
        | CARET                -> red BRedXor
-       | TILDE_AMPERSAND      ->
-           BUnOp { op = BNot; operand = red BRedAnd; result_type = result_t }
-       | TILDE_VBAR           ->
-           BUnOp { op = BNot; operand = red BRedOr; result_type = result_t }
-       | TILDE_CARET          ->
-           BUnOp { op = BNot; operand = red BRedXor; result_type = result_t }
-       | PLING                ->
-           BUnOp { op = BNot; operand = red BRedOr; result_type = result_t }
-       | _                    ->
-           BUnOp { op = BNot; operand = inner; result_type = result_t })
+       | TILDE_AMPERSAND      -> un BNot (red BRedAnd)
+       | TILDE_VBAR           -> un BNot (red BRedOr)
+       | TILDE_CARET          -> un BNot (red BRedXor)
+       | PLING                -> un BNot (red BRedOr)
+       | _                    -> un BNot inner)
   | TUPLE3 (STRING _, a, b) ->
       (* Generic single-content wrapper. Verible puts the meaningful
        * subtree in slot 1 most of the time (slot 2 is usually
