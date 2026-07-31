@@ -1995,10 +1995,23 @@ let cleanup_netlist (j : Y.t) : Y.t =
    untouched.  GT/MMCM blackbox params are left as strings (nextpnr passes them). *)
 let normalise_init (j : Y.t) : Y.t =
   let module U = Yojson.Safe.Util in
-  let is_prim t =
-    let pre p = String.length t >= String.length p && String.sub t 0 (String.length p) = p in
-    pre "LUT" || pre "FD" || pre "SRL" in
-  (* "N'hV" / "N'bV" / "N'dV" -> MSB-first bit-string of N bits, else None *)
+  (* hex digit string -> MSB-first bit-string (x/z -> 0), any length. *)
+  let hex_bits digits =
+    let buf = Buffer.create (4 * String.length digits) in
+    String.iter (fun c ->
+      let v = match c with
+        | '0'..'9' -> Char.code c - Char.code '0'
+        | 'a'..'f' -> Char.code c - Char.code 'a' + 10
+        | 'A'..'F' -> Char.code c - Char.code 'A' + 10
+        | 'x' | 'X' | 'z' | 'Z' -> 0
+        | _ -> raise Exit in
+      for k = 3 downto 0 do Buffer.add_char buf (if (v lsr k) land 1 = 1 then '1' else '0') done)
+      digits;
+    Buffer.contents buf in
+  (* Verilog literal "N'hV" / "N'bV" / "N'dV" -> MSB-first bit-string of N bits
+     (left-pad / low-truncate), else None.  Numeric literals are always numeric,
+     so this is safe for LUT/FF INIT *and* GT/MMCM CFG params (nextpnr reads the
+     latter via as_int64/write_int_vector, which assert on a string). *)
   let lit_to_bits s =
     match String.index_opt s '\'' with
     | Some q when q > 0 && q + 1 < String.length s ->
@@ -2007,41 +2020,40 @@ let normalise_init (j : Y.t) : Y.t =
          let base  = Char.lowercase_ascii s.[q + 1] in
          let digits = String.concat "" (String.split_on_char '_'
                         (String.sub s (q + 2) (String.length s - q - 2))) in
-         let value = (match base with
-           | 'h' -> Int64.of_string ("0x" ^ digits)
-           | 'b' -> Int64.of_string ("0b" ^ digits)
-           | 'd' -> Int64.of_string digits
-           | _   -> raise Exit) in
-         if width <= 0 || width > 64 then None
-         else begin
-           let b = Buffer.create width in
-           for i = width - 1 downto 0 do
-             Buffer.add_char b
-               (if Int64.logand (Int64.shift_right_logical value i) 1L = 1L then '1' else '0')
-           done;
-           Some (Buffer.contents b)
-         end
+         if width <= 0 then None
+         else
+           let raw = match base with
+             | 'h' -> hex_bits digits
+             | 'b' -> String.map (fun c -> match c with 'x'|'X'|'z'|'Z' -> '0' | c -> c) digits
+             | 'd' when width <= 62 ->
+                 let v = Int64.of_string digits in
+                 String.init width (fun i ->
+                   if Int64.logand (Int64.shift_right_logical v (width - 1 - i)) 1L = 1L then '1' else '0')
+             | _ -> raise Exit in
+           let n = String.length raw in
+           Some (if n >= width then String.sub raw (n - width) width
+                 else String.make (width - n) '0' ^ raw)
        with _ -> None)
     | _ -> None in
   let nfix = ref 0 in
+  (* Normalise EVERY Verilog-numeric-literal param on EVERY cell (a genuine
+     string param -- an enum/mode -- carries no apostrophe, so is left alone). *)
   let fix_cell (cn, cj) =
-    let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
-    if not (is_prim t) then (cn, cj)
-    else match cj with
-      | `Assoc a ->
-        (cn, `Assoc (List.map (fun (k, v) ->
-           if k <> "parameters" then (k, v)
-           else match v with
-             | `Assoc ps ->
-               (k, `Assoc (List.map (fun (pk, pv) ->
-                  match pk, pv with
-                  | "INIT", `String s when String.contains s '\'' ->
-                    (match lit_to_bits s with
-                     | Some bits -> incr nfix; (pk, `String bits)
-                     | None -> (pk, pv))
-                  | _ -> (pk, pv)) ps))
-             | _ -> (k, v)) a))
-      | _ -> (cn, cj) in
+    match cj with
+    | `Assoc a ->
+      (cn, `Assoc (List.map (fun (k, v) ->
+         if k <> "parameters" then (k, v)
+         else match v with
+           | `Assoc ps ->
+             (k, `Assoc (List.map (fun (pk, pv) ->
+                match pv with
+                | `String s when String.contains s '\'' ->
+                  (match lit_to_bits s with
+                   | Some bits -> incr nfix; (pk, `String bits)
+                   | None -> (pk, pv))
+                | _ -> (pk, pv)) ps))
+           | _ -> (k, v)) a))
+    | _ -> (cn, cj) in
   let fix_mod mj =
     match mj |> U.member "cells" with
     | `Assoc cells ->
