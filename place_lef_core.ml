@@ -1986,6 +1986,80 @@ let cleanup_netlist (j : Y.t) : Y.t =
   if !ndrop > 0 then Printf.eprintf "[cleanup] dropped %d inert ($-no-conn) cell(s)\n%!" !ndrop;
   r
 
+(* Pre-instantiated primitives (the PCS core's LUT/FF/SRL instances) carry INIT
+   as a Verilog literal string ("64'hABCD", "4'h7") rather than a [01] bit-string.
+   nextpnr's Property::extract treats INIT as a bit-string and asserts on the ' /
+   hex chars (crash at post-routing legalisation: str[i]==S0||S1||Sx||Sz).  The
+   yosys netlist feeds place_lef directly, so normalise LUT/FD/SRL INITs here to a
+   plain MSB-first bit-string of the literal's declared width -- keeping yosys
+   untouched.  GT/MMCM blackbox params are left as strings (nextpnr passes them). *)
+let normalise_init (j : Y.t) : Y.t =
+  let module U = Yojson.Safe.Util in
+  let is_prim t =
+    let pre p = String.length t >= String.length p && String.sub t 0 (String.length p) = p in
+    pre "LUT" || pre "FD" || pre "SRL" in
+  (* "N'hV" / "N'bV" / "N'dV" -> MSB-first bit-string of N bits, else None *)
+  let lit_to_bits s =
+    match String.index_opt s '\'' with
+    | Some q when q > 0 && q + 1 < String.length s ->
+      (try
+         let width = int_of_string (String.sub s 0 q) in
+         let base  = Char.lowercase_ascii s.[q + 1] in
+         let digits = String.concat "" (String.split_on_char '_'
+                        (String.sub s (q + 2) (String.length s - q - 2))) in
+         let value = (match base with
+           | 'h' -> Int64.of_string ("0x" ^ digits)
+           | 'b' -> Int64.of_string ("0b" ^ digits)
+           | 'd' -> Int64.of_string digits
+           | _   -> raise Exit) in
+         if width <= 0 || width > 64 then None
+         else begin
+           let b = Buffer.create width in
+           for i = width - 1 downto 0 do
+             Buffer.add_char b
+               (if Int64.logand (Int64.shift_right_logical value i) 1L = 1L then '1' else '0')
+           done;
+           Some (Buffer.contents b)
+         end
+       with _ -> None)
+    | _ -> None in
+  let nfix = ref 0 in
+  let fix_cell (cn, cj) =
+    let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
+    if not (is_prim t) then (cn, cj)
+    else match cj with
+      | `Assoc a ->
+        (cn, `Assoc (List.map (fun (k, v) ->
+           if k <> "parameters" then (k, v)
+           else match v with
+             | `Assoc ps ->
+               (k, `Assoc (List.map (fun (pk, pv) ->
+                  match pk, pv with
+                  | "INIT", `String s when String.contains s '\'' ->
+                    (match lit_to_bits s with
+                     | Some bits -> incr nfix; (pk, `String bits)
+                     | None -> (pk, pv))
+                  | _ -> (pk, pv)) ps))
+             | _ -> (k, v)) a))
+      | _ -> (cn, cj) in
+  let fix_mod mj =
+    match mj |> U.member "cells" with
+    | `Assoc cells ->
+      `Assoc (List.map (fun (k, v) ->
+                  if k = "cells" then (k, `Assoc (List.map fix_cell cells)) else (k, v))
+                (U.to_assoc mj))
+    | _ -> mj in
+  let r = match j |> U.member "modules" with
+    | `Assoc mods ->
+      `Assoc (List.map (fun (k, v) ->
+                  if k = "modules"
+                  then (k, `Assoc (List.map (fun (mn, mj) -> (mn, fix_mod mj)) mods))
+                  else (k, v)) (U.to_assoc j))
+    | _ -> j in
+  if !nfix > 0 then
+    Printf.eprintf "[cleanup] normalised %d Verilog-literal INIT param(s) to bit-strings\n%!" !nfix;
+  r
+
 (* ---- automatic hold buffering (FPGA_HOLD_LUT1=1) ------------------------------
    Insert an identity LUT1 (INIT="10") on every DIRECT FF->FF net — a register Q
    driving a register D with no cell between.  These zero-logic paths have no
@@ -2103,7 +2177,7 @@ let insert_hold_buffers (j : Y.t) : Y.t =
 
 (* CLI / file entry: read floorplan + netlist json from disk. *)
 let run floorplan_json netlist_json =
-  let j = insert_hold_buffers (cleanup_netlist (Y.from_file netlist_json)) in
+  let j = insert_hold_buffers (normalise_init (cleanup_netlist (Y.from_file netlist_json))) in
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
     ~get_j:(fun () -> j)
