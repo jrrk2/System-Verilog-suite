@@ -1364,12 +1364,22 @@ type placed = {
   p_orient : string;
 }
 
+(* a net for the nextpnr-JSON routing overlay: driver + sink positions
+   pre-resolved to placement coords (empty for DEF layouts). *)
+type lnet = {
+  ln_name : string;
+  ln_drv  : int * int;
+  ln_snks : (int * int) list;
+}
+
 type layout = {
   l_design     : string;
   l_units      : int;                                 (* DBU per μm *)
   l_die        : int * int * int * int;               (* x1 y1 x2 y2 in DBU *)
   l_components : placed list;
   l_macro_um   : (string, float * float) Hashtbl.t;   (* cell → (w,h) μm *)
+  l_nets       : lnet list;                           (* nextpnr routing overlay *)
+  l_hi         : (string, unit) Hashtbl.t;            (* net names to highlight *)
 }
 
 let layout_lines path =
@@ -1430,6 +1440,8 @@ let parse_def path =
     l_die        = !die;
     l_components = List.rev !comps;
     l_macro_um   = Hashtbl.create 256;
+    l_nets       = [];
+    l_hi         = Hashtbl.create 1;
   }
 
 let lef_macro_re = Str.regexp "[ \t]*MACRO[ \t]+\\([^ \t]+\\)"
@@ -1615,6 +1627,109 @@ let inst_index layout =
    Optional [path] is overlaid as a thick red polyline through the centres
    of each hop's placed instance.  Hops whose instance isn't in DEF
    (clock buffers, port-side hops) are silently skipped.               *)
+(* ---------- nextpnr placement/routing JSON reader ----------
+   nextpnr-xilinx emits a yosys-json superset: each cell carries a
+   NEXTPNR_BEL="SLICE_XxYy/slot" placement attribute, netnames map to bit
+   ids, and connections+port_directions give driver/sinks.  We render cells
+   at their BEL grid coords and overlay HIGHLIGHTED nets (driver->sinks) for
+   placement/routing debug -- e.g. the unroutable clock loads a route.log's
+   SKIP_FAILED_ARCS lines name.  Coord note: SLICE X/Y dominate; BRAM/DSP/BUFG
+   sit at their own (coarser) site X/Y, so those few are only approximate. *)
+let jmem k = function `Assoc a -> (try List.assoc k a with Not_found -> `Null) | _ -> `Null
+let jassoc = function `Assoc a -> a | _ -> []
+let jlist  = function `List l -> l | _ -> []
+let jstr   = function `String s -> s | `Int i -> string_of_int i | _ -> ""
+
+let bel_xy_re = Str.regexp "X\\([0-9]+\\)Y\\([0-9]+\\)"
+let bel_xy s =
+  try ignore (Str.search_forward bel_xy_re s 0);
+      Some (int_of_string (Str.matched_group 1 s),
+            int_of_string (Str.matched_group 2 s))
+  with Not_found -> None
+
+let parse_nextpnr_json path =
+  let j = Yojson.Safe.from_file path in
+  let modules = jassoc (jmem "modules" j) in
+  let is_top (_, mv) =
+    match jmem "top" (jmem "attributes" mv) with `Null -> false | _ -> true in
+  let (_, tm) =
+    try List.find is_top modules
+    with Not_found -> (match modules with x :: _ -> x | [] -> ("", `Null)) in
+  let cells = jassoc (jmem "cells" tm) in
+  let pos   = Hashtbl.create 8192 in
+  let comps = ref [] in
+  let minx = ref max_int and maxx = ref min_int
+  and miny = ref max_int and maxy = ref min_int in
+  List.iter (fun (cn, cv) ->
+    let ctype = jstr (jmem "type" cv) in
+    let attrs = jmem "attributes" cv in
+    let bel   = jstr (jmem "NEXTPNR_BEL" attrs) in
+    let bel   = if bel = "" then jstr (jmem "BEL" attrs) else bel in
+    match bel_xy bel with
+    | Some (x, y) ->
+        Hashtbl.replace pos cn (x, y);
+        comps := { p_inst = cn; p_cell = ctype; p_x = x; p_y = y; p_orient = "N" } :: !comps;
+        if x < !minx then minx := x;  if x > !maxx then maxx := x;
+        if y < !miny then miny := y;  if y > !maxy then maxy := y
+    | None -> ()) cells;
+  (* bit -> driver cell, bit -> sink cells *)
+  let drv = Hashtbl.create 16384 and snk = Hashtbl.create 16384 in
+  List.iter (fun (cn, cv) ->
+    let conns = jassoc (jmem "connections" cv) in
+    let dirs  = jassoc (jmem "port_directions" cv) in
+    List.iter (fun (port, bits) ->
+      let dir = jstr (try List.assoc port dirs with Not_found -> `Null) in
+      List.iter (function
+        | `Int b ->
+            if dir = "output" then Hashtbl.replace drv b cn
+            else Hashtbl.replace snk b
+                   (cn :: (try Hashtbl.find snk b with Not_found -> []))
+        | _ -> ()) (jlist bits)) conns) cells;
+  let netnames = jassoc (jmem "netnames" tm) in
+  let nets = ref [] in
+  List.iter (fun (nn, nv) ->
+    match jlist (jmem "bits" nv) with
+    | (`Int b) :: _ ->
+        (match Hashtbl.find_opt drv b with
+         | Some dc when Hashtbl.mem pos dc ->
+             let sxys =
+               List.filter_map (fun sc -> Hashtbl.find_opt pos sc)
+                 (try Hashtbl.find snk b with Not_found -> []) in
+             if sxys <> [] then
+               nets := { ln_name = nn; ln_drv = Hashtbl.find pos dc; ln_snks = sxys } :: !nets
+         | _ -> ())
+    | _ -> ()) netnames;
+  let pad = 4 in
+  let die =
+    if !minx = max_int then (0, 0, 1, 1)
+    else (!minx - pad, !miny - pad, !maxx + pad, !maxy + pad) in
+  { l_design     = Filename.basename path;
+    l_units      = 1;
+    l_die        = die;
+    l_components = List.rev !comps;
+    l_macro_um   = Hashtbl.create 4;
+    l_nets       = List.rev !nets;
+    l_hi         = Hashtbl.create 256 }
+
+(* union the SKIP_FAILED_ARCS net names from every route*.log beside the JSON
+   so the viewer opens with the unroutable nets already lit up. *)
+let skip_re = Str.regexp "SKIP_FAILED_ARCS.*net '\\([^']+\\)'"
+let load_skips_into hi dir =
+  let files = try Sys.readdir dir with _ -> [||] in
+  Array.iter (fun f ->
+    if String.length f >= 5 && String.sub f 0 5 = "route" && Filename.check_suffix f ".log"
+    then
+      try
+        let ic = open_in (Filename.concat dir f) in
+        (try while true do
+           let l = input_line ic in
+           (try ignore (Str.search_forward skip_re l 0);
+                Hashtbl.replace hi (Str.matched_group 1 l) ()
+            with Not_found -> ())
+         done with End_of_file -> ());
+        close_in ic
+      with _ -> ()) files
+
 let render_layout cr ~width ~height ?path layout =
   let (x1, y1, x2, y2) = layout.l_die in
   let dw = float_of_int (x2 - x1) and dh = float_of_int (y2 - y1) in
@@ -1660,6 +1775,29 @@ let render_layout cr ~width ~height ?path layout =
       Cairo.rectangle cr rx ry ~w:(w_dbu *. scale) ~h:(h_dbu *. scale)
     ) layout.l_components;
     Cairo.fill cr;
+    (* nextpnr routing overlay: highlighted nets (driver -> each sink) *)
+    if Hashtbl.length layout.l_hi > 0 && layout.l_nets <> [] then begin
+      let n_hi = ref 0 in
+      List.iter (fun ln ->
+        if Hashtbl.mem layout.l_hi ln.ln_name then begin
+          incr n_hi;
+          let (dx, dy) = xform (fst ln.ln_drv) (snd ln.ln_drv) in
+          Cairo.set_source_rgba cr 0.95 0.15 0.15 0.80;
+          Cairo.set_line_width cr 1.2;
+          List.iter (fun (sx, sy) ->
+            let (qx, qy) = xform sx sy in
+            Cairo.move_to cr dx dy; Cairo.line_to cr qx qy) ln.ln_snks;
+          Cairo.stroke cr;
+          Cairo.set_source_rgb cr 0.95 0.80 0.10;              (* driver = yellow box *)
+          Cairo.rectangle cr (dx -. 3.0) (dy -. 3.0) ~w:6.0 ~h:6.0; Cairo.fill cr;
+          Cairo.set_source_rgb cr 0.95 0.15 0.15;              (* sinks = red dots *)
+          List.iter (fun (sx, sy) ->
+            let (qx, qy) = xform sx sy in
+            Cairo.arc cr qx qy ~r:2.5 ~a1:0.0 ~a2:6.2831853; Cairo.fill cr) ln.ln_snks
+        end) layout.l_nets;
+      set_status (Printf.sprintf "%s — %d instances · %d highlighted net(s)"
+                    layout.l_design (List.length layout.l_components) !n_hi)
+    end;
     (* Critical-path overlay *)
     (match path with
      | None -> ()
@@ -1774,6 +1912,14 @@ let open_layout_window ?critical_path layout =
     | Some p -> Printf.sprintf
         "Critical path (worst max-delay)\n%s → %s\n%d hop(s) shown"
         p.tp_startpoint p.tp_endpoint (List.length p.tp_hops)
+    | None when layout.l_nets <> [] ->
+        Printf.sprintf
+          "nextpnr placement / routing\n%d placed cells · %d nets\n\
+           %d net(s) pre-lit from route*.log skips.\n\
+           Type a net name / substring below to highlight\n\
+           its driver (yellow) → sinks (red)."
+          (List.length layout.l_components) (List.length layout.l_nets)
+          (Hashtbl.length layout.l_hi)
     | None ->
         "No 6_finish.rpt found alongside this DEF\n\
          (or no max-delay path inside it)"
@@ -1792,6 +1938,29 @@ let open_layout_window ?critical_path layout =
     | None   -> ""
   in
   tv#buffer#set_text body;
+
+  (* nextpnr routing debug: highlight nets whose name matches a substring. *)
+  if layout.l_nets <> [] then begin
+    let hb = GPack.hbox ~spacing:4 ~packing:side#pack () in
+    let _  = GMisc.label ~text:"net:" ~packing:hb#pack () in
+    let e  = GEdit.entry ~packing:(hb#pack ~expand:true ~fill:true) () in
+    let apply () =
+      let q = e#text in
+      if q <> "" then begin
+        let re = Str.regexp_string q in
+        List.iter (fun ln ->
+          if (try ignore (Str.search_forward re ln.ln_name 0); true
+              with Not_found -> false)
+          then Hashtbl.replace layout.l_hi ln.ln_name ()) layout.l_nets
+      end;
+      da#misc#queue_draw () in
+    ignore (e#connect#activate ~callback:apply);
+    let addb = GButton.button ~label:"Add"   ~packing:hb#pack () in
+    ignore (addb#connect#clicked ~callback:apply);
+    let clrb = GButton.button ~label:"Clear" ~packing:hb#pack () in
+    ignore (clrb#connect#clicked
+      ~callback:(fun () -> Hashtbl.clear layout.l_hi; da#misc#queue_draw ()))
+  end;
 
   let (x1, y1, x2, y2) = layout.l_die in
   let info = Printf.sprintf
@@ -2131,6 +2300,28 @@ let synthesise_inner (path, p : string * Behavioral_ir.bprogram)
     top (List.length p'.modules) n_cells
     (List.length p'.library_cells) out_path in
   p', summary
+
+let do_open_nextpnr_json () =
+  let path = chooser_dialog `OPEN "Open nextpnr placement/routing JSON" in
+  if path <> "" then
+    try
+      let layout = parse_nextpnr_json path in
+      load_skips_into layout.l_hi (Filename.dirname path);
+      if layout.l_components = [] then
+        info_dialog
+          "No placed cells (NEXTPNR_BEL) in this JSON.\n\
+           Open a placed/routed nextpnr JSON — e.g. arp_stamped.json or\n\
+           *_routed.json — not the pre-placement synth output."
+      else begin
+        open_layout_window layout;
+        set_status (Printf.sprintf
+          "nextpnr JSON: %d cells · %d nets · %d skip-net(s) highlighted"
+          (List.length layout.l_components) (List.length layout.l_nets)
+          (Hashtbl.length layout.l_hi))
+      end
+    with e ->
+      error_dialog (Printf.sprintf "Failed to read nextpnr JSON:\n%s"
+                      (Printexc.to_string e))
 
 let do_synthesise () =
   with_errors "synthesise" (fun () ->
@@ -2538,6 +2729,7 @@ let () =
   let t = new GMenu.factory topology_menu ~accel_group in
   ignore (t#add_item "Run ORFS layout..."  ~callback:do_orfs_run);
   ignore (t#add_item "Open ORFS run..."    ~callback:do_open_orfs_run);
+  ignore (t#add_item "Open nextpnr placement/routing JSON..." ~callback:do_open_nextpnr_json);
 
   (* Schematic menu. *)
   let s = new GMenu.factory schematic_menu ~accel_group in
