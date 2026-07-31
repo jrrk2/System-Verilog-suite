@@ -1235,8 +1235,18 @@ let thread_body ?(blocking_vars = [])
                   rhs = BConst { value = Z.of_int (wi - 1); width = 32 };
                   result_type = u32 } in
                 set_field name lsb wi (subst env data)
+            (* is_comb, for the SAME reason as @slice_write below: a sequential
+               target must reach merge_slice_writes_deep instead.  Ungated, a
+               single-bit NBA (`wr_data[28] <= k[0]`) folded into env here and
+               every LATER @slice_write in the block then had its TARGET
+               substituted from `BVar wr_data` to that read-modify-write
+               expression -- so the merge rejected them (target not a BVar) and
+               the catch-all dropped them silently.  In the PCS rx_elastic_buffer
+               that severed the whole GT receive path (rxdata_rec et al orphaned,
+               link/sync never asserted on hardware). *)
             | "@mem_write", [BVar name; idx; data]
-              when (match elem_w_of name with Some e -> e = 1 | None -> true) ->
+              when is_comb
+                   && (match elem_w_of name with Some e -> e = 1 | None -> true) ->
                 (* packed-vector single-bit write (real arrays pre-folded). *)
                 set_field name (subst env idx) 1 (subst env data)
             (* @slice_write (constant bit-range) — fold into the running value the
@@ -1258,8 +1268,28 @@ let thread_body ?(blocking_vars = [])
                Hashtbl.replace env name newv;
                if not (List.mem name !local) then local := name :: !local
            | _ ->
-               out := BCallStmt { func; args = List.map (subst env) args }
-                      :: !out)
+               (* The FIRST argument of a write-call is the TARGET NAME, not a
+                  value: substituting it turns `@slice_write(wr_data,...)` into
+                  `@slice_write(<rmw expr>,...)`, which no downstream pass can
+                  match.  Thread the index/data operands only. *)
+               let func, args' =
+                 match func, args with
+                 (* A sequential single-bit packed-vector write is now left
+                    unfolded (above); re-express it in the slice form so
+                    merge_slice_writes_deep batches it with its neighbours
+                    instead of the catch-all dropping it. *)
+                 | "@mem_write", [ (BVar name as target);
+                                   (BConst _ as idx); data ]
+                   when (not is_comb)
+                        && (match elem_w_of name with
+                            | Some e -> e = 1 | None -> true) ->
+                     "@slice_write", [ target; idx; idx; subst env data ]
+                 | ("@slice_write" | "@part_sel_write_up"
+                   | "@part_sel_write_down" | "@mem_write"),
+                   (BVar _ as target) :: rest ->
+                     func, target :: List.map (subst env) rest
+                 | _ -> func, List.map (subst env) args in
+               out := BCallStmt { func; args = args' } :: !out)
       | other -> out := other :: !out
     ) (flatten_top stmts);
     (* flush signals assigned at this level that survived to the end *)
@@ -1299,6 +1329,34 @@ let merge_slice_writes ctx body =
          | _ -> rest := stmt :: !rest)
     | other -> rest := other :: !rest
   ) body;
+  if Sys.getenv_opt "SVS_DEBUG_MERGE" <> None then begin
+    Hashtbl.iter (fun arr ws ->
+      Printf.eprintf "[merge] target %s: %d slice-write(s):" arr (List.length ws);
+      List.iter (fun (m,l,_) -> Printf.eprintf " [%d:%d]" m l) ws;
+      prerr_newline ()) groups;
+    List.iter (function
+      | BCallStmt { func; args } ->
+          Printf.eprintf "[merge] UNMERGED call %s/%d args=[%s]%s\n"
+            func (List.length args)
+            (String.concat " | "
+               (List.map Behavioral_ir.string_of_bexpr args))
+            (match args with
+             | BVar a :: _ -> " target=BVar " ^ a
+             | BSlice { signal = BVar a; msb; lsb } :: _ ->
+                 Printf.sprintf " target=BSlice %s[%d:%d]" a msb lsb
+             | BSelect { array = BVar a; _ } :: _ -> " target=BSelect " ^ a
+             | BConst _ :: _ -> " target=BConst"
+             | BConcat _ :: _ -> " target=BConcat"
+             | BSlice _ :: _ -> " target=BSlice(non-var signal)"
+             | BCall { func; _ } :: _ -> " target=BCall " ^ func
+             | BCond _ :: _ -> " target=BCond"
+             | BBinOp _ :: _ -> " target=BBinOp"
+             | BUnOp _ :: _ -> " target=BUnOp"
+             | BReplicate _ :: _ -> " target=BReplicate"
+             | BSelect _ :: _ -> " target=BSelect(non-var array)"
+             | [] -> " target=<none>")
+      | _ -> ()) !rest
+  end;
   let merged_assigns = Hashtbl.fold (fun arr writes acc ->
     let total_w =
       match List.assoc_opt arr ctx.variables with
@@ -2599,10 +2657,33 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
               then String.sub s 1 (l - 2) else s in
             let is_bits =
               String.length s > 0 && String.for_all (fun c -> c = '0' || c = '1') s in
+            (* A REAL-valued parameter -- MMCM/PLL CLKIN1_PERIOD,
+               CLKOUT0_DIVIDE_F, CLKOUT0_PHASE, CLKOUT0_DUTY_CYCLE,
+               CLKFBOUT_MULT_F, REF_JITTER1 -- must be
+               emitted as a Verilog real, NOT a quoted string: yosys converts a
+               string parameter to the BIT-VECTOR OF ITS ASCII, so `"5.000"`
+               (0x35 2E 30 30 30) reached Vivado as CLKFBOUT_MULT_F =
+               228408176688 and was dropped for its default -- silently
+               mis-clocking the PCS.  Require a '.' so integer-looking strings
+               keep their existing String treatment. *)
+            (* ...but NOT for SIM_* attributes: SIM_VERSION is a string ENUM
+               whose legal values ("1.0".."5.0") merely look like reals, and
+               Vivado rejects the real form.  These are simulation-only and
+               never reach the bitstream, so keep them verbatim. *)
+            let sim_attr =
+              String.length n >= 4 && String.sub n 0 4 = "SIM_" in
+            let as_real =
+              if is_bits || sim_attr || not (String.contains s '.') then None
+              else match float_of_string_opt (String.trim s) with
+                | Some f when Float.is_finite f -> Some f
+                | _ -> None in
             let value =
-              if is_bits then
-                Parameter.Value.Std_logic_vector (Logic.Std_logic_vector.of_string s)
-              else Parameter.Value.String s in
+              match as_real with
+              | Some f -> Parameter.Value.Real f
+              | None ->
+                if is_bits then
+                  Parameter.Value.Std_logic_vector (Logic.Std_logic_vector.of_string s)
+                else Parameter.Value.String s in
             Some (Parameter.create ~name:n ~value)
           end) i.param_strs in
       let parameters = int_params @ str_params in
