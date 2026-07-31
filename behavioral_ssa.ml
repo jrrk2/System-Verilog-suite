@@ -409,8 +409,16 @@ let module_to_ssa bmod =
         | None -> name in
       match Hashtbl.find_opt known base with
       | Some src ->
+          (* Tag the minted version.  Downstream (behavioral_to_hardcaml's
+             register/wire classification) must be able to tell an SSA
+             temporary from an ordinary RTL name that merely LOOKS like one
+             (`IDLE_MATCH_2` alongside `IDLE_MATCH` is real Xilinx PCS RTL,
+             not SSA output) -- guessing from the `_<digits>` name shape
+             forced a real register to a wire and turned its feedback into a
+             combinational loop. *)
           let sig_ : bsignal = { src with name; direction = `Internal;
-                                          initial_value = None } in
+                                          initial_value = None;
+                                          attrs = ("ssa", "1") :: src.attrs } in
           Hashtbl.replace known name sig_
       | None -> ()
     end in

@@ -277,6 +277,12 @@ let get_or_create_var ctx name width is_reg =
            | None ->
              Reg_spec.override spec ~reset:Signal.gnd ~reset_to:const)
       in
+      (match Sys.getenv_opt "SVS_DEBUG_VAR" with
+       | Some pat when (try ignore (Str.search_forward (Str.regexp_string pat) name 0); true
+                        with Not_found -> false) ->
+           Printf.eprintf "[var] %s: is_reg=%b clock=%s\n%!" name is_reg
+             (match ctx.clock with Some _ -> "yes" | None -> "NO")
+       | _ -> ());
       let v =
         if is_reg then
           match ctx.clock, ctx.reset with
@@ -288,6 +294,14 @@ let get_or_create_var ctx name width is_reg =
               let spec = Reg_spec.create ~clock:clk () |> with_init in
               Always.Variable.reg spec ~width
           | _ ->
+              (* A registered signal whose process has NO resolvable clock
+                 silently becomes a WIRE.  Any iflift self-reference
+                 (`x <= c ? v : x`) then stops being register feedback and
+                 becomes a genuine COMBINATIONAL LOOP.  Fail loud. *)
+              if Sys.getenv_opt "SVS_DEBUG_NOCLK" <> None then
+                Printf.eprintf
+                  "[noclk] %s: registered signal lowered as WIRE (no clock)\n%!"
+                  name;
               Always.Variable.wire ~default:(Signal.zero width)
         else
           Always.Variable.wire ~default:(Signal.zero width)
@@ -1786,8 +1800,13 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.initial_value with
     | Some (BConst { value; width }) ->
+        if Sys.getenv_opt "SVS_DEBUG_INIT" <> None then
+          Printf.eprintf "[init] %s.%s = %d'h%s\n" bmod.name s.name width
+            (Z.format "%x" value);
         Hashtbl.replace ctx.initial_values s.name (width, value)
-    | _ -> ()) bmod.signals;
+    | _ ->
+        if Sys.getenv_opt "SVS_DEBUG_INIT" <> None then
+          Printf.eprintf "[init] %s.%s = <none>\n" bmod.name s.name) bmod.signals;
 
   (* Pre-pass: classify each non-input signal and pre-declare an
      Always.Variable of the right shape (register vs wire) at the
@@ -2147,18 +2166,36 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
          from intermediate stages leak through during the reset
          period.  Detection is by suffix; we keep the original
          `<base>` name as a reg. *)
+      (* An SSA temporary must be lowered as a WIRE even when it is written
+         inside a clocked process (it is an in-cycle value, not state).
+         Identify it by the tag [behavioral_ssa] stamps on the signals it
+         mints -- NOT by the `<base>_<digits>` name shape.  That shape is
+         ordinary RTL: the Xilinx PCS core declares both
+         `..AUTO_NEGOTIATION/IDLE_MATCH` and `..IDLE_MATCH_2`, so the
+         heuristic forced the real register IDLE_MATCH_2 to a wire, its
+         `IDLE_MATCH_2 <= SRESET ? 0 : IDLE_MATCH_2_reg.D` feedback became a
+         genuine combinational loop, and create_circuit rejected the whole
+         core.  If nothing is tagged (no SSA pass ran) nothing is
+         reclassified, which is the safe direction: state stays state.
+         SVS_SSA_NAME_HEURISTIC=1 restores the old name-shape guess.      *)
+      let ssa_name_heuristic = Sys.getenv_opt "SVS_SSA_NAME_HEURISTIC" <> None in
       let is_ssa_version name =
-        match String.rindex_opt name '_' with
-        | None -> false
-        | Some i ->
-            let suffix = String.sub name (i + 1) (String.length name - i - 1) in
-            if String.length suffix = 0
-            || not (String.for_all (fun c -> c >= '0' && c <= '9') suffix)
-            then false
-            else
-              let base = String.sub name 0 i in
-              List.exists (fun (s' : Behavioral_ir.bsignal) -> s'.name = base)
-                bmod.signals
+        match List.find_opt (fun (s' : Behavioral_ir.bsignal) -> s'.name = name)
+                bmod.signals with
+        | Some s' when List.mem_assoc "ssa" s'.attrs -> true
+        | _ ->
+          ssa_name_heuristic &&
+          (match String.rindex_opt name '_' with
+           | None -> false
+           | Some i ->
+               let suffix = String.sub name (i + 1) (String.length name - i - 1) in
+               if String.length suffix = 0
+               || not (String.for_all (fun c -> c >= '0' && c <= '9') suffix)
+               then false
+               else
+                 let base = String.sub name 0 i in
+                 List.exists (fun (s' : Behavioral_ir.bsignal) -> s'.name = base)
+                   bmod.signals)
       in
       (* Apply BIR initial_value into the Reg_spec at variable
          creation time — this is the pre-pass that runs BEFORE the
@@ -2672,6 +2709,21 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
                never reach the bitstream, so keep them verbatim. *)
             let sim_attr =
               String.length n >= 4 && String.sub n 0 4 = "SIM_" in
+            (* An UNRESOLVED parameter reference: the emitter wrote the
+               identifier instead of the value (SIM_RESET_SPEEDUP =
+               "WRAPPER_SIM_GTRESET_SPEEDUP").  Vivado rejects it and falls back
+               to the default anyway, with a CRITICAL WARNING -- so emitting
+               nothing is equivalent and quiet.  Only for SIM_* (simulation-only,
+               never in the bitstream); a real parameter with a bad value must
+               still be loud.  Detect an all-caps identifier that is not a
+               legal enum-ish value. *)
+            let unresolved_ref =
+              sim_attr
+              && s <> "" && s <> "TRUE" && s <> "FALSE"
+              && String.for_all (fun c ->
+                   (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_') s
+              && String.exists (fun c -> c = '_') s
+              && not (String.for_all (fun c -> c >= '0' && c <= '9') s) in
             let as_real =
               if is_bits || sim_attr || not (String.contains s '.') then None
               else match float_of_string_opt (String.trim s) with
@@ -2684,6 +2736,12 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
                 if is_bits then
                   Parameter.Value.Std_logic_vector (Logic.Std_logic_vector.of_string s)
                 else Parameter.Value.String s in
+            if unresolved_ref then begin
+              Printf.eprintf
+                "note: dropping unresolved SIM_ parameter %s = %s (emitting it \
+                 would only draw a CRITICAL WARNING and be discarded)\n%!" n s;
+              None
+            end else
             Some (Parameter.create ~name:n ~value)
           end) i.param_strs in
       let parameters = int_params @ str_params in

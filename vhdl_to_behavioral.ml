@@ -629,14 +629,28 @@ let rec expand_record_assign ctx lhs rhs_expr =
         in
         Some (List.map per_field fields)
 
+(* A waveform element is `Double (Vhdwaveform_element, rhs)` for a plain
+   assignment, but `Triple (Vhdwaveform_element, rhs, delay)` when the source
+   writes `x <= e after 100 ps;`.  The `after` time is simulation-only timing
+   (VHDL projected-waveform semantics); BIR is delta-cycle, so drop it and
+   keep the value.  Xilinx's own unisim primitives use it -- SRL16E.vhd's
+   `Q <= Q_Index after 100 ps;` was silently unhandled, so the SRL16E body
+   came out EMPTY and srl_infer's SRL cells degenerated into a combinational
+   feed-through. *)
+and waveform_rhs = function
+  | Double (Vhdwaveform_element, rhs) -> Some rhs
+  | Triple (Vhdwaveform_element, rhs, _after) -> Some rhs
+  | _ -> None
+
 (* Convert VHDL statements to behavioral IR statements *)
 and stmt_to_bstmt ctx = function
   (* Signal assignment: signal <= value *)
   | Double (VhdSequentialSignalAssignment,
            Double (VhdSimpleSignalAssignment,
                   Quintuple (Vhdsimple_signal_assignment_statement,
-                            Str "", Str name, VhdDelayNone,
-                            Double (Vhdwaveform_element, rhs)))) ->
+                            Str "", Str name, _delay, wave)))
+    when waveform_rhs wave <> None ->
+      let rhs = Option.get (waveform_rhs wave) in
       let rhs_expr = expr_to_bexpr ctx rhs in
       (match expand_record_assign ctx name rhs_expr with
        | Some xs -> xs
@@ -655,8 +669,9 @@ and stmt_to_bstmt ctx = function
   | Double (VhdSequentialSignalAssignment,
            Double (VhdSimpleSignalAssignment,
                   Quintuple (Vhdsimple_signal_assignment_statement,
-                            Str "", target, VhdDelayNone,
-                            Double (Vhdwaveform_element, rhs)))) ->
+                            Str "", target, _delay, wave)))
+    when waveform_rhs wave <> None ->
+      let rhs = Option.get (waveform_rhs wave) in
       (* Extract target name *)
       let rec get_target_name = function
         | Str n -> n
@@ -819,13 +834,30 @@ and stmt_to_bstmt ctx = function
       let head_name h =
         try Vhd_front.Asctoken.asctoken h with _ -> "?"
       in
-      let shape = match other with
-        | Double (h, _) -> Printf.sprintf "Double(%s)" (head_name h)
-        | Triple (h, _, _) -> Printf.sprintf "Triple(%s)" (head_name h)
-        | Quadruple (h, _, _, _) -> Printf.sprintf "Quad(%s)" (head_name h)
-        | Quintuple (h, _, _, _, _) -> Printf.sprintf "Quint(%s)" (head_name h)
-        | _ -> "leaf"
+      (* Print the shape SEVERAL levels deep: the outer constructor alone is
+         never enough to write a pattern against (every signal assignment is
+         `Double(VhdSequentialSignalAssignment)`; what differs is the delay
+         and waveform nested three levels in). *)
+      let rec shape_of d n =
+        if d <= 0 then "..." else
+        match n with
+        | Double (h, a) ->
+            Printf.sprintf "Double(%s,%s)" (head_name h) (shape_of (d-1) a)
+        | Triple (h, a, b) ->
+            Printf.sprintf "Triple(%s,%s,%s)" (head_name h)
+              (shape_of (d-1) a) (shape_of (d-1) b)
+        | Quadruple (h, a, b, c) ->
+            Printf.sprintf "Quad(%s,%s,%s,%s)" (head_name h)
+              (shape_of (d-1) a) (shape_of (d-1) b) (shape_of (d-1) c)
+        | Quintuple (h, a, b, c, e) ->
+            Printf.sprintf "Quint(%s,%s,%s,%s,%s)" (head_name h)
+              (shape_of (d-1) a) (shape_of (d-1) b) (shape_of (d-1) c)
+              (shape_of (d-1) e)
+        | Str x -> Printf.sprintf "Str %S" x
+        | List l -> Printf.sprintf "List[%d]" (List.length l)
+        | x -> (try Vhd_front.Asctoken.asctoken x with _ -> "leaf")
       in
+      let shape = shape_of 5 other in
       Printf.eprintf "[vhdl2bir] stmt unhandled %s\n%!" shape;
       []
 

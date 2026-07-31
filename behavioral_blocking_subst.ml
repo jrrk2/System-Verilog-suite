@@ -1,7 +1,8 @@
 (* Forward-substitute blocking-LHS reads within an always_ff body.
  *
- * Verible's BIR loses the SV `=` vs `<=` distinction (both lower to
- * BAssign). Without that, an idiom like
+ * Verible's BIR records which LHS used SV `=` in BSequential.blocking_vars
+ * (an empty list means "all non-blocking").  Only those may be forward-
+ * substituted in a clocked body.  The idiom this exists for is
  *
  *   always_ff @(posedge clk) begin
  *     tmp = a + b;            // blocking — intermediate
@@ -153,14 +154,47 @@ let rec partial_write_target name stmts =
     | BBlock ss -> partial_write_target name ss
     | _ -> false) stmts
 
-let process_seq_body stmts =
+(* [blocking] = BSequential.blocking_vars, the LHS actually written with SV
+ * `=` in this clocked block.  Everything else in the body is `<=`, i.e. a
+ * REAL flip-flop whose readers must see the OLD value -- forward-substituting
+ * it is not an optimisation, it deletes a register.
+ *
+ * That is not hypothetical: two `always @(posedge clk)` blocks get merged into
+ * one BSequential, and if the merge happens to order the definition before the
+ * use, this pass would rewrite the Xilinx PCS core's
+ *     TX_RST_SM_reg[1].D <= TX_RST_SM_reg[0].S;
+ *     TX_RST_SM_reg[2].D <= S ? 0 : TX_RST_SM_reg[1].D;
+ * into `reg[2].D <= S ? 0 : S` (identically 0) and DELETE reg[1] entirely,
+ * leaving every other reader of it undriven.  That collapsed the core's
+ * one-hot TX reset FSM, hardwired mgt_tx_reset to 0, and left the SGMII link
+ * dead on silicon.
+ *
+ * [read_elsewhere] additionally refuses to drop an assignment whose LHS is
+ * read by another process in the module -- dropping it would leave the signal
+ * with no driver at all.  (The original header claimed this check existed;
+ * the code did not implement it.)
+ *
+ * SVS_SEQ_SUBST_UNSAFE=1 restores the old unguarded behaviour.            *)
+let process_seq_body ~blocking ~read_elsewhere stmts =
+  let unsafe = Sys.getenv_opt "SVS_SEQ_SUBST_UNSAFE" <> None in
+  let dbg = Sys.getenv_opt "SVS_DEBUG_SUBST" <> None in
+  let substitutable lhs =
+    if unsafe then true
+    else if not (List.mem lhs blocking) then begin
+      if dbg then Printf.eprintf "[subst] skip (non-blocking) %s\n%!" lhs; false
+    end else if read_elsewhere lhs then begin
+      if dbg then Printf.eprintf "[subst] skip (read elsewhere) %s\n%!" lhs; false
+    end else begin
+      if dbg then Printf.eprintf "[subst] SUBST (blocking) %s\n%!" lhs; true
+    end in
   (* Pass 1: identify candidate substitutions: variables assigned
    * exactly once at the top level of the block AND read at least
    * once in subsequent statements. *)
   let rec collect i acc = function
     | [] -> List.rev acc
     | BAssign { lhs; rhs } as s :: rest
-      when assignment_count lhs stmts = 1
+      when substitutable lhs
+        && assignment_count lhs stmts = 1
         && count_in_stmts lhs rest >= 1
         && not (partial_write_target lhs stmts) ->
         collect (i + 1) ((i, lhs, rhs, s) :: acc) rest
@@ -346,9 +380,22 @@ let thread_comb_body orig_stmts =
     List.map thread_stmt stmts
   end
 
+let body_of = function
+  | BCombinational { body; _ } -> body
+  | BSequential { body; _ } -> body
+
 let process_module (m : bmodule) : bmodule =
-  let new_processes = List.map (function
-    | BSequential s -> BSequential { s with body = process_seq_body s.body }
+  let bodies = List.mapi (fun i p -> (i, body_of p)) m.processes in
+  let new_processes = List.mapi (fun i p -> match p with
+    | BSequential s ->
+        (* Only consulted for names already known to be blocking, so this stays
+           cheap even on the ~400-process PCS core. *)
+        let read_elsewhere name =
+          List.exists (fun (j, b) -> j <> i && count_in_stmts name b > 0)
+            bodies in
+        BSequential { s with
+          body = process_seq_body ~blocking:s.blocking_vars ~read_elsewhere
+                   s.body }
     | BCombinational s ->
         BCombinational { s with body = thread_comb_body s.body }
     | other -> other

@@ -2148,6 +2148,107 @@ let comb_nba_to_blocking (s : string) : string =
    the OCaml netlist fixups (strip param overrides, comb NBA->blocking, re-declare
    create_circuit-pruned input ports).  This is the "debug right after
    create_circuit" emit — no bir_to_aig / LUT cover involved. *)
+(* Re-attach power-on state to the emitted Verilog.
+ *
+ * [Behavioral_to_hardcaml.get_or_create_var] threads a BIR [initial_value]
+ * into Reg_spec via [~reset_to] with [~reset] tied to gnd.  That records the
+ * value on the Signal for the EDIF/yosys mappers, but Hardcaml.Rtl emits no
+ * reset logic for a constant-gnd reset and has no [initialize_to] in v0.17.x,
+ * so the emitted Verilog came out with NO power-on state whatsoever.
+ *
+ * That is silently fatal for any design whose reset is self-generated: the
+ * Xilinx PCS/PMA core brings itself out of reset from five FDP-style
+ * power-up-1 flops (MGT_RESET.SYNC_ASYNC_RESET/reset_sync2..6 + reset_out).
+ * Lose those and mgt_tx_reset never asserts, the transceiver TX pipeline
+ * never resets, and the link never comes up -- which is exactly how the
+ * Vivado-built emission behaved on silicon while the yosys path (which reads
+ * the metadata) reached sync.
+ *
+ * So re-emit them as Verilog declaration initialisers, which Vivado, yosys
+ * and Verilator all turn into FF INIT / power-up state.  Names are matched by
+ * sanitising BIR names the way Hardcaml legalises identifiers, and applied
+ * only when the match is UNAMBIGUOUS -- a wrong INIT is worse than none.
+ * SVS_NO_DECL_INIT=1 restores the old behaviour.                          *)
+let apply_decl_inits (m : Behavioral_ir.bmodule) (text : string) : string =
+  if Sys.getenv_opt "SVS_NO_DECL_INIT" <> None then text
+  else begin
+    let sanitise s =
+      String.map (fun c ->
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+           || (c >= '0' && c <= '9') || c = '_' then c else '_') s in
+    (* BIR signals carrying a constant power-on value, keyed by sanitised
+       name.  Ambiguous keys are dropped outright. *)
+    (* Hardcaml also PREFIXES an underscore when a legalised name would not
+       start with a letter (BIR `^status_vector[11]` -> `__status_vector_11_`),
+       so match on the leading-underscore-stripped form too. *)
+    let strip_us x =
+      let i = ref 0 in
+      while !i < String.length x && x.[!i] = '_' do incr i done;
+      String.sub x !i (String.length x - !i) in
+    let want : (string, (int * Z.t) option) Hashtbl.t = Hashtbl.create 16 in
+    let add k v =
+      if Hashtbl.mem want k then Hashtbl.replace want k None
+      else Hashtbl.replace want k v in
+    List.iter (fun (s : Behavioral_ir.bsignal) ->
+      match s.initial_value with
+      | Some (BConst { value; width }) when Z.sign value <> 0 ->
+          let k = sanitise s.name in
+          add k (Some (width, value));
+          let k' = strip_us k in
+          if k' <> k && k' <> "" then add k' (Some (width, value))
+      | _ -> ()) m.signals;
+    if Hashtbl.length want = 0 then text
+    else begin
+      let re = Str.regexp
+        "^\\([ \t]*reg[ \t]+\\(\\[[^]]*\\][ \t]*\\)?\\)\\([A-Za-z_][A-Za-z_0-9$]*\\)[ \t]*;[ \t]*$" in
+      let applied = ref 0 in
+      let lines = String.split_on_char '\n' text in
+      let out = List.map (fun line ->
+        if Str.string_match re line 0 then begin
+          let pre  = Str.matched_group 1 line in
+          let name = Str.matched_group 3 line in
+          let sname = sanitise name in
+          let hit = match Hashtbl.find_opt want sname with
+            | Some (Some _) as h -> h
+            | _ -> Hashtbl.find_opt want (strip_us sname) in
+          match hit with
+          | Some (Some (w, v)) ->
+              incr applied;
+              Printf.sprintf "%s%s = %d'h%s;" pre name w (Z.format "%x" v)
+          | _ -> line
+        end else line) lines in
+      if Sys.getenv_opt "SVS_DEBUG_INIT" <> None then begin
+        (* denominator = distinct BIR signals, not table keys (aliases) *)
+        let n_want =
+          List.length (List.filter (fun (s : Behavioral_ir.bsignal) ->
+            match s.initial_value with
+            | Some (BConst { value; _ }) -> Z.sign value <> 0
+            | _ -> false) m.signals) in
+        Printf.eprintf "[init] %s: re-attached %d/%d power-on value(s)\n%!"
+          m.Behavioral_ir.name !applied n_want;
+        (* name the ones we could not place: an unmatched power-on value is a
+           silently-wrong reset, so it must be visible rather than counted. *)
+        let placed = Hashtbl.create 16 in
+        List.iter (fun line ->
+          if Str.string_match re line 0 then begin
+            let k = sanitise (Str.matched_group 3 line) in
+            Hashtbl.replace placed k ();
+            (* record the stripped alias too, else a name Hardcaml prefixed
+               with `_` reports UNPLACED even though it was substituted *)
+            Hashtbl.replace placed (strip_us k) ()
+          end) lines;
+        Hashtbl.iter (fun k v ->
+          match v with
+          | Some _ when not (Hashtbl.mem placed k)
+                        && not (Hashtbl.mem placed (strip_us k)) ->
+              Printf.eprintf "[init]   UNPLACED %s\n%!" k
+          | None -> Printf.eprintf "[init]   AMBIGUOUS %s\n%!" k
+          | _ -> ()) want
+      end;
+      String.concat "\n" out
+    end
+  end
+
 let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
     (circ : Hardcaml.Circuit.t) : unit =
   (try Unix.mkdir dir 0o755 with _ -> ());
@@ -2173,6 +2274,7 @@ let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
      spurious unconstrained pads / dangling OBUFs out of every downstream P&R. *)
   let text = strip_keep_ports text in
   let text = comb_nba_to_blocking text in
+  let text = apply_decl_inits m text in
   (* re-declare pruned input ports so parent connections never dangle
      (Verilator 5.050 SIGSEGVs on a non-existent child pin). *)
   let emitted : (string, unit) Hashtbl.t = Hashtbl.create 64 in
@@ -2393,13 +2495,50 @@ let lgate_map mod_h k_lut io_flag =
 let lwrite_create_circuit_v prog_h dir =
   let _, p = find_prog prog_h in
   (try Unix.mkdir dir 0o755 with _ -> ());
+  (* PER-MODULE isolation.  A single module that Hardcaml rejects (typically
+     "Combinational loop") used to abort the WHOLE emission, so 39 good modules
+     were lost to one bad one and the caller saw only a raw Hardcaml signal
+     graph with no module name in it.  Report which module failed, name the BIR
+     signals in the reported cycle, keep going, and fail at the END with a
+     summary -- so the emit dir is still usable for the modules that converted
+     and the failure is actionable.  SVS_CIRC_STRICT=1 restores abort-on-first. *)
+  let failed = ref [] in
   List.iter (fun (m : Behavioral_ir.bmodule) ->
-    let port_dir = build_port_dir m p in
-    let circ =
-      Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
-    write_circ_verilog ~dir m circ) p.Behavioral_ir.modules;
-  Printf.sprintf "wrote %d create_circuit module(s) to %s"
-    (List.length p.Behavioral_ir.modules) dir
+    try
+      let port_dir = build_port_dir m p in
+      let circ =
+        Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
+      write_circ_verilog ~dir m circ
+    with e ->
+      let msg = Printexc.to_string e in
+      (* pull BIR signal names out of the hardcaml graph dump: they are the
+         only tokens with a '/' or '_reg' in them, and they localise the loop
+         far better than the (mux (width 1) ...) s-expression does. *)
+      let names =
+        let re = Str.regexp "[A-Za-z_][A-Za-z_0-9./]*\\(/\\|_reg\\)[A-Za-z_0-9./\\[\\]]*" in
+        let rec scan i acc =
+          if List.length acc >= 6 then List.rev acc
+          else match (try Some (Str.search_forward re msg i) with Not_found -> None) with
+            | Some j ->
+                let s = Str.matched_string msg in
+                scan (j + String.length s) (if List.mem s acc then acc else s :: acc)
+            | None -> List.rev acc in
+        scan 0 [] in
+      Printf.eprintf
+        "create_circuit FAILED for module %s: %s\n%s%!"
+        m.name
+        (String.sub msg 0 (min 120 (String.length msg)))
+        (if names = [] then ""
+         else "  signals in the cycle: " ^ String.concat ", " names ^ "\n");
+      if Sys.getenv_opt "SVS_CIRC_STRICT" <> None then raise e;
+      failed := m.name :: !failed) p.Behavioral_ir.modules;
+  let n = List.length p.Behavioral_ir.modules in
+  if !failed <> [] then
+    Printf.sprintf
+      "wrote %d/%d create_circuit module(s) to %s -- FAILED: %s"
+      (n - List.length !failed) n dir (String.concat ", " (List.rev !failed))
+  else
+    Printf.sprintf "wrote %d create_circuit module(s) to %s" n dir
 
 (* Dump a Mapped circuit as cell-mapped Verilog via Hardcaml.Rtl,
  * suitable for ver_front to re-parse into structural BIR. *)
