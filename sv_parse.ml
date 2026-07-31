@@ -441,30 +441,56 @@ let rec parse_json attr json =
       expr
 
   | "FUNCREF" ->
-      let args = json |> member "pinsp" |> to_list_safe |> 
-        List.filter_map (fun pin -> 
-          try Some (pin |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name)
-          with _ -> None
-        ) in
+  (* Verilator's JSON puts a call's arguments under `argsp`, whose children are
+     ARG nodes wrapping the real expression in `exprp`; `pinsp` is present but
+     EMPTY.  Reading only `pinsp` yielded a zero-argument call, and the silent
+     `try _ -> None` hid it: `bin2gray()` and `len_addr()` arrived with arity 0
+     and create_circuit lowered them to the constant 0.  That is why the FIFO
+     gray-code conversion and arp_ctrl's address decode quietly became 0 on the
+     verilator side only, while verible was correct -- 3 of the 8 modules the
+     verilator frontend could not emit at all.  Accept `argsp` (preferred) and
+     fall back to `pinsp`, and do NOT swallow a malformed argument: a call of
+     the wrong arity is far worse than a hard error. *)
+      let arg_nodes =
+        match json |> member "argsp" |> to_list_safe with
+        | [] -> json |> member "pinsp" |> to_list_safe
+        | l  -> l in
+      let args = List.map (fun pin ->
+        match pin |> member "exprp" |> to_list_safe with
+        | e :: _ -> parse' attr name e
+        | [] -> failwith
+            (Printf.sprintf "FUNCREF %s: argument node with no exprp" name))
+        arg_nodes in
       FuncRef { name; args }
       
   | "TASKREF" ->
-      let args = json |> member "pinsp" |> to_list_safe |>
-        List.filter_map (fun pin ->
-          try Some (pin |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name)
-          with _ -> None
-        ) in
+      let arg_nodes =
+        match json |> member "argsp" |> to_list_safe with
+        | [] -> json |> member "pinsp" |> to_list_safe
+        | l  -> l in
+      let args = List.map (fun pin ->
+        match pin |> member "exprp" |> to_list_safe with
+        | e :: _ -> parse' attr name e
+        | [] -> failwith
+            (Printf.sprintf "TASKREF %s: argument node with no exprp" name))
+        arg_nodes in
       TaskRef { name; args }
 
   | "METHODCALL" ->
       (* Method call on object: object.method(args) *)
       let method_name = json |> member "name" |> to_string in
       let obj = json |> member "fromp" |> to_list_safe |> List.hd |> parse' attr name in
-      let args = json |> member "pinsp" |> to_list_safe |>
-        List.filter_map (fun pin ->
-          try Some (pin |> member "exprp" |> to_list_safe |> List.hd |> parse' attr name)
-          with _ -> None
-        ) in
+      let arg_nodes =
+        match json |> member "argsp" |> to_list_safe with
+        | [] -> json |> member "pinsp" |> to_list_safe
+        | l  -> l in
+      let args = List.map (fun pin ->
+        match pin |> member "exprp" |> to_list_safe with
+        | e :: _ -> parse' attr name e
+        | [] -> failwith
+            (Printf.sprintf "METHODCALL %s: argument node with no exprp"
+               method_name))
+        arg_nodes in
       (* For now, represent as FuncRef with object as first arg *)
       FuncRef { name = method_name; args = obj :: args }
 

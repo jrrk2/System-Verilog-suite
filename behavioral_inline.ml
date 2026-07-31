@@ -235,9 +235,31 @@ let rec body_to_expr fname bindings = function
          function inlines as one big BCond/BBinOp tree.  This is
          what mac_q15-style functions look like — pa/qb/sum/sh
          intermediate computations followed by a saturating if/else. *)
+      (* Does this statement assign [fname] at any depth? *)
+      let rec yields_fname = function
+        | BAssign { lhs; _ } -> lhs = fname
+        | BIf { then_stmts; else_stmts; _ } ->
+            List.exists yields_fname then_stmts
+            || List.exists yields_fname else_stmts
+        | BCase { cases; default; _ } ->
+            List.exists (fun (_, ss) -> List.exists yields_fname ss) cases
+            || List.exists yields_fname default
+        | BBlock ss -> List.exists yields_fname ss
+        | _ -> false in
       let rec split_intermediates acc = function
         | [] -> None
         | [last] -> Some (List.rev acc, last)
+        | (BAssign { lhs; _ }) :: rest
+          when lhs = fname && List.exists yields_fname rest ->
+            (* DEAD return-value initialiser.  A `function automatic` gets an
+               `f = 0` inserted ahead of the real body, so the first statement
+               assigns fname and the old guard (`lhs <> fname`) bailed out --
+               the function then never inlined, the call survived into
+               create_circuit as an unsupported BCall, and was lowered to the
+               constant 0.  That is how arp_ctrl's `len_addr` silently became 0
+               on the verilator side while the non-automatic `bin2gray` next to
+               it inlined fine.  A later statement overwrites it, so drop it. *)
+            split_intermediates acc rest
         | (BAssign { lhs; _ } as s) :: rest when lhs <> fname ->
             split_intermediates (s :: acc) rest
         | _ -> None
