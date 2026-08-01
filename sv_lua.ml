@@ -529,7 +529,22 @@ let cut_blackboxes ?(trusted : string list = []) (m : bmodule) (p : bprogram) : 
                         !ok) ->
                     String.sub n 0 k
                 | _ -> n in
-              let bname = inst_canon ^ "/" ^ pin in
+              (* The boundary name must be IDENTICAL in both flows or the box
+                 is unpaired and every cone it feeds differs for free.  After
+                 flattening the instance name carries its hierarchy path, and
+                 the two flatteners spell that differently -- a Vivado netlist
+                 joins with '/' , the SVS emission with '__' -- so only boxes
+                 instantiated at TOP (unprefixed, e.g. cpu_mmcm) ever paired.
+                 That is why a design containing a GTXE2_CHANNEL produced just
+                 4 ufo nets, all of them the top-level MMCM's, leaving the GT
+                 and everything downstream of it uncomparable.  Normalise the
+                 separator so the two spellings converge. *)
+              let bname =
+                let b = Buffer.create (String.length inst_canon + 8) in
+                String.iter (fun c ->
+                  if c = '/' then Buffer.add_string b "__" else Buffer.add_char b c)
+                  inst_canon;
+                Buffer.contents b ^ "/" ^ pin in
               let w = expr_w expr in
               (match dir with
                | `Output ->
