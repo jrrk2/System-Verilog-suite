@@ -878,6 +878,110 @@ let namespace_genblk_locals ~label ~v ~eval_idx tok =
     rw_bare (rw_hier tok)
   end
 
+(* ── String-valued parameters for generate conditions ──────────────────
+   The elaboration scope is `(string * int) list` -- INTEGER only -- so a
+   string parameter (`parameter STYLE = "AUTO"`) cannot live in it.  A
+   generate condition like `STYLE_INT == "REDUCTION"` was therefore handed
+   straight to the integer evaluator, which compared two operands it could not
+   resolve and returned a confident 0 rather than "undecidable".  In
+   rgmii_lfsr BOTH arms of
+
+       if (STYLE_INT == "REDUCTION") ... else if (STYLE_INT == "LOOP") ...
+
+   evaluated false, so the pruner deleted both and the module came out with
+   state_out / data_out DECLARED BUT NEVER DRIVEN -- 32 bits of CRC logic
+   silently gone.
+
+   Resolve string parameters here instead: follow name -> value chains and
+   fold `cond ? "a" : "b"`, and when a side cannot be resolved return None so
+   the pruner keeps both branches rather than inventing a verdict. *)
+let cur_string_params : (string * string) list ref = ref []
+
+let str_trim_parens s =
+  let s = ref (String.trim s) in
+  let continue_ = ref true in
+  while !continue_ do
+    let t = !s in
+    let n = String.length t in
+    if n >= 2 && t.[0] = '(' && t.[n-1] = ')' then begin
+      (* only strip when the leading '(' matches the trailing ')' *)
+      let d = ref 0 and ok = ref true in
+      String.iteri (fun i c ->
+        if c = '(' then incr d
+        else if c = ')' then begin
+          decr d;
+          if !d = 0 && i < n - 1 then ok := false
+        end) t;
+      if !ok then s := String.trim (String.sub t 1 (n - 2)) else continue_ := false
+    end else continue_ := false
+  done;
+  !s
+
+(* Index of the first top-level (depth 0, outside quotes) occurrence of [pat]. *)
+let str_find_top s pat =
+  let n = String.length s and m = String.length pat in
+  let d = ref 0 and q = ref false and i = ref 0 and res = ref None in
+  while !res = None && !i <= n - m do
+    let c = s.[!i] in
+    if c = '"' then q := not !q
+    else if not !q then begin
+      if c = '(' then incr d
+      else if c = ')' then decr d
+      else if !d = 0 && String.sub s !i m = pat then res := Some !i
+    end;
+    incr i
+  done;
+  !res
+
+let str_is_ident s =
+  s <> "" && String.for_all (fun c ->
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+    || (c >= '0' && c <= '9') || c = '_') s
+
+let rec resolve_str depth s =
+  if depth > 8 then None else
+  let s = str_trim_parens s in
+  let n = String.length s in
+  if n >= 2 && s.[0] = '"' && s.[n-1] = '"' then Some (String.sub s 1 (n - 2))
+  else match str_find_top s "?" with
+    | Some qi ->
+        let cond = String.sub s 0 qi in
+        let rest = String.sub s (qi + 1) (n - qi - 1) in
+        (match str_find_top rest ":" with
+         | None -> None
+         | Some ci ->
+             let a = String.sub rest 0 ci
+             and b = String.sub rest (ci + 1) (String.length rest - ci - 1) in
+             (match eval_str_cond (depth + 1) cond with
+              | Some 1 -> resolve_str (depth + 1) a
+              | Some 0 -> resolve_str (depth + 1) b
+              | _ -> None))
+    | None ->
+        if str_is_ident s then begin
+          let r = List.assoc_opt s !cur_string_params in
+          if Sys.getenv_opt "ELAB_DEBUG" <> None then
+            Printf.eprintf "[strparam] lookup %S -> %s (table=%d)\n%!" s
+              (match r with Some v -> Printf.sprintf "%S" v | None -> "MISS")
+              (List.length !cur_string_params);
+          match r with
+          | Some v when String.trim v <> s -> resolve_str (depth + 1) v
+          | _ -> None
+        end else None
+
+and eval_str_cond depth s =
+  if depth > 8 then None else
+  let s = str_trim_parens s in
+  let pick op =
+    match str_find_top s op with
+    | None -> None
+    | Some i ->
+        let l = String.sub s 0 i
+        and r = String.sub s (i + 2) (String.length s - i - 2) in
+        (match resolve_str (depth + 1) l, resolve_str (depth + 1) r with
+         | Some a, Some b -> Some (if (a = b) = (op = "==") then 1 else 0)
+         | _ -> None) in
+  match pick "==" with Some r -> Some r | None -> pick "!="
+
 let rec prune_dead_generates scope tok =
   let take_branch cond_expr_opt branches =
     match cond_expr_opt with
@@ -892,7 +996,16 @@ let rec prune_dead_generates scope tok =
     | None -> None
     | Some e ->
         let s = !resolver_for_walk e in
-        !evaluator_for_walk scope s
+        (* A condition mentioning a STRING literal is a string comparison; the
+           integer evaluator cannot judge it and would answer 0.  Decide it as
+           a string, or report undecidable so both branches survive. *)
+        let r =
+          if String.contains s '"' then eval_str_cond 0 s
+          else !evaluator_for_walk scope s in
+        if Sys.getenv_opt "ELAB_DEBUG" <> None then
+          Printf.eprintf "[prune] cond=%S -> %s\n%!" s
+            (match r with Some n -> string_of_int n | None -> "UNDECIDABLE");
+        r
   in
   match tok with
   (* Loop-generate construct (`for (genvar k = 0; cond; step) body`).

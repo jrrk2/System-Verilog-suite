@@ -480,6 +480,22 @@ let rec expr_to_bexpr = function
       BConst { value = Z.zero; width = 1 }
 
 (* Convert Verilator statement to behavioral IR statement *)
+(* Is this statement pure elaboration-time computation?  Used to decide
+   whether an `initial` block is part of the design (constant precomputation)
+   or a testbench driver that must be dropped. *)
+let rec is_elab_stmt = function
+  | Assign _ | AssignW _ -> true
+  | Begin { stmts; _ } -> List.for_all is_elab_stmt stmts
+  | If { then_stmt; else_stmt; _ } ->
+      is_elab_stmt then_stmt
+      && (match else_stmt with Some e -> is_elab_stmt e | None -> true)
+  | For { stmts; incs; _ } ->
+      List.for_all is_elab_stmt stmts && List.for_all is_elab_stmt incs
+  | Case { items; _ } ->
+      List.for_all (fun (i : case_item) ->
+        List.for_all is_elab_stmt i.statements) items
+  | _ -> false
+
 let rec stmt_to_bstmt = function
   | AssignW { lhs; rhs } ->
       (* Newer Verilator (>=5.048) wraps each continuous `assign` in an ALWAYS
@@ -638,9 +654,34 @@ let rec stmt_to_bstmt = function
       BWhile { condition = expr_to_bexpr condition;
                body = body_stmts @ upd_stmts }
 
-  (* Initial / Final blocks — simulation-only, not synthesisable
-   * behaviour for our purposes. *)
-  | Initial _ | Final _ -> BBlock []
+  (* Initial / Final blocks.
+   *
+   * Most `initial` blocks are testbench-only and must stay dropped.  But the
+   * ELABORATION-TIME idiom -- a block of pure assignments/loops that computes
+   * constants the synthesisable logic then reads -- is part of the design.
+   * rgmii_lfsr (Alex Forencich's LFSR/CRC generator) builds its entire mask
+   * set that way:
+   *
+   *     initial begin
+   *         for (i = 0; i < LFSR_WIDTH; i = i + 1) begin
+   *             lfsr_mask_state[i] = ...; lfsr_mask_data[i] = ...;
+   *         end
+   *         ... simulate the shift register ...
+   *     end
+   *
+   * Dropping it left lfsr_mask_* completely undriven, so on the verilator
+   * side the CRC masks were unconstrained free variables and the module could
+   * not be equivalent to anything.  (Verible models the same block as a
+   * `__initial__` process.)
+   *
+   * Import an initial block only when EVERY statement in it is pure
+   * computation -- no delay, event control, $display/$stop, or task call --
+   * which is exactly the elaboration-time form and never a testbench driver.
+   * Final blocks stay dropped unconditionally. *)
+  | Initial { stmts; _ } | InitialStatic { stmts; _ }
+    when List.for_all is_elab_stmt stmts ->
+      BBlock (List.map stmt_to_bstmt stmts)
+  | Initial _ | InitialStatic _ | Final _ -> BBlock []
 
   (* Display/$display, $finish, $stop etc. — testbench primitives. *)
   | Display _ | Stop _ -> BBlock []

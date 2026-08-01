@@ -4348,14 +4348,30 @@ let extract_body_params ~pkgs ~params tok =
              preserve as a QUOTED value so param_value_to_bexpr packs it
              ASCII at full width — routing it through Z.to_string lost
              the width (re-parsed at 32 bits, truncating the compare). *)
-          let s = ref None in
-          walk (function
-            | TK_StringLiteral x when !s = None ->
-                let n = String.length x in
-                let x = if n >= 2 && x.[0] = '"' && x.[n-1] = '"'
-                        then String.sub x 1 (n - 2) else x in
-                s := Some x
-            | _ -> ()) v;
+          (* FOLD the value first.  Taking the first string literal is right
+             for `parameter LFSR_CONFIG = "GALOIS"` but wrong for an
+             EXPRESSION over string parameters: rgmii_lfsr's
+                 parameter STYLE_INT = (STYLE == "AUTO") ? "LOOP" : STYLE;
+             recorded "AUTO" -- the first literal it met, which is the
+             comparison's operand, not the result.  STYLE_INT then matched
+             neither arm of the `if (STYLE_INT=="REDUCTION") ... else if
+             (STYLE_INT=="LOOP")` generate, both were pruned, and the module
+             emerged with state_out/data_out declared but NEVER DRIVEN. *)
+          let folded =
+            try
+              Verible_elaborate.cur_string_params := acc;
+              Verible_elaborate.resolve_str 0
+                (Verible_elaborate.deep_string_of_token v)
+            with _ -> None in
+          let s = ref folded in
+          if !s = None then
+            walk (function
+              | TK_StringLiteral x when !s = None ->
+                  let n = String.length x in
+                  let x = if n >= 2 && x.[0] = '"' && x.[n-1] = '"'
+                          then String.sub x 1 (n - 2) else x in
+                  s := Some x
+              | _ -> ()) v;
           !s in
         let new_val =
           match str_default with
@@ -4989,6 +5005,14 @@ let convert_module ~pkgs (mdecl : module_decl)
     ) params in
     base @ List.filter (fun (n, _) -> not (List.mem_assoc n base)) pkg_consts
   in
+  (* Publish the module's STRING-valued parameters for the generate pruner.
+     int_scope keeps only those that evaluate to an integer, so `STYLE =
+     "AUTO"` and its derived `STYLE_INT` were invisible and every
+     `STYLE_INT == "..."` generate condition silently answered false. *)
+  Verible_elaborate.cur_string_params :=
+    params @ List.concat_map (fun (pk : Verible_elaborate.package_decl) ->
+      List.map (fun (n, v) -> (n, Verible_elaborate.string_of_pvalue v))
+        pk.pkg_params) pkgs;
   Verible_elaborate.resolver_for_walk :=
     (fun t -> Verible_elaborate.resolve_value pkgs t);
   Verible_elaborate.evaluator_for_walk :=
