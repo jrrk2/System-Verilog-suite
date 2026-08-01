@@ -1556,7 +1556,31 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
            :: rst_guards name);
         (match Z3.Solver.check miter_solver [] with
          | Z3.Solver.UNSATISFIABLE -> incr neq
-         | _ -> incr ndiff; if List.length !diffs < 60 then diffs := name :: !diffs);
+         | _ ->
+           incr ndiff;
+           if List.length !diffs < 60 then diffs := name :: !diffs;
+           (* Per-cone mode reports WHICH cones differ but never why.  With
+              Z3_MITER_CONE_CE=<substring>, dump the model and both sides'
+              value for the matching cone -- the point of localising a
+              difference is to be able to look at it. *)
+           (match Sys.getenv_opt "Z3_MITER_CONE_CE" with
+            | Some pat when (try ignore (Str.search_forward
+                                           (Str.regexp_string pat) name 0); true
+                             with Not_found -> false) ->
+                (match Z3.Solver.get_model miter_solver with
+                 | Some model ->
+                     Printf.printf "\n=== CONE COUNTEREXAMPLE: %s ===\n" name;
+                     let show tag z =
+                       match Z3.Model.eval model z true with
+                       | Some v -> Printf.printf "  %s = %s\n" tag
+                                     (Z3.Expr.to_string v)
+                       | None -> Printf.printf "  %s = <unmodelled>\n" tag in
+                     show "d1 (spec)" out1;
+                     show "d2 (impl)" out2;
+                     Printf.printf "--- full model ---\n%s\n"
+                       (Z3.Model.to_string model)
+                 | None -> Printf.printf "\n=== CONE %s: SAT but no model\n" name)
+            | _ -> ()));
         Z3.Solver.pop miter_solver 1) common_outputs;
       (* sparse-bit next-state cones (bitbus pairs) as extra cones *)
       List.iter (fun (name, differs) ->
