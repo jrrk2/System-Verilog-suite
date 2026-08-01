@@ -1621,12 +1621,31 @@ let linline prog_h =
  * flattened `m.awid` / `m\.awid` align by name in a cross-flow miter.  Intended
  * for LEAF (or already-flattened) modules — a module with instances would also
  * need its children canonicalised for the flatten to reconnect. *)
+(* Map the hierarchy separator '/' to '__' WITHOUT collapsing anything else.
+ * A flattened Vivado netlist spells a nested signal `i_sgmii/i_pcs_pma/foo`
+ * while our own flattener joins with '__' (`i_sgmii__i_pcs_pma__foo`), so no
+ * flattened internal state pairs across the two flows and every cone fed by it
+ * is free to differ.  canon_sep_name cannot do this job: it collapses runs of
+ * separators, so `a__b` and `a_b` would fold together and distinct signals
+ * would collide (tried: register correspondence fell from 10 matches to 4).
+ * This mapping is injective on names that do not already contain '__', which
+ * is the case for the Vivado side. *)
+let canon_hier_name s =
+  let b = Buffer.create (String.length s + 8) in
+  String.iter (fun c -> if c = '/' then Buffer.add_string b "__"
+                        else Buffer.add_char b c) s;
+  Buffer.contents b
+
 let canon_sep_name s =
   (* Collapse any run of separator chars ('.', '$', '\', '_') to a SINGLE '_'.
    * Different flows spell a scalarized record/interface member differently — the
    * VHDL frontend uses `ctrl_i__ir_funct3` (double underscore), GHDL-synth
    * Verilog uses `ctrl_i_ir_funct3` (single), Vivado uses `m.awid` — this maps
-   * them all to one canonical `ctrl_i_ir_funct3` so they align by name. *)
+   * them all to one canonical `ctrl_i_ir_funct3` so they align by name.
+   *
+   * NB '/' is deliberately NOT in this set: this function COLLAPSES runs
+   * (`a__b` -> `a_b`), so folding the hierarchy separator in here is lossy and
+   * can merge distinct signals.  Use [canon_hier_name] for hierarchy. *)
   let b = Buffer.create (String.length s) in
   let prev = ref false in
   String.iter (fun c ->
@@ -2091,6 +2110,15 @@ let lcanon_sep mod_h =
    * using it, so the whole program must be canonicalised, not just [m]. *)
   let cp = { p with modules = List.map canon_module p.modules } in
   hadd (Mod (n, canon_module m, cp))
+
+(* Hierarchy-separator canonicalisation, same shape as [lcanon_sep] but using
+   the non-lossy '/' -> '__' mapping.  Apply to BOTH miter sides so a flattened
+   Vivado netlist's `a/b/c` and our flattener's `a__b__c` name the same net. *)
+let lcanon_hier mod_h =
+  let n, m, p = find_mod mod_h in
+  let ch mm = rename_module canon_hier_name mm in
+  let cp = { p with modules = List.map ch p.modules } in
+  hadd (Mod (n, ch m, cp))
 
 let liflift prog_h =
   let label, p = find_prog prog_h in
@@ -3470,6 +3498,7 @@ module MakeLib
         "canon_module_names", V.efunc (V.string **->> V.string)
                            (wrap1 lcanon_module_names);
         "canon_sep",  V.efunc (V.string **->> V.string) (wrap1 lcanon_sep);
+        "canon_hier", V.efunc (V.string **->> V.string) (wrap1 lcanon_hier);
         "alias_output_regs", V.efunc (V.string **->> V.string) (wrap1 lalias_output_regs);
         "reg_correspond", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lreg_correspond);
         "miter_regcorr", V.efunc (V.string **-> V.string **->> V.string) (wrap2 lmiter_regcorr);
