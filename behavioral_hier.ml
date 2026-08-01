@@ -303,8 +303,23 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
     List.map (fun (dst, _) ->
       { name = dst; stype = BInt { width = 1; signed = Unsigned };
         direction = `Internal; initial_value = None; attrs = [] }) bit_assigns in
+  (* Carry the child's PRESERVED instances (unresolvable hard primitives --
+     GTXE2/MMCM/RAMB -- kept by flatten_one rather than inlined away) up into
+     the parent, renaming their connections exactly as reads are renamed.
+     Without this they were dropped on the way up and never surfaced at top,
+     so cut_blackboxes had nothing to cut and every cone fed by the block
+     compared against an undriven net. *)
+  let hoisted_instances =
+    List.map (fun (ci : binstance) ->
+      { ci with
+        inst_name = pname prefix ci.inst_name;
+        port_connections =
+          List.map (fun (pin, e) -> (pin, sub_bexpr ~subst ~prefix e))
+            ci.port_connections })
+      child.instances in
   { parent with
     signals   = obuf_sigs @ new_signals;
+    instances = hoisted_instances @ parent.instances;
     processes = fanout_procs @ bit_proc @ new_processes }
 
 (* Flatten a top-level module by recursively inlining every reachable
@@ -406,8 +421,21 @@ let flatten_for_z3 ?(debug = false) (p : bprogram) ~top : bmodule =
   and flatten_one (m : bmodule) : bmodule =
     let acc = ref { m with instances = [] } in
     List.iter (fun (i : binstance) ->
-      let child_flat = flatten ~parent:m i in
-      acc := inline_instance ~debug !acc i child_flat
+      match lookup_resolving ~parent:m i with
+      | None ->
+          (* Unresolvable => a hard primitive (GTXE2_CHANNEL, MMCME2_ADV,
+             RAMB36E1 ...).  PRESERVE the instance so it surfaces at top and
+             cut_blackboxes can turn it into tied inputs / compared outputs.
+             It used to be replaced by an EMPTY module and inlined away, which
+             deleted the cell outright: on the eth-arp diagnostic the emission
+             cut ONE black box (an MMCM at top level, the only one not buried
+             in a submodule) where the Vivado netlist cut FIVE, so the GT and
+             everything downstream of it was uncomparable. *)
+          unresolved_register ~parent_name:m.name i;
+          acc := { !acc with instances = i :: (!acc).instances }
+      | Some _ ->
+          let child_flat = flatten ~parent:m i in
+          acc := inline_instance ~debug !acc i child_flat
     ) m.instances;
     !acc
   in
