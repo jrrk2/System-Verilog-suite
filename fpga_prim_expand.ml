@@ -764,10 +764,34 @@ let expand_module (mo : bmodule) : bmodule =
       | Some l -> l := i.inst_name :: !l
       | None -> Hashtbl.add by_mod key (ref [ i.inst_name ])
     end) mo.instances;
+  (* Ordinal = position in the sorted instance list, and BOTH flows must sort
+     the same way or the cuts pair the wrong blocks.  They do not by default:
+     a flattened Vivado netlist joins hierarchy with '/' (0x2F) while the SVS
+     emission joins with '__' (0x5F), so `a/b` and `a__b` order differently
+     against their siblings and e.g. the seven BUFGs or the two MMCMs permute.
+     The ufo__/ufi__ nets then tie one flow's block to a DIFFERENT block in the
+     other, and every cone downstream of a hard block differs for free.
+     Sort on a separator-normalised key (and fall back to the raw name to keep
+     the order total).  SVS_CANON_RAW_SORT=1 restores the old ordering. *)
+  let sep_norm n =
+    let b = Buffer.create (String.length n) in
+    let i = ref 0 and len = String.length n in
+    while !i < len do
+      if n.[!i] = '/' then (Buffer.add_string b "__"; incr i)
+      else if !i + 1 < len && n.[!i] = '_' && n.[!i + 1] = '_' then
+        (Buffer.add_string b "__"; i := !i + 2)
+      else (Buffer.add_char b n.[!i]; incr i)
+    done;
+    Buffer.contents b in
+  let inst_order a b =
+    if Sys.getenv_opt "SVS_CANON_RAW_SORT" <> None then compare a b
+    else match compare (sep_norm a) (sep_norm b) with
+      | 0 -> compare a b
+      | c -> c in
   Hashtbl.iter (fun mn l ->
     List.iteri (fun k inst ->
       Hashtbl.replace canon_of inst (Printf.sprintf "%s_%d" mn k))
-      (List.sort compare !l)) by_mod;
+      (List.sort inst_order !l)) by_mod;
   let sigw : (string, int) Hashtbl.t = Hashtbl.create 64 in
   List.iter (fun (s : bsignal) ->
     match s.stype with

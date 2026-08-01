@@ -1732,6 +1732,7 @@ let legalize_port_name (s : string) : string =
    emission and [Lib_map.map_bexpr] for technology mapping. *)
 let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     ?(port_dir : (string -> string -> [ `Input | `Output ] option) = fun _ _ -> None)
+    ?(local_module : string -> bool = fun _ -> false)
     (bmod : Behavioral_ir.bmodule) =
   let scope = Scope.create () in
   let inputs = build_inputs bmod in
@@ -2664,7 +2665,17 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
       let is_prim_name s =
         String.length s > 0
         && not (String.exists (fun c -> c >= 'a' && c <= 'z') s) in
-      let keep_params = is_prim_name i.module_name in
+      (* The ALL-CAPS test alone misfires on a SPECIALISED user module whose
+         name happens to have no lowercase: flattening the retarget wrapper
+         `FD` produces `FD__I0`, which reads as a primitive, so the emitter
+         kept the `#(.INIT(..))` override on a module that no longer declares
+         one and Vivado rejected the whole design:
+             ERROR [Synth 8-3438] module 'FD__I0' does not have any parameter
+             'INIT' used as named parameter override
+         A module we are EMITTING ourselves is by definition not an external
+         primitive, whatever its case -- ask the program, not the spelling. *)
+      let keep_params =
+        is_prim_name i.module_name && not (local_module i.module_name) in
       (* Dedup by name (int wins over string) so a param listed in both
          param_values and param_strs isn't emitted twice — Hardcaml Rtl.output
          would otherwise write e.g. two `.DIVCLK_DIVIDE(1)` / two STARTUP_WAIT

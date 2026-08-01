@@ -2641,8 +2641,14 @@ let lwrite_create_circuit_v prog_h dir =
   List.iter (fun (m : Behavioral_ir.bmodule) ->
     try
       let port_dir = build_port_dir m p in
+      (* A module of THIS program is never an external primitive, so its
+         instantiations must not carry `#(...)` overrides. *)
+      let local_module n =
+        List.exists (fun (mm : Behavioral_ir.bmodule) -> mm.name = n)
+          p.Behavioral_ir.modules in
       let circ =
-        Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
+        Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir
+          ~local_module m in
       write_circ_verilog ~dir m circ
     with e ->
       let msg = Printexc.to_string e in
