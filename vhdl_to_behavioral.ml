@@ -1408,7 +1408,59 @@ let extract_architecture ctx entity_name = function
               (Printf.sprintf "_pos%d" i, expr_to_bexpr ctx other)
         ) elems
       in
-      let rec extract_stmts = function
+      (* Resolve an instantiation's reference to a plain name.  Vivado writes it
+         as a SELECTED name -- `work.sgmii_soc` (2 parts) for a user entity,
+         `unisim.vcomponents.GTXE2_CHANNEL` (3 parts) for a primitive -- so the
+         entity/component name is the LAST identifier, not the first, and never
+         a bare Str.  Taking the last non-empty identifier handles the bare,
+         2-part and 3-part forms alike. *)
+      let ref_last_ident ref_node =
+        (* FIRST identifier in traversal order, not the last: the selected-name
+           node stores its parts in reverse source order, so `work.sgmii_soc`
+           traverses as [sgmii_soc; work] and
+           `unisim.vcomponents.GTXE2_CHANNEL` as
+           [GTXE2_CHANNEL; vcomponents; unisim].  Taking the last yielded the
+           LIBRARY name ("work" / "unisim") as the module, which resolves to
+           nothing -- the miter then reported
+             INCONCLUSIVE - 2 unresolved primitive bodies: cpu_bufg:unisim,
+             i_sgmii:work
+           even though the instances themselves had been created. *)
+        let last = ref None in
+        let rec go = function
+          | Str x when x <> "" -> if !last = None then last := Some x
+          | Double (a, b) -> go a; go b
+          | Triple (a, b, c) -> go a; go b; go c
+          | Quadruple (a, b, c, d) -> List.iter go [a; b; c; d]
+          | Quintuple (a, b, c, d, e) -> List.iter go [a; b; c; d; e]
+          | Sextuple (a, b, c, d, e, f) -> List.iter go [a; b; c; d; e; f]
+          | List l -> List.iter go l
+          | _ -> () in
+        go ref_node;
+        match !last with Some n -> n | None -> "_unknown_entity" in
+      let rec extract_stmts stmt0 =
+        (* VHDL_STMT_TRACE=<substring>: print the deep shape of any architecture
+           statement mentioning the substring.  Needed because an instantiation
+           that fails to match its pattern is not necessarily REPORTED -- it can
+           be absorbed by an earlier case -- so the unhandled reporter alone
+           cannot find it. *)
+        (match Sys.getenv_opt "VHDL_STMT_TRACE" with
+         | Some pat ->
+             let head_name h = try Vhd_front.Asctoken.asctoken h with _ -> "?" in
+             let rec shp d n =
+               if d <= 0 then "..." else match n with
+               | Double (h,a) -> Printf.sprintf "Double(%s,%s)" (head_name h) (shp (d-1) a)
+               | Triple (h,a,b) -> Printf.sprintf "Triple(%s,%s,%s)" (head_name h) (shp (d-1) a) (shp (d-1) b)
+               | Quadruple (h,a,b,c) -> Printf.sprintf "Quad(%s,%s,%s,%s)" (head_name h) (shp (d-1) a) (shp (d-1) b) (shp (d-1) c)
+               | Quintuple (h,a,b,c,e) -> Printf.sprintf "Quint(%s,%s,%s,%s,%s)" (head_name h) (shp (d-1) a) (shp (d-1) b) (shp (d-1) c) (shp (d-1) e)
+               | Str x -> Printf.sprintf "Str %S" x
+               | List l -> Printf.sprintf "List[%d]" (List.length l)
+               | x -> (try Vhd_front.Asctoken.asctoken x with _ -> "leaf") in
+             let sh = shp 7 stmt0 in
+             (try ignore (Str.search_forward (Str.regexp_string pat) sh 0);
+                  Printf.eprintf "[vhdl-stmt] %s\n%!" sh
+              with Not_found -> ())
+         | None -> ());
+        match stmt0 with
         | List stmt_list -> List.iter extract_stmts stmt_list
 
         | Double (VhdConcurrentProcessStatement,
@@ -1438,9 +1490,10 @@ let extract_architecture ctx entity_name = function
         | Double (VhdConcurrentComponentInstantiationStatement,
                  Quintuple (Vhdcomponent_instantiation_statement,
                             Str inst_name,
-                            Double (VhdInstantiatedComponent, Str ref_name),
+                            Double (VhdInstantiatedComponent, ref_node),
                             _generic_assoc,
                             port_assoc_list)) ->
+            let ref_name = ref_last_ident ref_node in
             let port_connections = connect_ports port_assoc_list in
             instances := {
               inst_name; module_name = ref_name;
@@ -1451,19 +1504,28 @@ let extract_architecture ctx entity_name = function
         (* Direct entity instantiation:
               `inst : entity work.foo(rtl) PORT MAP (…)`
            wraps the ref name in VhdInstantiatedEntityArchitecture.
-           The architecture name is optional; pull just the entity. *)
+
+           Vivado's `synth_design -rtl` + `write_vhdl` emits this as a TRIPLE
+           (entity reference AND architecture name, the latter often "") with
+           the reference itself a `Double (VhdSelectedName, List [work; foo])`.
+           Only the Double form was matched and only a bare `Str`/one-level ref
+           was understood, so every hierarchical instantiation in such a netlist
+           fell through SILENTLY -- not even reaching the unhandled reporter,
+           because the statement did match the outer constructor.  The result
+           was 32 entities imported with ZERO instances between them: the whole
+           hierarchy disconnected, and `top` flattening to a 145-signal stub.
+
+           Accept both arities, and resolve the reference by taking the LAST
+           non-empty identifier in it, which is the entity/component name for a
+           bare name, `work.foo`, and `unisim.vcomponents.BUFG` alike. *)
         | Double (VhdConcurrentComponentInstantiationStatement,
                  Quintuple (Vhdcomponent_instantiation_statement,
                             Str inst_name,
-                            Double (VhdInstantiatedEntityArchitecture, ref_node),
+                            ( Double (VhdInstantiatedEntityArchitecture, ref_node)
+                            | Triple (VhdInstantiatedEntityArchitecture, ref_node, _) ),
                             _generic_assoc,
                             port_assoc_list)) ->
-            let ref_name = match ref_node with
-              | Str n -> n
-              | Double (_, Str n) -> n
-              | Triple (_, Str n, _) -> n
-              | _ -> "_unknown_entity"
-            in
+            let ref_name = ref_last_ident ref_node in
             let port_connections = connect_ports port_assoc_list in
             instances := {
               inst_name; module_name = ref_name;
@@ -1527,7 +1589,28 @@ let extract_architecture ctx entity_name = function
                 | Triple (_, _, _) -> "Triple(?)"
                 | _ -> "other"
               in
-              Printf.eprintf "[vhdl2bir] arch_stmt unhandled: %s\n%!" tag
+              (* Print the SHAPE several levels deep, not just the outer tag:
+                 every component instantiation is the same outer constructor and
+                 what differs (a selected name `work.foo` vs a bare one) is
+                 nested three levels in. *)
+              let head_name h = try Vhd_front.Asctoken.asctoken h with _ -> "?" in
+              let rec shape d n =
+                if d <= 0 then "..." else
+                match n with
+                | Double (h, a) -> Printf.sprintf "Double(%s,%s)" (head_name h) (shape (d-1) a)
+                | Triple (h, a, b) ->
+                    Printf.sprintf "Triple(%s,%s,%s)" (head_name h) (shape (d-1) a) (shape (d-1) b)
+                | Quadruple (h,a,b,c) ->
+                    Printf.sprintf "Quad(%s,%s,%s,%s)" (head_name h)
+                      (shape (d-1) a) (shape (d-1) b) (shape (d-1) c)
+                | Quintuple (h,a,b,c,e) ->
+                    Printf.sprintf "Quint(%s,%s,%s,%s,%s)" (head_name h)
+                      (shape (d-1) a) (shape (d-1) b) (shape (d-1) c) (shape (d-1) e)
+                | Str x -> Printf.sprintf "Str %S" x
+                | List l -> Printf.sprintf "List[%d]" (List.length l)
+                | x -> (try Vhd_front.Asctoken.asctoken x with _ -> "leaf") in
+              Printf.eprintf "[vhdl2bir] arch_stmt unhandled: %s :: %s\n%!" tag
+                (shape 6 other)
             end
       in
       extract_stmts stmts;
