@@ -22,11 +22,12 @@ let sig_width (m : bmodule) name =
   | Some s -> (match s.stype with BInt { width; _ } -> Some width | BBool -> Some 1 | _ -> None)
   | None -> None
 
+(* Power-on value of a shift register, full width -- `cpllpd_wait` is 96 bits
+   and `cpllreset_wait` 128, so this must stay arbitrary-precision. *)
 let init_of (m : bmodule) name =
   match List.find_opt (fun (s : bsignal) -> s.name = name) m.signals with
-  | Some { initial_value = Some (BConst { value; _ }); _ } ->
-      (try Z.to_int value with _ -> 0)
-  | _ -> 0
+  | Some { initial_value = Some (BConst { value; _ }); _ } -> value
+  | _ -> Z.zero
 
 (* Shift core:
  *   shift-UP   {sig[W-2:0], D}   -- D enters bit 0, tap k has delay k+1
@@ -182,20 +183,35 @@ let infer_module (m : bmodule) : bmodule =
       let mk_sig name =
         new_sigs := { name; stype = BInt { width = 1; signed = Unsigned };
                       direction = `Internal; initial_value = None; attrs = [] } :: !new_sigs in
-      let add_inst name ty ports =
+      let add_inst ?(init = 0) name ty ports =
         new_insts := { inst_name = name; module_name = ty;
-                       param_values = [ ("INIT", 0) ]; param_strs = [];
+                       param_values = [ ("INIT", init) ]; param_strs = [];
                        port_connections = ports } :: !new_insts in
       (* emit the SRL(s) for a single tap at absolute depth k (delay k+1):
          SRL16E for k<16, one SRLC32E for 16<=k<32, cascaded SRLC32E (Q31->D)
          for k>=32.  Returns the Q net for the tap. *)
-      let emit_tap ~sg ~a ~ce_e ~d ~clock =
+      let emit_tap ~sg ~a ~ce_e ~d ~clock ~initv ~w ~dir =
+        (* Preload the SRL with the register's power-on pattern, or the startup
+           sequence is lost: cpll_railing holds the GT CPLL down for 96 cycles
+           from `reg [95:0] cpllpd_wait = 96'hFFF...F`, and with INIT(0)
+           cpll_pd_out reads 0 from the first cycle.
+           Chain depth j is original bit j for a shift-UP (D enters bit 0), and
+           bit w-1-j for a shift-DOWN (D enters bit w-1, so the pattern is seen
+           in reverse). *)
+        let init_bit j =
+          let src = match dir with `Up -> j | `Down -> w - 1 - j in
+          src >= 0 && src < w && Z.testbit initv src in
+        let init_word ~base ~bits =
+          let v = ref 0 in
+          for j = bits - 1 downto 0 do
+            v := (!v lsl 1) lor (if init_bit (base + j) then 1 else 0)
+          done; !v in
         if a < 16 then begin
           incr counter;
           let q = Printf.sprintf "%s__srlq%d_%d" sg a !counter in
           mk_sig q;
           let addr = List.init 4 (fun b -> (Printf.sprintf "A%d" b, bconst ((a lsr b) land 1) 1)) in
-          add_inst q "SRL16E"
+          add_inst ~init:(init_word ~base:0 ~bits:16) q "SRL16E"
             (("Q", BVar q) :: ("CLK", BVar clock) :: ("CE", ce_e) :: ("D", d) :: addr);
           q
         end else begin
@@ -207,7 +223,8 @@ let infer_module (m : bmodule) : bmodule =
             let q = Printf.sprintf "%s__srlq%d_c%d_%d" sg a i !counter in
             let q31 = Printf.sprintf "%s__srl31_c%d_%d" sg i !counter in
             mk_sig q; mk_sig q31;
-            add_inst q "SRLC32E"
+            (* cell i holds chain depths 32*i .. 32*i+31 (cell 0 is nearest D) *)
+            add_inst ~init:(init_word ~base:(32 * i) ~bits:32) q "SRLC32E"
               [ ("Q", BVar q); ("Q31", BVar q31); ("CLK", BVar clock);
                 ("CE", ce_e); ("D", din); ("A", bconst av 5) ];
             if is_last then q else build (i + 1) (BVar q31)
@@ -222,7 +239,8 @@ let infer_module (m : bmodule) : bmodule =
            at bit w-1 so bit k has delay w-1-k. *)
         List.iter (fun k ->
           let a = match dir with `Up -> k | `Down -> w - 1 - k in
-          Hashtbl.replace tap_net (sg, k) (emit_tap ~sg ~a ~ce_e ~d ~clock)) ts) valid;
+          Hashtbl.replace tap_net (sg, k)
+            (emit_tap ~sg ~a ~ce_e ~d ~clock ~initv:(init_of m sg) ~w ~dir)) ts) valid;
       (* 4. rewrite tap reads sig[k:k] -> BVar net; drop shift-assigns; drop sigs *)
       let valid_sgs = List.map (fun (sg,_,_,_,_,_) -> sg) valid in
       let fe = function
