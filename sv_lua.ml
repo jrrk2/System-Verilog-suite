@@ -1815,11 +1815,26 @@ let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list 
       let widths = Hashtbl.create 512 in
       List.iter (fun (s : bsignal) -> Hashtbl.replace widths s.name (sigw s)) rm.signals;
       let comb = List.filter_map (function BCombinational r -> Some r.body | _ -> None) rm.processes in
+      (* The executor's exceptions were swallowed wholesale below, so a
+         reference whose statements it cannot evaluate simulated to all-zero
+         next-state and every register got the same signature -- the partition
+         refinement then had nothing to discriminate on.  Count what fails and
+         say so. *)
+      let n_exec_fail = ref 0 and n_exec_ok = ref 0 and first_fail = ref "" in
       let cap = 4 + List.length rm.signals in
       let inames = List.filter_map (fun (s : bsignal) ->
         if s.direction = `Input then Some s.name else None) rm.signals in
       let dnames = List.map (fun (b, _, _) -> b ^ "__D") regs in
       (inames, fun (assign : (string * Z.t) list) ->
+         (* Behavioral_initeval's step budget is a GLOBAL counter reset only by
+            eval_module, which this path never calls -- so it accumulated across
+            every refinement iteration, tripped permanently at 20M steps, and
+            from then on EVERY statement raised.  The failures were swallowed,
+            so the reference simulated to all-zero next-state, every register
+            got the same signature and the partition refinement had nothing to
+            discriminate on (ref_nonzero_D=0/963).  Reset per simulation run:
+            the budget is meant to bound one evaluation, not a whole session. *)
+         BI.fuel := 0;
          let env = { BI.widths; arrays = Hashtbl.create 4; elemw = Hashtbl.create 4;
                      scalars = Hashtbl.create 512; awrites = Hashtbl.create 4 } in
          List.iter (fun (n, v) -> BI.set_scalar env n v) assign;
@@ -1829,12 +1844,29 @@ let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list 
              (try Hashtbl.find env.BI.scalars d with Not_found -> Z.zero))) Z.zero dnames in
          let prev = ref (chksum ()) and i = ref 0 and stop = ref false in
          while not !stop && !i < cap do
-           List.iter (List.iter (fun st -> try BI.exec env st with _ -> ())) comb;
+           List.iter (List.iter (fun st ->
+             try BI.exec env st; incr n_exec_ok
+             with e ->
+               incr n_exec_fail;
+               if !first_fail = "" then
+                 first_fail := Printexc.to_string e)) comb;
            incr i;
            let c = chksum () in if Z.equal c !prev && !i > 1 then stop := true else prev := c
          done;
+         if Sys.getenv_opt "REGCORR_DEBUG" <> None && !n_exec_fail > 0 then begin
+           Printf.eprintf
+             "[regcorr] %s sim: %d stmt(s) evaluated, %d FAILED (first: %s)\n%!"
+             rm.name !n_exec_ok !n_exec_fail !first_fail;
+           n_exec_fail := 0
+         end;
          env.BI.scalars)
     in
+    if Sys.getenv_opt "REGCORR_DEBUG" <> None then
+      Printf.eprintf "[regcorr] comb processes: ref=%d tgt=%d\n%!"
+        (List.length (List.filter (function BCombinational _ -> true | _ -> false)
+                        rr.processes))
+        (List.length (List.filter (function BCombinational _ -> true | _ -> false)
+                        rt.processes));
     let (r_in, r_sim) = make_sim rr rregs and (t_in, t_sim) = make_sim rt tregs in
     let rng = Random.State.make [| 0x5eed; 0x1234; 0x9a1c |] in
     let randz w =
