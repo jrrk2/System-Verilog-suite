@@ -2379,6 +2379,113 @@ let comb_nba_to_blocking (s : string) : string =
  * sanitising BIR names the way Hardcaml legalises identifiers, and applied
  * only when the match is UNAMBIGUOUS -- a wrong INIT is worse than none.
  * SVS_NO_DECL_INIT=1 restores the old behaviour.                          *)
+(* Put a non-zero declared LSB back on the emitted vector.  BIR is zero-based
+   throughout and every index use was rebased on the way in, so the emission is
+   self-consistent either way -- but a MITER matches this text against a golden
+   netlist by NAME and refers to bits by their SOURCE index (`TIMER4096_reg[11]`,
+   not `[0]`).  Restoring the declaration and shifting the selects back keeps the
+   two flows referring to the same bit.  Signals carry the offset as the
+   `decl_lsb` attribute (set in verible_to_behavioral).  SVS_NO_DECL_RANGE=1
+   leaves the emission zero-based. *)
+let restore_decl_ranges (m : Behavioral_ir.bmodule) (text : string) : string =
+  if Sys.getenv_opt "SVS_NO_DECL_RANGE" <> None then text
+  else begin
+    let sanitise s =
+      String.map (fun c ->
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+           || (c >= '0' && c <= '9') || c = '_' then c else '_') s in
+    let strip_us x =
+      let i = ref 0 in
+      while !i < String.length x && x.[!i] = '_' do incr i done;
+      String.sub x !i (String.length x - !i) in
+    (* sanitised name -> Some lsb, or None when ambiguous *)
+    let want : (string, int option) Hashtbl.t = Hashtbl.create 8 in
+    let add k v =
+      if Hashtbl.mem want k then Hashtbl.replace want k None
+      else Hashtbl.replace want k v in
+    List.iter (fun (s : Behavioral_ir.bsignal) ->
+      match List.assoc_opt "decl_lsb" s.attrs with
+      | Some l ->
+          (match int_of_string_opt l with
+           | Some l when l <> 0 ->
+               let k = sanitise s.name in
+               add k (Some l);
+               let k' = strip_us k in
+               if k' <> k && k' <> "" then add k' (Some l)
+           | _ -> ())
+      | None -> ()) m.Behavioral_ir.signals;
+    if Hashtbl.length want = 0 then text
+    else begin
+      let off_of n =
+        match Hashtbl.find_opt want (sanitise n) with
+        | Some (Some l) -> Some l
+        | _ -> (match Hashtbl.find_opt want (strip_us (sanitise n)) with
+                | Some (Some l) -> Some l | _ -> None) in
+      (* 1. declarations: `wire [W-1:0] X;` -> `wire [W-1+L:L] X;` *)
+      let decl_re = Str.regexp
+        "^\\([ \t]*\\(wire\\|reg\\|input\\|output\\)[ \t]+\\)\\[\\([0-9]+\\):0\\][ \t]*\\([A-Za-z_][A-Za-z_0-9$]*\\)" in
+      let lines = String.split_on_char '\n' text in
+      (* A 1-bit signal is emitted as a bare scalar (`reg X;`), so there is no
+         `[0:0]` to widen -- give it the explicit `[L:L]` the golden netlist
+         uses. *)
+      let scalar_re = Str.regexp
+        "^\\([ \t]*\\(wire\\|reg\\|input\\|output\\)[ \t]+\\)\\([A-Za-z_][A-Za-z_0-9$]*\\)" in
+      let lines = List.map (fun line ->
+        if Str.string_match decl_re line 0 then
+          let pre = Str.matched_group 1 line in
+          let msb = int_of_string (Str.matched_group 3 line) in
+          let name = Str.matched_group 4 line in
+          let rest_at = Str.match_end () in
+          match off_of name with
+          | Some l ->
+              Printf.sprintf "%s[%d:%d] %s%s" pre (msb + l) l name
+                (String.sub line rest_at (String.length line - rest_at))
+          | None -> line
+        else if Str.string_match scalar_re line 0 then
+          let pre = Str.matched_group 1 line in
+          let name = Str.matched_group 3 line in
+          let rest_at = Str.match_end () in
+          match off_of name with
+          | Some l ->
+              Printf.sprintf "%s[%d:%d] %s%s" pre l l name
+                (String.sub line rest_at (String.length line - rest_at))
+          | None -> line
+        else line) lines in
+      let text = String.concat "\n" lines in
+      (* 2. selects on those signals: `X[a:b]` / `X[a]` -> shift both by L.
+         Skip a match that is itself a declaration (handled above). *)
+      let sel_re = Str.regexp
+        "\\([^A-Za-z_0-9$]\\)\\([A-Za-z_][A-Za-z_0-9$]*\\)\\[\\([0-9]+\\)\\(:\\([0-9]+\\)\\)?\\]" in
+      let buf = Buffer.create (String.length text) in
+      let pos = ref 0 in
+      (try
+         while true do
+           let i = Str.search_forward sel_re text !pos in
+           let whole = Str.matched_string text in
+           let lead = Str.matched_group 1 text in
+           let name = Str.matched_group 2 text in
+           let a = int_of_string (Str.matched_group 3 text) in
+           let b = try Some (int_of_string (Str.matched_group 5 text))
+                   with Not_found | Invalid_argument _ -> None in
+           Buffer.add_string buf (String.sub text !pos (i - !pos));
+           (match off_of name with
+            | Some l ->
+                (match b with
+                 | Some b ->
+                     Buffer.add_string buf
+                       (Printf.sprintf "%s%s[%d:%d]" lead name (a + l) (b + l))
+                 | None ->
+                     Buffer.add_string buf
+                       (Printf.sprintf "%s%s[%d]" lead name (a + l)))
+            | None -> Buffer.add_string buf whole);
+           pos := i + String.length whole
+         done
+       with Not_found -> ());
+      Buffer.add_string buf (String.sub text !pos (String.length text - !pos));
+      Buffer.contents buf
+    end
+  end
+
 let apply_decl_inits (m : Behavioral_ir.bmodule) (text : string) : string =
   if Sys.getenv_opt "SVS_NO_DECL_INIT" <> None then text
   else begin
@@ -2485,6 +2592,7 @@ let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
   let text = strip_keep_ports text in
   let text = comb_nba_to_blocking text in
   let text = apply_decl_inits m text in
+  let text = restore_decl_ranges m text in
   (* re-declare pruned input ports so parent connections never dangle
      (Verilator 5.050 SIGSEGVs on a non-existent child pin). *)
   let emitted : (string, unit) Hashtbl.t = Hashtbl.create 64 in

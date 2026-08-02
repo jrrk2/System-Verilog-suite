@@ -251,15 +251,15 @@ let rec eval_int ~pkgs ~params tok =
   | TUPLE4 (STRING "add_expr2", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a + b)
-       | _ -> None)
+       | _ -> real_fallback ~pkgs ~params tok)
   | TUPLE4 (STRING "add_expr3", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a - b)
-       | _ -> None)
+       | _ -> real_fallback ~pkgs ~params tok)
   | TUPLE4 (STRING "mul_expr2", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some a, Some b -> Some (a * b)
-       | _ -> None)
+       | _ -> real_fallback ~pkgs ~params tok)
   (* Integer `/` and `%`.  When the divisor is *concretely zero* (from
    * a fold that produced 0 — usually a struct-typed param's empty-config
    * default; see the reference2/hierarchy_extension1 case below) we
@@ -274,7 +274,14 @@ let rec eval_int ~pkgs ~params tok =
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some _, Some 0 -> Some 0
        | Some a, Some b -> Some (a / b)
-       | _ -> None)
+       (* A REAL operand makes the integer evaluator give up, and the
+          expr_to_bexpr path then folds the literal to 0 via silent_zero --
+          so `50000/1.25` became `50000/0` = 0.  On the SGMII GT that is
+          WAIT_TIME_CDRLOCK, whose 0 makes the CDR-lock counter match on its
+          first cycle: RECCLK_STABLE asserts at once, RX_STARTUP_FSM releases
+          RXUSERRDY ~40us early, and the receiver is enabled before the
+          recovered clock exists.  Evaluate in real arithmetic instead. *)
+       | _ -> real_fallback ~pkgs ~params tok)
   | TUPLE4 (STRING "mul_expr4", lhs, _op, rhs) ->
       (match eval_int ~pkgs ~params lhs, eval_int ~pkgs ~params rhs with
        | Some _, Some 0 -> Some 0
@@ -708,6 +715,41 @@ and eval_user_fn ~pkgs ~params fname call_base =
  * lsb_expr, RBRACK). Pull the msb/lsb subtrees directly — collect_by
  * would also descend into them and pick up nested expressions, which
  * shifts the lsb. *)
+(* Real-valued constant folding, used only when the integer evaluator gives up
+   because an operand is a real literal (SV 1800 allows reals in constant
+   expressions; the result is rounded when it lands in an integer context). *)
+and eval_real ~pkgs ~params tok : float option =
+  let rbin l r f =
+    match eval_real ~pkgs ~params l, eval_real ~pkgs ~params r with
+    | Some a, Some b -> Some (f a b)
+    | _ -> None in
+  match tok with
+  (* verible lexes a real literal as TK_RealTime, which the integer
+     evaluator cannot represent -- that is why `50000/1.25` collapsed. *)
+  | TK_RealTime n | TK_DecNumber n | TK_UnBasedNumber n ->
+      (try Some (float_of_string (String.trim n)) with _ -> None)
+  | TUPLE4 (STRING "add_expr2", l, _, r) -> rbin l r ( +. )
+  | TUPLE4 (STRING "add_expr3", l, _, r) -> rbin l r ( -. )
+  | TUPLE4 (STRING "mul_expr2", l, _, r) -> rbin l r ( *. )
+  | TUPLE4 (STRING "mul_expr3", l, _, r) ->
+      (match eval_real ~pkgs ~params l, eval_real ~pkgs ~params r with
+       | Some a, Some b when b <> 0.0 -> Some (a /. b)
+       | _ -> None)
+  | t ->
+      (* anything else (identifiers, params, sized literals) is integral *)
+      (match eval_int ~pkgs ~params t with
+       | Some i -> Some (float_of_int i)
+       | None -> None)
+
+and real_fallback ~pkgs ~params tok : int option =
+  let r = eval_real ~pkgs ~params tok in
+  if Sys.getenv_opt "SVS_DEBUG_REAL" <> None then
+    Printf.eprintf "[real] fallback: %s\n"
+      (match r with Some f -> string_of_float f | None -> "unresolved");
+  match r with
+  | Some f when Float.is_finite f -> Some (int_of_float (Float.round f))
+  | _ -> None
+
 let extract_range ~pkgs ~params tok =
   let pairs = collect_by (has_tag (prefix_is "decl_variable_dimension")) tok in
   match pairs with
@@ -1087,6 +1129,17 @@ let mk_bslice signal msb lsb =
        | _ -> BSlice { signal; msb; lsb })
   | _ -> BSlice { signal; msb; lsb }
 
+(* Declared LSB of each net/data signal with a non-zero-based packed range
+ * (`wire [4:3] w`).  Internal vectors are zero-based everywhere; this offset
+ * is subtracted at every index USE -- see rebase_decl_ranges. *)
+let cur_signal_wlsb : (string * int) list ref = ref []
+
+(* 1-bit signals minted by the per-bit split in merge_array_writes, appended
+ * to the module's signal list when the bmodule is built. *)
+let cur_bit_signals : bsignal list ref = ref []
+
+
+
 (* Per-module table of array-typed localparams from .svh includes /
    inline `'{e1, e2, …}` initialisers.  Maps the localparam name to
    the list of element bexprs in source order (index 0 = first elem).
@@ -1196,6 +1249,13 @@ let debug_expr = lazy (Sys.getenv_opt "MITER_VERIBLE_DEBUG" <> None)
 exception Silent_zero_substitution of string
 
 let lenient_mode = lazy (Sys.getenv_opt "SV_DECOMP_LENIENT" = Some "1")
+
+(* True when the subtree contains a REAL literal (verible: TK_RealTime).
+   Used to route constant arithmetic through the real-aware evaluator. *)
+let contains_real_literal tok =
+  let found = ref false in
+  walk (function TK_RealTime _ -> found := true | _ -> ()) tok;
+  !found
 
 let silent_zero ~reason ~width =
   if Lazy.force lenient_mode then begin
@@ -2101,6 +2161,19 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
             * is small. For the unsupported general case, fall back
             * to lhs (drops the power). *)
            ignore rhs; recurse lhs)
+  | TUPLE4 (STRING tag, _, _, _)
+    when (prefix_is "add_expr2" tag || prefix_is "add_expr3" tag
+          || prefix_is "mul_expr2" tag || prefix_is "mul_expr3" tag)
+         && contains_real_literal tok
+         && eval_int ~pkgs ~params tok <> None ->
+      (* A REAL literal in a constant arithmetic expression.  This walker has
+         no real representation, so `50000/1.25` used to build BDiv(50000, 0)
+         -- the GT's WAIT_TIME_CDRLOCK, whose 0 let the CDR-lock counter match
+         on cycle 0, asserting RECCLK_STABLE immediately and releasing
+         RXUSERRDY ~40us early (no sync, no link).  eval_int folds these in
+         real arithmetic, so use its result. *)
+      let n = Option.get (eval_int ~pkgs ~params tok) in
+      BConst { value = Z.of_int n; width = 32 }
   | TUPLE4 (STRING tag, lhs, _op, rhs) ->
       (* Binary expressions: add_expr, mul_expr, comp_expr, and_expr,
        * or_expr, xor_expr, shift_expr, logeq_expr, etc. *)
@@ -2666,10 +2739,27 @@ let concat_lhs_parts lhs =
       let infos = List.map (fun p ->
         match lhs_indexed_of p with
         | Some (n, _) ->
+            (* Keep the bit/part select on this concat element.  Dropping
+               it turned every element into a WHOLE-signal write, so
+               `assign {w[4], v[5]} = {p,q}` gave w and v the full RHS
+               (each sliced at the wrong offset) instead of one bit each.
+               On the PCS core that is line 2890 -- three separately
+               declared remnants driven from one 3-bit mux -- and it is
+               why s4[4:3][4] never received its bit.  Select node kept
+               raw; the consumer has pkgs/params to fold it. *)
+            let sel = ref `Whole in
+            walk (function
+              | TUPLE4 (STRING dt, _, e, _)
+                when prefix_is "select_variable_dimension" dt && !sel = `Whole ->
+                  sel := `Single e
+              | TUPLE6 (STRING dt, _, m, _, l, _)
+                when prefix_is "select_variable_dimension" dt && !sel = `Whole ->
+                  sel := `Rng (m, l)
+              | _ -> ()) p;
             let w =
               match List.assoc_opt n !cur_signal_widths with
               | Some w -> w | None -> 1 in
-            Some (n, w)
+            Some (n, w, !sel)
         | None -> None
       ) parts in
       if List.for_all (fun x -> x <> None) infos then
@@ -2739,19 +2829,71 @@ let extract_assign ~pkgs ~params ~arrays tok =
          | None ->
         (match concat_lhs_parts lhs with
          | Some parts ->
-             (* Split: each name gets a slice of the RHS, MSB-first. *)
+             (* Split: each element takes its own width off the RHS,
+                MSB-first, and a bit/part-selected element writes only
+                the bits it names (bracket-keyed, exactly as the
+                single-LHS path below does). *)
              let rhs_e = expr_to_bexpr ~pkgs ~params ~arrays rhs in
-             let total_w = List.fold_left (fun acc (_, w) -> acc + w) 0 parts in
+             let lit e = match expr_to_bexpr ~pkgs ~params ~arrays e with
+               | BConst { value; _ } -> Some (Z.to_int value)
+               | _ -> None in
+             let part_w (_, w, sel) = match sel with
+               | `Whole -> w
+               | `Single _ -> 1
+               | `Rng (m, l) ->
+                   (match lit m, lit l with
+                    | Some a, Some b -> abs (a - b) + 1
+                    | _ -> w) in
+             let total_w = List.fold_left (fun acc p -> acc + part_w p) 0 parts in
              let cursor = ref total_w in
-             List.map (fun (name, w) ->
+             List.concat_map (fun ((name, _, sel) as p) ->
+               let w = part_w p in
                let hi = !cursor - 1 and lo = !cursor - w in
                cursor := !cursor - w;
                let part_rhs = BSlice { signal = rhs_e; msb = hi; lsb = lo } in
-               BCombinational {
-                 name = "assign_concat_" ^ name;
-                 sensitivity = [BAny];
-                 body = [BAssign { lhs = name; rhs = part_rhs }];
-               }
+               let whole () =
+                 [BCombinational {
+                    name = "assign_concat_" ^ name;
+                    sensitivity = [BAny];
+                    body = [BAssign { lhs = name; rhs = part_rhs }];
+                  }] in
+               (* Indexed write, same shape the single-LHS path uses once
+                  the target has been promoted into `arrays`: the concat
+                  elements are promoted by scan_indexed_lhs above, so
+                  merge_array_writes consolidates these per-bit drives
+                  into one full-bus assign (rebasing a non-zero-based
+                  declared range on the way). *)
+               let mk_bit k r =
+                 BCombinational {
+                   name = Printf.sprintf "assign_concat_%s_bit%d" name k;
+                   sensitivity = [BAny];
+                   body = [BCallStmt {
+                     func = "@mem_write";
+                     args = [BVar name;
+                             BConst { value = Z.of_int k; width = 32 }; r] }];
+                 } in
+               match sel with
+               | `Whole -> whole ()
+               | `Single e ->
+                   (match lit e with
+                    | Some k -> [mk_bit k part_rhs]
+                    | None ->
+                        Printf.eprintf
+                          "verible_to_behavioral: WARNING dynamic bit-select in \
+                           concat continuous-assign LHS %s — select dropped\n" name;
+                        whole ())
+               | `Rng (m, l) ->
+                   (match lit m, lit l with
+                    | Some mv, Some lv ->
+                        let lo' = min mv lv and hi' = max mv lv in
+                        List.init (hi' - lo' + 1) (fun b ->
+                          mk_bit (lo' + b)
+                            (BSlice { signal = part_rhs; msb = b; lsb = b }))
+                    | _ ->
+                        Printf.eprintf
+                          "verible_to_behavioral: WARNING dynamic range-select in \
+                           concat continuous-assign LHS %s — select dropped\n" name;
+                        whole ())
              ) parts
          | None ->
              (match lhs_indexed_of lhs with
@@ -2982,7 +3124,8 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
            match kind with
            | `Range (m_n, l_n) ->
                BCallStmt { func = "@slice_write";
-                           args = [BVar nm; recurse_e m_n; recurse_e l_n;
+                           args = [BVar nm; recurse_e m_n;
+                                   recurse_e l_n;
                                    part_rhs] }
            | `IndexedUp (base_n, w_n) ->
                BCallStmt { func = "@part_sel_write_up";
@@ -5274,6 +5417,37 @@ let convert_module ~pkgs (mdecl : module_decl)
    * call. Keeps result_type_for from falling back to dummy_bool. *)
   cur_signal_widths := [];
   cur_signal_lsb := [];
+  (* Non-zero-based packed ranges on nets (`wire [4:3] w;`) -- the WRITE
+   * side only.  Reads are rebased by the post-hoc `range_offsets`
+   * normalisation further down, but that pass runs AFTER the
+   * @slice_write lowering, so it can never reach a write's indices and
+   * those kept the source values.  Recorded in a table of its own so the
+   * read path (mk_bslice / range_offsets) is left exactly as it was and
+   * cannot end up subtracting the offset twice. *)
+  cur_signal_wlsb := [];
+  cur_bit_signals := [];
+  let decl_nodes_lsb = collect_by (has_tag (fun t ->
+    prefix_is "net_declaration" t || prefix_is "data_declaration" t))
+    mdecl.m_body in
+  List.iter (fun dn ->
+    match extract_range ~pkgs ~params dn with
+    | Some (m, l) when min m l <> 0 ->
+        let off = min m l in
+        (* `reg [11:11] X = 1'h0;` carries a trailing initialiser, so its
+           register_variable node is a 4-tuple -- matching only the 3-tuple
+           form silently skipped every initialised declaration. *)
+        walk (function
+          | TUPLE3 (STRING t, SymbolIdentifier nm, _)
+            when prefix_is "net_variable" t
+                 || prefix_is "register_variable" t ->
+              cur_signal_wlsb := (nm, off) :: !cur_signal_wlsb
+          | TUPLE4 (STRING t, SymbolIdentifier nm, _, _)
+            when prefix_is "net_decl_assign" t
+                 || prefix_is "net_variable" t
+                 || prefix_is "register_variable" t ->
+              cur_signal_wlsb := (nm, off) :: !cur_signal_wlsb
+          | _ -> ()) dn
+    | _ -> ()) decl_nodes_lsb;
   if false && Sys.getenv_opt "STRUCT_DEBUG" <> None then
     List.iter (fun (n, t) ->
       Printf.eprintf "  signal %s : %s\n" n t
@@ -5608,13 +5782,22 @@ let convert_module ~pkgs (mdecl : module_decl)
          * design whose power-on state matters [[memory: 65]]. *)
         let init_v = ref None in
         let try_value v =
-          if !init_v = None then
-            try
-              match expr_to_bexpr ~pkgs ~params ~arrays:[] v with
-              | BConst { value; width } ->
-                  init_v := Some (BConst { value; width })
-              | _ -> ()
-            with _ -> ()
+          if !init_v = None then begin
+            (* eval_int resolves localparams (and, now, real arithmetic);
+               expr_to_bexpr leaves a localparam reference as a BVar, so
+               `integer WAIT_TIME_CDRLOCK = RX_CDRLOCK_TIME / STABLE_CLOCK_PERIOD;`
+               folded to nothing and the variable was left undriven = 0. *)
+            (match eval_int ~pkgs ~params v with
+             | Some n -> init_v := Some (BConst { value = Z.of_int n; width = 32 })
+             | None -> ());
+            if !init_v = None then
+              try
+                match expr_to_bexpr ~pkgs ~params ~arrays:[] v with
+                | BConst { value; width } ->
+                    init_v := Some (BConst { value; width })
+                | _ -> ()
+              with _ -> ()
+          end
         in
         walk (function
           | TUPLE3 (STRING t, _, v)
@@ -5688,7 +5871,17 @@ let convert_module ~pkgs (mdecl : module_decl)
       | None -> Hashtbl.replace by_name s.name s; order := s.name :: !order
       | Some prev -> Hashtbl.replace by_name s.name (merge prev s)
     ) (port_signals @ internal_signals);
-    List.rev_map (Hashtbl.find by_name) !order
+    let sigs = List.rev_map (Hashtbl.find by_name) !order in
+    (* Record a non-zero declared LSB on the signal itself.  BIR vectors are
+       zero-based, but a MITER matching this emission against a golden
+       netlist refers to bits by their SOURCE index, so the emitter needs to
+       put the range back when it writes the final Verilog (see
+       restore_decl_ranges in sv_lua). *)
+    List.map (fun (s : bsignal) ->
+      match List.assoc_opt s.name !cur_signal_wlsb with
+      | Some l when l <> 0 && not (List.mem_assoc "decl_lsb" s.attrs) ->
+          { s with attrs = ("decl_lsb", string_of_int l) :: s.attrs }
+      | _ -> s) sigs
   in
   (* Populate per-module width cache before any expr_to_bexpr call —
    * lets `result_type_for` set real widths on BBinOp/BUnOp instead
@@ -5716,17 +5909,30 @@ let convert_module ~pkgs (mdecl : module_decl)
     List.concat_map (fun n ->
       let found = collect_by (has_tag (prefix_is tag_prefix)) n in
       let _ = tag_prefix in
-      List.filter_map (fun a ->
+      List.concat_map (fun a ->
         let lhs = match a, lhs_pos with
           | TUPLE4 (_, l, _, _), 1 -> Some l
           | TUPLE6 (_, l, _, _, _, _), 1 -> Some l
           | _ -> None in
         match lhs with
         | Some lhs ->
-            (match lhs_indexed_of lhs with
-             | Some (name, Some _) -> Some name
-             | _ -> None)
-        | None -> None) found
+            (* A CONCAT lhs (`assign {w[4], v[5]} = …`) holds SEVERAL
+               indexed targets, but lhs_indexed_of collapses the tree to a
+               single name -- so only one element was promoted and the
+               writes to the others had nowhere to go (merge_array_writes
+               only consolidates names in `arrays`, and an unpromoted
+               target keeps the raw source index).  Walk the lhs and
+               promote every subtree that is itself an indexed target, in
+               addition to whatever lhs_indexed_of reports. *)
+            let acc = ref (match lhs_indexed_of lhs with
+                           | Some (name, Some _) -> [name]
+                           | _ -> []) in
+            walk (fun t ->
+              match lhs_indexed_of t with
+              | Some (n, Some _) when not (List.mem n !acc) -> acc := n :: !acc
+              | _ -> ()) lhs;
+            !acc
+        | None -> []) found
     ) nodes in
   (* Pre-scan: collect every name that appears with an indexed LHS,
      across continuous assigns (`assign x[i] = ...`) AND procedural
@@ -6147,7 +6353,102 @@ let convert_module ~pkgs (mdecl : module_decl)
       let covered =
         List.fold_left (fun a (_, data) ->
           a + (if is_scalar then data_width data else elem_w)) 0 writes in
-      if is_scalar && covered < arr_size then
+      (* Bits of a vector may legally be driven from OTHER bits of the same
+         vector -- the PCS core's `{s4[15:12], s4[10:8]} = {0, s4[11],
+         s4[11], 4'he}` is bit-disjoint, so no real loop.  Folding those
+         writes into ONE whole-vector assign makes the RHS read the vector
+         it drives, which Hardcaml rightly rejects as combinational.
+         (Latent until the indices were rebased correctly: with the raw
+         source indices these writes landed out of range and were silently
+         discarded.)
+         Splitting into several partial drivers is NOT a fix: each rebuilds
+         the whole vector with zero fillers, so they clobber one another's
+         bits -- that is what corrupted the TX running disparity and hence
+         txdata.  Keep one driver per written range instead.  Only
+         combinational processes reach this table, so a self-read is never
+         legitimate register feedback. *)
+      let rec mentions e = match e with
+        | BVar x -> x = arr
+        | BConst _ -> false
+        | BBinOp r -> mentions r.lhs || mentions r.rhs
+        | BUnOp r -> mentions r.operand
+        | BSelect r -> mentions r.array || mentions r.index
+        | BSlice r -> mentions r.signal
+        | BConcat es -> List.exists mentions es
+        | BReplicate r -> mentions r.value
+        | BCond r -> mentions r.condition || mentions r.then_val
+                     || mentions r.else_val
+        | BCall r -> List.exists mentions r.args in
+      let self_ref = List.exists (fun (_, d) -> mentions d) writes in
+      if is_scalar && self_ref then begin
+        (* PER-BIT SPLIT.  This vector has its bits driven by more than one
+           assign, one of which READS another bit of it (the PCS core's
+           `{s4[15:12],s4[10:8]} = {0,s4[11],s4[11],4'he}` alongside
+           `{s4[11],..} = ..`).  That is legal, bit-disjoint Verilog, but a
+           single whole-vector driver would read the vector it drives, and
+           several partial drivers each rebuild the whole vector with zero
+           fillers and clobber one another -- which corrupted bit 11, the
+           TX running disparity, and hence txdata.
+           So give every bit its own 1-bit signal and driver, rewrite the
+           intra-vector reads onto those signals, and reassemble the vector
+           from them.  The reassembly has no self-reference, so the cycle
+           is gone, and unlike splitting the signal globally this leaves
+           every other reader of the vector untouched. *)
+        let bit k = Printf.sprintf "%s$b%d" arr k in
+        let all_bits () =
+          BConcat (List.init arr_size (fun i -> BVar (bit (arr_size - 1 - i)))) in
+        let rec rw e = match e with
+          | BVar x when x = arr -> all_bits ()
+          | BSlice { signal = BVar x; msb; lsb } when x = arr ->
+              if msb = lsb then BVar (bit msb)
+              else BConcat (List.init (msb - lsb + 1) (fun i -> BVar (bit (msb - i))))
+          | BSelect { array = BVar x; index = BConst { value; _ } } when x = arr ->
+              BVar (bit (Z.to_int value))
+          | BVar _ | BConst _ -> e
+          | BBinOp r -> BBinOp { r with lhs = rw r.lhs; rhs = rw r.rhs }
+          | BUnOp r -> BUnOp { r with operand = rw r.operand }
+          | BSelect r -> BSelect { array = rw r.array; index = rw r.index }
+          | BSlice r -> BSlice { r with signal = rw r.signal }
+          | BConcat es -> BConcat (List.map rw es)
+          | BReplicate r -> BReplicate { r with value = rw r.value }
+          | BCond r -> BCond { condition = rw r.condition;
+                               then_val = rw r.then_val; else_val = rw r.else_val }
+          | BCall r -> BCall { r with args = List.map rw r.args } in
+        (* One driver per bit.  A write of width w at slot_top=idx covers
+           vector bits [idx .. idx-w+1], data bit b being vector bit
+           idx-w+1+b -- the same layout the whole-vector path uses. *)
+        let driven : (int, bexpr) Hashtbl.t = Hashtbl.create 8 in
+        List.iter (fun (idx, data) ->
+          let w = data_width data in
+          let d = rw data in
+          for b = 0 to w - 1 do
+            let vb = idx - w + 1 + b in
+            if vb >= 0 && vb < arr_size then
+              Hashtbl.replace driven vb
+                (if w = 1 then d else BSlice { signal = d; msb = b; lsb = b })
+          done) writes;
+        for k = 0 to arr_size - 1 do
+          cur_bit_signals :=
+            { name = bit k; stype = BInt { width = 1; signed = Unsigned };
+              direction = `Internal; initial_value = None; attrs = [] }
+            :: !cur_bit_signals
+        done;
+        let bit_procs =
+          List.init arr_size (fun k ->
+            let rhs = match Hashtbl.find_opt driven k with
+              | Some d -> d
+              (* Undriven bits keep the zero the whole-vector path would
+                 have filled in. *)
+              | None -> BConst { value = Z.zero; width = 1 } in
+            BCombinational { name = Printf.sprintf "assign_%s_b%d" arr k;
+                             sensitivity = [BAny];
+                             body = [BAssign { lhs = bit k; rhs }] }) in
+        BCombinational { name = "merged_bits_" ^ arr;
+                         sensitivity = [BAny];
+                         body = [BAssign { lhs = arr; rhs = all_bits () }] }
+        :: bit_procs @ acc
+      end
+      else if is_scalar && covered < arr_size then
         List.map (fun (idx, data) ->
           let w = data_width data in
           BCombinational {
@@ -6433,7 +6734,79 @@ let convert_module ~pkgs (mdecl : module_decl)
       | other -> other
     ) processes in
   let processes =
-    let merged = merge_array_writes (assign_procs @ always_procs) in
+    (* Subtract the declared LSB at every index USE -- reads and writes
+       alike -- once, here, before anything consumes the indices.  Internal
+       vectors are zero-based from this point on, so merge_array_writes
+       lays a `wire [4:3] w` write to w[4] out at bit 1 of a 2-bit vector
+       and a w[4] read selects the same bit.  Doing the two sides at
+       different points is what left the reads rebased and the writes not:
+       every write landed out of range and was silently discarded (the
+       eth-arp ENCOMMAALIGN bug). *)
+    let rebase_decl_ranges procs =
+      if !cur_signal_wlsb = [] then procs else
+      let off_of x = List.assoc_opt x !cur_signal_wlsb in
+      let sub o e = match e with
+        | BConst { value; width } ->
+            BConst { value = Z.sub value (Z.of_int o); width }
+        | _ -> e in
+      let rec rb e = match e with
+        | BSlice { signal = BVar x; msb; lsb } when off_of x <> None ->
+            let o = Option.get (off_of x) in
+            BSlice { signal = BVar x; msb = msb - o; lsb = lsb - o }
+        | BSelect { array = BVar x; index = BConst { value; width } }
+          when off_of x <> None ->
+            let o = Option.get (off_of x) in
+            BSelect { array = BVar x;
+                      index = BConst { value = Z.sub value (Z.of_int o); width } }
+        | BVar _ | BConst _ -> e
+        | BBinOp r -> BBinOp { r with lhs = rb r.lhs; rhs = rb r.rhs }
+        | BUnOp r -> BUnOp { r with operand = rb r.operand }
+        | BSelect r -> BSelect { array = rb r.array; index = rb r.index }
+        | BSlice r -> BSlice { r with signal = rb r.signal }
+        | BConcat es -> BConcat (List.map rb es)
+        | BReplicate r -> BReplicate { r with value = rb r.value }
+        | BCond r -> BCond { condition = rb r.condition;
+                             then_val = rb r.then_val; else_val = rb r.else_val }
+        | BCall r -> BCall { r with args = List.map rb r.args } in
+      (* The write pseudo-calls carry their indices as ARGUMENTS, which rb
+         leaves alone (a bare BConst is just a literal), so handle them
+         here: @mem_write takes one index, @slice_write an msb/lsb pair,
+         @part_sel_write_* a base (its width argument is not an index). *)
+      let rec rbs s = match s with
+        | BCallStmt { func = "@mem_write"; args = [BVar a; idx; d] }
+          when off_of a <> None ->
+            BCallStmt { func = "@mem_write";
+                        args = [BVar a; sub (Option.get (off_of a)) (rb idx);
+                                rb d] }
+        | BCallStmt { func = "@slice_write"; args = [BVar a; m; l; d] }
+          when off_of a <> None ->
+            let o = Option.get (off_of a) in
+            BCallStmt { func = "@slice_write";
+                        args = [BVar a; sub o (rb m); sub o (rb l); rb d] }
+        | BCallStmt { func = ("@part_sel_write_up" | "@part_sel_write_down") as f;
+                      args = [BVar a; base; w; d] } when off_of a <> None ->
+            BCallStmt { func = f;
+                        args = [BVar a; sub (Option.get (off_of a)) (rb base);
+                                rb w; rb d] }
+        | BAssign r -> BAssign { r with rhs = rb r.rhs }
+        | BIf r -> BIf { condition = rb r.condition;
+                         then_stmts = List.map rbs r.then_stmts;
+                         else_stmts = List.map rbs r.else_stmts }
+        | BCase r -> BCase { selector = rb r.selector;
+                             cases = List.map (fun (g, b) -> (rb g, List.map rbs b)) r.cases;
+                             default = List.map rbs r.default }
+        | BWhile r -> BWhile { condition = rb r.condition; body = List.map rbs r.body }
+        | BFor r -> BFor { init = rbs r.init; condition = rb r.condition;
+                           update = rbs r.update; body = List.map rbs r.body }
+        | BBlock b -> BBlock (List.map rbs b)
+        | BCallStmt r -> BCallStmt { r with args = List.map rb r.args }
+        | BReturn eo -> BReturn (Option.map rb eo) in
+      List.map (function
+        | BCombinational r -> BCombinational { r with body = List.map rbs r.body }
+        | BSequential r -> BSequential { r with body = List.map rbs r.body })
+        procs in
+    let merged =
+      merge_array_writes (rebase_decl_ranges (assign_procs @ always_procs)) in
     if Sys.getenv_opt "DISABLE_MEM_WRITE_LOWER" <> None then merged
     else
       merged
@@ -6809,11 +7182,9 @@ let convert_module ~pkgs (mdecl : module_decl)
         | BBlock b -> BBlock (List.map rbs b)
         | BCallStmt r -> BCallStmt { r with args = List.map rb r.args }
         | BReturn eo -> BReturn (Option.map rb eo) in
+      ignore rbs;
       (signals,
-       List.map (function
-         | BCombinational r -> BCombinational { r with body = List.map rbs r.body }
-         | BSequential r -> BSequential { r with body = List.map rbs r.body })
-         processes,
+       processes,   (* already rebased before merge_array_writes *)
        List.map (fun (i : binstance) ->
          { i with port_connections =
                     List.map (fun (p, e) -> (p, rb e)) i.port_connections })
@@ -6934,11 +7305,62 @@ let convert_module ~pkgs (mdecl : module_decl)
         processes in
       signals, processes
     end in
+  (* A variable with a declaration INITIALISER that nothing ever drives is a
+     CONSTANT, not an undriven net.  The initial value is otherwise honoured
+     only for clocked registers, so `integer WAIT_TIME_CDRLOCK = RX_CDRLOCK_TIME
+     / STABLE_CLOCK_PERIOD;` (Xilinx GT bring-up) emitted as 0 -- which made the
+     GT's CDR-lock counter match on cycle 0, assert RECCLK_STABLE at once and
+     release RXUSERRDY ~40us early, so the receiver was enabled before the
+     recovered clock existed and the SGMII link never synchronised.  Drive them
+     with their initial value instead. *)
+  let processes =
+    let written : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+    let base n = match String.index_opt n '[' with
+      | Some i -> String.sub n 0 i | None -> n in
+    let mark n = Hashtbl.replace written (base n) () in
+    let rec scan_s s = match s with
+      | BAssign { lhs; _ } -> mark lhs
+      | BIf r -> List.iter scan_s r.then_stmts; List.iter scan_s r.else_stmts
+      | BCase r ->
+          List.iter (fun (_, b) -> List.iter scan_s b) r.cases;
+          List.iter scan_s r.default
+      | BWhile r -> List.iter scan_s r.body
+      | BFor r -> scan_s r.init; scan_s r.update; List.iter scan_s r.body
+      | BBlock b -> List.iter scan_s b
+      | BCallStmt { args = BVar a :: _; _ } -> mark a
+      | _ -> () in
+    List.iter (function
+      | BCombinational r -> List.iter scan_s r.body
+      | BSequential r -> List.iter scan_s r.body) processes;
+    (* an instance output can drive a signal too *)
+    List.iter (fun (i : binstance) ->
+      List.iter (fun (_, e) ->
+        let rec mv = function
+          | BVar v -> mark v
+          | BConcat es -> List.iter mv es
+          | BSlice r -> mv r.signal
+          | BSelect r -> mv r.array
+          | _ -> () in
+        mv e) i.port_connections) instances;
+    let const_inits =
+      List.filter_map (fun (s : bsignal) ->
+        match s.initial_value with
+        | Some (BConst _ as c)
+          when s.direction = `Internal && not (Hashtbl.mem written s.name) ->
+            Some (BCombinational {
+                    name = "constinit_" ^ s.name;
+                    sensitivity = [BAny];
+                    body = [BAssign { lhs = s.name; rhs = c }] })
+        | _ -> None) signals in
+    if const_inits <> [] && Sys.getenv_opt "SVS_DEBUG_DECL" <> None then
+      Printf.eprintf "[constinit] %s: %d undriven initialised signal(s)\n"
+        mdecl.m_name (List.length const_inits);
+    processes @ const_inits in
   let m =
     {
       name = mdecl.m_name;
       params = [];
-      signals;
+      signals = signals @ !cur_bit_signals;
       processes;
       instances;
       funcs;

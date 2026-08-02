@@ -2703,6 +2703,40 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
               let l = String.length s in
               if l >= 2 && s.[0] = '"' && s.[l-1] = '"'
               then String.sub s 1 (l - 2) else s in
+            (* A SIZED Verilog literal (`10'b0001111111`, `24'hBC07DC`) is a
+               BIT VECTOR, not a string.  The all-0/1 test below never matched
+               one because of the `<width>'<base>` prefix, so every such
+               attribute reached Vivado QUOTED -- and a string assigned to a
+               `[9:0]` parameter takes its ASCII bit pattern.  On the GT that
+               is ALIGN_COMMA_ENABLE / ALIGN_PCOMMA_VALUE / ALIGN_MCOMMA_VALUE
+               (comma detection) among 128 attributes, so the receiver could
+               never frame the symbol stream.  Expand to the plain bit string
+               of the declared width and let the vector path handle it. *)
+            let s =
+              match
+                (try Some (Scanf.sscanf s "%d'%c%s" (fun w b d -> (w, b, d)))
+                 with _ -> None)
+              with
+              | Some (w, b, digits) when w > 0 && w <= 4096 ->
+                  let digits =
+                    String.concat "" (String.split_on_char '_' digits) in
+                  let base = match Char.lowercase_ascii b with
+                    | 'b' -> Some 2 | 'o' -> Some 8
+                    | 'h' -> Some 16 | 'd' -> Some 10 | _ -> None in
+                  (match base with
+                   | Some base when digits <> ""
+                       && String.for_all (fun c ->
+                            match Char.lowercase_ascii c with
+                            | '0'..'9' -> true
+                            | 'a'..'f' -> base = 16
+                            | _ -> false) digits ->
+                       (try
+                          let v = Z.of_string_base base digits in
+                          String.init w (fun i ->
+                            if Z.testbit v (w - 1 - i) then '1' else '0')
+                        with _ -> s)
+                   | _ -> s)
+              | _ -> s in
             let is_bits =
               String.length s > 0 && String.for_all (fun c -> c = '0' || c = '1') s in
             (* A REAL-valued parameter -- MMCM/PLL CLKIN1_PERIOD,
