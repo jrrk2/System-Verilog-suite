@@ -2632,8 +2632,38 @@ let extract_port_decl ~pkgs ~params tok =
      UNPACKED dimension -> unpacked array; a port with only range dims
      (`[A][B] x`) is a genuinely PACKED 2-D (dm_csrs `[DataCount-1:0][31:0]`).
      Exclude STRUCT-element arrays (scalarised to a packed concat). *)
+  (* An UNPACKED dimension may be written either in size form `[N]`
+     (decl_variable_dimension2) or as a RANGE `[0:7]` -- `wire [8:0] rs [0:7]`.
+     Testing only for the size form misread the range spelling as a packed 2-D
+     array and SWAPPED element width with array size: `rs` became 9 elements of
+     8 bits instead of 8 of 9, so `rs[k][7:0]` read fine while `rs[k][8]` was
+     out of range and folded to 0.  On the eth-arp datapath that bit is the
+     per-lane tlast flag, so `rx_has_tlast` was constant 0, no received frame
+     was ever committed to the ring buffer, and the ARP responder never saw a
+     packet.  What actually marks a dimension unpacked is its POSITION -- after
+     the identifier, i.e. inside the variable node -- which is how the
+     reg_var_signals path already decides it. *)
+  let after_name_dim =
+    let found = ref false in
+    let scan_sub sub =
+      walk (function
+        | TUPLE4 (STRING d, _, _, _)
+        | TUPLE6 (STRING d, _, _, _, _, _)
+          when prefix_is "decl_variable_dimension" d -> found := true
+        | _ -> ()) sub in
+    walk (function
+      | TUPLE3 (STRING t, _, sub) when prefix_is "net_variable" t
+                                    || prefix_is "register_variable" t ->
+          scan_sub sub
+      | TUPLE4 (STRING t, _, a, b) when prefix_is "net_variable" t
+                                     || prefix_is "register_variable" t
+                                     || prefix_is "net_decl_assign" t ->
+          scan_sub a; scan_sub b
+      | _ -> ()) tok;
+    !found in
   let has_size_form =
-    List.exists (function
+    after_name_dim
+    || List.exists (function
       | TUPLE4 (STRING tag, _, _, _) when prefix_is "decl_variable_dimension2" tag -> true
       | _ -> false) dim_nodes in
   let is_struct_arr = !struct_w <> None in
