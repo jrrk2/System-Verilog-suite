@@ -548,6 +548,41 @@ let pack (m : bmodule) : result =
      control sets CANNOT share a slice -- packing them together yields an
      unroutable slice (the SR/CE can't be driven two ways).  Vivado always packs
      by control set; we must too. *)
+  (* CRITICALITY-DRIVEN PACKING (PACK_CRIT_FILE = "<driver-cell>\t<crit>") ----
+     A LUT->FF pair packed into one slice carries its net through the slice's
+     own FF input mux, so the net disappears from the routing problem entirely.
+     That absorption is the ONLY thing packing can give a critical path here: a
+     SLICE has no generic LUT->LUT path, so co-packing two LUTs merely shortens
+     a wire, it does not remove it.  What can be given away is the CONTENTION --
+     when one LUT drives several FFs, or its LUT was already claimed by an
+     earlier FF, the pair cannot form and the net goes out to the interconnect.
+     Today that is decided by netlist instance order, i.e. arbitrarily.
+
+     So run the critical FFs FIRST and let them win the LUT.  Partitioning
+     (rather than sorting by criticality) is deliberate: the pass below packs
+     CONSECUTIVE same-control-set FFs into a slice and flushes whenever the
+     control set changes, so a criticality sort would interleave control sets
+     and flush on nearly every FF -- more slices, worse density, for no gain.
+     Partitioning keeps each subset in its original order, so control-set runs
+     survive inside both halves.
+
+     Criticality comes from the router's own timing engine
+     (NEXTPNR_CRIT_EXPORT), keyed by DRIVER CELL, so it is a second-pass input:
+     route once, feed the file back. *)
+  let pack_crit : (string, float) Hashtbl.t = Hashtbl.create 4096 in
+  (match Sys.getenv_opt "PACK_CRIT_FILE" with
+   | None -> ()
+   | Some path ->
+     (try
+        let ic = open_in path in
+        (try while true do
+             match String.split_on_char '\t' (input_line ic) with
+             | nm :: v :: _ ->
+               (try Hashtbl.replace pack_crit (String.trim nm) (float_of_string (String.trim v))
+                with _ -> ())
+             | _ -> ()
+           done with End_of_file -> ()); close_in ic
+      with Sys_error e -> Printf.eprintf "PACK_CRIT_FILE: %s\n" e));
   let ff_cs (i : binstance) =
     let g p = port_bit i.inst_name p 0 in
     let srk, srn =
@@ -556,6 +591,44 @@ let pack (m : bmodule) : result =
       match g "PRE" with Some n -> ("PRE", Some n) | None ->
       match g "CLR" with Some n -> ("CLR", Some n) | None -> ("", None) in
     (g "C", g "CE", srk, srn) in
+  (* order the FF pass: critical-D FFs first (see PACK_CRIT_FILE above) *)
+  let ff_pass_order =
+    if Hashtbl.length pack_crit = 0 then m.instances
+    else begin
+      let crit_min =
+        match Sys.getenv_opt "PACK_CRIT_MIN" with
+        | Some s -> (try float_of_string s with _ -> 0.5)
+        | None -> 0.5 in
+      let crit_of (i : binstance) =
+        match port_bit i.inst_name "D" 0 with
+        | Some (Net _ as nk) ->
+          (match Hashtbl.find_opt drv nk with
+           | Some (dn, _, _) ->
+             (match Hashtbl.find_opt pack_crit dn with Some c -> c | None -> 0.0)
+           | None -> 0.0)
+        | _ -> 0.0 in
+      let hot, cold =
+        List.partition (fun i -> is_ff i.module_name && crit_of i >= crit_min)
+          m.instances in
+      (* Report the JOIN RATE: two name spaces are meeting here (the router's
+         cell names vs BIR instance names) and a silent 0% match would look
+         exactly like "criticality did not help". *)
+      let matched = List.fold_left (fun a (i : binstance) ->
+          if is_ff i.module_name
+             && (match port_bit i.inst_name "D" 0 with
+                 | Some (Net _ as nk) ->
+                   (match Hashtbl.find_opt drv nk with
+                    | Some (dn, _, _) -> Hashtbl.mem pack_crit dn
+                    | None -> false)
+                 | _ -> false)
+          then a + 1 else a) 0 m.instances in
+      let nff = List.length (List.filter (fun i -> is_ff i.module_name) m.instances) in
+      Printf.printf
+        "crit-pack: %d crit entries; %d/%d FFs have a known driver criticality; \
+         %d above %.2f packed first\n"
+        (Hashtbl.length pack_crit) matched nff (List.length hot) crit_min;
+      hot @ cold
+    end in
   List.iter (fun (i : binstance) ->
       if is_ff i.module_name && not (Hashtbl.mem absorbed i.inst_name) then begin
         let cs = ff_cs i in
@@ -584,7 +657,7 @@ let pack (m : bmodule) : result =
          | None -> match port_bit i.inst_name "S" 0 with Some c -> slice_conns := ("SR", c) :: !slice_conns | None -> ());
         incr lane; if !lane >= 4 then flush_slice ()
       end)
-    m.instances;
+    ff_pass_order;
   flush_slice ();
   ignore pending;
 
