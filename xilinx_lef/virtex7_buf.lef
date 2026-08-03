@@ -1,0 +1,28 @@
+# A placeable LEF master for the LOGIC_BUF liberty cell.  OpenROAD's resizer
+# only counts a liberty buffer it can also PLACE, so a liberty-only cell still
+# yields "[ERROR RSZ-0022] no buffers found" and timing-driven global placement
+# refuses to start.  gpl itself never inserts buffers (only repair_design does,
+# which this flow never calls), so this master never reaches the written DEF.
+VERSION 5.8 ;
+MACRO LOGIC_BUF
+  CLASS CORE ;
+  ORIGIN 0 0 ;
+  SYMMETRY X Y ;
+  SITE SLICE ;
+  SIZE 1.000 BY 1.000 ;
+  PIN A
+    DIRECTION INPUT ;
+    PORT
+      LAYER metal1 ;
+        RECT 0.050 0.050 0.150 0.110 ;
+    END
+  END A
+  PIN Z
+    DIRECTION OUTPUT ;
+    PORT
+      LAYER metal1 ;
+        RECT 0.850 0.050 0.950 0.110 ;
+    END
+  END Z
+END LOGIC_BUF
+END LIBRARY
