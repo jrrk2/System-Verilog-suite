@@ -1410,7 +1410,123 @@ let merge_slice_writes ctx body =
    (FDCE with D=1'b0; ARP target-IP compare always failed on silicon).
    Recurse into every branch: same-branch writes to one register merge
    into a single read-modify-write BAssign, exactly NBA semantics. *)
+(* Sibling GUARDED part-writes to DISJOINT fields of one register.  SERV's
+   serv_bufreg is the case:
+
+     if (i_en)                            data[31:2] <= {...};   // A
+     if (i_init ? (i_cnt0|i_cnt1) : i_en) data[1:0]  <= {...};   // B
+
+   Both take effect under NBA semantics, so the result is {A-field, B-field}.
+   But merge_slice_writes runs per BRANCH, so each guard produced its own
+   FULL-REGISTER assign that self-read the other bits from the register's OLD
+   value; two whole-register `var <-- ...` in one Always block means LAST WINS,
+   and the emitted logic collapsed to
+
+     data <= B ? {data[31:2], new_low} : (A ? new_high : data)
+
+   which silently drops A's update to data[31:2] whenever B holds -- the common
+   case -- so the shift register never shifted and the CPU could not compute an
+   address.  Merge such siblings into ONE assign with PER-FIELD guards:
+
+     data <= { A ? new_high : data[31:2], B ? new_low : data[1:0] }
+
+   Deliberately conservative: only bare `@slice_write`s and single-armed BIfs
+   whose body is entirely slice-writes to ONE target, only when a target is
+   written by two or more sibling statements with DISJOINT ranges, and only when
+   at least one is guarded.  Anything else is left exactly as before, so the
+   existing silicon-validated paths are untouched. *)
+let merge_guarded_slice_writes ctx body =
+  let cst = function BConst { value; _ } -> Some (Z.to_int value) | _ -> None in
+  let sw_of = function
+    | BCallStmt { func = "@slice_write"; args = [BVar t; m; l; d] } ->
+        (match cst m, cst l with
+         | Some m, Some l -> Some (t, (m, l, d)) | _ -> None)
+    | _ -> None in
+  (* (target, [(msb,lsb,data)], guard) for a statement that qualifies *)
+  let contrib stmt = match stmt with
+    | BCallStmt _ -> (match sw_of stmt with
+        | Some (t, w) -> Some (t, [w], None) | None -> None)
+    | BIf { condition = c; then_stmts; else_stmts = [] } when then_stmts <> [] ->
+        let rec go tgt acc = function
+          | [] -> (match tgt with Some t -> Some (t, List.rev acc, Some c) | None -> None)
+          | st :: tl ->
+              (match sw_of st with
+               | Some (t, w) when tgt = None || tgt = Some t -> go (Some t) (w :: acc) tl
+               | _ -> None) in
+        go None [] then_stmts
+    | _ -> None in
+  let contribs = List.map (fun st -> (st, contrib st)) body in
+  (* which targets qualify: >=2 contributing statements, >=1 guarded, disjoint *)
+  let tally = Hashtbl.create 4 in
+  List.iter (function
+    | (_, Some (t, ws, g)) ->
+        let (n, gs, rs) = try Hashtbl.find tally t with Not_found -> (0, 0, []) in
+        Hashtbl.replace tally t
+          (n + 1, gs + (if g = None then 0 else 1), ws @ rs)
+    | _ -> ()) contribs;
+  let disjoint rs =
+    let rs = List.sort (fun (_,a,_) (_,b,_) -> compare a b) rs in
+    let rec ok = function
+      | (m1,_,_) :: ((_,l2,_) :: _ as tl) -> l2 > m1 && ok tl
+      | _ -> true in
+    ok (List.map (fun (m,l,d) -> (m,l,d)) rs) in
+  let qualifies t =
+    match Hashtbl.find_opt tally t with
+    | Some (n, gs, rs) -> n >= 2 && gs >= 1 && disjoint rs
+    | None -> false in
+  if not (Hashtbl.fold (fun t _ acc -> acc || qualifies t) tally false) then body
+  else begin
+    let width_of arr =
+      match List.assoc_opt arr ctx.variables with
+      | Some v -> Signal.width (Always.Variable.value v)
+      | None -> (match List.assoc_opt arr ctx.signals with
+                 | Some s -> Signal.width s | None -> 0) in
+    (* build the merged assign for one target *)
+    let build t =
+      let ws = List.concat_map (function
+        | (_, Some (t', ws, g)) when t' = t ->
+            List.map (fun (m, l, d) -> (m, l, d, g)) ws
+        | _ -> []) contribs in
+      let total_w = width_of t in
+      if total_w = 0 then None
+      else begin
+        let sorted = List.sort (fun (a,_,_,_) (b,_,_,_) -> compare b a) ws in
+        let parts = ref [] and cursor = ref (total_w - 1) in
+        List.iter (fun (msb, lsb, data, g) ->
+          if msb < !cursor then
+            parts := BSlice { signal = BVar t; msb = !cursor; lsb = msb + 1 } :: !parts;
+          let field = match g with
+            | None -> data
+            | Some c -> BCond { condition = c; then_val = data;
+                                else_val = BSlice { signal = BVar t; msb; lsb } } in
+          parts := field :: !parts;
+          cursor := lsb - 1) sorted;
+        if !cursor >= 0 then
+          parts := BSlice { signal = BVar t; msb = !cursor; lsb = 0 } :: !parts;
+        let rhs = match List.rev !parts with [one] -> one | many -> BConcat many in
+        Some (BAssign { lhs = t; rhs })
+      end in
+    (* drop contributing statements; emit each merged assign at the position of
+       its LAST contributor so ordering against other statements is preserved *)
+    let last_of t =
+      let idx = ref (-1) in
+      List.iteri (fun i (_, c) -> match c with
+        | Some (t', _, _) when t' = t -> idx := i | _ -> ()) contribs;
+      !idx in
+    let out = ref [] in
+    List.iteri (fun i (st, c) ->
+      match c with
+      | Some (t, _, _) when qualifies t ->
+          if last_of t = i then
+            (match build t with Some a -> out := a :: !out | None -> out := st :: !out)
+      | _ -> out := st :: !out) contribs;
+    List.rev !out
+  end
+
 let rec merge_slice_writes_deep ctx body =
+  (* per-field guarded merge FIRST: merge_slice_writes below would collapse each
+     guarded write into its own full-register assign and lose the field info *)
+  let body = merge_guarded_slice_writes ctx body in
   let body = merge_slice_writes ctx body in
   List.map (function
     | BIf r ->
