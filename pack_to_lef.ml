@@ -163,9 +163,133 @@ let pack (m : bmodule) : result =
     packed := { pc_name = name; pc_lef = lef; pc_conns = conns; pc_bels = bels } :: !packed in
   let mtype n = (Hashtbl.find inst_by_name n).module_name in
 
+  (* 0. SITE-GUIDED packing (PACK_SITE_IN = "<name>\t<SITE>/<BEL>") ----------
+     Adopt an EXTERNAL tool's SLICE GROUPING verbatim: EVERY primitive the map
+     puts in one SLICE becomes ONE packed cell, stamped with that tool's own
+     BELs.
+
+     Why this is needed: importing a foreign PLACEMENT is not enough if the
+     PACKING disagrees.  Vivado fits 5.16 primitives into a SLICE (up to 13) and
+     uses 1033 for eth-arp; our recognition packer averages 1.82 and needs 2437.
+     4546 packed cells cannot occupy 1033 sites, so most of an imported
+     placement is silently relocated and the "imported" result is really our own
+     placement again.
+
+     This runs BEFORE every recognition path, and takes CARRY4/DRAM/SRL too.
+     An earlier version ran after the carry path and skipped those types, which
+     left 128 slices (119 CARRY4+LUT/FF, 9 DRAM/SRL+LUT/FF) wanting TWO packed
+     cells for one physical site -- place_lef holds one cell per site, so one of
+     each pair was relocated and 872 primitives came off Vivado's site.  Nothing
+     was illegal about those placements and nextpnr never saw them; the
+     collision was ours.
+
+     Capacity is not a problem: place_lef's `fits` only distinguishes SLICEM
+     from SLICEL, so one packed cell may hold a whole slice, and nextpnr's
+     legaliser still gives each primitive a distinct BEL because Vivado's exact
+     A6LUT/A5FF/... assignment rides along in pc_bels.
+
+     The LEF type is chosen by CONTENT, SLICEM first: the site type is a hard
+     constraint (need_sm), whereas carry chaining is only a recognition hint --
+     and with an exact imported placement the chain is already placed. *)
+  let site_of : (string, string * string) Hashtbl.t = Hashtbl.create 8192 in
+  (match Sys.getenv_opt "PACK_SITE_IN" with
+   | None -> ()
+   | Some path ->
+     (try
+        let ic = open_in path in
+        (try while true do
+             match String.split_on_char '\t' (input_line ic) with
+             | nm :: sb :: _ ->
+               let nm = String.trim nm and sb = String.trim sb in
+               let site, bel = match String.index_opt sb '/' with
+                 | Some i -> (String.sub sb 0 i,
+                              String.sub sb (i + 1) (String.length sb - i - 1))
+                 | None -> (sb, "") in
+               Hashtbl.replace site_of nm (site, bel);
+               (* Distributed RAM arrives as LEAF sub-bels ("<macro>/RAMA",
+                  "/RAMB"...) while the netlist holds only the PARENT
+                  (RAM64M/RAM32X1D).  Without the collapsed key those
+                  primitives never group by site and drop through to the
+                  leftover path, which then fights the site-guided cell for the
+                  same slice -- 159 primitives, 125 cells, all relocated.
+                  place_lef's own reader does the same collapse. *)
+               (match String.rindex_opt nm '/' with
+                | Some i ->
+                  let p = String.sub nm 0 i in
+                  if p <> "" && not (Hashtbl.mem site_of p) then
+                    Hashtbl.add site_of p (site, bel)
+                | None -> ())
+             | _ -> ()
+           done with End_of_file -> ()); close_in ic
+      with Sys_error e -> Printf.eprintf "PACK_SITE_IN: %s\n" e));
+  if Hashtbl.length site_of > 0 then begin
+    let by_site : (string, binstance list ref) Hashtbl.t = Hashtbl.create 2048 in
+    let order = ref [] in
+    (* Only SLICE-resident types: BRAM/DSP/IO/MMCM/BUFG have their own sites and
+       are left to the dedicated paths. *)
+    let slice_resident t =
+      let u = String.uppercase_ascii t in
+      (starts_with u "LUT" || u = "INV" || starts_with u "FD"
+       || starts_with u "CARRY4" || slicem_map t <> None)
+      && hard_map t = None && io_map t = None in
+    List.iter (fun (i : binstance) ->
+        if not (Hashtbl.mem absorbed i.inst_name) && slice_resident i.module_name then
+          match Hashtbl.find_opt site_of i.inst_name with
+          | Some (s, _) ->
+            (match Hashtbl.find_opt by_site s with
+             | Some l -> l := i :: !l
+             | None -> Hashtbl.replace by_site s (ref [ i ]); order := s :: !order)
+          | None -> ()) m.instances;
+    let nsite = ref 0 and nprim = ref 0 and ncarry = ref 0 and nsm = ref 0 in
+    List.iter (fun s ->
+        let ms = List.rev !(Hashtbl.find by_site s) in
+        let has_sm = List.exists (fun (i : binstance) -> slicem_map i.module_name <> None) ms in
+        let has_carry = List.exists (fun (i : binstance) ->
+            starts_with (String.uppercase_ascii i.module_name) "CARRY4") ms in
+        let lef =
+          if has_sm then begin
+            incr nsm;
+            (* SRL and DRAM both need a SLICEM; pick whichever is present. *)
+            if List.exists (fun (i : binstance) ->
+                starts_with (String.uppercase_ascii i.module_name) "SRL") ms
+            then "SLICEM_SRL" else "SLICEM_DRAM"
+          end
+          else if has_carry then (incr ncarry; "SLICE_CARRY")
+          else "SLICE_LOGIC" in
+        let bels = ref [] and conns = ref [] in
+        List.iter (fun (i : binstance) ->
+            let bel = match Hashtbl.find_opt site_of i.inst_name with
+              | Some (_, b) when b <> "" -> b
+              | _ -> "A6LUT" in
+            bels := (i.inst_name, bel) :: !bels;
+            (* Pin names are prefixed by BEL so two primitives in one slice
+               cannot collide on a shared port name.  place_lef reads pc_conns
+               only for NET identity (HPWL and clock-domain detection), so the
+               names need to be unique, not architecturally exact. *)
+            (match Hashtbl.find_opt inst_ports i.inst_name with
+             | Some ports ->
+               List.iter (fun (p, arr) ->
+                   if Array.length arr > 0 then
+                     conns := (bel ^ "_" ^ p, arr.(0)) :: !conns) ports
+             | None -> ());
+            Hashtbl.replace absorbed i.inst_name (); incr nprim) ms;
+        add ~bels:(List.rev !bels) ("site_" ^ s) lef (List.rev !conns);
+        incr nsite; bump "site-guided slice") (List.rev !order);
+    Printf.printf
+      "site-guided pack: %d primitives -> %d slice cells (%.2f per slice; \
+       %d carry, %d slicem)\n"
+      !nprim !nsite (float_of_int !nprim /. float_of_int (max 1 !nsite)) !ncarry !nsm
+  end;
+
   (* 1. CARRY4 -> SLICE_CARRY, absorb S-LUTs + sum FFs ---------------------- *)
   List.iter (fun (i : binstance) ->
-      if starts_with (String.uppercase_ascii i.module_name) "CARRY4" then begin
+      (* The absorbed guard matters now that site-guided packing (phase 0) can
+         claim a CARRY4 first: without it this path built a SECOND SLICE_CARRY
+         for the same primitive, which then lost the race for the site and was
+         relocated -- 125 duplicate cells that re-stamped their CARRY4 away from
+         the imported placement. *)
+      if starts_with (String.uppercase_ascii i.module_name) "CARRY4"
+         && not (Hashtbl.mem absorbed i.inst_name) then begin
         let conns = ref [] in
         let put k v = conns := (k, v) :: !conns in
         (* BEL stamp: constrain ONLY the CARRY4 primitive to the site SVS chose,
@@ -410,6 +534,7 @@ let pack (m : bmodule) : result =
         we encounter un-absorbed FFs. *)
   let is_lut t = starts_with (String.uppercase_ascii t) "LUT" in
   let is_ff t = starts_with (String.uppercase_ascii t) "FD" in
+
   let pending = ref [] and lane = ref 0 and slice_no = ref 0 and slice_conns = ref [] and slice_bels = ref [] in
   let cur_cs = ref None in
   let flush_slice () =

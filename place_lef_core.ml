@@ -461,19 +461,64 @@ let run_gen floorplan_json ~get_bmod ~get_j =
   let group_key name =
     try String.sub name 0 (Str.search_forward (Str.regexp "\\.genblk\\|\\.ram_reg\\|\\[[0-9]") name 0)
     with Not_found -> name in
+  (* HARD-BLOCK SITE IMPORT.  site_import (TOPO_PLACE=site) only covers SLICE
+     kinds, and it runs far later than this -- by then BRAM/DSP are already
+     bound here and count as placed, so an imported placement kept OUR BRAM
+     positions (measured: 34 RAMB36E1 at e.g. RAMB36_X7Y19 where Vivado had
+     X13Y7).  Wide BRAM buses make that a real routing difference, so honour the
+     map here too; anything the map does not name falls through to the existing
+     group-contiguity heuristic below. *)
+  let site_by_name : (string, site) Hashtbl.t = Hashtbl.create 8192 in
+  Hashtbl.iter (fun _k lref ->
+      List.iter (fun s -> if not (Hashtbl.mem site_by_name s.sname) then
+                    Hashtbl.replace site_by_name s.sname s) !lref) fp;
+  let site_want : (string, string) Hashtbl.t = Hashtbl.create 8192 in
+  (match Sys.getenv_opt "TOPO_SITE_IN" with
+   | Some path when Sys.file_exists path ->
+     (try
+        let ic = open_in path in
+        (try while true do
+             match String.split_on_char '\t' (input_line ic) with
+             | nm :: sb :: _ ->
+               let nm = String.trim nm and sb = String.trim sb in
+               let site = match String.index_opt sb '/' with
+                 | Some i -> String.sub sb 0 i | None -> sb in
+               Hashtbl.replace site_want nm site;
+               (match String.rindex_opt nm '/' with
+                | Some i ->
+                  let p = String.sub nm 0 i in
+                  if p <> "" && not (Hashtbl.mem site_want p) then Hashtbl.add site_want p site
+                | None -> ())
+             | _ -> ()
+           done with End_of_file -> ()); close_in ic
+      with Sys_error _ -> ())
+   | _ -> ());
+  let want_site_of (c : Pack_to_lef.packed_cell) =
+    List.fold_left (fun acc (prim, _) ->
+        match acc with Some _ -> acc | None -> Hashtbl.find_opt site_want prim)
+      None c.Pack_to_lef.pc_bels in
   let hard = ref [] in
   Array.iteri (fun i c -> if kind_of_lef c.Pack_to_lef.pc_lef <> "SLICE" then hard := (i, c) :: !hard) cells;
   let hard = List.sort (fun (_, a) (_, b) ->
       let ka = kind_of_lef a.Pack_to_lef.pc_lef and kb = kind_of_lef b.Pack_to_lef.pc_lef in
       compare (ka, group_key a.Pack_to_lef.pc_name) (kb, group_key b.Pack_to_lef.pc_name)) !hard in
   let last_pos = Hashtbl.create 16 in
+  let hard_imported = ref 0 in
   List.iter (fun (i, c) ->
       let kind = kind_of_lef c.Pack_to_lef.pc_lef in
       let gk = kind ^ ":" ^ group_key c.Pack_to_lef.pc_name in
       let tgt = match Hashtbl.find_opt last_pos gk with Some p -> p | None -> (110, 100) in
-      match nearest_free_of kind tgt with
+      let imported = match want_site_of c with
+        | Some sn -> (match Hashtbl.find_opt site_by_name sn with
+            | Some s when not s.used -> incr hard_imported; Some s
+            | _ -> None)
+        | None -> None in
+      match (match imported with Some s -> Some s | None -> nearest_free_of kind tgt) with
       | Some s -> bind i s; Hashtbl.replace last_pos gk (s.sx, s.sy)
       | None -> Printf.eprintf "no free %s site for %s\n" kind c.Pack_to_lef.pc_name) hard;
+  if !hard_imported > 0 then
+    Printf.eprintf "[place_lef] SITE-IN: %d hard blocks (BRAM/DSP/...) placed from the map\n%!"
+      !hard_imported;
   (* anchor centroid = TOPO_ANCHOR_X/Y override (used to cluster the fabric next
      to a frozen macro's user-facing edge), else mean of placed hard blocks. *)
   let anchor_cx, anchor_cy =
@@ -623,24 +668,103 @@ let run_gen floorplan_json ~get_bmod ~get_j =
   let emit_def () = match Sys.getenv_opt "TOPO_DEF_OUT" with
     | None -> ()
     | Some defp ->
+      let def_timing = getenv_int "TOPO_DEF_TIMING" 0 <> 0 in
+      (* TOPO_DEF_ONLY_DOM=<clock-net substring>: emit ONLY that domain's cells
+         and the nets AMONG them -- everything else is OMITTED, not fixed.  With
+         the rest merely FIXED, OpenROAD optimises the critical domain against a
+         backdrop of place_lef SA positions we know are ~2.2x off Vivado, and it
+         has almost no freedom (measured: HPWL moved 3%, and the result was worse
+         than letting it place everything).  Omitting them lets it place the
+         domain on its own merits; place_lef then fits the rest around it. *)
+      let only_dom = Sys.getenv_opt "TOPO_DEF_ONLY_DOM" in
+      (* TOPO_DEF_ONLY_PREFIX=<cell-name prefix>: isolate a HIERARCHY instead of a
+         clock domain -- e.g. "eth." hands OpenROAD the whole Ethernet IP core
+         (PCS/PMA + MAC + FIFOs) as one unit.  Same rationale as ONLY_DOM: give
+         it the design's internal nets and full freedom, then let place_lef fit
+         the remainder around the frozen result. *)
+      let only_pre = Sys.getenv_opt "TOPO_DEF_ONLY_PREFIX" in
+      (* CONTAINMENT, not prefix: yosys's `flatten` tags a module's internal
+         cells as "$flatten\eth.$abc$..." -- they carry the hierarchy without
+         starting with it.  Matching on prefix finds only 23% of the eth core;
+         matching on containment finds 90%. *)
+      let has_prefix s pre =
+        let ls = String.length pre and ln = String.length s in
+        ls > 0 && (let rec go j = j + ls <= ln
+                                  && (String.sub s j ls = pre || go (j + 1)) in go 0) in
+      let in_dom i =
+        match only_pre with
+        | Some pre -> has_prefix cells.(i).Pack_to_lef.pc_name pre
+        | None ->
+        match only_dom with
+        | None -> true
+        | Some subs ->
+          (* comma-separated list: the whole eth IP core is the UNION of its
+             clock domains (userclk2 + rxrecclk + userclk + gtrefclk).  Selecting
+             by hierarchy does not work -- yosys flatten+abc strips it, leaving
+             only 23% of cells with an "eth." prefix. *)
+          let d = cell_dom.(i) in
+          d >= 0 &&
+          (let nm = dom_name.(d) in
+           List.exists (fun sub ->
+               let ls = String.length sub and ln = String.length nm in
+               ls > 0 && (let rec go j = j + ls <= ln
+                                         && (String.sub nm j ls = sub || go (j + 1)) in go 0))
+             (String.split_on_char ',' subs)) in
       let lefp = getenv_default "TOPO_LEF_CELLS"
           (Filename.concat (Filename.dirname Sys.executable_name) "virtex7_cells.lef") in
       (* macro -> ordered pin list, straight out of the LEF *)
       let macro_pins : (string, string list ref) Hashtbl.t = Hashtbl.create 32 in
+      (* pins split by DIRECTION so a connection can be bound to a pin of the
+         RIGHT CLASS.  Binding an output net to an input pin is invisible to a
+         wirelength placer but produces a nonsense timing graph, so it matters
+         as soon as OpenROAD runs -timing_driven. *)
+      let macro_in : (string, string list ref) Hashtbl.t = Hashtbl.create 32 in
+      let macro_out : (string, string list ref) Hashtbl.t = Hashtbl.create 32 in
+      let macro_clk : (string, string) Hashtbl.t = Hashtbl.create 32 in
       (try
          let ic = open_in lefp in
-         let cur = ref "" in
+         let cur = ref "" and lastpin = ref "" in
          (try while true do
             let l = String.trim (input_line ic) in
             if String.length l > 6 && String.sub l 0 6 = "MACRO " then begin
               cur := String.sub l 6 (String.length l - 6);
-              Hashtbl.replace macro_pins !cur (ref [])
-            end else if String.length l > 4 && String.sub l 0 4 = "PIN " && !cur <> "" then
+              Hashtbl.replace macro_pins !cur (ref []);
+              Hashtbl.replace macro_in !cur (ref []);
+              Hashtbl.replace macro_out !cur (ref [])
+            end else if String.length l > 4 && String.sub l 0 4 = "PIN " && !cur <> "" then begin
+              lastpin := String.sub l 4 (String.length l - 4);
               (match Hashtbl.find_opt macro_pins !cur with
-               | Some r -> r := String.sub l 4 (String.length l - 4) :: !r | None -> ())
+               | Some r -> r := !lastpin :: !r | None -> ());
+              let p = !lastpin in
+              let isclk = p = "CLK" || (String.length p >= 4 && String.sub p 0 4 = "CLKA")
+                          || (String.length p >= 4 && String.sub p 0 4 = "CLKB") in
+              if isclk && not (Hashtbl.mem macro_clk !cur) then Hashtbl.replace macro_clk !cur p
+            end else if String.length l > 10 && String.sub l 0 10 = "DIRECTION " && !cur <> "" then begin
+              let d = String.trim (String.sub l 10 (String.length l - 10)) in
+              let d = if String.length d > 0 && d.[String.length d - 1] = ';'
+                      then String.trim (String.sub d 0 (String.length d - 1)) else d in
+              let tbl = if d = "OUTPUT" then macro_out else macro_in in
+              if not (Hashtbl.mem macro_clk !cur && Hashtbl.find macro_clk !cur = !lastpin) then
+                (match Hashtbl.find_opt tbl !cur with
+                 | Some r -> r := !lastpin :: !r | None -> ())
+            end
           done with End_of_file -> ()); close_in ic
        with _ -> Printf.eprintf "[place_lef] DEF: cannot read %s\n" lefp);
       Hashtbl.iter (fun _ r -> r := List.rev !r) macro_pins;
+      Hashtbl.iter (fun _ r -> r := List.rev !r) macro_in;
+      Hashtbl.iter (fun _ r -> r := List.rev !r) macro_out;
+      (* classify a pc_conns port: pc_conns is a MIX of LEF pin names (explicitly
+         packed slices) and original primitive ports (the generic fall-through). *)
+      let is_clk_port p = p = "CLK" || p = "C" || p = "WCLK"
+                          || (String.length p >= 4 && String.sub p 0 4 = "CLKA")
+                          || (String.length p >= 4 && String.sub p 0 4 = "CLKB") in
+      let is_out_port p =
+        p = "O" || p = "Q" || p = "CO" || p = "O6" || p = "O5" || p = "MC31"
+        || (String.length p = 2 && (p.[1] = 'O' || p.[1] = 'Q')
+            && p.[0] >= 'A' && p.[0] <= 'D')
+        || (String.length p >= 2 && p.[0] = 'Q'
+            && p.[1] >= '0' && p.[1] <= '9')
+        || (String.length p >= 2 && String.sub p 0 2 = "DO") in
       (* Die = the REGION place_lef actually places into, expanded to contain the
          FIXED macros -- NOT the whole device.  Giving OpenROAD the full 222x350
          die let it spread the logic over 77700 positions at the requested
@@ -712,9 +836,59 @@ let run_gen floorplan_json ~get_bmod ~get_j =
       end;
       Printf.eprintf "[place_lef] DEF: %d placement blockage rect(s), %d sites left free\n"
         !nblk (Hashtbl.length avail);
+      (* ---- TOP-LEVEL PINS -----------------------------------------------
+         Derived from the IOB cells, which carry the port name directly
+         ($iopadmap$top.<port>$site) and are already placed.  Without a PINS
+         section `get_ports` resolves to nothing, so the real XDC's
+         `create_clock ... [get_ports clk_p]` cannot be used at all.
+         NOTE this does NOT replace the BUFG-output SDC for the internal
+         domains: userclk/userclk2/rxrecclk are generated through the GT and the
+         PCS MMCM, and neither has a timing model here, so a clock defined at
+         clk_p does not propagate to them. *)
+      let pinbuf = Buffer.create 4096 in
+      let npin = ref 0 in
+      if def_timing then begin
+        let strip_port n =
+          let pre = "$iopadmap$top." in
+          let n = if String.length n > String.length pre
+                     && String.sub n 0 (String.length pre) = pre
+                  then String.sub n (String.length pre)
+                         (String.length n - String.length pre) else n in
+          match String.rindex_opt n '$' with
+          | Some i -> String.sub n 0 i | None -> n in
+        Array.iteri (fun i c ->
+            if c.Pack_to_lef.pc_lef = "IOB" && is_placed i then begin
+              let port = strip_port c.Pack_to_lef.pc_name in
+              (* the NETS section names data nets "n<nid>", so a pin must use the
+                 SAME name -- referencing "<netname>_<bit>" creates a dangling
+                 net and OpenSTA reports Pi-model NaNs *)
+              let net = List.fold_left (fun acc (_, nk) -> match acc with
+                  | Some _ -> acc
+                  | None -> (match Hashtbl.find_opt net_of_key nk with
+                      | Some n -> Some (Printf.sprintf "n%d" n)
+                      | None -> None)) None c.Pack_to_lef.pc_conns in
+              match net with
+              | Some nn2 ->
+                incr npin;
+                Buffer.add_string pinbuf
+                  (Printf.sprintf
+                     "- %s + NET %s + DIRECTION INPUT + USE SIGNAL\n    + LAYER metal1 ( -100 -100 ) ( 100 100 ) + FIXED ( %d %d ) N ;\n"
+                     port nn2 ((pos_x.(i) - sx_min) * u) ((pos_y.(i) - sy_min) * u))
+              | None -> ()
+            end) cells;
+        if !npin > 0 then begin
+          Printf.fprintf oc "PINS %d ;\n" !npin;
+          Buffer.output_buffer oc pinbuf;
+          Printf.fprintf oc "END PINS\n"
+        end;
+        Printf.eprintf "[place_lef] DEF: %d top-level pin(s) at their IOB sites\n" !npin
+      end;
       (* components: pre-placed hard blocks are FIXED, the rest are free *)
-      Printf.fprintf oc "COMPONENTS %d ;\n" ncells;
+      let n_emit = ref 0 in
+      Array.iteri (fun i _ -> if in_dom i then incr n_emit) cells;
+      Printf.fprintf oc "COMPONENTS %d ;\n" !n_emit;
       Array.iteri (fun i c ->
+          if not (in_dom i) then () else
           let mac = c.Pack_to_lef.pc_lef in
           let mac = if Hashtbl.mem macro_pins mac then mac else "SLICE_LOGIC" in
           (* Carry chains stay where place_lef put them: nextpnr requires a
@@ -724,7 +898,21 @@ let run_gen floorplan_json ~get_bmod ~get_j =
           let fix_carry = getenv_int "TOPO_DEF_FREE_CARRY" 0 = 0
                           && (let m = c.Pack_to_lef.pc_lef in
                               String.length m >= 11 && String.sub m 0 11 = "SLICE_CARRY") in
-          if movable.(i) && not fix_carry then
+          (* TOPO_DEF_FREE_DOM=<clock-net substring>: free ONLY that clock
+             domain's cells and FIX everything else at place_lef's positions, so
+             OpenROAD optimises the CRITICAL domain in the context of the rest
+             rather than trading it off against the whole design. *)
+          let dom_ok =
+            match Sys.getenv_opt "TOPO_DEF_FREE_DOM" with
+            | None -> true
+            | Some sub ->
+              let d = cell_dom.(i) in
+              d >= 0 &&
+              (let nm = dom_name.(d) in
+               let ls = String.length sub and ln = String.length nm in
+               ls > 0 && (let rec go j = j + ls <= ln
+                                         && (String.sub nm j ls = sub || go (j + 1)) in go 0)) in
+          if movable.(i) && not fix_carry && dom_ok then
             Printf.fprintf oc "- %s %s ;\n" c.Pack_to_lef.pc_name mac
           else begin
             let x = (pos_x.(i) - sx_min) * u and y = (pos_y.(i) - sy_min) * u in
@@ -732,7 +920,12 @@ let run_gen floorplan_json ~get_bmod ~get_j =
           end) cells;
       Printf.fprintf oc "END COMPONENTS\n";
       (* nets: bind each cell's connection to the next free pin of its macro *)
+      (* SEPARATE pin counters per class: one shared counter indexes past the end
+         of the (much shorter) output list once a cell has taken many input pins,
+         which silently DROPPED that cell's driver connection and left 281 nets
+         driverless -> STA-1040 NaNs. *)
       let used = Array.make ncells 0 in
+      let used_out = Array.make ncells 0 in
       let buf = Buffer.create (1 lsl 20) in
       let nn = ref 0 and dropped = ref 0 and dup = ref 0 in
       (* CRITICALITY -> NET WEIGHT.  OpenROAD's gpl multiplies a GNet's timing
@@ -750,7 +943,11 @@ let run_gen floorplan_json ~get_bmod ~get_j =
         if wrep <= 0 || wmax <= 1.0 then 1
         else 1 + int_of_float (Float.round
                (float wrep *. (net_w.(nid) -. 1.0) /. (wmax -. 1.0))) in
-      Array.iteri (fun nid cs ->
+      Array.iteri (fun nid cs0 ->
+          let cs = if only_dom = None && only_pre = None then cs0
+                   else Array.of_list (List.filter in_dom (Array.to_list cs0)) in
+          (* In timing mode a net must have >=2 pins to carry a parasitic at all;
+             OpenSTA aborts with STA-1040 (Pi model NaNs) on degenerate nets. *)
           if Array.length cs >= 2 then begin
             let r = reps nid in
             if r > 1 then dup := !dup + (r - 1);
@@ -761,14 +958,52 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                  else Printf.sprintf "- n%d_w%d" nid copy);
               Array.iter (fun i ->
                   let mac = cells.(i).Pack_to_lef.pc_lef in
-                  let pins = match Hashtbl.find_opt macro_pins mac with
-                    | Some r -> !r | None -> (match Hashtbl.find_opt macro_pins "SLICE_LOGIC" with
-                        | Some r -> !r | None -> []) in
-                  let k = used.(i) in
-                  if k < List.length pins then begin
-                    used.(i) <- k + 1;
+                  (* TOPO_DEF_TIMING: bind by DIRECTION -- the driver of this net
+                     gets an OUTPUT pin, the sinks get INPUT pins.  Required for
+                     STA; irrelevant to a pure wirelength placer, so the old
+                     next-free-pin behaviour stays the default. *)
+                  let pool =
+                    if not def_timing then
+                      (match Hashtbl.find_opt macro_pins mac with
+                       | Some r -> !r
+                       | None -> (match Hashtbl.find_opt macro_pins "SLICE_LOGIC" with
+                           | Some r -> !r | None -> []))
+                    else begin
+                      (* Exactly ONE driver per net.  is_out_port misses output
+                         ports on some macro types, which left 515 of 3766 nets
+                         driverless -> OpenSTA cannot build a Pi model for a net
+                         with no driver ("[ERROR STA-1040] parasitic Pi model has
+                         NaNs").  So: prefer a cell that genuinely claims an
+                         output port, but if none does, designate the first cell
+                         on the net as the driver. *)
+                      let claims j =
+                        List.exists (fun (p, nk) ->
+                            is_out_port p &&
+                            (match Hashtbl.find_opt net_of_key nk with
+                             | Some n -> n = nid | None -> false))
+                          cells.(j).Pack_to_lef.pc_conns in
+                      let drv_idx =
+                        let found = ref (-1) in
+                        Array.iter (fun j -> if !found < 0 && claims j then found := j) cs;
+                        if !found >= 0 then !found
+                        else if Array.length cs > 0 then cs.(0) else (-1) in
+                      let drives = (i = drv_idx) in
+                      let tbl = if drives then macro_out else macro_in in
+                      match Hashtbl.find_opt tbl mac with
+                      | Some r when !r <> [] -> !r
+                      | _ -> (match Hashtbl.find_opt tbl "SLICE_LOGIC" with
+                          | Some r -> !r | None -> [])
+                    end in
+                  let out_pool = def_timing &&
+                    (match Hashtbl.find_opt macro_out mac with
+                     | Some r -> List.length !r > 0 && (try List.nth !r 0 = List.nth pool 0
+                                                        with _ -> false)
+                     | None -> false) in
+                  let k = if out_pool then used_out.(i) else used.(i) in
+                  if k < List.length pool then begin
+                    (if out_pool then used_out.(i) <- k + 1 else used.(i) <- k + 1);
                     Buffer.add_string buf
-                      (Printf.sprintf " ( %s %s )" cells.(i).Pack_to_lef.pc_name (List.nth pins k))
+                      (Printf.sprintf " ( %s %s )" cells.(i).Pack_to_lef.pc_name (List.nth pool k))
                   end else incr dropped) cs;
               Buffer.add_string buf " ;\n"
             done
@@ -776,8 +1011,73 @@ let run_gen floorplan_json ~get_bmod ~get_j =
       if !dup > 0 then
         Printf.eprintf "[place_lef] DEF: %d weight-duplicate net(s) (max %d copies), %d pin-starved conns\n"
           !dup (1 + wrep) !dropped;
-      Printf.fprintf oc "NETS %d ;\n" !nn;
+      (* CLOCK NETS.  place_lef excludes BUFG/MMCM-driven nets from its cost model,
+         so they never reach net_cells -- but without them OpenSTA has no clock,
+         no endpoints and therefore no slack, and -timing_driven is inert.
+         Rebuild them here straight from pc_conns' clock ports. *)
+      let clkbuf = Buffer.create 4096 in
+      let nclk = ref 0 in
+      let clk_src : (string, string) Hashtbl.t = Hashtbl.create 8 in
+      if def_timing then begin
+        let byclk : (Pack_to_lef.netkey, int list ref) Hashtbl.t = Hashtbl.create 16 in
+        Array.iteri (fun i c ->
+            List.iter (fun (p, nk) ->
+                if is_clk_port p then match nk with
+                  | Pack_to_lef.Net _ ->
+                    let l = (try Hashtbl.find byclk nk with Not_found ->
+                        let r = ref [] in Hashtbl.add byclk nk r; r) in
+                    if not (List.mem i !l) then l := i :: !l
+                  | _ -> ()) c.Pack_to_lef.pc_conns) cells;
+        Hashtbl.iter (fun nk l ->
+            if List.length !l >= 1 then begin
+              incr nclk;
+              let nm = match nk with Pack_to_lef.Net (s, b) -> Printf.sprintf "%s_%d" s b
+                                   | _ -> Printf.sprintf "clk%d" !nclk in
+              (* DEF syntax: the connection list comes FIRST, then "+ USE CLOCK" *)
+              Buffer.add_string clkbuf (Printf.sprintf "- %s" nm);
+              (* include the DRIVER (BUFG/MMCM) so create_clock has a source pin;
+                 without it OpenSTA sees a driverless net and there is no clock *)
+              Array.iteri (fun j c ->
+                  List.iter (fun (p, nk2) ->
+                      if nk2 = nk && is_out_port p then
+                        match Hashtbl.find_opt macro_out c.Pack_to_lef.pc_lef with
+                        | Some r when !r <> [] ->
+                          Buffer.add_string clkbuf
+                            (Printf.sprintf " ( %s %s )" c.Pack_to_lef.pc_name (List.hd !r));
+                          Hashtbl.replace clk_src nm
+                            (Printf.sprintf "%s/%s" c.Pack_to_lef.pc_name (List.hd !r))
+                        | _ -> ()) c.Pack_to_lef.pc_conns) cells;
+              List.iter (fun i ->
+                  let mac = cells.(i).Pack_to_lef.pc_lef in
+                  match Hashtbl.find_opt macro_clk mac with
+                  | Some cp -> Buffer.add_string clkbuf
+                                 (Printf.sprintf " ( %s %s )" cells.(i).Pack_to_lef.pc_name cp)
+                  | None -> ()) !l;
+              Buffer.add_string clkbuf " + USE CLOCK ;\n"
+            end) byclk;
+        Printf.eprintf "[place_lef] DEF: %d clock net(s) for STA\n" !nclk;
+        (* SDC: constrain each clock at its REAL target.  cpu_clk is 50 MHz
+           (200 MHz sysclk / MMCM 5/20); everything else is the 125 MHz eth side. *)
+        (match Sys.getenv_opt "TOPO_SDC_OUT" with
+         | None -> ()
+         | Some sdcp ->
+           let so = open_out sdcp in
+           let cpu_bit = getenv_int "TOPO_SDC_CPU_BIT" (-1) in
+           Hashtbl.iter (fun nm src ->
+               let per =
+                 if cpu_bit >= 0 &&
+                    (let s = Printf.sprintf "n%d_" cpu_bit in
+                     String.length nm >= String.length s
+                     && String.sub nm 0 (String.length s) = s)
+                 then 20.0 else 8.0 in
+               Printf.fprintf so "create_clock -name %s -period %.3f [get_pins {%s}]\n"
+                 nm per src) clk_src;
+           close_out so;
+           Printf.eprintf "[place_lef] SDC: %d clock(s) -> %s\n" (Hashtbl.length clk_src) sdcp)
+      end;
+      Printf.fprintf oc "NETS %d ;\n" (!nn + !nclk);
       Buffer.output_buffer oc buf;
+      Buffer.output_buffer oc clkbuf;
       Printf.fprintf oc "END NETS\nEND DESIGN\n";
       close_out oc;
       Printf.eprintf "[place_lef] DEF: %d cells, %d nets, die %dx%d sites -> %s\n%!"
@@ -812,10 +1112,23 @@ let run_gen floorplan_json ~get_bmod ~get_j =
   let next_of c = match List.assoc_opt "CO" c.Pack_to_lef.pc_conns with
     | Some co -> List.find_opt (fun c2 -> List.assoc_opt "CI" c2.Pack_to_lef.pc_conns = Some co) carry_cells
     | None -> None in
+  (* With an EXACT imported placement (TOPO_PLACE=site + TOPO_SITE_IN) the carry
+     chains are already placed -- legally and vertically -- by the tool we are
+     importing from, so this phase must not re-place them.  It otherwise runs
+     FIRST and binds every carry cell into its own column, after which
+     site_import sees them as already placed and skips: measured 843 of 968
+     cells imported exactly while the 125 carry slices (780 primitives) sat
+     where phase B had put them.
+     Site-guided packing also renames pins to <BEL>_<port>, so the "CI"/"CO"
+     lookups above find nothing and each carry cell looks like a singleton
+     chain -- the chain recognition is meaningless here in any case. *)
+  let site_place =
+    Sys.getenv_opt "TOPO_PLACE" = Some "site" && Sys.getenv_opt "TOPO_SITE_IN" <> None in
   let chains = ref [] in
-  List.iter (fun c -> if is_root c then begin
-      let rec walk c acc = match next_of c with Some n -> walk n (n :: acc) | None -> List.rev acc in
-      chains := (c :: walk c []) :: !chains end) carry_cells;
+  if not site_place then
+    List.iter (fun c -> if is_root c then begin
+        let rec walk c acc = match next_of c with Some n -> walk n (n :: acc) | None -> List.rev acc in
+        chains := (c :: walk c []) :: !chains end) carry_cells;
   (* find the first free consecutive vertical run of `len` slices in column arr *)
   let run_in_col arr len =
     let n = Array.length arr and res = ref None and i = ref 0 in
@@ -893,6 +1206,23 @@ let run_gen floorplan_json ~get_bmod ~get_j =
         match !best with Some (bd, _) when bd <= d -> () | _ -> best := Some (d, s) end) region_arr;
     Option.map snd !best in
 
+  (* Die-wide nearest free site.  The region is a COMPACT block sized for this
+     design, but an imported external placement (TOPO_SITE_IN) follows the
+     foreign tool's own floorplan and generally lies outside it -- Vivado spread
+     this design over X 46..221 where the region is X 24..106.  Falling back to
+     nearest_region_free then drops every unmapped cell into a block 100+ tiles
+     away from the neighbours it shares nets with, which is far worse than
+     either placement alone.  Sites are the same mutable records region_arr
+     holds, so `used` stays consistent. *)
+  let all_slices_arr = Array.of_list all_slices in
+  let nearest_any_free i (tx, ty) =
+    let best = ref None in
+    Array.iter (fun s -> if (not s.used) && fits i s then begin
+        let d = abs (s.sx - tx) + abs (s.sy - ty) in
+        match !best with Some (bd, _) when bd <= d -> () | _ -> best := Some (d, s) end)
+      all_slices_arr;
+    Option.map snd !best in
+
   (* ======================================================================= *)
   (* Constructive placement of remaining movable SLICE cells (region-bound).  *)
   (* centroid = mean of already-placed net neighbours.                        *)
@@ -923,6 +1253,104 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      snap each cell to the nearest free REAL site, closest-first so the cells
      OpenROAD packed tightest get their preferred site.  DEF is in DB units
      (2000 per 1x1 site) offset to the floorplan origin. *)
+  (* ---- SITE IMPORT (TOPO_SITE_IN) -------------------------------------
+     Adopt an EXTERNAL placement given as "<primitive-name>\t<SITE>" -- the same
+     shape as BELS_OUT -- and then run all the normal downstream machinery
+     (feedthrough relays, $cebuf promotion, carry stamping).  That machinery is
+     the whole point: nextpnr's packer invents cells no external placer knows
+     about ($PACKER_GND_NET$LUT drivers for a CARRY4's tied-off DI/S), and they
+     MUST sit in the carry's own slice.  Hand-stamping a foreign placement into
+     the netlist leaves them homeless ("cannot bind chain child ... bel not
+     available"); letting place_lef do the placement import means carry_stamp
+     still emits the const LUTs it always did.
+     Keyed by PRIMITIVE because that is what external tools name; the packed
+     cell is found through pc_bels. *)
+  let site_import () = match Sys.getenv_opt "TOPO_SITE_IN" with
+    | None -> false
+    | Some path when not (Sys.file_exists path) ->
+      Printf.eprintf "[place_lef] SITE-IN: %s not found\n" path; false
+    | Some path ->
+      let want = Hashtbl.create 8192 in
+      (try
+         let ic = open_in path in
+         (try while true do
+            let l = input_line ic in
+            match String.split_on_char '\t' l with
+            | nm :: s :: _ ->
+              (* accept "SITE" or "SITE/BEL" *)
+              let s = match String.index_opt s '/' with
+                | Some i -> String.sub s 0 i | None -> s in
+              let nm = String.trim nm and s = String.trim s in
+              Hashtbl.replace want nm s;
+              (* Distributed RAM arrives from Vivado as its LEAF sub-bels --
+                 "<macro>/RAMA", "/RAMB"... -- but the netlist holds only the
+                 PARENT (RAM64M/RAM32X1D), so the leaf name matches nothing.
+                 All sub-bels of one macro share a site, so also offer the
+                 collapsed parent key; first one wins. *)
+              (match String.rindex_opt nm '/' with
+               | Some i ->
+                 let p = String.sub nm 0 i in
+                 if p <> "" && not (Hashtbl.mem want p) then Hashtbl.add want p s
+               | None -> ())
+            | _ -> ()
+          done with End_of_file -> ()); close_in ic
+       with _ -> ());
+      if Hashtbl.length want = 0 then false else begin
+        let by_site = Hashtbl.create 4096 in
+        Array.iter (fun s -> Hashtbl.replace by_site s.sname s) region_arr;
+        Array.iter (fun s -> if not (Hashtbl.mem by_site s.sname) then
+                       Hashtbl.replace by_site s.sname s) (Array.of_list all_slices);
+        let ok = ref 0 and nosite = ref 0 and unmapped = ref 0 and moved = ref 0 in
+        Array.iteri (fun i c ->
+            if kind_of_lef c.Pack_to_lef.pc_lef = "SLICE" && not (is_placed i)
+               && not skip.(i) then begin
+              (* the packed cell inherits the site of any primitive it absorbed *)
+              let tgt = List.fold_left (fun acc (prim, _) ->
+                  match acc with Some _ -> acc
+                               | None -> Hashtbl.find_opt want prim)
+                  None c.Pack_to_lef.pc_bels in
+              match tgt with
+              | None -> incr unmapped
+              | Some sn ->
+                (match Hashtbl.find_opt by_site sn with
+                 | Some s when not s.used && fits i s -> bind i s; incr ok
+                 | Some s ->
+                   (* site taken (two primitives of one pack, or a site the
+                      packing collapsed): stay NEXT TO where it was asked for *)
+                   (match nearest_any_free i (s.sx, s.sy) with
+                    | Some s2 -> bind i s2; incr moved | None -> incr nosite)
+                 | None -> incr unmapped)
+            end) cells;
+        (* Whatever the external placement did not cover -- cells it never named,
+           and the feedthrough/relay cells place_lef itself will add -- goes
+           beside its already-imported net neighbours, searching the WHOLE die.
+           Confining these to the region would tear the placement in two. *)
+        let late = ref 0 in
+        Array.iteri (fun i c ->
+            if kind_of_lef c.Pack_to_lef.pc_lef = "SLICE" && not (is_placed i)
+               && not skip.(i) then
+              match nearest_any_free i (centroid i) with
+              | Some s -> bind i s; incr late
+              | None -> Printf.eprintf "no free site for %s\n" c.Pack_to_lef.pc_name)
+          cells;
+        Printf.eprintf "[place_lef] SITE-IN: %d placed beside neighbours\n%!" !late;
+        (* EXACT vs RELOCATED must be reported separately.  A packed cell claims
+           a WHOLE slice, but Vivado puts 5+ primitives in one -- so most cells
+           find their requested site already taken and get relocated.  Counting
+           those as successful imports hides the fact that the imported
+           placement was never actually reproduced. *)
+        Printf.eprintf
+          "[place_lef] SITE-IN: %d EXACT, %d RELOCATED (site taken), \
+           %d unmapped, %d no free site -- from %s\n%!"
+          !ok !moved !unmapped !nosite path;
+        if !moved > !ok then
+          Printf.eprintf
+            "[place_lef] SITE-IN WARNING: most cells moved -- the external \
+             placement packs denser than pack_to_lef does; the result is NOT \
+             the imported placement\n%!";
+        true
+      end in
+
   let def_import () = match Sys.getenv_opt "TOPO_DEF_IN" with
     | None -> false
     | Some defp ->
@@ -980,6 +1408,12 @@ let run_gen floorplan_json ~get_bmod ~get_j =
               dsum := !dsum + abs (s.sx - tx) + abs (s.sy - ty);
               bind i s; incr ok
             | None -> incr miss) cand;
+        (* TOPO_DEF_FIX_IMPORTED=1: treat what OpenROAD placed as FROZEN, so the
+           subsequent constructive+SA pass places only the remaining cells around
+           it.  This is what makes "place the critical domain first, fit the rest
+           around it" possible in one flow. *)
+        if getenv_int "TOPO_DEF_FIX_IMPORTED" 0 <> 0 then
+          List.iter (fun (i, _) -> if is_placed i then movable.(i) <- false) cand;
         (* anything OpenROAD did not place falls back to the normal path *)
         Array.iteri (fun i c ->
             if kind_of_lef c.Pack_to_lef.pc_lef = "SLICE" && not (is_placed i)
@@ -1535,7 +1969,10 @@ let run_gen floorplan_json ~get_bmod ~get_j =
   end;
   let def_only = getenv_int "TOPO_DEF_ONLY" 0 <> 0 in
   (match mode with
+   | "site"     -> if not (site_import ()) then constructive ()
    | "def"      -> if not (def_import ()) then constructive ()
+   | "defsa"    -> ignore (def_import ()); constructive ();
+                   if not def_only then anneal_multi ()
    | "analytic" -> analytic (); anneal_multi ()
    | "sa"       -> constructive (); emit_def ();
                    if not def_only then begin
