@@ -255,6 +255,7 @@ let getstr = function
 | LESS  -> "LESS"
 | LINEFEED  -> "LINEFEED"
 | LPAREN  -> "LPAREN"
+| LPAREN_STAR_RPAREN  -> "LPAREN_STAR_RPAREN"
 | LPAREN_STAR  -> "LPAREN_STAR"
 | LPAREN_STAR_attribute_STAR_RPAREN  -> "LPAREN_STAR_attribute_STAR_RPAREN"
 | LPAREN_timescale_unit_RPAREN  -> "LPAREN_timescale_unit_RPAREN"

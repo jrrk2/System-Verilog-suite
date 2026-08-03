@@ -270,6 +270,7 @@
 %token  LESS
 %token  LINEFEED
 %token  LPAREN
+%token  LPAREN_STAR_RPAREN
 %token  LPAREN_STAR
 %token  LPAREN_STAR_attribute_STAR_RPAREN
 %token  LPAREN_timescale_unit_RPAREN
@@ -1768,7 +1769,15 @@ pull01: Pull0 { (Pull0) }
 
 event_control: AT hierarchy_event_identifier { TUPLE3(STRING("event_control1"),AT,$2) }
 	|	AT LPAREN event_expression_list RPAREN { TUPLE5(STRING("event_control2"),AT,LPAREN,$3,RPAREN) }
+	(* Implicit event control spelled with parens arrives as ONE token, so it
+	 * can never be split into LPAREN STAR ... STAR RPAREN and matched as an
+	 * attribute_instance.  Two such always blocks in one file used to let the
+	 * parser pair the opener of the FIRST with the closer of the SECOND and
+	 * swallow everything between them -- serv_decode.v lost 50 lines that way,
+	 * reported as a failure on `begin` at the first block.  Patching either
+	 * occurrence alone made the file parse, which is what gave it away. *)
 	|	AT LPAREN STAR RPAREN { TUPLE5(STRING("event_control3"),AT,LPAREN,STAR,RPAREN) }
+	|	AT LPAREN_STAR_RPAREN { TUPLE5(STRING("event_control3"),AT,LPAREN,STAR,RPAREN) }
 	|	AT STAR { TUPLE3(STRING("event_control4"),AT,STAR) }
 
 event_control_opt: event_control { ($1) }

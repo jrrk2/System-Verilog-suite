@@ -275,6 +275,7 @@ type token = Source_text_verible.token =
   | LT_EQ
   | LPAREN_timescale_unit_RPAREN
   | LPAREN_STAR_attribute_STAR_RPAREN
+  | LPAREN_STAR_RPAREN
   | LPAREN_STAR
   | LPAREN
   | LINEFEED

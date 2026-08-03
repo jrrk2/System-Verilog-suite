@@ -474,7 +474,9 @@ let import_seen = ref false
 
 let tok arg =
   import_seen := (match arg with Import -> true | Package -> true | _ -> !import_seen);
-  if false then print_endline ("tok: "^tok' arg);
+  (* SVS_LEX_DEBUG=1 dumps the raw token stream -- the fastest way to see what
+   * the lexer really produced, rather than inferring it from a parse error. *)
+  if Sys.getenv_opt "SVS_LEX_DEBUG" <> None then print_endline ("tok: "^tok' arg);
   [arg]
 }
 
@@ -594,6 +596,11 @@ rule token = parse
 | '%' { tok ( PERCENT ) }
 | '&' { tok ( AMPERSAND ) }
 | ''' { tok ( QUOTE ) }
+(* Implicit event control, lexed as ONE token.  Splitting it into
+ * LPAREN STAR RPAREN made a SECOND implicit-event always block in the
+ * same file unparseable: the file failed on `begin`, and patching either
+ * occurrence alone made it parse.  Whitespace variants fold in here. *)
+| '(' [' ' '\t']* '*' [' ' '\t']* ')' { tok ( LPAREN_STAR_RPAREN ) }
 | '(' { tok ( LPAREN ) }
 | '[' { tok ( LBRACK ) }
 | '{' { tok ( LBRACE ) }

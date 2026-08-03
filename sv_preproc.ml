@@ -474,7 +474,17 @@ let strip_attributes s =
   let buf = Buffer.create n in
   let i = ref 0 in
   while !i < n do
-    if !i + 1 < n && s.[!i] = '(' && s.[!i + 1] = '*' then begin
+    (* `@(*)` is implicit event control, NOT an empty attribute -- and an empty
+     * attribute is not legal SV, so excluding it costs nothing.  The scan below
+     * starts at i+2, i.e. PAST this construct's own ')', so without this guard
+     * it runs on to the NEXT `*)` in the file and deletes everything in
+     * between.  With a single `always @(*)` there is no later `*)`, the scan
+     * finds nothing and the text survives; with TWO, the first one swallowed
+     * ~50 lines of serv_decode.v and the parse failed on `begin` at the FIRST
+     * block.  Patching either occurrence alone made it parse, which is the
+     * signature of a pairing bug rather than a bad construct. *)
+    if !i + 1 < n && s.[!i] = '(' && s.[!i + 1] = '*'
+       && not (!i + 2 < n && s.[!i + 2] = ')') then begin
       let j = ref (!i + 2) in
       let closed = ref false in
       while not !closed && !j + 1 < n do
