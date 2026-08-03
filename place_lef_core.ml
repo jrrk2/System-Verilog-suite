@@ -250,6 +250,51 @@ let run_gen floorplan_json ~get_bmod ~get_j =
   (* cell -> net ids *)
   let cell_nets = Array.make ncells [] in
   Array.iteri (fun nid cs -> Array.iter (fun i -> cell_nets.(i) <- nid :: cell_nets.(i)) cs) net_cells;
+  (* ---- CLOCK-DOMAIN AFFINITY -------------------------------------------
+     Clock nets are excluded from the wirelength cost above (a BUFG-driven net
+     is un-shortenable and would swamp HPWL), so the annealer has NO notion of
+     clock domains and interleaves them freely.  Measured on eth-arp: userclk2's
+     1049 FFs and the CPU's 515 were both smeared over the SAME 76x76 tile box,
+     which is why same-domain paths came out 0.9 ns logic / 10.6 ns routing.
+     Pull each domain together with a centroid-attraction term.  The centroid is
+     held FIXED between refreshes so a move costs O(1) -- adding the clock net to
+     net_cells instead would make every move O(domain size) (~1000x). *)
+  let dom_of_key : (Pack_to_lef.netkey, int) Hashtbl.t = Hashtbl.create 16 in
+  let ndom = ref 0 in
+  let cell_dom = Array.make ncells (-1) in
+  Array.iteri (fun i c ->
+      if c.Pack_to_lef.pc_lef <> "BUFG" && c.Pack_to_lef.pc_lef <> "MMCM" then
+        List.iter (fun (_p, nk) -> match nk with
+          | Pack_to_lef.Net _ when Hashtbl.mem clk_nets nk && cell_dom.(i) < 0 ->
+            let d = match Hashtbl.find_opt dom_of_key nk with
+              | Some d -> d
+              | None -> let d = !ndom in incr ndom; Hashtbl.add dom_of_key nk d; d in
+            cell_dom.(i) <- d
+          | _ -> ()) c.Pack_to_lef.pc_conns) cells;
+  let dom_w = try float_of_string (Sys.getenv "TOPO_DOM_W") with _ -> 0.0 in
+  let dom_cx = Array.make (max 1 !ndom) 0.0 and dom_cy = Array.make (max 1 !ndom) 0.0 in
+  let refresh_dom () =
+    if dom_w > 0.0 && !ndom > 0 then begin
+      let sx = Array.make !ndom 0.0 and sy = Array.make !ndom 0.0
+      and n = Array.make !ndom 0 in
+      Array.iteri (fun i d ->
+          if d >= 0 && is_placed i then begin
+            sx.(d) <- sx.(d) +. float pos_x.(i);
+            sy.(d) <- sy.(d) +. float pos_y.(i);
+            n.(d) <- n.(d) + 1
+          end) cell_dom;
+      for d = 0 to !ndom - 1 do
+        if n.(d) > 0 then begin
+          dom_cx.(d) <- sx.(d) /. float n.(d); dom_cy.(d) <- sy.(d) /. float n.(d)
+        end
+      done
+    end in
+  (* attraction cost of cell i sitting at (x,y), 0 when the term is off *)
+  let dom_cost i x y =
+    if dom_w <= 0.0 then 0.0 else
+    let d = cell_dom.(i) in
+    if d < 0 then 0.0
+    else dom_w *. (abs_float (float x -. dom_cx.(d)) +. abs_float (float y -. dom_cy.(d))) in
   (* TIMING-DRIVEN PLACEMENT: per-net criticality weight (default 1.0).  Loaded
      from PLACE_CRIT_FILE (nextpnr NEXTPNR_CRIT_EXPORT: "<driver-cell>\t<crit>").
      eval_delta minimises SUM (net_w.(n) * hpwl n) so the SA annealer keeps near-
@@ -260,11 +305,30 @@ let run_gen floorplan_json ~get_bmod ~get_j =
   let net_w = Array.make !nnets 1.0 in
   (match Sys.getenv_opt "PLACE_CRIT_FILE" with
    | Some cf when Sys.file_exists cf ->
-     let strip n = match String.index_opt n '$' with Some i -> String.sub n 0 i | None -> n in
+     (* Recover the pre-packing cell name by removing a KNOWN packer suffix from
+        the END.  Truncating at the FIRST '$' is wrong for yosys-generated names,
+        which BEGIN with one -- `$abc$29188$...$29189$logic` collapsed to the
+        empty string, so only the handful of cells whose pc_name happened to be
+        unsuffixed ever matched (119 of 4968 on eth-arp).  pack_to_lef appends
+        these; keep in sync with it. *)
+     let strip n = match String.rindex_opt n '$' with
+       | Some i ->
+         let suf = String.sub n (i + 1) (String.length n - i - 1) in
+         if List.mem suf [ "carry"; "mux"; "site"; "hard"; "m"; "logic"; "ff" ]
+         then String.sub n 0 i else n
+       | None -> n in
      let base2ids = Hashtbl.create (ncells * 2) in
+     let add_base b i =
+       Hashtbl.replace base2ids b (i :: (try Hashtbl.find base2ids b with Not_found -> [])) in
      Array.iteri (fun i c ->
-       let b = strip c.Pack_to_lef.pc_name in
-       Hashtbl.replace base2ids b (i :: (try Hashtbl.find base2ids b with Not_found -> []))) cells;
+       add_base (strip c.Pack_to_lef.pc_name) i;
+       (* A packed cell ABSORBS several original primitives; only the base one is
+          recoverable from pc_name, so index every original too.  pc_bels stamps
+          each at its slot, and its fst IS the pre-packing inst_name -- the exact
+          space nextpnr keys criticality by.  Without this, LUTs/FFs folded into
+          a SLICE_CARRY or SLICE_LOGIC are invisible to the annealer (matching
+          went 1661 -> 4029 of 4968 on eth-arp). *)
+       List.iter (fun (orig, _) -> add_base orig i) c.Pack_to_lef.pc_bels) cells;
      let k = try float_of_string (Sys.getenv "PLACE_CRIT_K") with _ -> 8.0 in
      let ic = open_in cf in
      let matched = ref 0 and lines = ref 0 in
@@ -276,7 +340,17 @@ let run_gen floorplan_json ~get_bmod ~get_j =
            if c > 0.0 then begin
              let ids = match Hashtbl.find_opt name2id cname with
                | Some i -> [ i ]
-               | None -> (try Hashtbl.find base2ids cname with Not_found -> []) in
+               | None ->
+                 (match Hashtbl.find_opt base2ids cname with
+                  | Some l -> l
+                  | None ->
+                    (* nextpnr names some drivers by PIN ("<cell>/DP" on a
+                       dist-RAM); fall back to the cell part. *)
+                    (match String.rindex_opt cname '/' with
+                     | Some i ->
+                       (try Hashtbl.find base2ids (String.sub cname 0 i)
+                        with Not_found -> [])
+                     | None -> [])) in
              if ids <> [] then incr matched;
              let w = 1.0 +. k *. c in
              List.iter (fun idx ->
@@ -892,6 +966,9 @@ let run_gen floorplan_json ~get_bmod ~get_j =
             if net_stamp.(nid) <> st then (net_stamp.(nid) <- st; nets := nid :: !nets))
             cell_nets.(i)) moved;
         let before = List.fold_left (fun a n -> a +. net_w.(n) *. float (net_hpwl n)) 0.0 !nets in
+        (* clock-domain attraction, O(1) per moved cell (fixed centroid) *)
+        let dom_before =
+          List.fold_left (fun a i -> a +. dom_cost i pos_x.(i) pos_y.(i)) 0.0 moved in
         (* congestion: accumulate the affected nets' OLD RUDY (negated) *)
         let cmap = Hashtbl.create 32 in
         let acc b a = Hashtbl.replace cmap b ((try Hashtbl.find cmap b with Not_found -> 0.0) +. a) in
@@ -903,6 +980,9 @@ let run_gen floorplan_json ~get_bmod ~get_j =
         let olds = List.map (fun i -> (pos_x.(i), pos_y.(i))) moved in
         List.iter2 (fun i (nx, ny) -> pos_x.(i) <- nx; pos_y.(i) <- ny) moved newpos;
         let after = List.fold_left (fun a n -> a +. net_w.(n) *. float (net_hpwl n)) 0.0 !nets in
+        let dom_after =
+          List.fold_left (fun a i -> a +. dom_cost i pos_x.(i) pos_y.(i)) 0.0 moved in
+        let ddom = dom_after -. dom_before in
         (* add the NEW RUDY -> cmap now holds per-bin demand delta *)
         if cong_on then List.iter (fun n -> net_rudy_acc n (1.0) acc) !nets;
         if ll_on then List.iter (fun n -> net_track_acc n (1.0) hacc vacc) !nets;
@@ -935,18 +1015,25 @@ let run_gen floorplan_json ~get_bmod ~get_j =
             | _ -> acc in
           go 0.0 moved olds in
         ((after -. before) +. cong_w *. dcong +. site_w *. sdelta +. ll_w *. dtrack
-           +. coh_w *. dcoh,
+           +. coh_w *. dcoh +. ddom,
          olds, cmap, omap, hmap, vmap) in
       let accepted = ref 0 in
+      refresh_dom ();
+      if dom_w > 0.0 then
+        Printf.eprintf "[place_lef] clock-domain affinity: %d domain(s), W=%.1f\n%!" !ndom dom_w;
       (* Periodic progress to stderr (unbuffered) -- a 900k-move anneal is
          minutes of otherwise total silence, which reads as a hang. *)
       let prog_every = max 1 (moves / 20) in
       let t_start = Sys.time () in
       for mvno = 1 to moves do
-        if mvno mod prog_every = 0 then
+        if mvno mod prog_every = 0 then begin
+          (* re-centre each clock domain on where its cells actually are now;
+             held fixed between refreshes to keep eval_delta O(1) *)
+          refresh_dom ();
           Printf.eprintf "  SA %3d%%  moves=%d/%d  accepted=%d  temp=%.2f  %.0fs\n%!"
             (100 * mvno / moves) mvno moves !accepted !t
-            (Sys.time () -. t_start);
+            (Sys.time () -. t_start)
+        end;
         let i = mv.(Random.int m) in
         let s = region_arr.(Random.int (Array.length region_arr)) in
         let si = match cell_site.(i) with Some s -> s | None -> assert false in
@@ -1242,6 +1329,54 @@ let run_gen floorplan_json ~get_bmod ~get_j =
          end) region_arr;
        match !best with Some (_, s) -> s.used <- true; Some s | None -> None in
      let ftn = ref 0 and rewire = Hashtbl.create 4096 and newcells = ref [] and ftstamps = ref [] in
+     (* replication diagnostics: a cluster silently ABANDONED (no free site within
+        relay_maxd of its centroid) leaves the whole net on one overloaded driver,
+        which is invisible without this counter. *)
+     let ft_toofar = ref 0 and ft_nosite = ref 0 and ft_worst = ref "" and ft_worst_n = ref 0 in
+     let ft_bygain = ref 0 in
+     (* Positions of the cells driving a LUT's INPUTS.  Replicating a LUT does NOT
+        come free: the copy needs every input net routed to its new site.  The
+        inputs sit near the ORIGINAL driver (the annealer put them there), so a
+        replica parked at a distant sink cluster pays that distance on each input
+        -- measured, a replica 72 tiles out turned its input arc into 4.3 ns, the
+        largest single term on the path, and eth._1018 went 86.7 -> 80.0.  Any
+        sound accept test must price the input side too. *)
+     let drv_input_pos dcn =
+       match Hashtbl.find_opt cell_json_of dcn with
+       | Some (`Assoc a) ->
+         (match List.assoc_opt "connections" a, List.assoc_opt "port_directions" a with
+          | Some (`Assoc conns), Some (`Assoc pdirs) ->
+            List.concat_map (fun (port, bits) ->
+                match List.assoc_opt port pdirs with
+                | Some (`String "input") ->
+                  (match bits with
+                   | `List bl ->
+                     List.filter_map (function
+                       | `Int b ->
+                         (match Hashtbl.find_opt drv b with
+                          | Some (icn, _) -> Hashtbl.find_opt inst2pos icn
+                          | None -> None)
+                       | _ -> None) bl
+                   | _ -> [])
+                | _ -> []) conns
+          | _ -> [])
+       | _ -> [] in
+     (* worst-case Manhattan reach from a set of source positions to (x,y) *)
+     let worst_reach srcs (x, y) =
+       List.fold_left (fun acc (sx, sy) ->
+           Stdlib.max acc (abs (sx - x) + abs (sy - y))) 0 srcs in
+     (* how much closer than the ORIGINAL driver a far replica must be to be worth
+        placing (tiles).  0 = accept any improvement. *)
+     let repl_margin = getenv_int "TOPO_REPL_MARGIN" 4 in
+     (* TOPO_REPL_GAIN=1 enables driver replication by distance-gain (below).
+        DEFAULT OFF: measured on eth-arp it REGRESSES eth._1018 (86.70 MHz with
+        replication off -> 78.95 naive / 80.01 true-replica-only / 81.78 with the
+        input-aware model).  The annealer has already clustered each LUT with its
+        fanin, so any replica site far enough to help the distant sinks is far
+        from that fanin, and the input cost cancels the output saving.  To pay
+        off, replication must happen INSIDE the anneal, where the fanin can
+        migrate with the copy -- not as a post-pass on a frozen placement. *)
+     let repl_gain_on = getenv_int "TOPO_REPL_GAIN" 0 <> 0 in
      (* regional buffering: a high-fanout CONTROL net (many CE/R/S sinks) is put
         on a global BUFG so it uses the dedicated clock/enable network instead of
         saturating per-slice CEUSEDMUX/SRUSEDMUX in the fabric.  Bounded by the
@@ -1413,11 +1548,48 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                    let cy = (List.fold_left (fun a (cn,_,_) -> a + snd (Hashtbl.find inst2pos cn)) 0 grp) / n in
                    if abs (cx-dx) + abs (cy-dy) <= thresh && List.length placed < minfo then () else
                    match take_free (cx, cy) with
-                   | None -> ()
+                   | None -> incr ft_nosite
                    | Some site ->
-                     (* never strand a relay/replica far from the sinks it serves *)
-                     if abs (site.sx - cx) + abs (site.sy - cy) > relay_maxd then site.used <- false
+                     (* Accept a replica if it is near the cluster (relay_maxd
+                        fast path) OR simply CLOSER to the cluster than the
+                        original driver is, by repl_margin.
+                        The old test was `d_site > relay_maxd -> abandon`, which
+                        threw away 5652 of 5729 clusters on eth-arp: a DENSE
+                        cluster saturates its own neighbourhood, so take_free
+                        returns a site tens of tiles away and the hard cutoff
+                        rejected it -- leaving the whole net on ONE driver
+                        reaching every sink (a 72-CE net stuck at 45 tiles).
+                        A replica strictly closer than the driver is always a
+                        win, however far it sits in absolute terms. *)
+                     let d_site = abs (site.sx - cx) + abs (site.sy - cy) in
+                     let d_drv = abs (dx - cx) + abs (dy - cy) in
+                     (* The distance-gain path is only sound for a TRUE REPLICA:
+                        replica_or_relay clones the driver only when it is a LUT,
+                        so the cloned copy adds NO logic level.  For a non-LUT
+                        driver it falls back to a LUT1 buffer, which is an extra
+                        level IN SERIES -- accepting those on distance alone made
+                        things worse (2374 LUT1 buffers, eth._1018 86.7 -> 79.0,
+                        logic 0.9 -> 1.5 ns).  Those keep the old relay_maxd rule,
+                        which is about routability, not timing. *)
+                     let is_true_replica = is_lut_ty dty in
+                     (* net gain = output-side saving - input-side cost *)
+                     let gain_ok =
+                       repl_gain_on && is_true_replica &&
+                       (let srcs = drv_input_pos dcn in
+                        let d_in = worst_reach srcs (site.sx, site.sy)
+                        and d_in0 = worst_reach srcs (dx, dy) in
+                        (d_drv - d_site) - (d_in - d_in0) > repl_margin) in
+                     if d_site > relay_maxd && not gain_ok then begin
+                       incr ft_toofar;
+                       if List.length grp > !ft_worst_n then begin
+                         ft_worst_n := List.length grp;
+                         ft_worst := Printf.sprintf "bit %d grp=%d centroid=(%d,%d) nearest free=(%d,%d) d_site=%d d_drv=%d"
+                             bit (List.length grp) cx cy site.sx site.sy d_site d_drv
+                       end;
+                       site.used <- false
+                     end
                      else begin
+                       if d_site > relay_maxd then incr ft_bygain;
                        let nb = newbit () in
                        let ftname = Printf.sprintf "$feedthrough$%d" !ftn in incr ftn;
                        newcells := (ftname, bit, nb, Some dcn) :: !newcells;
@@ -1575,6 +1747,11 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      List.iter (fun s -> Printf.fprintf ob "%s\n" s) !ftstamps; close_out ob;
      Printf.eprintf "feedthroughs: %d LUT1 relays + %d buffers (%d %s + %d BUFHCE + %d BUFG wide) -> %s (+%d stamps)\n"
        !ftn !nbufg (!nbufg - !ngbuf - !nbufh) buf_type !nbufh !ngbuf outj (List.length !ftstamps);
+     if !ft_toofar > 0 || !ft_nosite > 0 then begin
+       Printf.eprintf "replication: %d cluster(s) ABANDONED (no gain over driver), %d with no free site at all, %d accepted by distance-gain\n"
+         !ft_toofar !ft_nosite !ft_bygain;
+       if !ft_worst <> "" then Printf.eprintf "replication: worst abandoned %s\n" !ft_worst
+     end;
 
      (* ===== CARRY-SLICE COMPLETION (OCaml port of carry_stamp.py) ==========
         Emits a SECOND json (TOPO_STAMPED_JSON) with all BEL stamps applied
