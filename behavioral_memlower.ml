@@ -52,6 +52,27 @@ open Behavioral_ir
 
 (* ──────────── helpers ──────────── *)
 
+(* Fold trivial muxes so two ADDRESS expressions that are the same signal can be
+   recognised as such.  The write address arrives as a per-byte-strobe mux and
+   the read address as a constant-true mux, both over the SAME `addr`:
+
+     w_addr = (we[3] ? addr : (we[2] ? addr : (we[1] ? addr : addr)))
+     r_addr = (1'1   ? addr : (... the same ...))
+
+   Structural equality said "different", so the registered read was NOT absorbed
+   into the block RAM and the emitted RAM ended up with TWO cycles of read
+   latency while o_wb_ack still asserted after one -- the CPU sampled the
+   previous cycle's data and the SoC never executed an instruction. *)
+let rec fold_triv_mux e = match e with
+  | BCond { condition; then_val; else_val } ->
+      let t = fold_triv_mux then_val and f = fold_triv_mux else_val in
+      if t = f then t
+      else (match fold_triv_mux condition with
+            | BConst { value; _ } when Z.equal value Z.zero -> f
+            | BConst { value; _ } -> t
+            | c -> BCond { condition = c; then_val = t; else_val = f })
+  | e -> e
+
 let bits_needed n = if n <= 1 then 1 else
   let rec loop b m = if m >= n then b else loop (b + 1) (m * 2) in loop 1 2
 
@@ -1350,7 +1371,18 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                          ; p_we = we_expr; p_wdata = w_data; p_wstrb = None })
                      , w_addr )
                  in
-                 let absorb = Option.is_some read_reg && w_addr_used = r_addr in
+                 let absorb =
+                   Option.is_some read_reg
+                   && fold_triv_mux w_addr_used = fold_triv_mux r_addr in
+                 if Sys.getenv_opt "MEMLOWER_DEBUG" <> None then
+                   Printf.eprintf
+                     "[memlower] %s: read_reg=%s addr_match=%b -> absorb=%b\n%!"
+                     mname (match read_reg with Some r -> r | None -> "<none>")
+                     (w_addr_used = r_addr) absorb;
+                 if Sys.getenv_opt "MEMLOWER_DEBUG" <> None then
+                   Printf.eprintf "[memlower]   w_addr=%s\n[memlower]   r_addr=%s\n%!"
+                     (Behavioral_ir.string_of_bexpr w_addr_used)
+                     (Behavioral_ir.string_of_bexpr r_addr);
                  let insts, new_sigs, drv_stmts, _ =
                    Fpga_bram_resolve.build_byte_lane_ram ~name:mname ~depth:mm.depth
                      ~width:dw ?init ~ports:[ port ] ()
