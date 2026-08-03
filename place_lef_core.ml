@@ -271,6 +271,40 @@ let run_gen floorplan_json ~get_bmod ~get_j =
               | None -> let d = !ndom in incr ndom; Hashtbl.add dom_of_key nk d; d in
             cell_dom.(i) <- d
           | _ -> ()) c.Pack_to_lef.pc_conns) cells;
+  (* name of each domain's clock net, for TOPO_DOM_PRIO matching *)
+  let dom_name = Array.make (max 1 !ndom) "" in
+  Hashtbl.iter (fun nk d -> match nk with
+    | Pack_to_lef.Net (nm, _) -> if d < Array.length dom_name then dom_name.(d) <- nm
+    | _ -> ()) dom_of_key;
+  (* Spread the domain tag from the registers to the COMBINATIONAL cells between
+     them, by NEAREST-REGISTER breadth-first search from every tagged cell at
+     once.  A logic cone belongs to the domain of the registers it sits between.
+     The previous majority-vote-over-neighbours rule was a popularity contest,
+     not a cone: a LUT between two eth registers but touching several cpu-domain
+     cells came out cpu.  It also only spread from already-tagged cells over a
+     few passes, so coverage DECAYED with distance from the registers -- worst
+     for the domain with the deepest logic.  Measured on eth-arp it captured 61%
+     of the cpu cone but only 38% of userclk2's (819 of ~2180 cells), so zone
+     sizing undercounted userclk2 2.7x and the partition SPLIT the very domain it
+     was meant to compact.  A true backward cone is near-unambiguous here (2695 of
+     2713 comb cells lie in exactly one domain's cone, 18 shared), so nearest-
+     register BFS is an accurate stand-in and needs no port-direction data.
+     High-fanout nets are skipped: a 72-sink clock enable would otherwise bridge
+     every domain it touches. *)
+  let () =
+    let maxfan = getenv_int "TOPO_DOM_MAXFAN" 16 in
+    let q = Queue.create () in
+    Array.iteri (fun i d -> if d >= 0 then Queue.add i q) cell_dom;
+    while not (Queue.is_empty q) do
+      let i = Queue.pop q in
+      let d = cell_dom.(i) in
+      List.iter (fun nid ->
+          let cs = net_cells.(nid) in
+          if Array.length cs <= maxfan then
+            Array.iter (fun j ->
+                if cell_dom.(j) < 0 then begin cell_dom.(j) <- d; Queue.add j q end) cs)
+        cell_nets.(i)
+    done in
   let dom_w = try float_of_string (Sys.getenv "TOPO_DOM_W") with _ -> 0.0 in
   let dom_cx = Array.make (max 1 !ndom) 0.0 and dom_cy = Array.make (max 1 !ndom) 0.0 in
   let refresh_dom () =
@@ -528,6 +562,227 @@ let run_gen floorplan_json ~get_bmod ~get_j =
       Array.to_list (Array.sub arr 0 k)
     end in
   let region_arr = Array.of_list region_sites in
+  (* ---- PRIORITY DOMAIN ZONING (TOPO_DOM_ZONE=1) --------------------------
+     Give the CRITICAL clock domain its own contiguous block of sites first and
+     let the slack domains take what is left.  region_arr is already ordered
+     nearest-anchor-first, so a prefix is the most compact space available.
+     Rationale: on eth-arp the 125 MHz userclk2 domain and the 50 MHz cpu domain
+     are fully interleaved across the same 76x76 tile area, while cpu closes 56
+     against a 50 MHz target -- it can afford to be scattered, userclk2 cannot.
+     A SOFT centroid pull (TOPO_DOM_W) failed because it fought the wirelength
+     term; a HARD partition instead hands the good contiguous space to the domain
+     that needs it, which is the shape Vivado's placement has.
+     TOPO_DOM_PRIO="sub1,sub2" ranks domains by clock-net-name substring (first =
+     highest); unlisted domains follow, largest first. *)
+  let zone_on = getenv_int "TOPO_DOM_ZONE" 0 <> 0 in
+  let zone_arr = Array.make (max 1 !ndom) [||] in
+  let site_zone : (string, int) Hashtbl.t = Hashtbl.create 4096 in
+  let () =
+    if zone_on && !ndom > 0 && region_arr <> [||] then begin
+      let cnt = Array.make !ndom 0 in
+      Array.iteri (fun i d -> if d >= 0 && movable.(i) then cnt.(d) <- cnt.(d) + 1) cell_dom;
+      let prio = match Sys.getenv_opt "TOPO_DOM_PRIO" with
+        | Some s -> String.split_on_char ',' s | None -> [] in
+      let rank d =
+        let rec find k = function
+          | [] -> 1000
+          | sub :: tl ->
+            let nm = dom_name.(d) in
+            let hit =
+              let ls = String.length sub and ln = String.length nm in
+              ls > 0 && (let rec go j = j + ls <= ln && (String.sub nm j ls = sub || go (j+1)) in go 0) in
+            if hit then k else find (k+1) tl in
+        find 0 prio in
+      let order = Array.init !ndom (fun d -> d) in
+      Array.sort (fun a b ->
+          let ra = rank a and rb = rank b in
+          if ra <> rb then compare ra rb else compare cnt.(b) cnt.(a)) order;
+      let pos = ref 0 and total = Array.length region_arr in
+      Array.iter (fun d ->
+          if cnt.(d) > 0 && !pos < total then begin
+            let want = int_of_float (ceil (float cnt.(d) /. fill)) in
+            let take = min want (total - !pos) in
+            zone_arr.(d) <- Array.sub region_arr !pos take;
+            Array.iter (fun s -> Hashtbl.replace site_zone s.sname d) zone_arr.(d);
+            Printf.eprintf "[place_lef] zone: domain '%s' cells=%d sites=%d (rank %d)\n"
+              dom_name.(d) cnt.(d) take (rank d);
+            pos := !pos + take
+          end) order;
+      Printf.eprintf "[place_lef] zoning: %d/%d region sites allocated to %d domain(s)\n%!"
+        !pos total !ndom
+    end in
+  (* ---- DEF EXPORT for OpenROAD (TOPO_DEF_OUT) ----------------------------
+     nextpnr's HeAP hangs on this design and its SA produces invalid placements,
+     so the only untried analytic placer is OpenROAD's RePlAce/OpenDP.  The LEF
+     model already exists (xilinx_lef/virtex7.tech.lef + virtex7_cells.lef, one
+     MACRO per pc_lef on a 1x1 SITE grid), so all that is missing is the DEF.
+     Pins carry no geometry inside a 1x1 cell, so a connection is bound to the
+     next free pin of the right macro -- which pin is irrelevant to placement,
+     only the connectivity matters.  DATABASE MICRONS 2000 and SITE 1.0 => 2000
+     DB units per site. *)
+  let emit_def () = match Sys.getenv_opt "TOPO_DEF_OUT" with
+    | None -> ()
+    | Some defp ->
+      let lefp = getenv_default "TOPO_LEF_CELLS"
+          (Filename.concat (Filename.dirname Sys.executable_name) "virtex7_cells.lef") in
+      (* macro -> ordered pin list, straight out of the LEF *)
+      let macro_pins : (string, string list ref) Hashtbl.t = Hashtbl.create 32 in
+      (try
+         let ic = open_in lefp in
+         let cur = ref "" in
+         (try while true do
+            let l = String.trim (input_line ic) in
+            if String.length l > 6 && String.sub l 0 6 = "MACRO " then begin
+              cur := String.sub l 6 (String.length l - 6);
+              Hashtbl.replace macro_pins !cur (ref [])
+            end else if String.length l > 4 && String.sub l 0 4 = "PIN " && !cur <> "" then
+              (match Hashtbl.find_opt macro_pins !cur with
+               | Some r -> r := String.sub l 4 (String.length l - 4) :: !r | None -> ())
+          done with End_of_file -> ()); close_in ic
+       with _ -> Printf.eprintf "[place_lef] DEF: cannot read %s\n" lefp);
+      Hashtbl.iter (fun _ r -> r := List.rev !r) macro_pins;
+      (* Die = the REGION place_lef actually places into, expanded to contain the
+         FIXED macros -- NOT the whole device.  Giving OpenROAD the full 222x350
+         die let it spread the logic over 77700 positions at the requested
+         density while place_lef confines placement to ~5k sites, so importing
+         that placement cost a 16-site average snap and destroyed it. *)
+      let sx_min = ref max_int and sy_min = ref max_int
+      and sx_max = ref min_int and sy_max = ref min_int in
+      Array.iter (fun s ->
+          if s.sx < !sx_min then sx_min := s.sx;
+          if s.sx > !sx_max then sx_max := s.sx;
+          if s.sy < !sy_min then sy_min := s.sy;
+          if s.sy > !sy_max then sy_max := s.sy) region_arr;
+      Array.iteri (fun i _ ->
+          if not movable.(i) && is_placed i then begin
+            if pos_x.(i) < !sx_min then sx_min := pos_x.(i);
+            if pos_x.(i) > !sx_max then sx_max := pos_x.(i);
+            if pos_y.(i) < !sy_min then sy_min := pos_y.(i);
+            if pos_y.(i) > !sy_max then sy_max := pos_y.(i)
+          end) cells;
+      let sx_min = !sx_min and sy_min = !sy_min
+      and sx_max = !sx_max and sy_max = !sy_max in
+      let u = 2000 in
+      let oc = open_out defp in
+      Printf.fprintf oc "VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\n";
+      Printf.fprintf oc "DESIGN top ;\nUNITS DISTANCE MICRONS %d ;\n" u;
+      Printf.fprintf oc "DIEAREA ( 0 0 ) ( %d %d ) ;\n"
+        ((sx_max - sx_min + 1) * u) ((sy_max - sy_min + 1) * u);
+      for y = sy_min to sy_max do
+        Printf.fprintf oc "ROW ROW_%d SLICE 0 %d N DO %d BY 1 STEP %d 0 ;\n"
+          (y - sy_min) ((y - sy_min) * u) (sx_max - sx_min + 1) u
+      done;
+      (* ---- PLACEMENT BLOCKAGES over every position the region does NOT own ---
+         Without these OpenROAD treats the whole die rectangle as placeable and
+         optimises onto sites place_lef cannot legalise onto, so the import has
+         to drag cells back (measured 16.0 sites average with the full die, still
+         10.5 with the region bbox) -- which is exactly the quality being thrown
+         away.  Blocking the non-region / macro-occupied positions makes
+         OpenROAD's placement legal BY CONSTRUCTION.  Runs are merged
+         horizontally to keep the DEF small. *)
+      let avail = Hashtbl.create 16384 in
+      Array.iter (fun s -> Hashtbl.replace avail (s.sx, s.sy) true) region_arr;
+      (* a site holding a cell we export FIXED is not available to OpenROAD *)
+      Array.iteri (fun i c ->
+          let is_carry = (let m = c.Pack_to_lef.pc_lef in
+                          String.length m >= 11 && String.sub m 0 11 = "SLICE_CARRY") in
+          if (not movable.(i) || is_carry) && is_placed i then
+            Hashtbl.remove avail (pos_x.(i), pos_y.(i))) cells;
+      let blk = Buffer.create (1 lsl 16) in
+      let nblk = ref 0 in
+      for y = sy_min to sy_max do
+        let x = ref sx_min in
+        while !x <= sx_max do
+          if Hashtbl.mem avail (!x, y) then incr x
+          else begin
+            let x0 = !x in
+            while !x <= sx_max && not (Hashtbl.mem avail (!x, y)) do incr x done;
+            Buffer.add_string blk
+              (Printf.sprintf "    - PLACEMENT RECT ( %d %d ) ( %d %d ) ;\n"
+                 ((x0 - sx_min) * u) ((y - sy_min) * u)
+                 ((!x - sx_min) * u) ((y - sy_min + 1) * u));
+            incr nblk
+          end
+        done
+      done;
+      if !nblk > 0 then begin
+        Printf.fprintf oc "BLOCKAGES %d ;\n" !nblk;
+        Buffer.output_buffer oc blk;
+        Printf.fprintf oc "END BLOCKAGES\n"
+      end;
+      Printf.eprintf "[place_lef] DEF: %d placement blockage rect(s), %d sites left free\n"
+        !nblk (Hashtbl.length avail);
+      (* components: pre-placed hard blocks are FIXED, the rest are free *)
+      Printf.fprintf oc "COMPONENTS %d ;\n" ncells;
+      Array.iteri (fun i c ->
+          let mac = c.Pack_to_lef.pc_lef in
+          let mac = if Hashtbl.mem macro_pins mac then mac else "SLICE_LOGIC" in
+          (* Carry chains stay where place_lef put them: nextpnr requires a
+             CARRY4's S/DI feeders in its OWN slice, so letting OpenROAD move
+             them apart produces an unroutable design (measured: cross-slice
+             ACY0_OUT / MC31 arcs).  TOPO_DEF_FREE_CARRY=1 to override. *)
+          let fix_carry = getenv_int "TOPO_DEF_FREE_CARRY" 0 = 0
+                          && (let m = c.Pack_to_lef.pc_lef in
+                              String.length m >= 11 && String.sub m 0 11 = "SLICE_CARRY") in
+          if movable.(i) && not fix_carry then
+            Printf.fprintf oc "- %s %s ;\n" c.Pack_to_lef.pc_name mac
+          else begin
+            let x = (pos_x.(i) - sx_min) * u and y = (pos_y.(i) - sy_min) * u in
+            Printf.fprintf oc "- %s %s + FIXED ( %d %d ) N ;\n" c.Pack_to_lef.pc_name mac x y
+          end) cells;
+      Printf.fprintf oc "END COMPONENTS\n";
+      (* nets: bind each cell's connection to the next free pin of its macro *)
+      let used = Array.make ncells 0 in
+      let buf = Buffer.create (1 lsl 20) in
+      let nn = ref 0 and dropped = ref 0 and dup = ref 0 in
+      (* CRITICALITY -> NET WEIGHT.  OpenROAD's gpl multiplies a GNet's timing
+         weight by a customWeight_, but NOTHING ever calls setCustomWeight and
+         gpl never reads dbNet::getWeight, so a DEF "+ WEIGHT" is parsed and then
+         ignored.  Emulate weight portably by emitting a critical net as PARALLEL
+         DUPLICATES: any placer that sums per-net HPWL then pays k times for it,
+         which is exactly what place_lef's net_w does in its own SA.  Weight comes
+         from net_w (1 + PLACE_CRIT_K * crit), rescaled to 1..1+TOPO_DEF_WREP
+         copies.  Pins are plentiful (2589 cells expose ~90k terminals, only ~14k
+         used), and a duplicate that cannot find a free pin is simply skipped. *)
+      let wrep = getenv_int "TOPO_DEF_WREP" 2 in
+      let wmax = Array.fold_left (fun a w -> Stdlib.max a w) 1.0 net_w in
+      let reps nid =
+        if wrep <= 0 || wmax <= 1.0 then 1
+        else 1 + int_of_float (Float.round
+               (float wrep *. (net_w.(nid) -. 1.0) /. (wmax -. 1.0))) in
+      Array.iteri (fun nid cs ->
+          if Array.length cs >= 2 then begin
+            let r = reps nid in
+            if r > 1 then dup := !dup + (r - 1);
+            for copy = 0 to r - 1 do
+              incr nn;
+              Buffer.add_string buf
+                (if copy = 0 then Printf.sprintf "- n%d" nid
+                 else Printf.sprintf "- n%d_w%d" nid copy);
+              Array.iter (fun i ->
+                  let mac = cells.(i).Pack_to_lef.pc_lef in
+                  let pins = match Hashtbl.find_opt macro_pins mac with
+                    | Some r -> !r | None -> (match Hashtbl.find_opt macro_pins "SLICE_LOGIC" with
+                        | Some r -> !r | None -> []) in
+                  let k = used.(i) in
+                  if k < List.length pins then begin
+                    used.(i) <- k + 1;
+                    Buffer.add_string buf
+                      (Printf.sprintf " ( %s %s )" cells.(i).Pack_to_lef.pc_name (List.nth pins k))
+                  end else incr dropped) cs;
+              Buffer.add_string buf " ;\n"
+            done
+          end) net_cells;
+      if !dup > 0 then
+        Printf.eprintf "[place_lef] DEF: %d weight-duplicate net(s) (max %d copies), %d pin-starved conns\n"
+          !dup (1 + wrep) !dropped;
+      Printf.fprintf oc "NETS %d ;\n" !nn;
+      Buffer.output_buffer oc buf;
+      Printf.fprintf oc "END NETS\nEND DESIGN\n";
+      close_out oc;
+      Printf.eprintf "[place_lef] DEF: %d cells, %d nets, die %dx%d sites -> %s\n%!"
+        ncells !nn (sx_max - sx_min + 1) (sy_max - sy_min + 1) defp
+  in
   (* region column index for carry-run search *)
   let slice_by_col : (int, site array) Hashtbl.t = Hashtbl.create 256 in
   let cols = Hashtbl.create 256 in
@@ -660,6 +915,82 @@ let run_gen floorplan_json ~get_bmod ~get_j =
             | None -> Printf.eprintf "no free region %s for %s\n"
                         (if want_sm then "SLICEM" else "SLICE") c.Pack_to_lef.pc_name) cells in
     do_pass true; do_pass false in
+
+  (* ---- DEF IMPORT (TOPO_DEF_IN): adopt OpenROAD's logic-cell placement ----
+     place_lef placed the MACROS (BRAM/dist-RAM/SRL/DSP/IO/clock buffers and the
+     carry chains) and exported them FIXED; OpenROAD's RePlAce+OpenDP placed the
+     ~2.4k free SLICE_LOGIC cells around them.  Read those coordinates back and
+     snap each cell to the nearest free REAL site, closest-first so the cells
+     OpenROAD packed tightest get their preferred site.  DEF is in DB units
+     (2000 per 1x1 site) offset to the floorplan origin. *)
+  let def_import () = match Sys.getenv_opt "TOPO_DEF_IN" with
+    | None -> false
+    | Some defp ->
+      (* same origin the export used: region bbox expanded over fixed macros *)
+      let sx_min = ref max_int and sy_min = ref max_int in
+      Array.iter (fun s ->
+          if s.sx < !sx_min then sx_min := s.sx;
+          if s.sy < !sy_min then sy_min := s.sy) region_arr;
+      Array.iteri (fun i _ ->
+          if not movable.(i) && is_placed i then begin
+            if pos_x.(i) < !sx_min then sx_min := pos_x.(i);
+            if pos_y.(i) < !sy_min then sy_min := pos_y.(i)
+          end) cells;
+      let sx_min = !sx_min and sy_min = !sy_min in
+      let u = 2000 in
+      let tgt = Hashtbl.create (ncells * 2) in
+      (try
+         let ic = open_in defp in
+         (try while true do
+            let l = String.trim (input_line ic) in
+            if String.length l > 2 && String.sub l 0 2 = "- " then begin
+              let toks = List.filter (fun s -> s <> "")
+                  (String.split_on_char ' ' l) in
+              match toks with
+              | _ :: nm :: rest ->
+                (* find "(" x y ")" *)
+                let rec scan = function
+                  | "(" :: xs :: ys :: _ ->
+                    (try Some (int_of_string xs, int_of_string ys) with _ -> None)
+                  | _ :: tl -> scan tl
+                  | [] -> None in
+                (match scan rest with
+                 | Some (x, y) ->
+                   Hashtbl.replace tgt nm (x / u + sx_min, y / u + sy_min)
+                 | None -> ())
+              | _ -> ()
+            end
+          done with End_of_file -> ()); close_in ic
+       with _ -> Printf.eprintf "[place_lef] DEF-IN: cannot read %s\n" defp);
+      if Hashtbl.length tgt = 0 then false else begin
+        (* order by distance to the DEF target: tight clusters bind first *)
+        let cand = ref [] in
+        Array.iteri (fun i c ->
+            if kind_of_lef c.Pack_to_lef.pc_lef = "SLICE" && not (is_placed i)
+               && not skip.(i) then
+              match Hashtbl.find_opt tgt c.Pack_to_lef.pc_name with
+              | Some p -> cand := (i, p) :: !cand
+              | None -> ()) cells;
+        let cand = List.sort (fun (_, (ax, ay)) (_, (bx, by)) ->
+            compare (ax + ay) (bx + by)) !cand in
+        let ok = ref 0 and miss = ref 0 and dsum = ref 0 in
+        List.iter (fun (i, (tx, ty)) ->
+            match nearest_region_free i (tx, ty) with
+            | Some s ->
+              dsum := !dsum + abs (s.sx - tx) + abs (s.sy - ty);
+              bind i s; incr ok
+            | None -> incr miss) cand;
+        (* anything OpenROAD did not place falls back to the normal path *)
+        Array.iteri (fun i c ->
+            if kind_of_lef c.Pack_to_lef.pc_lef = "SLICE" && not (is_placed i)
+               && not skip.(i) then
+              match nearest_region_free i (centroid i) with
+              | Some s -> bind i s | None -> ()) cells;
+        Printf.eprintf
+          "[place_lef] DEF-IN: adopted %d cells from %s (mean snap %.2f sites, %d unplaceable)\n%!"
+          !ok defp (if !ok = 0 then 0.0 else float !dsum /. float !ok) !miss;
+        true
+      end in
 
   (* ======================================================================= *)
   (* ANALYTIC: quadratic (weighted-clique) wirelength min by conjugate        *)
@@ -1035,12 +1366,23 @@ let run_gen floorplan_json ~get_bmod ~get_j =
             (Sys.time () -. t_start)
         end;
         let i = mv.(Random.int m) in
-        let s = region_arr.(Random.int (Array.length region_arr)) in
+        (* zoned: draw the target only from this cell's own domain block *)
+        let pool =
+          if not zone_on then region_arr
+          else let d = cell_dom.(i) in
+            if d >= 0 && zone_arr.(d) <> [||] then zone_arr.(d) else region_arr in
+        let s = pool.(Random.int (Array.length pool)) in
         let si = match cell_site.(i) with Some s -> s | None -> assert false in
         if s.sname <> si.sname && fits i s then begin
           let j = match Hashtbl.find_opt occ s.sname with Some j -> j | None -> -1 in
+          (* a swap must not evict the partner out of ITS OWN zone *)
+          let swap_ok j =
+            not zone_on || j < 0 ||
+            (let dj = cell_dom.(j) in
+             dj < 0 || zone_arr.(dj) = [||] ||
+             (match Hashtbl.find_opt site_zone si.sname with Some z -> z = dj | None -> false)) in
           (* legal iff empty target, or a swap where BOTH land on a site they fit *)
-          if (j = -1 || (movable.(j) && fits j si)) then begin
+          if (j = -1 || (movable.(j) && fits j si && swap_ok j)) then begin
             let moved, newpos =
               if j = -1 then [i], [(s.sx, s.sy)]
               else [i; j], [(s.sx, s.sy); (si.sx, si.sy)] in
@@ -1191,12 +1533,17 @@ let run_gen floorplan_json ~get_bmod ~get_j =
       region_shape region_aspect anchor_cx anchor_cy rx0 rx1 ry0 ry1 w h
       (100. *. float_of_int (Array.length region_arr) /. float_of_int (w * h))
   end;
+  let def_only = getenv_int "TOPO_DEF_ONLY" 0 <> 0 in
   (match mode with
+   | "def"      -> if not (def_import ()) then constructive ()
    | "analytic" -> analytic (); anneal_multi ()
-   | "sa"       -> constructive (); let h0, _ = total_hpwl () in
-                   Printf.eprintf "SA seed HPWL=%d\n" h0; anneal_multi ()
-   | "region"   -> constructive ()
-   | "greedy" | _ -> constructive ());
+   | "sa"       -> constructive (); emit_def ();
+                   if not def_only then begin
+                     let h0, _ = total_hpwl () in
+                     Printf.eprintf "SA seed HPWL=%d\n" h0; anneal_multi ()
+                   end
+   | "region"   -> constructive (); emit_def ()
+   | "greedy" | _ -> constructive (); emit_def ());
 
   (* ---- report + emit ---------------------------------------------------- *)
   let placed_n = Array.fold_left (fun a i -> if is_placed i then a + 1 else a) 0
