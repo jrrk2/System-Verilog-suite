@@ -1356,6 +1356,39 @@ let do_orfs_run () =
    needed — DEF/LEF top-level keywords are stable enough that line
    regexes are simpler than extending the menhir parser.              *)
 
+(* ---- hierarchy colour-coding -------------------------------------------
+   A cell's hierarchy is its first path component.  yosys's `flatten` tags a
+   module's internal cells as "$flatten\\eth.$abc$..." -- they carry the
+   hierarchy WITHOUT starting with it -- so the marker is stripped first;
+   matching on a plain prefix finds only a fraction of a subsystem. *)
+let hier_of (name : string) : string =
+  let m = "$flatten\\" in
+  let lm = String.length m in
+  let s =
+    if String.length name > lm && String.sub name 0 lm = m
+    then String.sub name lm (String.length name - lm) else name in
+  match String.index_opt s '.' with
+  | Some i when i > 0 -> String.sub s 0 i
+  | _ -> "(top)"
+
+(* stable colour per hierarchy: hash -> hue, fixed saturation/value so the
+   groups stay distinguishable and the same subsystem keeps its colour between
+   runs. *)
+let hier_colour (k : string) : float * float * float =
+  if k = "(top)" then (0.30, 0.50, 0.80)
+  else begin
+    let h = float_of_int (abs (Hashtbl.hash k) mod 360) /. 60.0 in
+    let s = 0.70 and v = 0.95 in
+    let i = int_of_float (Float.of_int (int_of_float h)) mod 6 in
+    let f = h -. Float.of_int (int_of_float h) in
+    let p = v *. (1.0 -. s) in
+    let q = v *. (1.0 -. s *. f) in
+    let t' = v *. (1.0 -. s *. (1.0 -. f)) in
+    match i with
+    | 0 -> (v, t', p) | 1 -> (q, v, p) | 2 -> (p, v, t')
+    | 3 -> (p, q, v)  | 4 -> (t', p, v) | _ -> (v, p, q)
+  end
+
 type placed = {
   p_inst   : string;
   p_cell   : string;
@@ -1844,10 +1877,15 @@ let render_layout cr ~width ~height ?path layout =
     Cairo.set_line_width cr 1.5;
     Cairo.rectangle cr dx0 dy0 ~w:(dx1 -. dx0) ~h:(dy1 -. dy0);
     Cairo.stroke cr;
-    (* Instances — fill mostly transparent so dense regions read as colour
-       intensity. *)
-    Cairo.set_source_rgba cr 0.30 0.50 0.80 0.45;
+    (* Instances, COLOUR-CODED BY HIERARCHY so a subsystem's placement is
+       visible at a glance -- e.g. whether the eth core sits as one compact
+       block or is smeared across the die.  Cairo fills every queued path with
+       the CURRENT source, so the cells are grouped by hierarchy first and each
+       group filled separately.  Fill stays mostly transparent so dense regions
+       still read as intensity. *)
     let units_f = float_of_int layout.l_units in
+    let groups : (string, (float * float * float * float) list ref) Hashtbl.t =
+      Hashtbl.create 32 in
     List.iter (fun p ->
       let w_um, h_um =
         try Hashtbl.find layout.l_macro_um p.p_cell
@@ -1861,9 +1899,16 @@ let render_layout cr ~width ~height ?path layout =
       let w_dbu = w_um *. units_f in
       let h_dbu = h_um *. units_f in
       let (rx, ry) = xform p.p_x (p.p_y + int_of_float h_dbu) in
-      Cairo.rectangle cr rx ry ~w:(w_dbu *. scale) ~h:(h_dbu *. scale)
-    ) layout.l_components;
-    Cairo.fill cr;
+      let k = hier_of p.p_inst in
+      let l = (try Hashtbl.find groups k with Not_found ->
+                 let r = ref [] in Hashtbl.add groups k r; r) in
+      l := (rx, ry, w_dbu *. scale, h_dbu *. scale) :: !l)
+      layout.l_components;
+    Hashtbl.iter (fun k rects ->
+      let (r, g, b) = hier_colour k in
+      Cairo.set_source_rgba cr r g b 0.55;
+      List.iter (fun (x, y, w, h) -> Cairo.rectangle cr x y ~w ~h) !rects;
+      Cairo.fill cr) groups;
     (* nextpnr routing overlay.  Small nets keep the driver->sink star.  A
        global buffer's star is useless -- 149 lines from one corner BUFGCTRL
        tell you nothing -- so above WIDE_FANOUT we drop the lines and plot the
