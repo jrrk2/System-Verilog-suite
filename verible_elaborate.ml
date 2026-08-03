@@ -205,6 +205,16 @@ let rec eval_cw tok : (int * int) option =
      `pow_expr` are `TUPLE4(tag, lhs, op, rhs)`.  Fold directly (dispatching on
      the operator leaf) so overrides like `.Depth(MEM_SIZE / 4)` resolve without
      the fragile stringify→re-parse Eval path. *)
+  (* Conditional operator: `cond_expr2` is TUPLE6(tag, cond, QUERY, then,
+     COLON, else).  Needed for parameter overrides that gate a feature, e.g.
+     SERV's servile.v passes `.WITH_CSR (with_csr?1:0)` -- without this the
+     override cannot be folded and elaboration aborts with
+     "resolve_overrides: could not fold numeric override". *)
+  | TUPLE6 (STRING tag, c, QUERY, t, COLON, e)
+    when prefix_is "cond_expr" tag ->
+      (match eval_cw c with
+       | Some (cv, _) -> eval_cw (if cv <> 0 then t else e)
+       | None -> None)
   | TUPLE4 (STRING tag, lhs, op, rhs)
     when prefix_is "add_expr" tag || prefix_is "mul_expr" tag
       || prefix_is "shift_expr" tag || prefix_is "pow_expr" tag ->
