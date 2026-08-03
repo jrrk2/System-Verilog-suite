@@ -2875,6 +2875,31 @@ let extract_assign ~pkgs ~params ~arrays tok =
                     | Some a, Some b -> abs (a - b) + 1
                     | _ -> w) in
              let total_w = List.fold_left (fun acc p -> acc + part_w p) 0 parts in
+             (* Verilog evaluates an assignment's RHS in a context whose width is
+                the MAX of the LHS width and the operand widths.  So
+
+                   assign {add_cy, result_add} = i_rs1 + add_b + add_cy_r;
+
+                must be added at 1+W bits, or the carry-out is never computed at
+                all.  Width was being inferred from the 1-bit OPERANDS instead,
+                so slicing bit 1 off a 1-bit sum folded add_cy to CONSTANT ZERO
+                -- `assign _37 = 1'b0` in the emitted serv_alu, with no multi-bit
+                wire anywhere in the module.  SERV is bit-serial and feeds that
+                carry back through add_cy_r, so every arithmetic instruction was
+                wrong and the CPU never got past its first address computation
+                (dark board; formal miter refutes serv_alu at depth 3).
+                Widen the add/sub chain to the concat width before slicing. *)
+             let rec widen_arith w e = match e with
+               | BBinOp { op = (BAdd | BSub) as op; lhs = a; rhs = b; _ } ->
+                   BBinOp { op; lhs = widen_arith w a; rhs = widen_arith w b;
+                            result_type = BInt { width = w; signed = Unsigned } }
+               | e ->
+                   let ew =
+                     match width_of_bexpr_ctx !cur_signal_widths e with
+                     | Some n -> n | None -> w in
+                   if ew >= w then e
+                   else BConcat [ BConst { value = Z.zero; width = w - ew }; e ] in
+             let rhs_e = if total_w > 1 then widen_arith total_w rhs_e else rhs_e in
              let cursor = ref total_w in
              List.concat_map (fun ((name, _, sel) as p) ->
                let w = part_w p in

@@ -129,6 +129,19 @@ let proc_exprs = function
 
 let counter = ref 0
 
+(* every assignment to `sg` anywhere in a statement list *)
+let rec assigns_to sg = function
+  | BAssign { lhs; rhs } when lhs = sg -> [rhs]
+  | BAssign _ -> []
+  | BIf { then_stmts; else_stmts; _ } ->
+      List.concat_map (assigns_to sg) (then_stmts @ else_stmts)
+  | BCase { cases; default; _ } ->
+      List.concat_map (assigns_to sg) (List.concat_map snd cases @ default)
+  | BWhile { body; _ } -> List.concat_map (assigns_to sg) body
+  | BFor { body; _ } -> List.concat_map (assigns_to sg) body
+  | BBlock ss -> List.concat_map (assigns_to sg) ss
+  | _ -> []
+
 (* find shift-register assigns anywhere in a stmt list.  Recurse into BBlock;
  * an `if(C) <shift>` (no else) gates the shift, so C AND's into the CE. *)
 let rec find_shifts m clock ce_ctx acc = function
@@ -171,10 +184,34 @@ let infer_module (m : bmodule) : bmodule =
       | BSequential s -> BSequential { s with body = strip_shift cand_sgs s.body }
       | p -> p) m.processes in
     let all_exprs = List.concat_map proc_exprs procs_noshift in
-    (* 2. validate each candidate: only single-bit taps, no bad reads *)
-    let valid = List.filter (fun (sg,_,_,_,_,_) ->
+    (* An SRL16E/SRLC32E can ONLY shift -- it has no parallel-load path.  So the
+       matched shift must be the signal's ONLY assignment.  serv_rf_ram_if has
+
+          rdata0 <= {{W{1'b0}}, rdata0[width-1:W]};   // shift, zero-fill
+          if (rtrig0) rdata0 <= i_rdata;              // parallel LOAD
+
+       and strip_shift below deletes EVERY assign to a candidate signal, so
+       without this guard the load is silently discarded -- the SRL keeps only
+       the shift.  That is exactly how the fully-open SERV SoC came out dark:
+       rdata0 could never receive read data, the register file read back 0
+       forever, and the CPU never executed one instruction.  The differential
+       sim (ethsoc/svs_race/tb_serv_diff.v) pins it at cycle 16 on o_rf_wen.
+       Rejecting the candidate costs a few LUTs of FF chain and is correct. *)
+    let all_stmts = List.concat_map (function
+      | BSequential s -> s.body
+      | BCombinational c -> c.body) m.processes in
+    let shift_is_only_assign sg w =
+      List.for_all (fun rhs -> match_shift ~sg ~w rhs <> None)
+        (List.concat_map (assigns_to sg) all_stmts) in
+    (* 2. validate each candidate: only single-bit taps, no bad reads, and no
+          assignment the SRL cannot represent *)
+    let valid = List.filter (fun (sg,w,_,_,_,_) ->
       not (List.exists (bad_read sg) all_exprs)
-      && List.exists (fun e -> taps sg [] e <> []) all_exprs) cands in
+      && List.exists (fun e -> taps sg [] e <> []) all_exprs
+      && (shift_is_only_assign sg w
+          || (Printf.eprintf
+                "srl_infer: %s has a non-shift assignment (parallel load?) -- \
+                 not SRL-inferable, keeping FFs\n" sg; false))) cands in
     if valid = [] then m
     else begin
       (* 3. build SRL instances + tap-net rewrites *)
