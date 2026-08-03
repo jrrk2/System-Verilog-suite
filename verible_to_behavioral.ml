@@ -5536,6 +5536,26 @@ let convert_module ~pkgs (mdecl : module_decl)
     List.iteri (fun i pn ->
       Printf.eprintf "[iface] %s port_node #%d:\n%!" mdecl.m_name i; dmp 1 pn) port_nodes
   end;
+  (* PORTS need the same non-zero-LSB treatment as internal declarations.
+     decl_nodes_lsb above scans only net_declaration / data_declaration, so a
+     port like serv_decode's `input wire [31:2] i_wb_rdt` had its DECLARATION
+     rebased to [29:0] (correct width) while every USE kept the original
+     indices: `i_wb_rdt[6:2]` then selected vector bits 6..2, which are
+     instruction bits 8..4, and `i_wb_rdt[30]` was off the end of a 30-bit
+     vector so imm30 read 0 forever.  serv_decode and serv_immdec are exactly
+     the CPU modules with such ports, and exactly the ones a formal miter
+     refutes; every module without one proves equivalent. *)
+  List.iter (fun pn ->
+    match extract_range ~pkgs ~params pn with
+    | Some (m, l) when min m l <> 0 ->
+        let off = min m l in
+        List.iter (fun (s : bsignal) ->
+          if Sys.getenv_opt "IFACE_DEBUG" <> None then
+            Printf.eprintf "[portlsb] %s off=%d\n%!" s.name off;
+          if not (List.mem_assoc s.name !cur_signal_wlsb) then
+            cur_signal_wlsb := (s.name, off) :: !cur_signal_wlsb)
+          (extract_port_decl ~pkgs ~params pn)
+    | _ -> ()) port_nodes;
   let explicit_signals =
     List.concat_map (extract_port_decl ~pkgs ~params) port_nodes
   in
