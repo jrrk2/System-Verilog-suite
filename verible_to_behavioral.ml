@@ -6092,17 +6092,35 @@ let convert_module ~pkgs (mdecl : module_decl)
       let basename = Filename.basename path in
       let candidates =
         let env_dir = match Sys.getenv_opt "MEM_INIT_DIR" with
-          | Some d -> [Filename.concat d basename]
+          | Some d -> [Filename.concat d path; Filename.concat d basename]
           | None -> [] in
+        (* Try each directory with the path AS WRITTEN as well as with just its
+           basename.  Only the basename was tried before, which throws away any
+           directory component: servant_ram's `memfile = "fw/servant_eth.hex"`
+           could then never resolve, because the file is at <dir>/fw/... and
+           every candidate looked for <dir>/servant_eth.hex.  The RAM came out
+           blank, and that was recorded for a long time as "SVS drops
+           $readmemh" -- it does not; the path was simply never canonicalised
+           against the right directory. *)
         let auto_dirs =
-          List.map (fun d -> Filename.concat d basename)
+          List.concat_map (fun d ->
+            [Filename.concat d path; Filename.concat d basename])
             !mem_init_search_paths in
-        path :: env_dir @ auto_dirs
-        @ (List.map (fun d -> Filename.concat d basename)
-             [Sys.getcwd ();
-              Filename.concat (Sys.getcwd ()) "generated";
-              Filename.concat (Sys.getcwd ()) "../generated"]) in
-      List.find_opt Sys.file_exists candidates in
+        let cwd_dirs =
+          List.concat_map (fun d ->
+            [Filename.concat d path; Filename.concat d basename])
+            [Sys.getcwd ();
+             Filename.concat (Sys.getcwd ()) "generated";
+             Filename.concat (Sys.getcwd ()) "../generated"] in
+        path :: env_dir @ auto_dirs @ cwd_dirs in
+      let hit = List.find_opt Sys.file_exists candidates in
+      (* A miss used to be silent, so a blank memory looked like an unsupported
+         construct rather than a path that was never found.  Say so. *)
+      if hit = None then
+        Printf.eprintf
+          "[mem_init] WARNING: $readmemh file %S not found; memory left            UNINITIALISED.  Tried: %s\n%!"
+          path (String.concat ", " candidates);
+      hit in
     let read_hex elem_w n_words path =
       try
         let ic = open_in path in
@@ -7498,6 +7516,14 @@ let convert_module ~pkgs (mdecl : module_decl)
 
 let discover_init_dirs files =
   let acc = ref [] in
+  (* The SOURCE FILE's own directory first: a relative $readmemh path is written
+     relative to the RTL that contains it, so <dir-of-source>/<path-as-written>
+     is the natural resolution and the one that was missing.  Walking up for
+     sibling `generated/` dirs (below) only ever helped trees that vendor their
+     hex files that way. *)
+  List.iter (fun f ->
+    let d = Filename.dirname f in
+    if not (List.mem d !acc) then acc := d :: !acc) files;
   List.iter (fun f ->
     let dir = ref (Filename.dirname f) in
     let last = ref "" in

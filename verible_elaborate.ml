@@ -2950,6 +2950,28 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
      parameter of the parent resolves to that parent value — propagating string
      params (VMEM paths, RAM_MODE, …) down the hierarchy, which the int-only
      Eval path cannot do. *)
+  (* STRING-valued parameter DEFAULTS of the enclosing module.  int_scope_of
+     deliberately keeps these out of the integer scope, and nothing else ever
+     supplied them, so str_env held only the parent's OVERRIDES.  A pass-down
+     override like servant_ram's
+
+         servant_ram #(.memfile (memfile), ...)
+
+     then failed its str_env lookup and fell through to OStr "memfile" -- the
+     parameter's own NAME as the value.  The program RAM was elaborated with
+     memfile = "memfile", $readmemh looked for a file of that name, found
+     nothing, and the RAM came out blank.  That was recorded for a long time as
+     "SVS drops $readmemh"; it does not, the filename was never resolved.
+     Defaults are kept quoted, matching how an explicit string override is
+     stored, and the parent's overrides are prepended so they still win. *)
+  let str_scope_of mdecl overrides =
+    let defaults = extract_module_port_param_defaults mdecl.m_body in
+    let base = List.filter_map (fun (name, rhs_tok) ->
+      let v = String.trim (resolve_value pkgs rhs_tok) in
+      if String.length v >= 2 && v.[0] = '"' then Some (name, OStr v) else None)
+      defaults in
+    overrides @ base
+  in
   let resolve_overrides_with scope str_env ovs =
     (* Let the TYPED token evaluator see the instance's own param scope, so an
        override referencing a sibling param resolves. Save/restore the touched
@@ -3036,7 +3058,9 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
              * target module name actually exists. *)
             if not (Hashtbl.mem by_name inst.i_module) then ()
             else begin
-              let ovs = resolve_overrides_with scope overrides inst.i_overrides_tok in
+              let ovs =
+                resolve_overrides_with scope (str_scope_of mdecl overrides)
+                  inst.i_overrides_tok in
               if debug then
                 Printf.eprintf "[elab]   inst %s of %s: %s\n%!"
                   inst.i_inst inst.i_module
