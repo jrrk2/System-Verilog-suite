@@ -139,6 +139,10 @@ let collect_roms (bmod : Behavioral_ir.bmodule) =
 let lossage_strict = lazy (Sys.getenv_opt "SVS_LENIENT_LOWERING" = None)
 let lossage_seen : (string, unit) Hashtbl.t = Hashtbl.create 64
 let lossage_warn where msg =
+  (* Print in FULL to stderr before raising: the exception text travels through
+     the Lua binding, which clips it (at a newline or a quote), so the most
+     useful part of a lossage report was being lost exactly when it mattered. *)
+  Printf.eprintf "[LOSSAGE %s] %s\n%!" where msg;
   if Lazy.force lossage_strict then
     failwith (Printf.sprintf "create_circuit lossage [%s]: %s" where msg)
   else begin
@@ -148,6 +152,22 @@ let lossage_warn where msg =
       Printf.eprintf "[LOSSAGE %s] %s\n%!" where msg
     end
   end
+
+(* Fold constant arithmetic so a slice bound that is a constant EXPRESSION is
+   recognised as constant.  `havereset_d_aligned[NrHarts-1:0] = '1;` with
+   NrHarts=1 arrives as msb = (32'1 - 32'1), NOT a bare BConst, so const_of
+   returned None, the write fell through to the lossage guard and dm_csrs failed
+   to emit entirely -- which is why `make ibex_yosys` has been dying on
+   "Module dm_csrs__N1_B32_S1 ... is not part of the design" since 3c3db3b. *)
+let rec fold_const_arith e = match e with
+  | BBinOp { op = (BAdd | BSub | BMul) as op; lhs; rhs; result_type } ->
+      (match fold_const_arith lhs, fold_const_arith rhs with
+       | BConst { value = a; width }, BConst { value = b; _ } ->
+           let v = match op with
+             | BAdd -> Z.add a b | BSub -> Z.sub a b | _ -> Z.mul a b in
+           BConst { value = v; width }
+       | l, r -> BBinOp { op; lhs = l; rhs = r; result_type })
+  | e -> e
 
 let rec width_of_btype = function
   | BInt { width; _ } -> width
@@ -957,6 +977,39 @@ let rec stmt_to_always ~is_reg ctx alw = function
              let new_val = Signal.concat_msb (List.rev slots) in
              Always.(var <-- new_val) :: alw
        | _ -> alw)
+  (* `name[idx] <= rhs` with a DYNAMIC (non-constant) bit index.  The constant
+     forms are folded earlier by merge_slice_writes; a variable index reached
+     the catch-all below and was reported as lossage, killing the whole module.
+     dm_csrs does exactly this:
+
+         havereset_d_aligned = NrHartsAligned'(havereset_q);
+         havereset_d_aligned[selected_hart] = 1'b0;      // selected_hart is a variable
+         havereset_d_aligned[NrHarts-1:0]   = '1;
+
+     so `make ibex_yosys` failed with "Module dm_csrs__N1_B32_S1 ... is not part
+     of the design" -- the module simply never emitted.  Lower it the same way
+     @mem_write and @part_sel_write already lower a dynamic target: rebuild the
+     bus, taking rhs for the bit whose position equals idx and self-reading the
+     rest. *)
+  | BCallStmt { func = "@slice_write"; args = [BVar lhs; msb_e; lsb_e; data_e] }
+    when (match msb_e, lsb_e with
+          | BConst _, BConst _ -> false
+          | _ -> msb_e = lsb_e) ->
+      let var = get_or_create_var ctx lhs 1 is_reg in
+      let cur = Always.Variable.value var in
+      let total_w = Signal.width cur in
+      if total_w = 0 then alw
+      else begin
+        let s_idx = expr_to_signal ctx msb_e in
+        let s_data = expr_to_signal ctx data_e in
+        let s_bit =
+          if Signal.width s_data = 1 then s_data else Signal.select s_data 0 0 in
+        let bits = List.init total_w (fun k ->
+          let cur_bit = Signal.select cur k k in
+          let k_const = Signal.of_int ~width:(Signal.width s_idx) k in
+          Signal.mux2 (Signal.(s_idx ==: k_const)) s_bit cur_bit) in
+        Always.(var <-- Signal.concat_msb (List.rev bits)) :: alw
+      end
   | BCallStmt { func; args } ->
       (* A `@`-prefixed write pseudo-op (@mem_write / @slice_write /
          @part_sel_write) reaching here means it survived the folding passes and
@@ -969,10 +1022,15 @@ let rec stmt_to_always ~is_reg ctx alw = function
             dropped write worth surfacing.  A write whose target is a constant or
             a computed expression (a ternary, `32'0`, …) is not an assignable
             l-value — a folded-away dead write — so drop it quietly. *)
-         | (BVar n) :: _ ->
+         | (BVar n) :: rest ->
              lossage_warn "stmt:BCallStmt"
-               (Printf.sprintf "write pseudo-op %s on %s survived folding; state update dropped"
-                  func n)
+               (Printf.sprintf
+                  "write pseudo-op %s on %s survived folding; state update dropped (%d args: %s)"
+                  func n (1 + List.length rest)
+                  (String.concat " ;; "
+                     (List.map (fun e ->
+                        String.map (function '\n' -> ' ' | c -> c)
+                          (Behavioral_ir.string_of_bexpr e)) rest)))
          | (BSlice { signal = BVar n; _ }) :: _ | (BSelect { array = BVar n; _ }) :: _ ->
              lossage_warn "stmt:BCallStmt"
                (Printf.sprintf "write pseudo-op %s on %s[...] survived folding; state update dropped"
@@ -1285,8 +1343,19 @@ let thread_body ?(blocking_vars = [])
                if(c) ld[..]=v` → base ran last, always winning) — wrong for the
                not-taken branch (ibex_counter counter_load).  set_field threads it in
                order and uses comb-ZERO for unwritten bits (no self-read loop). *)
-            | "@slice_write", [BVar name; BConst { value = hi; _ }; BConst { value = lo; _ }; data]
-              when is_comb && Z.geq hi lo ->
+            (* Bounds may be constant EXPRESSIONS (`[NrHarts-1:0]` arrives as
+               (32'1 - 32'1)), so fold before matching -- otherwise the write
+               falls through to the lossage guard and the whole module is lost. *)
+            | "@slice_write", [BVar name; m; l; data]
+              when is_comb
+                   && (match fold_const_arith m, fold_const_arith l with
+                       | BConst { value = hi; _ }, BConst { value = lo; _ } ->
+                           Z.geq hi lo
+                       | _ -> false) ->
+                let hi = (match fold_const_arith m with
+                          | BConst { value; _ } -> value | _ -> Z.zero) in
+                let lo = (match fold_const_arith l with
+                          | BConst { value; _ } -> value | _ -> Z.zero) in
                 let lo_i = Z.to_int lo and hi_i = Z.to_int hi in
                 set_field name (BConst { value = Z.of_int lo_i; width = 32 })
                   (hi_i - lo_i + 1) (subst env data)
@@ -1343,7 +1412,7 @@ let thread_body ?(blocking_vars = [])
 let merge_slice_writes ctx body =
   let groups : (string, (int * int * bexpr) list) Hashtbl.t = Hashtbl.create 4 in
   let rest = ref [] in
-  let const_of = function
+  let const_of e = match fold_const_arith e with
     | BConst { value; _ } -> Some value
     | _ -> None in
   List.iter (fun stmt ->
