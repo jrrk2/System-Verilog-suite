@@ -137,20 +137,17 @@ let get_signal_type ctx name =
    architecture statement was skipped entirely.  Silent substitution is how a
    whole module comes out as a constant with its inputs unused, and how a
    cross-flow miter then reports confident nonsense: a vector built bit by bit
-   read as 0 and every verdict involving it was noise for hours.  Complain
-   LOUDLY and stop by default; VHDL_ALLOW_UNHANDLED=1 restores the old
-   best-effort behaviour for triage. *)
+   read as 0 and every verdict involving it was noise for hours.  This is FATAL
+   and deliberately has NO opt-out: an "allow unhandled" switch just recreates
+   the silent-corruption path under a different name, and the first thing it
+   gets used for is to push a broken design through one more stage. *)
 let vhdl_unhandled kind shape =
-  let msg =
-    Printf.sprintf
-      "[vhdl2bir] UNHANDLED %s: %s\n\
-       [vhdl2bir]   the reader has no rule for this construct.  Continuing would\n\
-       [vhdl2bir]   silently substitute a constant / drop the statement, which\n\
-       [vhdl2bir]   yields a WRONG design that still looks well-formed.\n\
-       [vhdl2bir]   Set VHDL_ALLOW_UNHANDLED=1 to continue anyway (results are\n\
-       [vhdl2bir]   then untrustworthy)." kind shape in
-  prerr_string msg; prerr_newline (); flush stderr;
-  if Sys.getenv_opt "VHDL_ALLOW_UNHANDLED" = None then failwith msg
+  failwith
+    (Printf.sprintf
+       "[vhdl2bir] UNHANDLED %s: %s -- the reader has no rule for this \
+        construct.  Continuing would silently substitute a constant or drop the \
+        statement, giving a WRONG design that still looks well-formed.  Add a \
+        rule for it." kind shape)
 
 let rec expr_to_bexpr ctx = function
   (* Simple name — but enum literals look like simple names too.
