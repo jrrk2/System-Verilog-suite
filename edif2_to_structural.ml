@@ -435,9 +435,13 @@ let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
   (* net_name -> (port_name, bir_bit_index).  EDIF (member P k) indexes
      by declaration order, k=0 = MSB for "P[hi:lo]"; BIR bit i = LSB+i,
      so bir_bit = port_width - 1 - k. *)
+  let port_dir : (string, [`Input | `Output | `Internal]) Hashtbl.t =
+    Hashtbl.create 16 in
+  List.iter (fun (p : pinfo) -> Hashtbl.replace port_dir p.pname p.pdir) c.cports;
   let port_alias : (string, string * int) Hashtbl.t = Hashtbl.create 64 in
-  List.iter (fun (n : net_t) ->
-    List.iter (fun (pr : portref) ->
+  (* Bare portrefs on this net, in EDIF order, as (port, bir_bit). *)
+  let bare_ports (n : net_t) =
+    List.filter_map (fun (pr : portref) ->
       match pr.prinst with
       | None when is_port_name pr.prpin ->
         let w = Hashtbl.find port_width pr.prpin in
@@ -445,9 +449,81 @@ let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
           | Some k -> w - 1 - k
           | None   -> 0     (* scalar port *)
         in
-        Hashtbl.replace port_alias n.nname (pr.prpin, bir_bit)
-      | _ -> ()) n.nports
+        Some (pr.prpin, bir_bit)
+      | _ -> None) n.nports
+  in
+  (* Choose the net's canonical port.  When a net joins SEVERAL ports the
+     canonical one must be the SOURCE, and inside a module the source is an
+     INPUT port (it drives inwards) — outputs are driven.  Picking the last
+     portref instead, as this used to, aliased eth_macro's net onto the OUTPUT
+     `phy_reset_n` and orphaned the INPUT `lopt` that actually feeds it;
+     Vivado's own netlist writes exactly `assign phy_reset_n = lopt;`, and the
+     board's PHY reset went undriven. *)
+  let canonical_port ps =
+    match List.find_opt (fun (p, _) -> Hashtbl.find_opt port_dir p = Some `Input) ps with
+    | Some src -> src
+    | None -> List.nth ps (List.length ps - 1)
+  in
+  List.iter (fun (n : net_t) ->
+    match bare_ports n with
+    | [] -> ()
+    | ps -> Hashtbl.replace port_alias n.nname (canonical_port ps)
   ) c.cnets;
+
+  (* SIBLING PORTS.  One EDIF net may join SEVERAL bare portrefs — Vivado does
+     this constantly with `-flatten_hierarchy rebuilt`, which promotes internal
+     nets to extra scalar ports and shorts them to the declared one:
+
+       (net ... (joined (portref O (instanceref ..._i_4))
+                        (portref gen_normal_fifo_storage_126__7__i_4_0_0_)
+                        (portref sbaddr_q_reg_0__1)))
+       eth_macro:  one net joins ports `lopt` AND `phy_reset_n`
+                   (Vivado's own netlist writes `assign phy_reset_n = lopt;`)
+
+     `port_alias` is keyed by NET and built with Hashtbl.replace, so only the
+     LAST portref survives: every other port loses its driver, and the parent's
+     net for it is left driverless.  nextpnr then rejects the WHOLE design with
+     "timing analysis failed ... incomplete specification of timing ports".
+     That cost the uart's E[0] clock enable (8 FF CE pins) here.
+
+     Those ports are electrically ONE net, so the PARENT's actuals must be
+     unified.  Emit `assign sibling = representative;` inside this cell:
+     flatten_structural rewrites both sides through port_actual and resolves
+     the result via its `amap` substitution, which merges the two parent nets.
+     The representative must be the port `port_alias` kept — the LAST one — so
+     that the driver (already rewritten onto it) is the one being read. *)
+  let sibling_assigns = ref [] in
+  List.iter (fun (n : net_t) ->
+    let ps = bare_ports n in
+    (* Distinct port NAMES only: a bus joined at several members is one port. *)
+    let uniq = List.sort_uniq String.compare (List.map fst ps) in
+    if List.length uniq > 1 then begin
+      let rep = fst (canonical_port ps) in   (* same choice as port_alias *)
+      List.iter (fun p ->
+        if p <> rep then begin
+          let w_p = try Hashtbl.find port_width p with Not_found -> 1 in
+          let w_r = try Hashtbl.find port_width rep with Not_found -> 1 in
+          if w_p = 1 && w_r = 1 then
+            sibling_assigns :=
+              Behavioral_ir.BAssign { lhs = p; rhs = BVar rep } :: !sibling_assigns
+          else
+            (* Vector siblings would need a per-BIT assign, which BAssign's
+               string lhs cannot express.  Not seen in practice (Vivado's
+               promoted ports are scalar); warn rather than drop silently. *)
+            Printf.eprintf
+              "[edif2_to_structural] WARN: cell %s net %s joins VECTOR ports %s(w=%d) \
+               and %s(w=%d); sibling tie not emitted, %s will be undriven\n%!"
+              c.cname n.nname p w_p rep w_r p
+        end) uniq
+    end) c.cnets;
+  let sibling_procs =
+    if !sibling_assigns = [] then []
+    else [ Behavioral_ir.BCombinational
+             { name = "$edif_sibling_ports"; sensitivity = [];
+               body = List.rev !sibling_assigns } ] in
+  (if !sibling_assigns <> [] && Sys.getenv_opt "SVS_PORT_DEBUG" <> None then
+     Printf.eprintf "[edif2_to_structural] cell %s: %d sibling-port tie(s)\n%!"
+       c.cname (List.length !sibling_assigns));
 
   (* Pin lookup: (inst, pin) -> [(member_index option, net_name); ...]    *)
   let pin_entries : (string * string, (int option * string) list) Hashtbl.t =
@@ -578,7 +654,7 @@ let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
   { name = c.cname;
     params = [];
     signals;
-    processes = [];
+    processes = sibling_procs;   (* see SIBLING PORTS above *)
     instances;
     funcs = [];
     mems  = [];

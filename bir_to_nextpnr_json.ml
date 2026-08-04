@@ -20,9 +20,29 @@ let bit_json = function I i -> `Int i | C s -> `String s
 let bits_json lst = `List (List.map bit_json lst)
 
 (* Map a Vivado-style constant net name to its yosys-JSON constant. *)
+(* Substring test (no Stdlib helper for this). *)
+let contains_sub (s : string) (sub : string) : bool =
+  let n = String.length s and m = String.length sub in
+  let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+  m = 0 || go 0
+
 let const_of_name = function
   | "<const0>" | "GND" -> Some "0"
   | "<const1>" | "VCC" -> Some "1"
+  (* edif2_to_structural pads a SPARSE EDIF bus pin (only some `(member P k)`
+     present) with a fresh dangling net per absent member, so the present
+     members keep their absolute positions.  An absent member on an INPUT is an
+     unconnected pin bit, which Verilog reads as 0 -- but emitted as a real net
+     it is a driverless net, and nextpnr then fails the whole design with
+     "timing analysis failed ... incomplete specification of timing ports"
+     (352 of them here, nearly all RAMB36E1 WEBWE/DIADI/DIBDI).  Tie them to 0.
+     On an OUTPUT this is still right: sanitize_output_bits redirects a const
+     bit on an output pin to a fresh dead net, which is exactly the isolated
+     dangling net the gap wants.
+     flatten_struct PREFIXES the hierarchy path onto the sentinel, so this must
+     be a substring test, not a prefix test:
+       u_ibex_demo_system__u_eth__...__ram_inst__$svs_unconn$ram$WEBWE$3 *)
+  | s when contains_sub s "$svs_unconn$" -> Some "0"
   | _                  -> None
 
 (* Net key — what we put in the (signal_base, bit) -> id table.        *)
@@ -114,6 +134,17 @@ let rec resolve_bit_ref (e : bexpr) : (string * int option) option =
   | BVar nm -> Some (nm, None)
   | BSelect { array = BVar nm; index = BConst { value; _ } } ->
       Some (nm, Some (Z.to_int value))
+  | BSlice { signal = BVar nm; msb; lsb } when msb = lsb ->
+      (* A WIDTH-1 slice IS a bit-select.  Vivado EDIF renders a scalar
+         instance-pin member as `name[0:0]` and then wraps it in a chain of
+         redundant `[0]` selects, e.g.
+           u_dm_top_n_8[0:0][32'0][32'0][32'0][32'0][32'0][32'0][32'0]
+         Without this case the recursion bottoms out on a BSlice that
+         resolve_bit_ref cannot reduce, returns None, and the whole pin
+         expression is rejected.  bits_of_conn matches the DIRECT
+         `BSlice { signal = BVar _; _ }` earlier, so this only ever fires for
+         the nested form -- no change to the ordinary slice path. *)
+      Some (nm, Some lsb)
   | BSelect { array; index = BConst { value; _ } } ->
       (* Nested select, e.g. Vivado EDIF renders a scalar top-level port
          as IO_CLK_P[0][0].  Resolve the inner ref: indexing a scalar

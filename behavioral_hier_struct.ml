@@ -87,7 +87,22 @@ let is_const_sentinel = function
   | "VCC" | "GND" | "<const0>" | "<const1>" -> true
   | _ -> false
 
-let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr) : bexpr =
+(* Reduce a (possibly NESTED) constant bit-select chain over a BVar to
+   (name, bit).  Vivado's EDIF wraps a scalar member in a redundant [0] once
+   per hierarchy level it crosses, so `eth_rst_n_OBUF[0][0][0]` is simply
+   bit 0 of that net.  A single-level match misses those and the enclosing
+   continuous assign gets dropped. *)
+let rec reduce_bitref (e : bexpr) : (string * int) option =
+  match e with
+  | BSlice { signal = BVar nm; msb; lsb } when msb = lsb -> Some (nm, lsb)
+  | BSelect { array = BVar nm; index = BConst { value; _ } } ->
+      Some (nm, Z.to_int value)
+  | BSelect { array; index = BConst { value; _ } } when Z.equal value Z.zero ->
+      reduce_bitref array
+  | _ -> None
+
+let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option)
+                      ~(is_local : string -> bool) (e : bexpr) : bexpr =
   match e with
   | BVar nm when is_const_sentinel nm -> e
   | BVar nm ->
@@ -99,6 +114,15 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
          CDC-FIFO cross-domain bits). *)
       (match port_actual nm with
        | Some actual -> actual
+       (* A name this module DECLARES is a real net: never reinterpret it as
+          "<port>__<bit>".  Vivado's EDIF mangles `dmcontrol_q_reg[haltreq]__0`
+          to the VALIDID `dmcontrol_q_reg_haltreq___0`, which parse_bit happily
+          splits into base `dmcontrol_q_reg_haltreq_` + bit 0 -- and dm_top
+          really HAS a port of that name, so a private internal net was aliased
+          onto the port's parent net.  That merged two distinct nets and left
+          the netlist multiply driven (an FF .Q and a LUT .O on one net), which
+          nextpnr rejects.  Only the EXACT port lookup above may claim nm. *)
+       | None when is_local nm -> BVar (pname prefix nm)
        | None ->
       let base, idx_opt = parse_bit nm in
       (match port_actual base, idx_opt with
@@ -113,7 +137,7 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
                  | None        -> BVar (pname prefix nm))
             | None -> BVar (pname prefix nm))))
   | BSelect { array; index } ->
-      let array' = rewrite_bexpr ~prefix ~port_actual array in
+      let array' = rewrite_bexpr ~prefix ~port_actual ~is_local array in
       (match array', index with
        | BConcat es, BConst { value; _ } ->
            (* MSB-first concat: bit i is at position (width-1 - i).        *)
@@ -124,11 +148,11 @@ let rec rewrite_bexpr ~prefix ~(port_actual : string -> bexpr option) (e : bexpr
        | _ -> BSelect { array = array'; index })
   | BConst _ -> e
   | BConcat es ->
-      BConcat (List.map (rewrite_bexpr ~prefix ~port_actual) es)
+      BConcat (List.map (rewrite_bexpr ~prefix ~port_actual ~is_local) es)
   | BSlice { signal; msb; lsb } ->
       (* hardcaml_to_behavioral emits BSlice on output-port bits after
        * regrouping per-bit Circuit.t outputs into vector ports.        *)
-      let signal' = rewrite_bexpr ~prefix ~port_actual signal in
+      let signal' = rewrite_bexpr ~prefix ~port_actual ~is_local signal in
       BSlice { signal = signal'; msb; lsb }
   | _ -> e   (* other forms shouldn't appear in a structural net *)
 
@@ -210,7 +234,7 @@ let process_is_resolvable = function
    rewritten into the caller's flat scope (so an output-port LHS resolves to
    the parent net it drives).  Fails loudly on any UN-resolvable process —
    silent-lossage guard: that logic would otherwise vanish. *)
-let collect_resolvable_assigns ~prefix ~port_actual (m : bmodule)
+let collect_resolvable_assigns ~prefix ~port_actual ~is_local (m : bmodule)
     : (string * bexpr) list =
   let bad = List.filter (fun p -> not (process_is_resolvable p)) m.processes in
   if bad <> [] then
@@ -222,8 +246,8 @@ let collect_resolvable_assigns ~prefix ~port_actual (m : bmodule)
     | Behavioral_ir.BCombinational { body; _ } ->
         List.concat_map (function
           | Behavioral_ir.BAssign { lhs; rhs } ->
-              let lhs' = rewrite_bexpr ~prefix ~port_actual (BVar lhs) in
-              let rhs' = rewrite_bexpr ~prefix ~port_actual rhs in
+              let lhs' = rewrite_bexpr ~prefix ~port_actual ~is_local (BVar lhs) in
+              let rhs' = rewrite_bexpr ~prefix ~port_actual ~is_local rhs in
               (match lhs' with
                | BVar nm -> [(nm, rhs')]
                | BSlice { signal = BVar nm; msb; lsb } when msb = lsb ->
@@ -255,20 +279,44 @@ let collect_resolvable_assigns ~prefix ~port_actual (m : bmodule)
                        | _ -> None)
                        (List.init we (fun b -> b)))
                      elems
-               | _ -> [])
+               | BSelect _ when reduce_bitref lhs' <> None ->
+                   (* net_to_expr_aliased renders a port-aliased net as
+                      BSelect{BVar port; bit}, and each hierarchy level the
+                      assign crosses adds another redundant [0].  These used to
+                      fall through to [] and the assign vanished silently —
+                      which is how the EDIF sibling-port ties (uart E[0] clock
+                      enable, eth_rst_n) were lost.  Key it per-bit, like the
+                      BSlice case. *)
+                   (match reduce_bitref lhs' with
+                    | Some (nm, b) -> [(Printf.sprintf "%s[%d]" nm b, rhs')]
+                    | None -> [])
+               | other ->
+                   (* Never drop an assign silently: a lost continuous assign
+                      shows up much later as an undriven net and a whole-design
+                      nextpnr failure. *)
+                   Printf.eprintf
+                     "[flatten_structural] WARN: dropped continuous assign in %s \
+                      — unsupported LHS shape %s\n%!"
+                     m.name (Behavioral_ir.string_of_bexpr other);
+                   [])
           | _ -> []) body
     | _ -> []) m.processes
 
 let rec flatten_module ~by_name ~prefix ~assigns (m : bmodule)
                       ~(port_actual : string -> bexpr option) : binstance list =
-  assigns := collect_resolvable_assigns ~prefix ~port_actual m @ !assigns;
+  (* A name this module DECLARES is a real net and must never be reinterpreted
+     as "<port>__<bit>" -- see rewrite_bexpr. *)
+  let local_tbl = Hashtbl.create (List.length m.signals) in
+  List.iter (fun (s : bsignal) -> Hashtbl.replace local_tbl s.name ()) m.signals;
+  let is_local nm = Hashtbl.mem local_tbl nm in
+  assigns := collect_resolvable_assigns ~prefix ~port_actual ~is_local m @ !assigns;
   List.concat_map (fun (i : binstance) ->
     let new_inst_name = pname prefix i.inst_name in
     match Hashtbl.find_opt by_name i.module_name with
     | None ->
         (* Primitive cell — rewrite its pin nets and emit. *)
         let pcs = List.map (fun (pin, expr) ->
-          pin, rewrite_bexpr ~prefix ~port_actual expr) i.port_connections in
+          pin, rewrite_bexpr ~prefix ~port_actual ~is_local expr) i.port_connections in
         [{ i with inst_name = new_inst_name; port_connections = pcs }]
     | Some child ->
         (* User-defined cell — recurse with the inst's port_connections
@@ -276,7 +324,7 @@ let rec flatten_module ~by_name ~prefix ~assigns (m : bmodule)
            pins their concrete parent-level nets. *)
         let inst_port_rewritten =
           List.map (fun (pin, expr) ->
-            pin, rewrite_bexpr ~prefix ~port_actual expr)
+            pin, rewrite_bexpr ~prefix ~port_actual ~is_local expr)
             i.port_connections in
         let port_set =
           List.filter_map (fun (s : bsignal) ->
@@ -319,6 +367,24 @@ let flatten_structural (p : bprogram) ~top : bmodule =
      vanishes and the net dangles (P&R trims the reader). *)
   let amap : (string, bexpr) Hashtbl.t = Hashtbl.create 256 in
   List.iter (fun (nm, rhs) -> if not (Hashtbl.mem amap nm) then Hashtbl.add amap nm rhs) !assigns;
+  (* A bit-keyed assign `nm[0]` on a SCALAR net must also answer a BARE `nm`
+     read: the sibling-port tie for eth_rst_n arrives bit-keyed (the LHS came
+     through a chain of redundant [0] selects) while the OBUF reads the net as
+     a plain BVar, so the tie was recorded and never consulted.  Only safe when
+     nm carries no OTHER assigned bit — a real bus keeps its per-bit keys. *)
+  List.iter (fun (nm, rhs) ->
+    let n = String.length nm in
+    if n > 3 && nm.[n - 1] = ']' then
+      match String.rindex_opt nm '[' with
+      | Some lb when String.sub nm (lb + 1) (n - lb - 2) = "0" ->
+          let base = String.sub nm 0 lb in
+          let other_bit =
+            List.exists (fun (k, _) ->
+              String.length k > lb + 1 && String.sub k 0 (lb + 1) = base ^ "["
+              && k <> nm) !assigns in
+          if (not other_bit) && not (Hashtbl.mem amap base) then
+            Hashtbl.add amap base rhs
+      | _ -> ()) !assigns;
   (* TOP-port bitbus stitching: when the flatten TOP is itself a GATE-MAPPED
      module, its internal logic reads input-port bits by the Hardcaml
      convention `<port>__<i>` — with no parent to map them through
@@ -358,6 +424,24 @@ let flatten_structural (p : bprogram) ~top : bmodule =
         else BConcat (List.init (msb - lsb + 1) (fun k -> bexpr_bit rhs (msb - k)))
     | BSlice { signal; msb; lsb } -> BSlice { signal = apply ~depth signal; msb; lsb }
     | BConcat es -> BConcat (List.map (apply ~depth) es)
+    (* Reads arrive port-aliased as BSelect{BVar net; bit}; resolve them against
+       the per-bit assign keys the BSelect LHS case above emits, else the tie is
+       recorded but never consulted. *)
+    | BSelect _
+      when (match reduce_bitref e with
+            | Some (nm, b) -> Hashtbl.mem amap (Printf.sprintf "%s[%d]" nm b)
+            | None -> false) ->
+        (match reduce_bitref e with
+         | Some (nm, b) ->
+             apply ~depth:(depth + 1) (Hashtbl.find amap (Printf.sprintf "%s[%d]" nm b))
+         | None -> e)
+    | BSelect _
+      when (match reduce_bitref e with
+            | Some (nm, _) -> Hashtbl.mem amap nm
+            | None -> false) ->
+        (match reduce_bitref e with
+         | Some (nm, b) -> bexpr_bit (apply ~depth:(depth + 1) (Hashtbl.find amap nm)) b
+         | None -> e)
     | BSelect { array; index } -> BSelect { array = apply ~depth array; index = apply ~depth index }
     | _ -> e
   in
