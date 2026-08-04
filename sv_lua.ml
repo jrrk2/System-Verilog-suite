@@ -1880,10 +1880,29 @@ let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list 
     List.iter (fun (b, w, _) -> Hashtbl.replace cls (key "R" b) w; Hashtbl.replace rw (key "R" b) w) rregs;
     List.iter (fun (b, w, _) -> Hashtbl.replace cls (key "T" b) w; Hashtbl.replace rw (key "T" b) w) tregs;
     let all_in = List.sort_uniq compare (r_in @ t_in) in
+    (* Stimulus must respect each input's DECLARED WIDTH.  Every input used to be
+       driven with randz 64 regardless of width, so a 1-bit port received 64 bits
+       of garbage; the two representations mask that at different points (SVS's
+       IR vs a VHDL-derived one), the simulated next-state then disagreed for
+       registers that are actually identical, and partition refinement split
+       them.  serv_alu showed it plainly: cmp_r and add_cy_r have the SAME names
+       and the SAME __D values on both sides, yet ended in four separate classes
+       and 0 registers matched.  Take the narrower width when the two sides
+       disagree, so neither side is over-driven. *)
+    let inw = Hashtbl.create 64 in
+    let note_inputs (m : bmodule) =
+      List.iter (fun (s : bsignal) ->
+        if s.direction = `Input then
+          let w = sigw s in
+          match Hashtbl.find_opt inw s.name with
+          | Some w0 -> Hashtbl.replace inw s.name (min w0 w)
+          | None -> Hashtbl.replace inw s.name w) m.signals in
+    note_inputs rr; note_inputs rt;
+    let in_width n = match Hashtbl.find_opt inw n with Some w when w > 0 -> w | _ -> 1 in
     let nclasses () = let s = Hashtbl.create 64 in
       Hashtbl.iter (fun _ c -> Hashtbl.replace s c ()) cls; Hashtbl.length s in
     let refine () =
-      let inval = List.map (fun n -> (n, randz 64)) all_in in
+      let inval = List.map (fun n -> (n, randz (in_width n))) all_in in
       let class_val = Hashtbl.create 64 in
       Hashtbl.iter (fun k c -> if not (Hashtbl.mem class_val c) then
                       Hashtbl.replace class_val c (randz (Hashtbl.find rw k))) cls;
@@ -1908,7 +1927,7 @@ let reg_correspond (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list 
     done;
     if Sys.getenv_opt "REGCORR_DEBUG" <> None then begin
       (* probe: how many distinct __D values does one random vector give each side *)
-      let inval = List.map (fun n -> (n, randz 64)) all_in in
+      let inval = List.map (fun n -> (n, randz (in_width n))) all_in in
       let cv = Hashtbl.create 64 in
       Hashtbl.iter (fun k c -> if not (Hashtbl.mem cv c) then Hashtbl.replace cv c (randz (Hashtbl.find rw k))) cls;
       let qv regs tag = List.filter_map (fun (b,_,q) -> match Hashtbl.find_opt cls (key tag b) with Some c -> Some (q, Hashtbl.find cv c) | None -> None) regs in

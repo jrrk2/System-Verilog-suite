@@ -19,6 +19,13 @@ type context = {
      signal-decl processing so signals of record type can be
      expanded. *)
   mutable record_types: (string * (string * btype) list) list;
+  (* User-declared SUBTYPES: `subtype t is std_logic_vector(3 downto 0);`
+     name -> btype.  Without these a signal declared through a subtype fell to
+     infer_btype's 1-bit default, so `q <= wrap_q` became
+     `q = {3'b000, wrap_q[0]}` -- the vector silently narrowed to its LSB.
+     GHDL's synthesis output declares its wrapper signals exactly this way, so
+     every GHDL-derived reference read as near-constant. *)
+  mutable subtypes: (string * btype) list;
   (* Signals in the current module that are of a record type:
      signal_name → record_type_name.  Used to split record-level
      assigns like `r <= rin` into per-field assigns. *)
@@ -35,6 +42,7 @@ let create_context () = {
   next_temp_id = 0;
   generics = [];
   record_types = [];
+  subtypes = [];
   record_signals = [];
   enum_types = [];
   enum_values = [];
@@ -105,6 +113,10 @@ let infer_btype ctx subty =
                      Double (VhdRange,
                        Triple (VhdIncreasingRange, lo, hi)))))) ->
       mk_range type_name hi lo
+  (* a user-declared subtype name, resolved from the architecture's decls *)
+  | Quadruple (Vhdsubtype_indication, _, Str type_name, _)
+    when List.mem_assoc type_name ctx.subtypes ->
+      List.assoc type_name ctx.subtypes
   | _ -> BInt { width = 1; signed = Unsigned }
 
 let fresh_temp ctx =
@@ -120,6 +132,26 @@ let get_signal_type ctx name =
   with Not_found -> BInt { width = 32; signed = Unsigned }  (* Default *)
 
 (* Convert VHDL expressions to behavioral IR expressions *)
+(* An unhandled VHDL construct used to WARN and then substitute something
+   plausible -- an expression became BConst 0, a statement became [], an
+   architecture statement was skipped entirely.  Silent substitution is how a
+   whole module comes out as a constant with its inputs unused, and how a
+   cross-flow miter then reports confident nonsense: a vector built bit by bit
+   read as 0 and every verdict involving it was noise for hours.  Complain
+   LOUDLY and stop by default; VHDL_ALLOW_UNHANDLED=1 restores the old
+   best-effort behaviour for triage. *)
+let vhdl_unhandled kind shape =
+  let msg =
+    Printf.sprintf
+      "[vhdl2bir] UNHANDLED %s: %s\n\
+       [vhdl2bir]   the reader has no rule for this construct.  Continuing would\n\
+       [vhdl2bir]   silently substitute a constant / drop the statement, which\n\
+       [vhdl2bir]   yields a WRONG design that still looks well-formed.\n\
+       [vhdl2bir]   Set VHDL_ALLOW_UNHANDLED=1 to continue anyway (results are\n\
+       [vhdl2bir]   then untrustworthy)." kind shape in
+  prerr_string msg; prerr_newline (); flush stderr;
+  if Sys.getenv_opt "VHDL_ALLOW_UNHANDLED" = None then failwith msg
+
 let rec expr_to_bexpr ctx = function
   (* Simple name — but enum literals look like simple names too.
      If `name` is a known enum value, fold it to a constant of the
@@ -604,7 +636,7 @@ let rec expr_to_bexpr ctx = function
             (try Printf.sprintf "const(%s)" (Vhd_front.Asctoken.asctoken other)
              with _ -> "leaf?")
       in
-      Printf.eprintf "[vhdl2bir] expr unhandled %s\n%!" shape;
+      vhdl_unhandled "expression" shape;
       BConst { value = Z.zero; width = 1 }
 
 (* Whole-record copy-out: if `lhs` is a known record signal/variable
@@ -858,7 +890,7 @@ and stmt_to_bstmt ctx = function
         | x -> (try Vhd_front.Asctoken.asctoken x with _ -> "leaf")
       in
       let shape = shape_of 5 other in
-      Printf.eprintf "[vhdl2bir] stmt unhandled %s\n%!" shape;
+      vhdl_unhandled "statement" shape;
       []
 
 (* Convert elsif chain to nested if-else *)
@@ -1140,6 +1172,10 @@ let scan_types_into ctx trees =
              register_record type_name elems
          | Double (VhdEnumerationTypeDefinition, List lits) -> register_enum type_name lits
          | _ -> ())
+    | Double (VhdBlockSubTypeDeclaration,
+              Triple (Vhdsubtype_declaration, Str type_name, subty)) ->
+        if not (List.mem_assoc type_name ctx.subtypes) then
+          ctx.subtypes <- (type_name, infer_btype ctx subty) :: ctx.subtypes
     | _ -> ()
   in
   List.iter go trees
@@ -1375,6 +1411,25 @@ let extract_architecture ctx entity_name = function
         }
       in
       let instances = ref [] in
+      (* Concurrent assignments to an INDEXED target (`q(3) <= a;`) are collected
+         per target and emitted as ONE combinational process of @slice_write
+         calls, so the existing slice-write merge builds a single driver.  They
+         used to match no arm at all and were SILENTLY DROPPED -- a vector built
+         bit-by-bit came out as its default constant with the driving inputs
+         unused, so any such module read as a constant and every cross-flow
+         miter verdict involving it was noise. *)
+      let idx_writes : (string, (int * bexpr) list ref) Hashtbl.t =
+        Hashtbl.create 8 in
+      let rec first_actual = function
+        | Triple (Vhdassociation_element, VhdFormalIndexed, actual) ->
+            first_actual actual
+        | Double (VhdActualExpression, inner) -> first_actual inner
+        | List (x :: _) -> first_actual x
+        | other -> other in
+      let const_index ctx params =
+        match expr_to_bexpr ctx (first_actual params) with
+        | BConst { value; _ } -> (try Some (Z.to_int value) with _ -> None)
+        | _ -> None in
       (* Walk a port-association list and build BIR
          port_connections.  Each association is
          `Triple(Vhdassociation_element, formal, actual)`.
@@ -1474,6 +1529,25 @@ let extract_architecture ctx entity_name = function
             in
             let proc = process_to_bprocess ctx proc_name sens_list ~proc_decls proc_body in
             processes := proc :: !processes
+
+        (* Concurrent signal assignment with an INDEXED target: `Q(i) <= rhs;` *)
+        | Double (VhdConcurrentSignalAssignmentStatement,
+                 Quadruple (Vhdconcurrent_signal_assignment_statement,
+                            Str "", _,
+                            Double (VhdConcurrentSimpleSignalAssignment,
+                                    Quintuple (Vhdconcurrent_simple_signal_assignment,
+                                               Double (VhdTargetDotted,
+                                                       Triple (VhdNameParametersPrimary,
+                                                               Str dst, params)),
+                                               _, VhdDelayNone,
+                                               Double (Vhdwaveform_element, rhs)))))
+          when const_index ctx params <> None ->
+            let i = Option.get (const_index ctx params) in
+            let rhs_expr = expr_to_bexpr ctx rhs in
+            let l = match Hashtbl.find_opt idx_writes dst with
+              | Some r -> r
+              | None -> let r = ref [] in Hashtbl.replace idx_writes dst r; r in
+            l := (i, rhs_expr) :: !l
 
         (* Concurrent signal assignment: `Q <= rhs;` *)
         | Double (VhdConcurrentSignalAssignmentStatement,
@@ -1578,7 +1652,7 @@ let extract_architecture ctx entity_name = function
             } :: !processes
 
         | other ->
-            if Sys.getenv_opt "VHDL2BIR_DEBUG" <> None then begin
+            begin
               let tag = match other with
                 | Double (Vhdarchitecture_body, _) -> "arch_body"
                 | Double (VhdConcurrentSignalAssignmentStatement, _) ->
@@ -1609,11 +1683,23 @@ let extract_architecture ctx entity_name = function
                 | Str x -> Printf.sprintf "Str %S" x
                 | List l -> Printf.sprintf "List[%d]" (List.length l)
                 | x -> (try Vhd_front.Asctoken.asctoken x with _ -> "leaf") in
-              Printf.eprintf "[vhdl2bir] arch_stmt unhandled: %s :: %s\n%!" tag
-                (shape 6 other)
+              vhdl_unhandled ("architecture statement " ^ tag) (shape 6 other)
             end
       in
       extract_stmts stmts;
+
+      (* one driver per indexed target, MSB-first so the merge sees a clean
+         set of constant-range slice writes *)
+      Hashtbl.iter (fun dst l ->
+        let body =
+          List.map (fun (i, e) ->
+            let ic = BConst { value = Z.of_int i; width = 32 } in
+            BCallStmt { func = "@slice_write"; args = [BVar dst; ic; ic; e] })
+            (List.sort (fun (a, _) (b, _) -> compare b a) !l) in
+        if body <> [] then
+          processes := BCombinational { name = next_conc_name ();
+                                        sensitivity = [BAny]; body }
+                       :: !processes) idx_writes;
 
       (!internal_signals, !processes, !instances)
 
@@ -1660,6 +1746,7 @@ let convert_vhdl_to_behavioral vhdl_ast =
   scan_types_into type_ctx vhdl_ast;
   let seed_types ctx =
     ctx.record_types <- type_ctx.record_types;
+    ctx.subtypes <- type_ctx.subtypes;
     ctx.enum_types <- type_ctx.enum_types;
     ctx.enum_values <- type_ctx.enum_values in
   (* One context per entity, shared between port extraction and the architecture
