@@ -680,7 +680,18 @@ let rec expr_to_signal ctx = function
          Pinning is scoped to concat/replicate: a bare `(sig>>i)&1` used as a
          slice-write RHS (`rev[i] = sig[31-i]`) must keep its generic width so the
          write truncates to bit 0 as SystemVerilog does. *)
+      (* A ZERO-WIDTH replication contributes nothing to a concatenation and is
+         legal Verilog: serv_csr has `{mcause31, {B{1'b0}}}` with B = W-1 = 0 at
+         the default W=1.  Hardcaml has no zero-width signal, so such elements
+         must be DROPPED here rather than handed to concat_msb -- otherwise the
+         whole module fails to emit ("[concat] got empty list"), which is why
+         serv_csr could not be emitted at all and with_csr was forced to 0. *)
+      let exprs =
+        List.filter (function BReplicate { count = 0; _ } -> false | _ -> true)
+          exprs in
       let signals = List.map (bitsel1 ctx) exprs in
+      if signals = [] then
+        failwith "create_circuit: BConcat with no elements (empty {} concat)";
       Signal.concat_msb signals
 
   | BReplicate { count; value } ->
@@ -689,6 +700,9 @@ let rec expr_to_signal ctx = function
          1-bit-per-lane RAM byte-write mask → sb/sh/sw stored one bit). *)
       let s_value = bitsel1 ctx value in
       let replicated = List.init count (fun _ -> s_value) in
+      if replicated = [] then
+        failwith (Printf.sprintf
+          "create_circuit: BReplicate with count=%d (zero-width replication)" count);
       Signal.concat_msb replicated
 
   (* `@signed(x)` is the converter's signedness annotation — it does not
@@ -2234,6 +2248,10 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
           pos := msb + 1) sorted;
         if !pos < width then pieces := Signal.zero (width - !pos) :: !pieces;
         (* !pieces is MSB-first (ascending-lsb inserts prepend the highest last) *)
+        if !pieces = [] then
+          failwith (Printf.sprintf
+            "create_circuit: signal %S has partial drivers but no pieces \
+             (declared width %d, max msb %d)" base width max_msb);
         ctx.signals <- (base, Signal.concat_msb !pieces) :: ctx.signals) partial;
       infos
     end in
