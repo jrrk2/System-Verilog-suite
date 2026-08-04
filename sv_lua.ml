@@ -2867,19 +2867,30 @@ let lwrite_create_circuit_v prog_h dir =
                 scan (j + String.length s) (if List.mem s acc then acc else s :: acc)
             | None -> List.rev acc in
         scan 0 [] in
+      (* Print the message IN FULL.  It used to be cut to 120 characters, which
+         is just past "…survived folding; state update dropped" and short of the
+         operand shapes -- the part that actually identifies the construct.  The
+         dm_csrs bug hid behind that truncation for 33 commits. *)
       Printf.eprintf
         "create_circuit FAILED for module %s: %s\n%s%!"
-        m.name
-        (String.sub msg 0 (min 120 (String.length msg)))
+        m.name msg
         (if names = [] then ""
          else "  signals in the cycle: " ^ String.concat ", " names ^ "\n");
       if Sys.getenv_opt "SVS_CIRC_STRICT" <> None then raise e;
       failed := m.name :: !failed) p.Behavioral_ir.modules;
   let n = List.length p.Behavioral_ir.modules in
   if !failed <> [] then
-    Printf.sprintf
-      "wrote %d/%d create_circuit module(s) to %s -- FAILED: %s"
-      (n - List.length !failed) n dir (String.concat ", " (List.rev !failed))
+    (* FAIL, do not summarise.  A module that does not emit becomes a module
+       that is "not part of the design" several stages later, in a tool that
+       cannot say why -- `make ibex_yosys` died that way for months because this
+       returned a string the caller printed and ignored, while the emit step
+       still exited 0.  A partial emission is not a usable result. *)
+    failwith
+      (Printf.sprintf
+         "create_circuit: %d of %d module(s) FAILED to emit (%s) -- see the \
+          per-module errors above.  A partial netlist is not usable: the \
+          missing module reappears downstream as \"not part of the design\"."
+         (List.length !failed) n (String.concat ", " (List.rev !failed)))
   else
     Printf.sprintf "wrote %d create_circuit module(s) to %s" n dir
 
