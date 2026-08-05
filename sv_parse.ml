@@ -15,6 +15,72 @@ let to_list_safe j =
   | `Null -> []
   | _ -> to_list j
 
+(* SCOPE-QUALIFY UNROLLED GENERATE BLOCKS.
+ *
+ * Verilator names generate-block contents SCOPE-LOCALLY.  All sixteen
+ * unrolled copies of
+ *     generate for (i = 0; i < 16; i = i + 1) begin : membit
+ *         wire [15:0] doa, dob;  RAMB18E1 ram (...);
+ *     end
+ * arrive as GENBLOCK "membit[0]" .. "membit[15]", each declaring a CELL called
+ * `ram` and VARs called `doa`/`dob`.  The behavioral converter has to flatten
+ * GENBLOCKs (their contents are ordinary module items), and flattening drops
+ * the scope -- so the sixteen collapse onto one another.  picosoc_mem_dp came
+ * out of the verilator frontend with ONE RAMB18E1 instead of sixteen, i.e. a
+ * 2-bit-wide SoC RAM, and 15/16 of the memory silently vanished.  56 of this
+ * design's 77 GENBLOCKs are unrolled iterations, so this is not a one-off.
+ *
+ * Fix: before parsing an unrolled block (its name carries the iteration index,
+ * `membit[3]`), prefix every name DECLARED anywhere in its subtree, and every
+ * reference to one, with the sanitised block name.  Nested blocks are
+ * qualified again by their own pass as parsing descends, which prefixes twice
+ * but stays unique per path.  Only indexed blocks are touched: a singly
+ * elaborated `if`-generate cannot collide with itself, and renaming it would
+ * churn signal names for nothing. *)
+let sanitise_scope s =
+  String.map (fun c ->
+    if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+       || (c >= '0' && c <= '9') || c = '_' then c else '_') s
+
+let json_type kvs =
+  match List.assoc_opt "type" kvs with Some (`String s) -> s | _ -> ""
+
+(* names introduced by this subtree -- CELL covers instances, VAR covers
+ * wires/regs/genvars.  `modp` is an address string, not an embedded module,
+ * so this never wanders into a child module's namespace. *)
+let rec collect_scope_decls json acc =
+  match json with
+  | `Assoc kvs ->
+      let acc = (match json_type kvs with
+        | "VAR" | "CELL" ->
+            (match List.assoc_opt "name" kvs with
+             | Some (`String n) -> n :: acc
+             | _ -> acc)
+        | _ -> acc) in
+      List.fold_left (fun a (_, v) -> collect_scope_decls v a) acc kvs
+  | `List l -> List.fold_left (fun a v -> collect_scope_decls v a) acc l
+  | _ -> acc
+
+let rec rename_scope_decls names prefix json =
+  match json with
+  | `Assoc kvs ->
+      let ty = json_type kvs in
+      let renameable = (ty = "VAR" || ty = "CELL" || ty = "VARREF") in
+      `Assoc (List.map (fun (k, v) ->
+        match k, v with
+        | "name", `String n when renameable && List.mem n names ->
+            (k, `String (prefix ^ n))
+        | _ -> (k, rename_scope_decls names prefix v)) kvs)
+  | `List l -> `List (List.map (rename_scope_decls names prefix) l)
+  | x -> x
+
+let qualify_genblock name json =
+  if not (String.contains name '[') then json
+  else
+    match List.sort_uniq compare (collect_scope_decls json []) with
+    | [] -> json
+    | decls -> rename_scope_decls decls (sanitise_scope name ^ "_") json
+
 (* Parse type table entries *)
 let rec parse_type attr json =
   let node_type = json |> member "type" |> to_string in
@@ -301,6 +367,8 @@ let rec parse_json attr json =
      unrolled generate-for header.  Treat as a generate Begin so the enclosed
      instances/assigns are walked. *)
   | "GENBLOCK" ->
+      (* see qualify_genblock: unrolled iterations share scope-local names *)
+      let json = qualify_genblock name json in
       let items = json |> member "itemsp" |> to_list_safe |> List.map (parse' attr name) in
       let genfor = json |> member "genforp" |> to_list_safe |> List.map (parse' attr name) in
       Begin { name; stmts = genfor @ items; is_generate = true }

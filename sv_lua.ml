@@ -304,6 +304,50 @@ let load_frontend ~frontend ~top ~files : bprogram =
                         "[verilator] dropped %d primitive module definition(s) \
                          so they stay unresolved (matches the verible frontend; \
                          SVS_VERILATOR_KEEP_PRIMS=1 to keep)\n%!" dropped;
+                    (* Dropping the primitive DEFINITIONS is not enough: the
+                       instances still reference the specialised name, so the
+                       emitted netlist says MMCME2_ADV__CJz1_CHz2 and yosys
+                       rejects it -- "referenced in module clkgen_vc707 ... is
+                       not part of the design".  The specialisation is only a
+                       parameter binding (kept separately via
+                       SVS_CIRC_KEEP_PARAMS), so rewrite instances of a dropped
+                       primitive back to the base name, which is exactly what
+                       the verible frontend produces. *)
+                    (* Carry the specialisation's parameter values onto the
+                       instance: verilator bakes them into the specialised
+                       MODULE, so renaming alone loses them and Vivado falls
+                       back to defaults -- MMCM CLKFBOUT_MULT_F reverted to 5
+                       and DRC rejected the VCO, and the program ROM came back
+                       with 12 non-zero INIT words instead of 72. *)
+                    let modparams = Hashtbl.create 64 in
+                    List.iter (fun (m : Behavioral_ir.bmodule) ->
+                        if m.params <> [] then
+                          Hashtbl.replace modparams m.name m.params)
+                      p.Behavioral_ir.modules;
+                    let renamed = ref 0 and carried = ref 0 in
+                    let fix_inst (i : Behavioral_ir.binstance) =
+                      let b = base i.module_name in
+                      if b <> i.module_name && Hashtbl.mem prims b then begin
+                        incr renamed;
+                        let extra =
+                          match Hashtbl.find_opt modparams i.module_name with
+                          | None -> []
+                          | Some ps ->
+                            List.filter (fun (n, _) ->
+                                not (List.mem_assoc n i.param_values)) ps in
+                        carried := !carried + List.length extra;
+                        { i with module_name = b;
+                                 param_values = i.param_values @ extra }
+                      end else i in
+                    let kept =
+                      List.map (fun (m : Behavioral_ir.bmodule) ->
+                          { m with Behavioral_ir.instances =
+                                     List.map fix_inst m.instances }) kept in
+                    if !renamed > 0 then
+                      Printf.eprintf
+                        "[verilator] rewrote %d specialised primitive instance(s) to their \
+                         base name (%d parameter value(s) carried over)\n%!"
+                        !renamed !carried;
                     { p with Behavioral_ir.modules = kept }
                   end in
                 post_load p

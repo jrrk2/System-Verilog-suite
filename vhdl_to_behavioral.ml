@@ -2027,6 +2027,18 @@ let maybe_write_ports_cache () =
      with e -> Printf.eprintf "[xil-ports] cache write to %s failed: %s\n"
                  path (Printexc.to_string e))
 
+(* Verilator SPECIALISES modules by parameter and renames them, so a primitive
+   arrives as MMCME2_ADV__CJz1_CHz2 / RAMB18E1__pi6 rather than MMCME2_ADV /
+   RAMB18E1.  Every lookup here is keyed on the PLAIN primitive name (the
+   unisim .vhd filename, the builtin table, the JSON cache), so the mangled name
+   misses and gate_map aborts with "unresolved primitive port directions".  The
+   verible frontend never does this, which is why the same design emits there.
+   Strip a trailing __<suffix> and retry with the base name. *)
+let strip_param_suffix n =
+  match Str.bounded_split_delim (Str.regexp_string "__") n 2 with
+  | base :: _ :: [] when base <> "" -> base
+  | _ -> n
+
 let lookup_xil_primitive_ports names :
     (string * Behavioral_ir.library_port list) list =
   let dedup = List.sort_uniq compare names in
@@ -2053,7 +2065,20 @@ let lookup_xil_primitive_ports names :
          cache so the tool still resolves the interface. *)
       (match Hashtbl.find_opt (Lazy.force json_cache) n with
        | Some ports -> Hashtbl.replace xil_primitive_cache n ports; None
-       | None -> Hashtbl.add xil_primitive_missing n (); None)) need in
+       | None ->
+         (* retry under the un-specialised name (see strip_param_suffix) *)
+         let base = strip_param_suffix n in
+         (match (if base = n then None
+                 else match Hashtbl.find_opt (Lazy.force json_cache) base with
+                      | Some ports -> Some ports
+                      | None ->
+                        (match List.assoc_opt base builtin_prim_ports with
+                         | Some ps -> Some (List.map (fun (pn, d) ->
+                             { Behavioral_ir.port_name = pn; port_direction = d;
+                               port_width = 1 }) ps)
+                         | None -> None)) with
+          | Some ports -> Hashtbl.replace xil_primitive_cache n ports; None
+          | None -> Hashtbl.add xil_primitive_missing n (); None))) need in
   if to_parse <> [] then begin
     let paths = List.map snd to_parse in
     (match convert_vhdl_files_to_behavioral paths with

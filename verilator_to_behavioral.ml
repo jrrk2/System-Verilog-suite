@@ -485,11 +485,26 @@ let rec expr_to_bexpr = function
    or a testbench driver that must be dropped. *)
 let rec is_elab_stmt = function
   | Assign _ | AssignW _ -> true
+  (* declarations inside the block: stmt_to_bstmt skips them, so they neither
+     add nor remove design intent *)
+  | Var _ | Var' _ -> true
   | Begin { stmts; _ } -> List.for_all is_elab_stmt stmts
   | If { then_stmt; else_stmt; _ } ->
       is_elab_stmt then_stmt
       && (match else_stmt with Some e -> is_elab_stmt e | None -> true)
   | For { stmts; incs; _ } ->
+      List.for_all is_elab_stmt stmts && List.for_all is_elab_stmt incs
+  (* Verilator emits a for-loop as LOOP + LOOPTEST, which sv_parse turns into
+     For', NOT For -- For is only produced by the rewriter that collapses an
+     adjacent [Var i; Assign i = init; For' ...] triple.  Omitting For' here
+     rejected every initial block containing a plain loop, which is precisely
+     the elaboration-time idiom this test exists to ACCEPT: rgmii_lfsr builds
+     its CRC masks with `for (i = 0; i < LFSR_WIDTH; i = i + 1)`, the block was
+     dropped, lfsr_mask_* stayed at zero and the entire XOR tree const-folded
+     away -- the emitted module drove state_out and data_out to constant 0, so
+     both the TX and RX Ethernet CRCs were dead (bad FCS out, every frame
+     rejected in).  stmt_to_bstmt has always handled For' (as a BWhile). *)
+  | For' { stmts; incs; _ } ->
       List.for_all is_elab_stmt stmts && List.for_all is_elab_stmt incs
   | Case { items; _ } ->
       List.for_all (fun (i : case_item) ->
@@ -532,6 +547,41 @@ let rec stmt_to_bstmt = function
                           expr_to_bexpr rhs];
                 }
             | None -> BBlock [])
+       (* `arr[i][lsb +: w] = rhs` -- a bit/part write INTO AN ARRAY ELEMENT.
+          The generic Sel branch below finds the base name by walking through
+          the ArraySel, so it emitted a slice write to the ARRAY name and threw
+          the element index away: rgmii_lfsr's `lfsr_mask_state[i][i] = 1'b1`
+          seeded nothing, every mask row stayed 0 and the CRC came out wrong
+          (not merely absent -- the initial block evaluated, just on garbage).
+          Lower it as an explicit read-modify-write of element `i`.  Written
+          with SUB rather than a NOT mask on purpose: BNot's result depends on
+          the evaluator's width inference for the element, which is exactly the
+          sort of thing that goes wrong silently here. *)
+       | Sel { expr = ArraySel { expr = arr_e; index = arr_ix };
+               lsb; width; width_const = width_attr; _ }
+         when (match base_name arr_e with Some _ -> true | None -> false) ->
+           let name = Option.get (base_name arr_e) in
+           let const_int_of t =
+             match expr_to_bexpr t with
+             | BConst { value; _ } -> Some (Z.to_int value)
+             | _ -> None in
+           let w = match Option.bind width const_int_of with
+             | Some w -> w
+             | None -> (match width_attr with Some w when w > 0 -> w | _ -> 1) in
+           let i32 v = BConst { value = Z.of_int v; width = 32 } in
+           let u32 = BInt { width = 32; signed = Unsigned } in
+           let bin op lhs rhs = BBinOp { op; lhs; rhs; result_type = u32 } in
+           let lsb_e = match lsb with
+             | Some l -> expr_to_bexpr l
+             | None   -> i32 0 in
+           let idx_e  = expr_to_bexpr arr_ix in
+           let field  = i32 ((1 lsl w) - 1) in
+           let smask  = bin BShl field lsb_e in
+           let elem   = BSelect { array = BVar name; index = idx_e } in
+           let cleared = bin BSub elem (bin BAnd elem smask) in
+           let ins = bin BShl (bin BAnd (expr_to_bexpr rhs) field) lsb_e in
+           BCallStmt { func = "@mem_write";
+                       args = [BVar name; idx_e; bin BOr cleared ins] }
        | Sel { expr = sel_expr; lsb; width; width_const = width_attr; _ } ->
            (* Bit-slice write: `name[lsb +: width] <= rhs` (also used
               for the `[hi:lo]` form, which Verilator lowers to lsb +
@@ -1025,7 +1075,7 @@ let cell_to_bprocess = function
  * to cell_to_bprocess. *)
 let cell_to_binstance = function
   | Cell { name = inst_name;
-           modp_addr = Some (Module { name = mod_name; _ }); pins } ->
+           modp_addr = Some (Module { name = mod_name; stmts = mod_stmts }); pins } ->
       let is_rtl = String.length mod_name >= 4
                    && String.sub mod_name 0 4 = "RTL_" in
       if is_rtl then None
@@ -1033,8 +1083,53 @@ let cell_to_binstance = function
         let conns = List.filter_map (function
           | Pin { name; expr = Some e } -> Some (name, expr_to_bexpr e)
           | _ -> None) pins in
+        (* PARAMETERS.  Verilator SPECIALISES a parameterised module and bakes
+           the values into the specialised copy (MMCME2_ADV__CJz1_CHz2), so the
+           instantiation carries no #(...) of its own.  Emitting the instance
+           with empty params therefore loses them all: Vivado fell back to
+           MMCM CLKFBOUT_MULT_F=5 and its DRC rejected the VCO, and the program
+           ROM came out with 12 non-zero INIT words instead of 72.
+           bmodule.params cannot carry them either -- it is (string * int), and
+           CLKFBOUT_MULT_F is a REAL -- so read them off the referenced module's
+           own GPARAM/LPARAM vars and split by what they actually are:
+           int-valued into param_values, everything else (reals, strings, wide
+           bit-vectors like RAMB INIT_xx) into param_strs verbatim. *)
+        (* SIMULATION-ONLY parameters must not be re-emitted.  The MMCM's
+           frequency bounds are declared in Vivado's SIMULATION unisim
+           (parameter real CLKIN_FREQ_MAX = 1066.000) and in yosys's cell
+           library, but NOT in the synthesis view unisim_comp.v -- so passing
+           them through makes synth_design fail with
+             module 'MMCME2_ADV' ... does not have any parameter
+             'CLKIN_FREQ_MAX' used as named parameter override
+           They carry no design intent; they are model guard-rails. *)
+        let sim_only_param n =
+          let suffix_is s suf =
+            let ls = String.length s and lf = String.length suf in
+            ls >= lf && String.sub s (ls - lf) lf = suf in
+          suffix_is n "_FREQ_MAX" || suffix_is n "_FREQ_MIN" in
+        let pvals = ref [] and pstrs = ref [] in
+        List.iter (function
+          | Var { name; var_type = ("GPARAM" | "LPARAM");
+                  value = Some cv; _ }
+          | Var { name; is_param = true; value = Some cv; _ } ->
+            let lit = (match cv with
+              | Const { name = n; _ } | Const' { name = n; _ } -> Some n
+              | _ -> None) in
+            (match (if sim_only_param name then None else lit) with
+             | None -> ()
+             | Some n ->
+               (* a plain decimal/sized integer goes in param_values; anything
+                  else is kept as text so the emitter can pass it through *)
+               (match int_of_string_opt n with
+                | Some v -> pvals := (name, v) :: !pvals
+                | None ->
+                  (match int_of_string_opt (String.concat "" (String.split_on_char '_' n)) with
+                   | Some v -> pvals := (name, v) :: !pvals
+                   | None -> pstrs := (name, n) :: !pstrs)))
+          | _ -> ()) mod_stmts;
         Some { inst_name; module_name = mod_name;
-               param_values = []; param_strs = []; port_connections = conns }
+               param_values = List.rev !pvals; param_strs = List.rev !pstrs;
+               port_connections = conns }
   | _ -> None
 
 (* Extract function/task definitions from a list of stmts. Called at
@@ -1273,10 +1368,36 @@ let module_to_bmodule_with_funcs extra_funcs = function
              | None -> None)
         | _ -> None
       ) flat_stmts in
+      (* ELABORATION-TIME initial blocks -- the multi-statement form.
+       *
+       * stmt_to_bstmt has an Initial case, but that only fires for an
+       * `initial` nested INSIDE an always block; a module-level one was never
+       * turned into a process at all, and the single-assign rule just above
+       * only rescues Verilator's constant-folded `assign`.  So rgmii_lfsr's
+       *     initial begin  for (i...) lfsr_mask_state[i] = ...;  ... end
+       * -- which is where the CRC masks come from -- was silently discarded:
+       * lfsr_mask_* stayed zero, the XOR tree const-folded, and the emitted
+       * module drove state_out/data_out to constant 0.  Both Ethernet CRCs
+       * were dead, so the MAC transmitted a bad FCS and rejected every frame
+       * it received.  is_elab_stmt is the guard that keeps testbench initial
+       * blocks out; anything that passes it is pure precomputation. *)
+      let elab_seq = ref 0 in
+      let elab_initial_processes = List.filter_map (function
+        | Initial { stmts = [Assign _]; _ } -> None   (* the case above *)
+        | (Initial { stmts; _ } | InitialStatic { stmts; _ })
+          when stmts <> [] && List.for_all is_elab_stmt stmts ->
+            incr elab_seq;
+            Some (BCombinational {
+              name = Printf.sprintf "__initial__%d" !elab_seq;
+              sensitivity = [BAny];
+              body = List.map stmt_to_bstmt stmts;
+            })
+        | _ -> None
+      ) flat_stmts in
       let cell_processes = List.filter_map cell_to_bprocess flat_stmts in
       let processes =
         always_processes @ assignw_processes @ initial_processes
-        @ cell_processes
+        @ elab_initial_processes @ cell_processes
       in
 
       (* Functions/tasks defined inline in this module + imported from
