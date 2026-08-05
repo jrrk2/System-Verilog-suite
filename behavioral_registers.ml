@@ -108,7 +108,11 @@ let is_original_signal known_signals name =
   not (is_cse_temp name) && List.mem stripped known_signals
 
 (* Collect all assignments with their conditions *)
-let rec collect_assignments condition priority = function
+(* [vec_w name] = Some width when [name] is a VECTOR signal, None when it is an
+   unpacked array (a memory, which meminfer handles and which is not a register
+   in this sense) or unknown.  Threaded through so the partial-write intrinsics
+   below can be recognised without mistaking memory writes for registers. *)
+let rec collect_assignments vec_w condition priority = function
   | BAssign { lhs; rhs } ->
       let original = strip_ssa_suffix lhs in
       [{ target = lhs; original_signal = original; value = rhs; condition; priority }]
@@ -127,11 +131,11 @@ let rec collect_assignments condition priority = function
       in
 
       let then_assigns = List.concat (List.mapi (fun i stmt ->
-        collect_assignments then_cond (priority * 10 + i) stmt
+        collect_assignments vec_w then_cond (priority * 10 + i) stmt
       ) then_stmts) in
 
       let else_assigns = List.concat (List.mapi (fun i stmt ->
-        collect_assignments else_cond (priority * 10 + 100 + i) stmt
+        collect_assignments vec_w else_cond (priority * 10 + 100 + i) stmt
       ) else_stmts) in
 
       then_assigns @ else_assigns
@@ -145,21 +149,63 @@ let rec collect_assignments condition priority = function
           | Some prev -> Some (BBinOp { op = BAnd; lhs = prev; rhs = case_cond; result_type = BBool })
         in
         List.concat (List.mapi (fun j stmt ->
-          collect_assignments combined (priority * 100 + i * 10 + j) stmt
+          collect_assignments vec_w combined (priority * 100 + i * 10 + j) stmt
         ) stmts)
       ) cases) in
 
       (* Default case: none of the above *)
       let default_assigns = List.concat (List.mapi (fun i stmt ->
-        collect_assignments condition (priority * 100 + 900 + i) stmt
+        collect_assignments vec_w condition (priority * 100 + 900 + i) stmt
       ) default) in
 
       case_assigns @ default_assigns
 
   | BBlock stmts ->
       List.concat (List.mapi (fun i stmt ->
-        collect_assignments condition (priority * 10 + i) stmt
+        collect_assignments vec_w condition (priority * 10 + i) stmt
       ) stmts)
+
+  (* PARTIAL WRITES ARE REGISTER WRITES.
+   *
+   * `qbit[4] <= d[0]; qbit[3] <= d[4]; ...` -- a vector driven bit by bit --
+   * reaches the BIR as a run of @mem_write / @slice_write intrinsics rather
+   * than BAssign, and discarding BCallStmt here dropped the whole register:
+   * verible and slang reported 4 registers on a generated case where
+   * verilator, yosys, synlig and sv2v+yosys all reported 5, the missing one
+   * being exactly the bit-written vector.  A register that the analyser cannot
+   * see cannot be paired in a miter, so this also silently poisoned every
+   * cross-flow comparison of any module that builds a vector this way -- which
+   * is a common enough RTL idiom that it was doing so quietly.
+   *
+   * The value is the read-modify-write the write implies, mirroring
+   * behavioral_to_hardcaml's set_field: (cur & ~(mask<<lsb)) | ((data & mask)
+   * << lsb), with cur = the register itself (keep-old, correct for a
+   * register).  Gated on the target being a VECTOR: @mem_write on an unpacked
+   * array is a MEMORY write, which meminfer owns and which must not be
+   * promoted to a register here. *)
+  | BCallStmt { func = ("@mem_write" | "@slice_write"
+                       | "@part_sel_write_up" | "@part_sel_write_down") as f;
+                args = BVar name :: rest }
+    when vec_w name <> None ->
+      let w = match vec_w name with Some w -> w | None -> 32 in
+      let ty = BInt { width = w; signed = Unsigned } in
+      let bin op lhs rhs = BBinOp { op; lhs; rhs; result_type = ty } in
+      let one = BConst { value = Z.one; width = 32 } in
+      let lsb, wid, data =
+        match f, rest with
+        | "@mem_write", [idx; d] -> idx, one, d
+        | "@slice_write", [m; l; d] -> l, bin BAdd (bin BSub m l) one, d
+        | "@part_sel_write_up", [b; wd; d] -> b, wd, d
+        | "@part_sel_write_down", [b; wd; d] ->
+            bin BAdd (bin BSub b wd) one, wd, d
+        | _ -> one, one, BConst { value = Z.zero; width = w } in
+      let mask = bin BSub (bin BShl one wid) one in
+      let cleared =
+        bin BAnd (BVar name)
+          (BUnOp { op = BNot; operand = bin BShl mask lsb; result_type = ty }) in
+      let ins = bin BShl (bin BAnd data mask) lsb in
+      [{ target = name; original_signal = strip_ssa_suffix name;
+         value = bin BOr cleared ins; condition; priority }]
 
   | BWhile _ | BFor _ | BCallStmt _ | BReturn _ ->
       (* These don't produce register assignments *)
@@ -212,10 +258,17 @@ let find_final_variable assigns =
   | assign :: _ -> Some assign.target
 
 (* Infer registers from sequential process *)
+(* width of [name] if it is a plain vector; None for arrays / unknown *)
+let vec_width_of ctx name =
+  match Hashtbl.find_opt ctx.signal_types name with
+  | Some (BInt { width; _ }) -> Some width
+  | Some BBool -> Some 1
+  | _ -> None
+
 let infer_sequential_registers ctx proc_name clock clock_edge reset reset_edge body =
   (* Collect all assignments with conditions *)
   let all_assigns = List.concat (List.mapi (fun i stmt ->
-    collect_assignments None i stmt
+    collect_assignments (vec_width_of ctx) None i stmt
   ) body) in
 
   (* Filter to only real signal assignments (not CSE temps)
@@ -274,7 +327,7 @@ let infer_sequential_registers ctx proc_name clock clock_edge reset reset_edge b
 let infer_combinational_wires ctx body =
   (* Collect assignments *)
   let all_assigns = List.concat (List.mapi (fun i stmt ->
-    collect_assignments None i stmt
+    collect_assignments (vec_width_of ctx) None i stmt
   ) body) in
 
   (* Group by target *)

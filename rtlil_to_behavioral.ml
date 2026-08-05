@@ -364,6 +364,68 @@ let cell_to_bprocess (c : rtlil_cell) =
              blocking_vars = [];
            })
        | _ -> None)
+  (* Synchronous reset WITH clock enable.  Two cells, differing only in
+   * PRIORITY -- and getting that backwards silently yields a register that is
+   * wrong only in the cycle where reset and enable disagree, which is the
+   * hardest kind of bug to see.  From yosys simlib.v verbatim:
+   *
+   *   $sdffe   always @(posedge CLK) if (SRST) Q <= VAL;
+   *                                  else if (EN) Q <= D;      reset > enable
+   *   $sdffce  always @(posedge CLK) if (EN) begin
+   *                                    if (SRST) Q <= VAL; else Q <= D; end
+   *                                                                enable > reset
+   *
+   * Neither was handled, so every $sdffe in the design was DROPPED: reading
+   * axis_gmii_rx through the RTLIL front ends gave 16 registers where verible,
+   * slang, Vivado -rtl and the RTLIL itself all say 27 -- the missing 11 being
+   * exactly the $sdffe count.  That made synlig (Surelog) and the yosys front
+   * end useless as register-correspondence peers for a reason that was in our
+   * importer, not in either reader.
+   *
+   * EN_POLARITY is honoured here (the plain $dffe handler above assumes active
+   * high); yosys emits active-low enables after some optimisation passes. *)
+  | "$sdffe" | "$sdffce" ->
+      (match pin_lhs_slice c "Q", pin_expr c "D", pin c "CLK",
+             pin c "SRST", pin_expr c "EN" with
+       | Some (lhs, slice), Some d, Some clk, Some srst, Some en ->
+           let clk_name = match clk with SigWire n -> n | _ -> "clk" in
+           let rst_name = match srst with SigWire n -> n | _ -> "rst" in
+           let rst_val =
+             try sigspec_to_bexpr (SigConst (List.assoc "SRST_VALUE" c.cell_params))
+             with Not_found -> BConst { value = Z.zero; width = yw } in
+           let pol name dflt =
+             try int_of_string (List.assoc name c.cell_params) with _ -> dflt in
+           let apply_pol p e =
+             if p = 0 then BUnOp { op = BNot; operand = e; result_type = bool_t }
+             else e in
+           let rst_cond = apply_pol (pol "SRST_POLARITY" 1) (BVar rst_name) in
+           let en_cond  = apply_pol (pol "EN_POLARITY" 1) en in
+           let put e  = assign_or_slice_write lhs slice e in
+           let keep   = assign_or_slice_write lhs slice (BVar lhs) in
+           let body =
+             if c.cell_type = "$sdffe" then
+               [BIf { condition = rst_cond;
+                      then_stmts = [put rst_val];
+                      else_stmts = [BIf { condition = en_cond;
+                                          then_stmts = [put d];
+                                          else_stmts = [keep] }] }]
+             else
+               [BIf { condition = en_cond;
+                      then_stmts = [BIf { condition = rst_cond;
+                                          then_stmts = [put rst_val];
+                                          else_stmts = [put d] }];
+                      else_stmts = [keep] }] in
+           Some (BSequential {
+             name = Printf.sprintf "sdffe_%s" c.cell_inst;
+             clock = clk_name;
+             clock_edge = `Pos;
+             reset = Some rst_name;
+             reset_edge = None;       (* sync: not in the sensitivity list *)
+             reset_async = false;
+             body;
+             blocking_vars = [];
+           })
+       | _ -> None)
   (* Clock-enable flip-flop, no reset. Body: if (EN) q<=D. The else
    * branch keeps q (lhs <= lhs). *)
   | "$dffe" ->
