@@ -35,7 +35,10 @@ fe      = ARGV[2]
 if fe == nil then fe = "vhdl" end
 target  = ARGV[3]
 
-p1 = svd.parse(fe, "", {srcfile})
+-- verible and friends need the top as a hint; the VHDL reader ignores it
+tophint = target
+if tophint == nil then tophint = "" end
+p1 = svd.parse(fe, tophint, {srcfile})
 
 if target == nil then
     -- listing form: one module name per line, for the shell loop to consume
@@ -56,7 +59,7 @@ if target == nil then
     return
 end
 
-p2 = svd.parse(fe, "", {srcfile})
+p2 = svd.parse(fe, tophint, {srcfile})
 
 -- GND/VCC and other Xilinx primitives have no body in the source; without the
 -- models every verdict is INCONCLUSIVE on GND:GND.  augment_xil_models covers

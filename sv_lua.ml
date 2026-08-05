@@ -153,7 +153,14 @@ let run_yosys_to_rtlil ~top ~files ~out =
     | None -> failwith "yosys not found" in
   let script = Filename.temp_file "yosys_" ".ys" in
   let oc = open_out script in
-  if Sys.getenv_opt "YOSYS_SLANG" <> None then begin
+  (* yosys-slang IS the reader now.  yosys's own `read_verilog -sv` has partial
+     SystemVerilog support and it shows: it was the weakest reader in the
+     coverage census (65.6%) and failed EVERY generated `struct` case, while
+     the slang plugin -- a real SV elaborator feeding RTLIL -- has none of
+     those gaps.  Keeping a second-rate reader as the default only produced
+     failures to explain away.  YOSYS_READ_VERILOG=1 restores it for the rare
+     case where the plugin is unavailable. *)
+  if Sys.getenv_opt "YOSYS_READ_VERILOG" = None then begin
     Printf.fprintf oc "plugin -i slang\n";
     Printf.fprintf oc "read_slang --top %s %s\n" top
       (String.concat " " files);
@@ -563,12 +570,40 @@ let lparse_all frontend files =
   in
   hadd (Prog ("(all)", p))
 
+(* PARAMETER SPECIALISATION renames the module, and not every front end does it.
+   slang emits `rand_gen_100__N6` for `module rand_gen_100 #(parameter N = 6)`
+   and `axis_gmii_tx__EP1_MFL64` for the ethernet TX; verilator does the same on
+   some designs (`picosoc_ethmin__M800_S1000`); verible keeps the base name.  So
+   a caller asking for the name it wrote in the RTL failed outright on one front
+   end and worked on another -- slang failed EVERY generated `gen` case that way
+   ("no module 'rand_gen_100'"), which reads like a parse failure but is a
+   lookup failure: the parse reported 0 errors, 0 warnings.
+
+   Fall back to a UNIQUE `<top>__<suffix>` match.  Unique is the important
+   part: with several specialisations alive the right one is a real choice the
+   caller has to make, so list them rather than guess. *)
 let lpick prog_h top =
   let _, p = find_prog prog_h in
   match List.find_opt (fun (m : bmodule) -> m.name = top) p.modules with
   | Some m -> hadd (Mod (top, m, p))
   | None ->
-      failwith (Printf.sprintf "no module '%s' in %s" top prog_h)
+      let pfx = top ^ "__" in
+      let pl = String.length pfx in
+      let cands = List.filter (fun (m : bmodule) ->
+        String.length m.name > pl && String.sub m.name 0 pl = pfx) p.modules in
+      (match cands with
+       | [ m ] ->
+           if Sys.getenv_opt "SVS_PICK_DEBUG" <> None then
+             Printf.eprintf "[pick] %s -> %s (parameter specialisation)\n%!"
+               top m.name;
+           hadd (Mod (m.name, m, p))
+       | [] -> failwith (Printf.sprintf "no module '%s' in %s" top prog_h)
+       | _ ->
+           failwith (Printf.sprintf
+             "module '%s' in %s is ambiguous -- %d specialisations: %s"
+             top prog_h (List.length cands)
+             (String.concat ", "
+                (List.map (fun (m : bmodule) -> m.name) cands))))
 
 (* Verification pipeline (mirrors cmd_miter in sv_suite.ml):
  *   1. Behavioral_arch_subst — abstract attributed adder/mul leaves
