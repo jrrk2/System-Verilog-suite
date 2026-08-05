@@ -294,7 +294,48 @@ let json_string_of_bexpr e = Yojson.Safe.to_string (json_of_bexpr e)
    invariants. *)
 let lossage_strict = lazy (Sys.getenv_opt "SVS_LENIENT_LOWERING" = None)
 let lossage_seen : (string, unit) Hashtbl.t = Hashtbl.create 64
+
+(* REVIEWED ALLOWLIST.  A blanket lenient mode turns every future drop into
+   noise nobody reads; this instead permits named, individually-justified
+   messages and leaves everything else fatal.  SVS_LOSSAGE_ALLOW points at a
+   file of substrings, one per line, `#` to end-of-line for the justification.
+   An allowed drop is still PRINTED, tagged ALLOWED, so it stays visible. *)
+let contains_sub (s : string) (sub : string) : bool =
+  let n = String.length s and m = String.length sub in
+  let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+  m = 0 || go 0
+
+let lossage_allow : string list Lazy.t = lazy (
+  match Sys.getenv_opt "SVS_LOSSAGE_ALLOW" with
+  | None -> []
+  | Some path ->
+      (try
+         let ic = open_in path in
+         let acc = ref [] in
+         (try
+            while true do
+              let line = input_line ic in
+              let line =
+                match String.index_opt line '#' with
+                | Some i -> String.sub line 0 i
+                | None -> line in
+              let line = String.trim line in
+              if line <> "" then acc := line :: !acc
+            done
+          with End_of_file -> ());
+         close_in ic; !acc
+       with _ ->
+         Printf.eprintf "[LOSSAGE] cannot read allowlist %s -- staying strict\n%!" path;
+         []))
+
 let lossage_warn (where : string) (msg : string) =
+  let key = where ^ "|" ^ msg in
+  if List.exists (contains_sub key) (Lazy.force lossage_allow) then begin
+    if not (Hashtbl.mem lossage_seen key) then begin
+      Hashtbl.add lossage_seen key ();
+      Printf.eprintf "[LOSSAGE-ALLOWED %s] %s\n%!" where msg
+    end
+  end else
   if Lazy.force lossage_strict then
     failwith (Printf.sprintf "SVS lossage [%s]: %s" where msg)
   else begin

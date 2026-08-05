@@ -3027,6 +3027,15 @@ let extract_assign ~pkgs ~params ~arrays tok =
 
 (* Recognised statement shapes inside an `always_*` body. Anything
  * else becomes BBlock []. *)
+(* True when a statement's payload is a system task call ($display etc.).
+   Those are simulation constructs with no synthesised hardware. *)
+let rec stmt_is_system_task = function
+  | SystemTFIdentifier _ -> true
+  | TUPLE2 (a, b) -> stmt_is_system_task a || stmt_is_system_task b
+  | TUPLE3 (STRING _, a, b) -> stmt_is_system_task a || stmt_is_system_task b
+  | TUPLE3 (a, b, _) -> stmt_is_system_task a || stmt_is_system_task b
+  | _ -> false
+
 let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
   let recurse_e = expr_to_bexpr ~pkgs ~params ~arrays in
   let recurse_s = stmt_to_bstmt ~pkgs ~params ~arrays in
@@ -3745,6 +3754,16 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
         | _ -> []
       in
       BBlock stmts
+  (* A SIMULATION-ONLY system task used as a statement -- $display, $write,
+     $finish, $stop, $fatal, $fflush, $monitor ... -- has no hardware effect,
+     so for synthesis it is an explicit NO-OP, not "unhandled".  Without this
+     the catch-all below fired the lossage bomb on any design carrying debug
+     output: picorv32.v has 25 of them (mostly inside `debug(...) macros) and
+     that alone blocked the whole SoC from being emitted.  Matching on the
+     leading '$' keeps genuinely unhandled statement shapes loud. *)
+  | TUPLE3 (STRING tag, inner, _) when prefix_is "statement" tag
+                                       && stmt_is_system_task inner ->
+      BBlock []
   (* statement_item wrappers — descend. *)
   | TUPLE3 (STRING tag, inner, _) when prefix_is "statement_item" tag ->
       recurse_s inner

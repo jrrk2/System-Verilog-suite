@@ -1241,6 +1241,11 @@ let miter_core ?(trusted : string list = [])
     (try if Z3_miter.check_miter_equivalence ~input_consts ~output_masks ma' mb'
          then "EQUIVALENT" else "DIFFER"
      with
+     | Z3_miter.Solver_unknown why ->
+         (* A timeout is NOT a difference.  Reporting DIFFER here is the same
+            false-negative class as Vacuous_comparison below, and it is worse
+            because it looks like a definite answer. *)
+         Printf.sprintf "INCONCLUSIVE — solver returned UNKNOWN: %s" why
      | Z3_miter.Vacuous_comparison why ->
          (* NOT a difference: the two sides share no comparable port, so the
             miter constrained nothing.  Reporting DIFFER here manufactures

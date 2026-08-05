@@ -233,11 +233,18 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
   let lhs_subst = List.filter_map (fun (formal, actual) ->
     match List.assoc_opt formal port_dirs, actual with
     | Some `Output, BVar n -> Some (formal, n)
+    | Some `Output, (BSlice { signal = BVar _; _ } | BSelect { array = BVar _; _ }
+                    | BConcat _) ->
+        (* handled below by slice_procs / bit_assigns / fanout_procs *)
+        None
     | Some `Output, _ ->
-        if debug then
-          Printf.eprintf
-            "[hier] %s.%s drives non-BVar; bit-blast not yet supported\n"
-            inst.inst_name formal;
+        (* Anything else is a DROPPED DRIVER: the parent net is left read but
+           never written, which Z3 mints as a free variable and a miter then
+           reports DIFFER against an identical design.  Never silent. *)
+        Printf.eprintf
+          "[hier] WARNING: %s.%s drives an unsupported actual shape -- driver \
+DROPPED, its net will be free\n" inst.inst_name formal;
+        flush stderr;
         None
     | _ -> None
   ) inst.port_connections in
@@ -263,6 +270,49 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
      maps a formal to a single parent net).  The child writes the whole port
      `<inst>__<formal>`; fan it out bit-wise to the concat's nets (MSB-first) so
      they aren't left undriven.  Without this the CARRY4 sum/carry nets float. *)
+  (* An OUTPUT port wired to a MULTI-BIT SLICE of a parent net.  Vivado's
+     write_vhdl ALWAYS writes an explicit range -- `rptr_o(6 downto 0) =>
+     \gen_normal_fifo.fifo_rptr\(6 downto 0)` -- so this is the normal shape,
+     not an edge case.  lhs_subst takes only whole-net BVar actuals, the
+     BConcat fanout below takes only concats, and bit_assigns only single bits
+     (msb = lsb), so a multi-bit slice matched NOTHING and was dropped: the
+     parent net was read but never written, Z3 minted it as a free variable,
+     and the two sides of a miter got INDEPENDENT free values.  That is why
+     every HIERARCHICAL module failed to prove equivalent to ITSELF while
+     leaves passed (bisected on the ibex uart: prim_fifo_sync_cnt EQUIVALENT,
+     prim_fifo_sync DIFFER on exactly \gen_normal_fifo.fifo_{r,w}ptr\).
+     Full-width -> a plain whole-net write; partial -> @slice_write, which the
+     SSA pass already understands. *)
+  let parent_width n =
+    let rec f = function
+      | [] -> None
+      | (s : bsignal) :: tl ->
+          if s.name = n then
+            (match s.stype with
+             | BInt { width; _ } -> Some width
+             | BBool -> Some 1
+             | _ -> None)
+          else f tl in
+    f parent.signals in
+  let slice_procs =
+    List.filter_map (fun (formal, actual) ->
+      match List.assoc_opt formal port_dirs, actual with
+      | Some `Output, BSlice { signal = BVar n; msb; lsb } when msb <> lsb ->
+          let hi = max msb lsb and lo = min msb lsb in
+          let src = BVar (pname prefix formal) in
+          let stmt =
+            match parent_width n with
+            | Some w when lo = 0 && hi = w - 1 -> BAssign { lhs = n; rhs = src }
+            | _ ->
+                BCallStmt { func = "@slice_write";
+                            args = [BVar n;
+                                    BConst { value = Z.of_int hi; width = 32 };
+                                    BConst { value = Z.of_int lo; width = 32 };
+                                    src] } in
+          Some (BCombinational { name = pname prefix (formal ^ "__slicedrv");
+                                 sensitivity = [BAny]; body = [stmt] })
+      | _ -> None
+    ) inst.port_connections in
   let fanout_procs =
     List.filter_map (fun (formal, actual) ->
       match List.assoc_opt formal port_dirs, actual with
@@ -320,7 +370,7 @@ let inline_instance ~debug (parent : bmodule) (inst : binstance)
   { parent with
     signals   = obuf_sigs @ new_signals;
     instances = hoisted_instances @ parent.instances;
-    processes = fanout_procs @ bit_proc @ new_processes }
+    processes = slice_procs @ fanout_procs @ bit_proc @ new_processes }
 
 (* Flatten a top-level module by recursively inlining every reachable
  * binstance. Memoised by module name so cells used multiple times only
@@ -361,8 +411,102 @@ let take_unresolved () : (string * string * string) list =
   Hashtbl.clear unresolved_seen;
   r
 
+(* ORPHAN AUDIT.  An inlined child can leave a signal that is READ but never
+ * WRITTEN -- an unconnected pin, a port whose actual did not substitute, a
+ * fan-out that did not materialise.  Z3 mints such a signal as a FREE
+ * variable, and the two sides of a miter get INDEPENDENT free variables, so
+ * the verdict is DIFFER no matter what the logic does.  That is why a
+ * hierarchical module could not be proven equivalent to ITSELF while a leaf
+ * could: bisected on the ibex uart, prim_fifo_sync_cnt (leaf) EQUIVALENT,
+ * prim_fifo_sync (one child) DIFFER, uart (two children) DIFFER.
+ *
+ * Per feedback-no-silent-lossage this must be auditable, so record and print
+ * it the way `unresolved` does rather than letting a bad verdict stand. *)
+let orphans : (string * string) list ref = ref []
+
+let take_orphans () : (string * string) list =
+  let r = List.rev !orphans in orphans := []; r
+
+let rec expr_reads acc (e : bexpr) =
+  match e with
+  | BVar n -> n :: acc
+  | BConst _ -> acc
+  | BBinOp { lhs; rhs; _ } -> expr_reads (expr_reads acc lhs) rhs
+  | BUnOp { operand; _ } -> expr_reads acc operand
+  | BSelect { array; index } -> expr_reads (expr_reads acc array) index
+  | BSlice { signal; _ } -> expr_reads acc signal
+  | BConcat es -> List.fold_left expr_reads acc es
+  | BReplicate { value; _ } -> expr_reads acc value
+  | BCond { condition; then_val; else_val } ->
+      expr_reads (expr_reads (expr_reads acc condition) then_val) else_val
+  | BCall { args; _ } -> List.fold_left expr_reads acc args
+
+let rec stmt_rw (wr, rd) (s : bstmt) =
+  match s with
+  | BAssign { lhs; rhs } -> (lhs :: wr, expr_reads rd rhs)
+  | BIf { condition; then_stmts; else_stmts } ->
+      let acc = (wr, expr_reads rd condition) in
+      List.fold_left stmt_rw (List.fold_left stmt_rw acc then_stmts) else_stmts
+  | BCase { selector; cases; default } ->
+      let acc = (wr, expr_reads rd selector) in
+      let acc = List.fold_left (fun a (v, ss) ->
+        let (w, r) = a in
+        List.fold_left stmt_rw (w, expr_reads r v) ss) acc cases in
+      List.fold_left stmt_rw acc default
+  | BWhile { condition; body } ->
+      List.fold_left stmt_rw (wr, expr_reads rd condition) body
+  | BFor { init; condition; update; body } ->
+      let acc = stmt_rw (wr, expr_reads rd condition) init in
+      let acc = stmt_rw acc update in
+      List.fold_left stmt_rw acc body
+  | BBlock ss -> List.fold_left stmt_rw (wr, rd) ss
+  | BCallStmt { args; _ } -> (wr, List.fold_left expr_reads rd args)
+  | BReturn (Some e) -> (wr, expr_reads rd e)
+  | BReturn None -> (wr, rd)
+
+let audit_orphans (m : bmodule) : unit =
+  let body_of = function
+    | BCombinational { body; _ } -> body
+    | BSequential { body; _ } -> body
+    | _ -> [] in
+  let (wr, rd) =
+    List.fold_left (fun acc p -> List.fold_left stmt_rw acc (body_of p))
+      ([], []) m.processes in
+  let written = Hashtbl.create 256 in
+  List.iter (fun n -> Hashtbl.replace written n ()) wr;
+  (* A top-level INPUT is legitimately free; so is anything a surviving
+     black-box instance drives (cut_blackboxes compares those). *)
+  let driven_ok = Hashtbl.create 64 in
+  List.iter (fun (s : bsignal) ->
+    match s.direction with
+    | `Input -> Hashtbl.replace driven_ok s.name ()
+    | _ -> ()) m.signals;
+  List.iter (fun (i : binstance) ->
+    List.iter (fun (_, e) ->
+      List.iter (fun n -> Hashtbl.replace driven_ok n ()) (expr_reads [] e))
+      i.port_connections) m.instances;
+  let seen = Hashtbl.create 64 in
+  List.iter (fun n ->
+    if not (Hashtbl.mem written n) && not (Hashtbl.mem driven_ok n)
+       && not (Hashtbl.mem seen n) then begin
+      Hashtbl.replace seen n ();
+      orphans := (m.name, n) :: !orphans
+    end) rd;
+  let n = List.length !orphans in
+  if n > 0 then begin
+    Printf.eprintf
+      "[flatten_for_z3] WARNING: %d signal(s) READ but never WRITTEN in %s \
+       after inlining -- Z3 will treat each as a FREE variable, so a miter \
+       against an identical design can report DIFFER:\n" n m.name;
+    List.iteri (fun i (_, s) ->
+      if i < 20 then Printf.eprintf "    %s\n" s) (List.rev !orphans);
+    if n > 20 then Printf.eprintf "    ... %d more\n" (n - 20);
+    flush stderr
+  end
+
 let flatten_for_z3 ?(debug = false) (p : bprogram) ~top : bmodule =
   unresolved := [];
+  orphans := [];
   Hashtbl.clear unresolved_seen;
   let by_name = Hashtbl.create 16 in
   List.iter (fun m -> Hashtbl.replace by_name m.name m) p.modules;
@@ -440,6 +584,6 @@ let flatten_for_z3 ?(debug = false) (p : bprogram) ~top : bmodule =
     !acc
   in
   match Hashtbl.find_opt by_name top with
-  | Some m -> flatten_one m
+  | Some m -> let f = flatten_one m in audit_orphans f; f
   | None ->
       failwith ("flatten_for_z3: no module '" ^ top ^ "' in program")

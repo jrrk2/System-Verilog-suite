@@ -73,6 +73,14 @@ let bv_var name width suffix =
    UNCOMPARABLE. *)
 exception Vacuous_comparison of string
 
+(* Z3 returned UNKNOWN (timeout / incomplete theory).  This is NOT a
+   difference, and collapsing it to `false` made a 30-second timeout
+   indistinguishable from a real counterexample -- a hierarchical module then
+   "failed" its own null test purely because it was bigger than a leaf.
+   Raise instead, so callers can report INCONCLUSIVE and the user can raise
+   Z3_MITER_TIMEOUT_MS. *)
+exception Solver_unknown of string
+
 let clear_cache () = Hashtbl.clear signal_cache
 
 (* Clear caches that are scoped to a single miter so a decl created
@@ -1714,9 +1722,13 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
         Printf.printf "═══════════════════════════════════════════════════════════════\n";
         Printf.printf "  ⚠️  UNKNOWN (Timeout or Incomplete)\n";
         Printf.printf "═══════════════════════════════════════════════════════════════\n\n";
+        let why = Z3.Solver.get_reason_unknown miter_solver in
         Printf.printf "Z3 could not determine equivalence.\n";
-        Printf.printf "Reason: %s\n\n" (Z3.Solver.get_reason_unknown miter_solver);
-        false
+        Printf.printf "Reason: %s\n\n" why;
+        raise (Solver_unknown
+                 (Printf.sprintf "%s (after %.1fs; raise Z3_MITER_TIMEOUT_MS, currently %s)"
+                    why elapsed
+                    (try Sys.getenv "Z3_MITER_TIMEOUT_MS" with Not_found -> "30000")))
     end
   end
 

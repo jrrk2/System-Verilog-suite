@@ -680,6 +680,55 @@ let pack (m : bmodule) : result =
         | None -> ())
     m.instances;
 
+  (* 3a. leftover LUTs -> FILL THE SLICE.  Every un-absorbed LUT used to become
+        its own SLICE_LOGIC holding a single A6LUT.  Measured on ethmin that put
+        3064 of 3486 LUT-bearing slices at exactly ONE LUT (mean 1.25/slice
+        against Vivado's 3.65 on the same netlist) and spread the design over
+        4692 slices where Vivado used 1669.  That 2.8x spread is what puts
+        100-140 tile hops on the critical path and holds eth_clk at 68-92 MHz
+        against a 125 MHz target -- packing, not the router, is the limit.
+
+        Four LUT6 may share a slice unconditionally: a SLICE has 24 independent
+        input pins (A1-A6 .. D1-D6) and four independent outputs, so unlike FFs
+        (which share one CLK/CE/SR and must be grouped by control set) LUTs
+        impose NO compatibility constraint.  Group in netlist order, which keeps
+        logically related LUTs -- yosys emits them near their consumers -- in the
+        same slice rather than scattering them.
+
+        NOT applied to LUTs that hard_map/slicem_map claim (SRL, distributed
+        RAM): those need a specific site type, and stealing them into a generic
+        SLICE_LOGIC would place them illegally. *)
+  let lut_group = ref [] and lut_cnt = ref 0 and lut_slice = ref 0 in
+  let flush_luts () =
+    if !lut_group <> [] then begin
+      let items = List.rev !lut_group in
+      let bels = List.mapi (fun k (nm, _) -> (nm, lane_letter k ^ "6LUT")) items in
+      let conns =
+        List.concat (List.mapi (fun k (_, ports) ->
+            let l = lane_letter k in
+            List.map (fun (p, nk) -> (l ^ p, nk)) ports) items) in
+      add ~bels (Printf.sprintf "lut_slice_%d" !lut_slice) "SLICE_LOGIC" conns;
+      incr lut_slice; lut_group := []; lut_cnt := 0
+    end in
+  List.iter (fun (i : binstance) ->
+      if not (Hashtbl.mem absorbed i.inst_name)
+         && i.module_name <> "GND" && i.module_name <> "VCC"
+         && hard_map i.module_name = None && slicem_map i.module_name = None then begin
+        let u = String.uppercase_ascii i.module_name in
+        if starts_with u "LUT" || u = "INV" then begin
+          let ports = List.filter_map (fun (p, arr) ->
+              if Array.length arr > 0 then Some (p, arr.(0)) else None)
+              (Hashtbl.find inst_ports i.inst_name) in
+          lut_group := (i.inst_name, ports) :: !lut_group;
+          incr lut_cnt;
+          Hashtbl.replace absorbed i.inst_name ();
+          bump "LUT packed into shared slice";
+          if !lut_cnt >= 4 then flush_luts ()
+        end
+      end)
+    m.instances;
+  flush_luts ();
+
   (* 3. leftover LUT / FF -> SLICE_LOGIC / SLICE_FF ------------------------- *)
   List.iter (fun (i : binstance) ->
       if not (Hashtbl.mem absorbed i.inst_name)

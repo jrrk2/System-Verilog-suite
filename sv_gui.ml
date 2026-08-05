@@ -1524,6 +1524,96 @@ type timing_path = {
   tp_text       : string;            (* full block text *)
 }
 
+(* ---- nextpnr critical-path overlay -------------------------------------
+   A SECOND source for the path overlay, and for this flow the only usable
+   one: OpenSTA's setup numbers here are advisory nonsense (arnoldi cascades
+   slew down long LUT chains and inflates whole paths into the microseconds,
+   e.g. -2299 ns), so nextpnr's own engine is what we optimise against.
+
+   It also sidesteps the failure mode the OpenSTA overlay suffers from.  That
+   one matches hops to placement by INSTANCE NAME, and a name-space mismatch
+   silently yields "0/N hops matched".  nextpnr prints SITE COORDINATES in the
+   report itself:
+
+     Info:  7.1  7.4    Net <name> budget 1.773000 ns (154,333) -> (192,160)
+
+   so the segment endpoints need no lookup at all and cannot mis-join.
+
+   Feed it with:  NEXTPNR_CRIT_PATH_REPORT=1 (and NEXTPNR_POST_ROUTE_TIMING=1
+   for routed rather than post-placement numbers), then point
+   SV_GUI_NPNR_PATH at the log.  Set SV_GUI_NPNR_CLOCK to pick one clock
+   domain by substring; otherwise the WORST (longest total) path is drawn. *)
+type npnr_seg = {
+  ns_x1 : int; ns_y1 : int;
+  ns_x2 : int; ns_y2 : int;
+  ns_delay : float;                    (* ns for this hop *)
+  ns_net : string;
+}
+
+let npnr_seg_re =
+  Str.regexp
+    "Net \\(.*\\) budget [-0-9.]+ ns (\\([0-9]+\\),\\([0-9]+\\)) -> (\\([0-9]+\\),\\([0-9]+\\))"
+let npnr_delay_re = Str.regexp "^Info: +\\([0-9.]+\\) +\\([0-9.]+\\) +Net "
+let npnr_clock_re = Str.regexp "Critical path report for clock '\\([^']*\\)'"
+let npnr_total_re = Str.regexp "\\([0-9.]+\\) ns logic, \\([0-9.]+\\) ns routing"
+
+(* Returns (clock, segments, logic_ns, routing_ns) for the selected path. *)
+let parse_nextpnr_critpath file : (string * npnr_seg list * float * float) option =
+  let want = try Some (Sys.getenv "SV_GUI_NPNR_CLOCK") with Not_found -> None in
+  let best = ref None in
+  (try
+     let ic = open_in file in
+     let cur_clk = ref "" and cur = ref [] and cur_delay = ref 0.0 in
+     let finish () =
+       if !cur <> [] then begin
+         let segs = List.rev !cur in
+         let tot = List.fold_left (fun a s -> a +. s.ns_delay) 0.0 segs in
+         let keep = match want with
+           | Some w ->
+             (* substring match on the clock name *)
+             let re = Str.regexp_string w in
+             (try ignore (Str.search_forward re !cur_clk 0); true
+              with Not_found -> false)
+           | None -> (match !best with None -> true | Some (_, _, t, _) -> tot > t) in
+         if keep then best := Some (!cur_clk, segs, tot, !cur_delay)
+       end;
+       cur := []; cur_delay := 0.0 in
+     (try
+        while true do
+          let l = input_line ic in
+          if Str.string_match npnr_clock_re l 0
+             || (try ignore (Str.search_forward npnr_clock_re l 0); true
+                 with Not_found -> false)
+          then begin finish (); cur_clk := Str.matched_group 1 l end
+          else if (try ignore (Str.search_forward npnr_total_re l 0); true
+                   with Not_found -> false)
+          then cur_delay := float_of_string (Str.matched_group 2 l)
+          else if (try ignore (Str.search_forward npnr_seg_re l 0); true
+                   with Not_found -> false)
+          then begin
+            let net = Str.matched_group 1 l in
+            let x1 = int_of_string (Str.matched_group 2 l) in
+            let y1 = int_of_string (Str.matched_group 3 l) in
+            let x2 = int_of_string (Str.matched_group 4 l) in
+            let y2 = int_of_string (Str.matched_group 5 l) in
+            (* the hop delay sits in the same line's leading columns *)
+            let d = if Str.string_match npnr_delay_re l 0
+                    then (try float_of_string (Str.matched_group 1 l) with _ -> 0.0)
+                    else 0.0 in
+            cur := { ns_x1 = x1; ns_y1 = y1; ns_x2 = x2; ns_y2 = y2;
+                     ns_delay = d; ns_net = net } :: !cur
+          end
+        done
+      with End_of_file -> ());
+     finish ();
+     close_in ic
+   with Sys_error e -> Printf.eprintf "[npnr-path] %s\n%!" e);
+  match !best with
+  | Some (c, s, _, r) -> Some (c, s, 0.0, r)
+  | None -> None
+
+let npnr_path : (string * npnr_seg list * float * float) option ref = ref None
+
 let path_re_start = Str.regexp "^Startpoint: \\([^ \t]+\\)"
 let path_re_end   = Str.regexp "^Endpoint: \\([^ \t]+\\)"
 let path_re_max   = Str.regexp "^Path Type: max"
@@ -2150,27 +2240,88 @@ let open_layout_window ?critical_path layout =
   in
   tv#buffer#set_text body;
 
-  (* nextpnr routing debug: highlight nets whose name matches a substring. *)
+  (* nextpnr routing debug: highlight nets by WILDCARD, chosen from a list.
+     Typing a substring meant knowing a net's name before you could look at it,
+     and these names are unusable by hand -- a flattened abc net reads
+     `$flatten\eth.\i_mac.$abc$45263$auto$blifparse.cc:557:parse_blif$45311.
+      genblk1.genblk1...f0`.  So offer PATTERNS instead: the categories you
+     actually want (clocks, resets, enables, carry chains) plus whatever the
+     design itself supplies.
+     Patterns come from, in order: SV_GUI_NET_PATTERNS (a file, one glob per
+     line, '#' comments), then `sv_gui_net_patterns.txt` beside the loaded
+     design, then the built-ins below.  The chosen pattern is matched with
+     `*`/`?` globbing against every net name; the match count is reported so a
+     pattern that selects nothing says so instead of looking like a redraw. *)
   if layout.l_nets <> [] then begin
+    let glob_match pat s =
+      let np = String.length pat and ns = String.length s in
+      let memo = Hashtbl.create 64 in
+      let rec go i j =
+        match Hashtbl.find_opt memo (i, j) with
+        | Some r -> r
+        | None ->
+          let r =
+            if i >= np then j >= ns
+            else match pat.[i] with
+              | '*' -> go (i + 1) j || (j < ns && go i (j + 1))
+              | '?' -> j < ns && go (i + 1) (j + 1)
+              | c   -> j < ns && s.[j] = c && go (i + 1) (j + 1) in
+          Hashtbl.replace memo (i, j) r; r in
+      go 0 0 in
+    let builtin = [
+      "*";                    (* everything *)
+      "*clk*"; "*CLK*";
+      "*rst*"; "*reset*"; "*RESET*"; "*SRESET*";
+      "*_CE*"; "*cen*"; "*enable*";
+      "*carry*"; "*CARRY*";
+      "*NotGate*";            (* abc-replicated inverters (the SR class) *)
+      "*abc*";
+    ] in
+    let from_file path =
+      if Sys.file_exists path then begin
+        let acc = ref [] in
+        (try
+           let ic = open_in path in
+           (try while true do
+              let l = input_line ic in
+              let l = match String.index_opt l '#' with
+                | Some i -> String.sub l 0 i | None -> l in
+              let l = String.trim l in
+              if l <> "" then acc := l :: !acc
+            done with End_of_file -> ());
+           close_in ic
+         with Sys_error _ -> ());
+        List.rev !acc
+      end else [] in
+    let extra =
+      (match Sys.getenv_opt "SV_GUI_NET_PATTERNS" with
+       | Some f -> from_file f | None -> [])
+      @ from_file (Filename.concat (Sys.getcwd ()) "sv_gui_net_patterns.txt") in
+    let pats = extra @ builtin in
     let hb = GPack.hbox ~spacing:4 ~packing:side#pack () in
-    let _  = GMisc.label ~text:"net:" ~packing:hb#pack () in
-    let e  = GEdit.entry ~packing:(hb#pack ~expand:true ~fill:true) () in
+    let _  = GMisc.label ~text:"net pattern:" ~packing:hb#pack () in
+    let combo = GEdit.combo_box_text ~packing:(hb#pack ~expand:true ~fill:true) () in
+    let combo_box, _ = combo in
+    List.iter (fun p -> GEdit.text_combo_add combo p) pats;
+    if pats <> [] then combo_box#set_active 0;
+    let stat = GMisc.label ~text:"" ~packing:hb#pack () in
     let apply () =
-      let q = e#text in
-      if q <> "" then begin
-        let re = Str.regexp_string q in
-        List.iter (fun ln ->
-          if (try ignore (Str.search_forward re ln.ln_name 0); true
-              with Not_found -> false)
-          then Hashtbl.replace layout.l_hi ln.ln_name ()) layout.l_nets
+      let i = combo_box#active in
+      if i >= 0 && i < List.length pats then begin
+        let q = List.nth pats i in
+        let n = List.fold_left (fun n ln ->
+          if glob_match q ln.ln_name
+          then (Hashtbl.replace layout.l_hi ln.ln_name (); n + 1) else n) 0 layout.l_nets in
+        stat#set_text (Printf.sprintf "%d/%d" n (List.length layout.l_nets))
       end;
       da#misc#queue_draw () in
-    ignore (e#connect#activate ~callback:apply);
+    ignore (combo_box#connect#changed ~callback:apply);
     let addb = GButton.button ~label:"Add"   ~packing:hb#pack () in
     ignore (addb#connect#clicked ~callback:apply);
     let clrb = GButton.button ~label:"Clear" ~packing:hb#pack () in
     ignore (clrb#connect#clicked
-      ~callback:(fun () -> Hashtbl.clear layout.l_hi; da#misc#queue_draw ()))
+      ~callback:(fun () -> Hashtbl.clear layout.l_hi; stat#set_text "";
+                  da#misc#queue_draw ()))
   end;
 
   let (x1, y1, x2, y2) = layout.l_die in

@@ -364,6 +364,21 @@ let run_gen floorplan_json ~get_bmod ~get_j =
           went 1661 -> 4029 of 4968 on eth-arp). *)
        List.iter (fun (orig, _) -> add_base orig i) c.Pack_to_lef.pc_bels) cells;
      let k = try float_of_string (Sys.getenv "PLACE_CRIT_K") with _ -> 8.0 in
+     (* CONCENTRATING the weight, not just raising it.  nextpnr exports every
+        cell with crit>0.05 -- 8686 of them here -- and their criticality is
+        mostly middling: median 0.327, p90 0.697, only 2.0% at >=0.9.  Under the
+        linear law w = 1 + K*crit the median weighted net already gets 3.6x at
+        K=8 while the worst gets 9.0x, so the genuinely critical 2% are a mere
+        2.5x more attractive to the annealer than the median.  Raising K alone
+        does not fix that: it scales both ends and the RATIO stays 2.5.
+
+        PLACE_CRIT_P applies w = 1 + K*crit^P, which is what actually separates
+        them -- at P=3 the median falls to 1.28x while the worst stays 9.0x, a
+        7x spread.  PLACE_CRIT_MIN additionally ignores everything below a
+        cutoff, so near-idle nets stop competing for the annealer's attention.
+        Defaults P=1.0 / MIN=0.0 reproduce the previous behaviour exactly. *)
+     let p = try float_of_string (Sys.getenv "PLACE_CRIT_P") with _ -> 1.0 in
+     let cmin = try float_of_string (Sys.getenv "PLACE_CRIT_MIN") with _ -> 0.0 in
      let ic = open_in cf in
      let matched = ref 0 and lines = ref 0 in
      (try while true do
@@ -386,15 +401,19 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                         with Not_found -> [])
                      | None -> [])) in
              if ids <> [] then incr matched;
-             let w = 1.0 +. k *. c in
+             let w = if c < cmin then 1.0
+                     else 1.0 +. k *. (if p = 1.0 then c else Float.pow c p) in
              List.iter (fun idx ->
                List.iter (fun nid -> if net_w.(nid) < w then net_w.(nid) <- w)
                  cell_nets.(idx)) ids
            end
          | _ -> ())
        done with End_of_file -> ()); close_in ic;
-     Printf.eprintf "[place_lef] timing-driven: %d/%d crit cells matched (K=%.1f)\n%!"
-       !matched !lines k
+     let wmx = Array.fold_left (fun a w -> Stdlib.max a w) 1.0 net_w in
+     let nw = Array.fold_left (fun a w -> if w > 1.0 then a + 1 else a) 0 net_w in
+     Printf.eprintf
+       "[place_lef] timing-driven: %d/%d crit cells matched (K=%.1f P=%.1f MIN=%.2f)         -> %d net(s) weighted, max %.1fx\n%!"
+       !matched !lines k p cmin nw wmx
    | _ -> ());
 
   (* SR CO-LOCATION: yosys maps async set/reset to native FF PRE/CLR pins fed by
@@ -2193,12 +2212,56 @@ let run_gen floorplan_json ~get_bmod ~get_j =
        design_bufg gbuf_max;
      let xmid = List.fold_left (fun a s -> max a s.sx) 0 all_slices / 2 in
      let ngbuf = ref 0 in
-     (* buffer the highest-fanout control nets first (within budget) *)
+     (* ROUTE-FAILURE FEEDBACK -> GLOBAL BUFFER.  TOPO_BUFG_NETS names nets that
+        MUST go on a global buffer whatever their fanout, harvested from
+        nextpnr's unroutable arcs (ethsoc/harvest_unroutable_nets.py).  The
+        fanout threshold alone is not enough: on ethmin the failing arcs were CE
+        nets in axis_gmii_tx_inst with fanout well under TOPO_BUFG_FANOUT, yet
+        their sinks were spread far enough by the placer (1.85 cells/slice, 72 x
+        123 slices) that no fabric route existed.  Fanout measures how BIG a net
+        is; it does not measure how far the placer threw it.  Only the router
+        knows that, so let the router's failures name the nets.
+        TOPO_FIXNETS is the sibling knob and does something DIFFERENT: it
+        relays a net through a LUT1 feedthrough toward one failing sink.  Use
+        that for a single stubborn arc, this for a net that needs a spine. *)
+     let forced_bufg : (int, unit) Hashtbl.t = Hashtbl.create 16 in
+     (match Sys.getenv_opt "TOPO_BUFG_NETS" with
+      | Some fl when Sys.file_exists fl ->
+        let name2bit = Hashtbl.create 4096 in
+        (match member "netnames" topm with `Assoc a ->
+           List.iter (fun (nm, info) -> match member "bits" info with
+             | `List (`Int b :: _) -> Hashtbl.replace name2bit nm b
+             | _ -> ()) a
+         | _ -> ());
+        let last_comp s = match String.rindex_opt s '.' with
+          | Some i -> String.sub s (i+1) (String.length s - i - 1) | None -> s in
+        let ic = open_in fl in
+        let nfound = ref 0 and nmiss = ref 0 in
+        (try while true do
+           let line = input_line ic in
+           let line = match String.index_opt line '#' with
+             | Some i -> String.sub line 0 i | None -> line in
+           let nm = String.trim line in
+           if nm <> "" then
+             match (match Hashtbl.find_opt name2bit nm with
+                    | Some b -> Some b
+                    | None -> Hashtbl.find_opt name2bit (last_comp nm)) with
+             | Some b -> Hashtbl.replace forced_bufg b (); incr nfound
+             | None -> incr nmiss;
+               Printf.eprintf "[place_lef] TOPO_BUFG_NETS: no net matches %S\n" nm
+         done with End_of_file -> ());
+        close_in ic;
+        Printf.eprintf "[place_lef] TOPO_BUFG_NETS: forcing %d net(s) onto globals (%d unmatched)\n%!"
+          !nfound !nmiss
+      | _ -> ());
+     (* buffer the highest-fanout control nets first (within budget); a FORCED
+        net is admitted regardless of fanout and sorts ahead of the rest. *)
      let ctrl_nets = Hashtbl.fold (fun bit sinks acc ->
          match Hashtbl.find_opt drv bit with
          | Some (_, dty) when dty <> "BUFG" && dty <> "BUFGCTRL" && dty <> "GND" && dty <> "VCC" ->
            let c = List.length (List.filter (fun (_,p,_) -> is_ctrl p) sinks) in
-           if c >= bufg_thresh && c * 2 >= List.length sinks then (c, bit) :: acc else acc
+           if Hashtbl.mem forced_bufg bit then (max c 1 + 1_000_000, bit) :: acc
+           else if c >= bufg_thresh && c * 2 >= List.length sinks then (c, bit) :: acc else acc
          | _ -> acc) snk [] in
      (* Per-region BUFR SITE budget: only ~4 BUFR sites per clock-region side.
         If more single-region nets target one region than it has sites, nextpnr
@@ -3186,8 +3249,406 @@ let insert_hold_buffers (j : Y.t) : Y.t =
   end
 
 (* CLI / file entry: read floorplan + netlist json from disk. *)
+(* Delete the GT pad pseudo-IBUF/OBUF cells, identified STRUCTURALLY.
+
+   Vivado models a transceiver's dedicated pins (GTXRXP/GTXRXN/GTXTXP/GTXTXN and
+   the IBUFDS_GTE2 refclk pair) as pseudo IBUF/OBUF cells on IPAD/OPAD sites.
+   They are not fabric IO buffers: nextpnr's pack_io would try to place them in
+   an IOB and pack_gt wants the raw pad nets, so they have to go.  Left in, the
+   placer assigns one to an IPAD site and nextpnr dies with
+
+     ERROR: No Bel named 'IPAD_X2Y8/IOB33/INBUF_EN' located for this chip
+
+   stamp_placement.py finds them by reading a VIVADO placement dump for
+   IPAD_/OPAD_ sites, which is fine for the placement-replay path and useless
+   for a Vivado-free flow.  So identify them from CONNECTIVITY instead: any
+   IBUF/OBUF whose pad-side net is also touched by a GT primitive's dedicated
+   pin.  Same merge either way -- rewrite every use of the buffer's fabric-side
+   bit to the pad-side bit.
+
+   (Was ethsoc/stitch_gt_pad_buffers.py, a separate pipeline stage feeding
+   place_lef a temp json; it is a netlist prepass like the others, so it lives
+   here now and there is one less file to keep in step.) *)
+let stitch_gt_pad_buffers (j : Y.t) : Y.t =
+  let module U = Yojson.Safe.Util in
+  let gt_types = [ "GTXE2_CHANNEL"; "GTXE2_COMMON"; "IBUFDS_GTE2";
+                   "GTPE2_CHANNEL"; "GTPE2_COMMON"; "GTHE2_CHANNEL"; "GTHE2_COMMON" ] in
+  let gt_pad_pins = [ "GTXRXP"; "GTXRXN"; "GTXTXP"; "GTXTXN";
+                      "GTPRXP"; "GTPRXN"; "GTPTXP"; "GTPTXN";
+                      "GTHRXP"; "GTHRXN"; "GTHTXP"; "GTHTXN";
+                      "I"; "IB" ] in
+  let buf_types = [ "IBUF"; "OBUF"; "IBUFDS"; "OBUFDS" ] in
+  let bits_of e = match e with
+    | `List l -> List.filter_map (function `Int i -> Some i | _ -> None) l
+    | _ -> [] in
+  let nstitch = ref 0 in
+  let do_mod mj =
+    match mj |> U.member "cells" with
+    | `Assoc cells when cells <> [] ->
+      let ty cj = try cj |> U.member "type" |> U.to_string with _ -> "" in
+      let conns cj = match cj |> U.member "connections" with `Assoc c -> c | _ -> [] in
+      let pad_bits = Hashtbl.create 64 in
+      List.iter (fun (_, cj) ->
+          if List.mem (ty cj) gt_types then
+            List.iter (fun (p, e) ->
+                if List.mem p gt_pad_pins then
+                  List.iter (fun b -> Hashtbl.replace pad_bits b ()) (bits_of e))
+              (conns cj)) cells;
+      if Hashtbl.length pad_bits = 0 then mj
+      else begin
+        (* victim -> (pad-side bit kept, fabric-side bit dropped) *)
+        let remap = Hashtbl.create 16 in
+        let victims = Hashtbl.create 16 in
+        List.iter (fun (cn, cj) ->
+            if List.mem (ty cj) buf_types then
+              let c = conns cj in
+              match List.assoc_opt "I" c, List.assoc_opt "O" c with
+              | Some ie, Some oe ->
+                (match bits_of ie, bits_of oe with
+                 | bi :: _, bo :: _ ->
+                   (* IBUF: pad on I, fabric on O.  OBUF: the other way round. *)
+                   if Hashtbl.mem pad_bits bi then begin
+                     Hashtbl.replace victims cn (); Hashtbl.replace remap bo bi; incr nstitch;
+                     Printf.eprintf "[gtstitch] %s (kept pad bit %d, dropped %d)\n%!" cn bi bo
+                   end else if Hashtbl.mem pad_bits bo then begin
+                     Hashtbl.replace victims cn (); Hashtbl.replace remap bi bo; incr nstitch;
+                     Printf.eprintf "[gtstitch] %s (kept pad bit %d, dropped %d)\n%!" cn bo bi
+                   end
+                 | _ -> ())
+              | _ -> ()) cells;
+        if Hashtbl.length victims = 0 then mj
+        else begin
+          (* follow drop->keep chains so order of removal cannot matter *)
+          let rec resolve b n =
+            if n > 16 then b
+            else match Hashtbl.find_opt remap b with Some k -> resolve k (n + 1) | None -> b in
+          let fix e = match e with
+            | `List l -> `List (List.map (function `Int i -> `Int (resolve i 0) | x -> x) l)
+            | x -> x in
+          let fix_bits kv =
+            List.map (fun (k, v) -> if k = "bits" then (k, fix v) else (k, v)) kv in
+          let cells' =
+            List.filter_map (fun (cn, cj) ->
+                if Hashtbl.mem victims cn then None
+                else Some (cn, `Assoc (List.map (fun (k, v) ->
+                    if k <> "connections" then (k, v)
+                    else (k, match v with
+                        | `Assoc c -> `Assoc (List.map (fun (p, e) -> (p, fix e)) c)
+                        | x -> x)) (U.to_assoc cj)))) cells in
+          `Assoc (List.map (fun (k, v) ->
+              match k with
+              | "cells" -> (k, `Assoc cells')
+              | "ports" | "netnames" ->
+                (k, match v with
+                    | `Assoc entries ->
+                      `Assoc (List.map (fun (n, ej) -> (n, `Assoc (fix_bits (U.to_assoc ej)))) entries)
+                    | x -> x)
+              | _ -> (k, v)) (U.to_assoc mj))
+        end
+      end
+    | _ -> mj in
+  let r =
+    match j |> U.member "modules" with
+    | `Assoc mods ->
+      `Assoc (List.map (fun (k, v) ->
+          if k = "modules"
+          then (k, `Assoc (List.map (fun (mn, mj) -> (mn, do_mod mj)) mods))
+          else (k, v)) (U.to_assoc j))
+    | _ -> j in
+  Printf.eprintf "[gtstitch] stitched %d GT pad buffer(s)\n%!" !nstitch;
+  r
+
+(* `opt_merge -share_all` (run after flatten in the open flow) merges ANY two
+   identical cells -- including the two data LUTs of one MUXF7 when they compute
+   the same function.  The mux is then left with I0 and I1 tied to the same net.
+
+   That is fatal on 7-series.  A MUXF7 data input is not general routing: it is
+   hard-wired to a fixed LUT pair -- F7AMUX <- A6LUT+B6LUT, F7BMUX <- C6LUT+D6LUT,
+   with F8MUX combining the two F7s.  Pack_to_lef.absorb_mux7 absorbs the shared
+   LUT into ONE lane, and its "not already absorbed" guard then skips the other
+   lane, which is left with no instance to bind.  Its dedicated sitewire has no
+   driver and the router reports the impossible arc
+
+       SITEWIRE/SLICE_XnYm/B6LUT_O6 -> SITEWIRE/SLICE_XnYm/A6LUT_O6
+
+   -- LUT output to LUT output.  That is NOT congestion: no amount of rip-up,
+   rerouting or global-buffer promotion can fix it, because the path does not
+   exist in the device.  (This is what the harvested "unroutable nets" list was
+   really full of; every entry was a .f0/.f1 wide-mux net.)  It cannot be
+   repaired inside pack_to_lef either, which binds EXISTING instances to bels
+   and cannot conjure the missing LUT.
+
+   So restore the second lane here, before packing: clone the shared driver,
+   give the clone a fresh output net, and rewire the mux's I1 to it.  Same
+   function, same inputs; it costs one LUT per degenerate mux, which is exactly
+   what opt_merge saved.  The SR-inverter sharing that -share_all was added for
+   is untouched.
+
+   Collapsing the mux instead is NOT viable: a MUXF8 data input must be driven
+   by a MUXF7, so deleting the F7 just moves the illegality up a level. *)
+let split_degenerate_muxf (j : Y.t) : Y.t =
+  let module U = Yojson.Safe.Util in
+  let ncloned = ref 0 and nskipped = ref 0 in
+  let bits_of e = match e with
+    | `List l -> List.filter_map (function `Int i -> Some i | _ -> None) l
+    | _ -> [] in
+  let is_lut t = String.length t >= 3 && String.uppercase_ascii (String.sub t 0 3) = "LUT" in
+  let do_mod mj =
+    match mj |> U.member "cells" with
+    | `Assoc cells when cells <> [] ->
+      let drv : (int, string * string) Hashtbl.t = Hashtbl.create 4096 in
+      let byname : (string, Y.t) Hashtbl.t = Hashtbl.create 4096 in
+      let maxbit = ref 1 in
+      List.iter (fun (cn, cj) ->
+          Hashtbl.replace byname cn cj;
+          let dirs = try cj |> U.member "port_directions" |> U.to_assoc with _ -> [] in
+          match cj |> U.member "connections" with
+          | `Assoc conns ->
+            List.iter (fun (p, e) ->
+                let bs = bits_of e in
+                List.iter (fun b -> if b > !maxbit then maxbit := b) bs;
+                match List.assoc_opt p dirs with
+                | Some (`String "output") -> List.iter (fun b -> Hashtbl.replace drv b (cn, p)) bs
+                | _ -> ())
+              conns
+          | _ -> ()) cells;
+      (match mj |> U.member "netnames" with
+       | `Assoc nets ->
+         List.iter (fun (_, nj) ->
+             List.iter (fun b -> if b > !maxbit then maxbit := b)
+               (bits_of (nj |> U.member "bits"))) nets
+       | _ -> ());
+      let dt_of dn =
+        match Hashtbl.find_opt byname dn with
+        | Some dcj -> (try dcj |> U.member "type" |> U.to_string with _ -> "")
+        | None -> "" in
+      let extra = ref [] and extranets = ref [] in
+      (* Duplicate the LUT driving [b] and return the clone's fresh output bit. *)
+      let clone_driver b =
+        match Hashtbl.find_opt drv b with
+        | Some (dn, dp) when is_lut (dt_of dn) ->
+          incr maxbit;
+          let fresh = !maxbit in
+          let dcj = Hashtbl.find byname dn in
+          let clone =
+            `Assoc (List.map (fun (k, v) ->
+                if k <> "connections" then (k, v)
+                else (k, match v with
+                    | `Assoc cc ->
+                      `Assoc (List.map (fun (p, e) ->
+                          if p = dp then (p, `List [ `Int fresh ]) else (p, e)) cc)
+                    | _ -> v))
+                (U.to_assoc dcj)) in
+          let nm = ref (dn ^ "$muxdup") and k = ref 1 in
+          while Hashtbl.mem byname !nm do
+            incr k; nm := Printf.sprintf "%s$muxdup%d" dn !k
+          done;
+          Hashtbl.replace byname !nm clone;
+          extra := (!nm, clone) :: !extra;
+          extranets := (!nm ^ "." ^ dp,
+                        `Assoc [ "hide_name", `Int 1;
+                                 "bits", `List [ `Int fresh ];
+                                 "attributes", `Assoc [] ]) :: !extranets;
+          incr ncloned;
+          Some fresh
+        (* A MUXF8 data pin is driven by a MUXF7, not a LUT.  Duplicating a
+           whole F7 subtree is a different (so far unobserved) problem -- count
+           it rather than emit something subtly wrong. *)
+        | _ -> incr nskipped; None in
+      (* Every wide-mux data pin needs a LUT of its OWN, in its own lane of its
+         own slice.  Two pins sharing one driver is unsatisfiable whether they
+         are I0/I1 of the SAME mux (opt_merge collapsed an identical pair) or
+         pins of two DIFFERENT muxes (opt_merge shared one LUT between them):
+         a single instance cannot sit in two lanes.  First claimant keeps the
+         original, every later one gets a clone. *)
+      let claimed : (int, unit) Hashtbl.t = Hashtbl.create 256 in
+      let cells' =
+        List.map (fun (cn, cj) ->
+            let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
+            if t <> "MUXF7" && t <> "MUXF8" then (cn, cj)
+            else
+              match cj |> U.member "connections" with
+              | `Assoc conns ->
+                let rewire = ref [] in
+                List.iter (fun pin ->
+                    match List.assoc_opt pin conns with
+                    | Some e ->
+                      (match bits_of e with
+                       | [ b ] ->
+                         if Hashtbl.mem claimed b then
+                           (match clone_driver b with
+                            | Some fresh ->
+                              Hashtbl.replace claimed fresh ();
+                              rewire := (pin, fresh) :: !rewire
+                            | None -> ())
+                         else Hashtbl.replace claimed b ()
+                       | _ -> ())
+                    | None -> ()) [ "I0"; "I1" ];
+                if !rewire = [] then (cn, cj)
+                else
+                  (cn, `Assoc (List.map (fun (k, v) ->
+                       if k <> "connections" then (k, v)
+                       else (k, `Assoc (List.map (fun (p, e) ->
+                           match List.assoc_opt p !rewire with
+                           | Some fresh -> (p, `List [ `Int fresh ])
+                           | None -> (p, e)) conns)))
+                       (U.to_assoc cj)))
+              | _ -> (cn, cj)) cells in
+      let kv = U.to_assoc mj in
+      let kv =
+        List.map (fun (k, v) ->
+            if k = "cells" then (k, `Assoc (cells' @ List.rev !extra))
+            else if k = "netnames" then
+              (k, match v with
+                  | `Assoc nn -> `Assoc (nn @ List.rev !extranets)
+                  | _ -> v)
+            else (k, v)) kv in
+      let kv =
+        if List.mem_assoc "netnames" kv then kv
+        else kv @ [ "netnames", `Assoc (List.rev !extranets) ] in
+      `Assoc kv
+    | _ -> mj in
+  let r =
+    match j |> U.member "modules" with
+    | `Assoc mods ->
+      `Assoc (List.map (fun (k, v) ->
+          if k = "modules"
+          then (k, `Assoc (List.map (fun (mn, mj) -> (mn, do_mod mj)) mods))
+          else (k, v)) (U.to_assoc j))
+    | _ -> j in
+  if !ncloned > 0 || !nskipped > 0 then
+    Printf.eprintf
+      "[muxsplit] %d wide-mux data pin(s) given their own LUT back \
+       (%d left alone: driver is not a LUT)\n%!" !ncloned !nskipped;
+  r
+
+(* Emit create_clock constraints for nextpnr, resolved from BUFG CELL names.
+
+   Without this every clock is timed against nextpnr's --freq default.  The XDC
+   nextpnr reads can only constrain PORTS, and the interesting clocks are BUFG
+   outputs several derivations downstream of a port (GT refclk -> GTXE2 ->
+   TXOUTCLK -> MMCM -> userclk2), which nextpnr cannot derive.  Measured on
+   ethmin, that meant:
+
+     Max frequency for clock '_40[0]': 65.35 MHz (PASS at 25.00 MHz)
+
+   -- the 125 MHz SGMII datapath missing its real target by 2x and being
+   reported as a PASS.  Every criticality the router exports is then relative to
+   the wrong period, so timing-driven placement ranks the SLOW domain (closest
+   to the uniform default) above the fast one that is actually failing, and no
+   amount of PLACE_CRIT_K/P tuning can fix a wrong ranking.
+
+   Net names are synthesis-generated and unstable (_40, _57), so key off the
+   BUFG cell names, which come from the design hierarchy and are stable:
+
+     TOPO_CLOCK_PERIODS="bufg_userclk2=8.0,clk_sys_bufg=40.0,..."
+
+   matches each substring against BUFG/BUFGCTRL cell names and constrains the
+   net that cell drives.  nextpnr names a multi-bit net's members "<name>[i]",
+   so resolve the driver bit's INDEX too -- "_40" alone matches nothing. *)
+let emit_clock_xdc (j : Y.t) =
+  match Sys.getenv_opt "TOPO_CLOCKS_XDC" with
+  | None -> ()
+  | Some out ->
+    let module U = Yojson.Safe.Util in
+    let spec = getenv_default "TOPO_CLOCK_PERIODS" "" in
+    let pairs =
+      String.split_on_char ',' spec
+      |> List.filter_map (fun kv ->
+          match String.index_opt kv '=' with
+          | Some i ->
+            let k = String.trim (String.sub kv 0 i) in
+            let v = String.sub kv (i + 1) (String.length kv - i - 1) in
+            (try if k = "" then None else Some (k, float_of_string (String.trim v))
+             with _ -> None)
+          | None -> None) in
+    if pairs = [] then
+      Printf.eprintf "[clocks] TOPO_CLOCKS_XDC set but TOPO_CLOCK_PERIODS empty -- no constraints emitted\n%!"
+    else begin
+      let bits_of e = match e with
+        | `List l -> List.filter_map (function `Int i -> Some i | _ -> None) l
+        | _ -> [] in
+      (* pick the real design module: the one with the most cells *)
+      let best = ref (`Null) and bestn = ref (-1) in
+      (match j |> U.member "modules" with
+       | `Assoc mods ->
+         List.iter (fun (_, mj) ->
+             let n = match mj |> U.member "cells" with `Assoc c -> List.length c | _ -> 0 in
+             if n > !bestn then (bestn := n; best := mj)) mods
+       | _ -> ());
+      let mj = !best in
+      (* driver bit -> "name" or "name[i]" *)
+      let bitname = Hashtbl.create 4096 in
+      (* Index over the RAW bits array, INCLUDING constant ('0'/'1') entries:
+         that is how nextpnr numbers a bus member.  Filtering the constants out
+         first shifts every later index -- eth.i_pcs_pma._61 has constants at
+         32/38/39, so the userclk BUFG's bit 43 came out as [40] and the
+         create_clock silently matched nothing. *)
+      (match mj |> U.member "netnames" with
+       | `Assoc nets ->
+         List.iter (fun (nn, nj) ->
+             match nj |> U.member "bits" with
+             | `List l ->
+               let w = List.length l in
+               List.iteri (fun i e ->
+                   match e with
+                   | `Int b ->
+                     if not (Hashtbl.mem bitname b) then
+                       Hashtbl.replace bitname b
+                         (if w > 1 then Printf.sprintf "%s[%d]" nn i else nn)
+                   | _ -> ()) l
+             | _ -> ()) nets
+       | _ -> ());
+      let buf = Buffer.create 1024 in
+      Buffer.add_string buf
+        "# GENERATED by place_lef (TOPO_CLOCK_PERIODS) -- do not edit.\n# nextpnr can only create_clock on PORTS; these are BUFG outputs\n# it cannot derive, so without them every clock falls back to --freq.\n";
+      let n = ref 0 in
+      (match mj |> U.member "cells" with
+       | `Assoc cells ->
+         List.iter (fun (cn, cj) ->
+             let t = try cj |> U.member "type" |> U.to_string with _ -> "" in
+             if t = "BUFG" || t = "BUFGCTRL" then
+               match List.find_opt (fun (k, _) -> contains cn k) pairs with
+               | None -> ()
+               | Some (k, per) ->
+                 (match cj |> U.member "connections" with
+                  | `Assoc conns ->
+                    (match List.assoc_opt "O" conns with
+                     | Some e ->
+                       (match bits_of e with
+                        | b :: _ ->
+                          (match Hashtbl.find_opt bitname b with
+                           | Some nname ->
+                             incr n;
+                             Buffer.add_string buf
+                               (Printf.sprintf
+                                  "create_clock -period %.3f -name %s [get_nets {%s}]\n" per k nname);
+                             Printf.eprintf "[clocks] %-16s %6.3f ns  cell=%s  net=%s\n%!"
+                               k per cn nname
+                           | None ->
+                             Printf.eprintf
+                               "[clocks] WARNING %s: driver bit %d of %s has no netname -- NOT constrained\n%!"
+                               k b cn)
+                        | [] -> ())
+                     | None -> ())
+                  | _ -> ())) cells
+       | _ -> ());
+      (* Say so loudly: an unmatched key means that clock silently keeps the
+         --freq default, which is exactly the failure this function exists for. *)
+      List.iter (fun (k, _) ->
+          let seen = Buffer.contents buf in
+          if not (contains seen ("-name " ^ k ^ " ")) then
+            Printf.eprintf "[clocks] WARNING no BUFG matched '%s' -- that clock keeps the --freq default\n%!" k)
+        pairs;
+      let oc = open_out out in
+      output_string oc (Buffer.contents buf); close_out oc;
+      Printf.eprintf "[clocks] wrote %d create_clock line(s) -> %s\n%!" !n out
+    end
+
 let run floorplan_json netlist_json =
-  let j = insert_hold_buffers (normalise_init (cleanup_netlist (Y.from_file netlist_json))) in
+  let j = insert_hold_buffers (normalise_init (split_degenerate_muxf
+            (stitch_gt_pad_buffers (cleanup_netlist (Y.from_file netlist_json))))) in
+  emit_clock_xdc j;
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
     ~get_j:(fun () -> j)
@@ -3197,7 +3658,7 @@ let run floorplan_json netlist_json =
    Packing goes through bmodule_of_yosys_tree so the placer sees EXACTLY the
    same netlist it would from the on-disk json. *)
 let run_inmem floorplan_json (j : Y.t) =
-  let j = insert_hold_buffers (cleanup_netlist j) in
+  let j = insert_hold_buffers (split_degenerate_muxf (stitch_gt_pad_buffers (cleanup_netlist j))) in
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
     ~get_j:(fun () -> j)
