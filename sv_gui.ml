@@ -1413,6 +1413,17 @@ type lnet = {
   ln_tracks : string list;                (* distinct GCLK_* tracks used *)
 }
 
+(* One hop of nextpnr's critical path (NEXTPNR_CRIT_PATH_REPORT=1).  The report
+   prints tile coordinates, but the viewer indexes placement by SLICE_XnYm, so
+   hops carry CELL NAMES and are resolved against the placement table at draw
+   time -- the two coordinate systems do not correspond. *)
+type chop = {
+  ch_src : string;                      (* driving cell *)
+  ch_dst : string;                      (* sink cell *)
+  ch_net : string;
+  ch_ns  : float;                       (* net delay of this hop *)
+}
+
 type layout = {
   l_design     : string;
   l_units      : int;                                 (* DBU per μm *)
@@ -1421,6 +1432,9 @@ type layout = {
   l_macro_um   : (string, float * float) Hashtbl.t;   (* cell → (w,h) μm *)
   l_nets       : lnet list;                           (* nextpnr routing overlay *)
   l_hi         : (string, unit) Hashtbl.t;            (* net names to highlight *)
+  l_crit       : chop list;                           (* worst critical path *)
+  l_crit_clk   : string;                              (* which clock it belongs to *)
+  l_crit_ns    : float;                               (* its total *)
 }
 
 let layout_lines path =
@@ -1483,6 +1497,7 @@ let parse_def path =
     l_macro_um   = Hashtbl.create 256;
     l_nets       = [];
     l_hi         = Hashtbl.create 1;
+    l_crit       = []; l_crit_clk = ""; l_crit_ns = 0.0;
   }
 
 let lef_macro_re = Str.regexp "[ \t]*MACRO[ \t]+\\([^ \t]+\\)"
@@ -1901,7 +1916,103 @@ let parse_nextpnr_json path =
     l_components = List.rev !comps;
     l_macro_um   = Hashtbl.create 4;
     l_nets       = List.rev !nets;
-    l_hi         = Hashtbl.create 256 }
+    l_hi         = Hashtbl.create 256;
+    l_crit       = []; l_crit_clk = ""; l_crit_ns = 0.0 }
+
+(* nextpnr's critical path (NEXTPNR_CRIT_PATH_REPORT=1), read from the same
+   route log as the skips.  The report reads:
+
+     Info: curr total
+     Info:  0.3  0.3  Source <cell>.<port>
+     Info:  6.5  6.8    Net <net> budget 7.779000 ns (23,248) -> (192,160)
+     Info:               Sink <cell>.<port>
+     ...
+     Info: 0.9 ns logic, 19.1 ns routing
+
+   One report per clock, and the log holds several (the placer's and the
+   post-route pass), so keep the LAST report seen for each clock -- that is the
+   post-route one -- and then the clock whose total is largest.  Every domain
+   here comes out >85% ROUTING, so what matters visually is WHERE each hop goes,
+   which is why this is worth drawing rather than reading. *)
+let crit_src_re  = Str.regexp "Source \\([^ \t]+\\)\\."
+let crit_sink_re = Str.regexp "Sink \\([^ \t]+\\)\\."
+let crit_net_re  =
+  Str.regexp "^Info: +\\([0-9.]+\\) +\\([0-9.]+\\) +Net \\([^ ]+\\) "
+let crit_hdr_re  = Str.regexp "Critical path report for clock '\\([^']+\\)'"
+
+let load_crit_path log_path =
+  let per_clock : (string, chop list * float) Hashtbl.t = Hashtbl.create 8 in
+  let clk = ref "" and hops = ref [] and src = ref "" and pend = ref None in
+  let total = ref 0.0 in
+  let finish () =
+    if !clk <> "" && !hops <> [] then
+      Hashtbl.replace per_clock !clk (List.rev !hops, !total);
+    hops := []; src := ""; pend := None; total := 0.0 in
+  (try
+     let ic = open_in log_path in
+     (try while true do
+        let l = input_line ic in
+        (try
+           ignore (Str.search_forward crit_hdr_re l 0);
+           finish (); clk := Str.matched_group 1 l
+         with Not_found ->
+           (try
+              ignore (Str.search_forward crit_src_re l 0);
+              src := Str.matched_group 1 l
+            with Not_found ->
+              (try
+                 ignore (Str.search_forward crit_net_re l 0);
+                 let ns = float_of_string (Str.matched_group 1 l) in
+                 total := (try float_of_string (Str.matched_group 2 l) with _ -> !total);
+                 pend := Some (Str.matched_group 3 l, ns)
+               with Not_found ->
+                 (try
+                    ignore (Str.search_forward crit_sink_re l 0);
+                    (match !pend with
+                     | Some (net, ns) when !src <> "" ->
+                       hops := { ch_src = !src; ch_dst = Str.matched_group 1 l;
+                                 ch_net = net; ch_ns = ns } :: !hops
+                     | _ -> ());
+                    pend := None
+                  with Not_found -> ()))))
+      done with End_of_file -> ());
+     close_in ic
+   with _ -> ());
+  finish ();
+  (* Pick the clock with the worst SLACK, not the longest path.  The longest
+     path here is the 25 MHz CPU domain at 18.9 ns, which passes comfortably,
+     while the eth datapath misses a 125 MHz target -- ranking by absolute
+     length points the overlay at the wrong path entirely.  nextpnr prints
+       Max frequency for clock 'X': 83.59 MHz (FAIL at 125.00 MHz)
+     so rank by achieved/target and let a FAIL outrank any PASS. *)
+  let ratio = Hashtbl.create 8 in
+  (try
+     let ic = open_in log_path in
+     let re = Str.regexp
+         "Max frequency for clock +'\\([^']+\\)': +\\([0-9.]+\\) MHz +(\\(PASS\\|FAIL\\) at +\\([0-9.]+\\)" in
+     (try while true do
+        let l = input_line ic in
+        (try
+           ignore (Str.search_forward re l 0);
+           let c = Str.matched_group 1 l in
+           let got = float_of_string (Str.matched_group 2 l) in
+           let fail = Str.matched_group 3 l = "FAIL" in
+           let tgt = float_of_string (Str.matched_group 4 l) in
+           if tgt > 0.0 then Hashtbl.replace ratio c (got /. tgt, fail)
+         with Not_found -> ())
+      done with End_of_file -> ());
+     close_in ic
+   with _ -> ());
+  let score c t =
+    match Hashtbl.find_opt ratio c with
+    | Some (r, fail) -> (if fail then 0 else 1), r          (* fails first, tightest first *)
+    | None -> 2, 1000.0 /. (t +. 1.0) in                    (* unranked: fall back to length *)
+  Hashtbl.fold (fun c (h, t) acc ->
+      let sc = score c t in
+      match acc with
+      | Some (_, _, _, bsc) when bsc <= sc -> acc
+      | _ -> Some (c, h, t, sc)) per_clock None
+  |> Option.map (fun (c, h, t, _) -> (c, h, t))
 
 (* Pre-light the unroutable nets from the route log that produced THIS JSON.
    A build dir accumulates route*.log from earlier experiments (route_sr.log,
@@ -2669,18 +2780,61 @@ let do_open_nextpnr_json () =
     try
       let layout = parse_nextpnr_json path in
       let skip_log = load_skips_into layout.l_hi path in
+      (* Same route log the skips came from carries the critical path. *)
+      let layout =
+        match skip_log with
+        | None -> layout
+        | Some f ->
+          (match load_crit_path (Filename.concat (Filename.dirname path) f) with
+           | Some (clk, hops, tot) ->
+             { layout with l_crit = hops; l_crit_clk = clk; l_crit_ns = tot }
+           | None -> layout) in
       if layout.l_components = [] then
         info_dialog
           "No placed cells (NEXTPNR_BEL) in this JSON.\n\
            Open a placed/routed nextpnr JSON — e.g. arp_stamped.json or\n\
            *_routed.json — not the pre-placement synth output."
       else begin
-        open_layout_window layout;
+        (* Reuse the existing critical-path overlay rather than drawing a second
+           one: it already resolves hops through inst_index and reports the
+           match rate, which is the thing that silently breaks when two name
+           spaces meet.  Arrival is cumulative so the hop labels read like the
+           nextpnr report. *)
+        let critical_path =
+          if layout.l_crit = [] then None
+          else begin
+            let acc = ref 0.0 in
+            let hops =
+              (match layout.l_crit with
+               | h :: _ -> [ { t_inst = h.ch_src; t_cell = ""; t_arrival = 0.0 } ]
+               | [] -> [])
+              @ List.map (fun (c : chop) ->
+                  acc := !acc +. c.ch_ns;
+                  { t_inst = c.ch_dst; t_cell = ""; t_arrival = !acc })
+                layout.l_crit in
+            Some { tp_startpoint = (match layout.l_crit with
+                                    | h :: _ -> h.ch_src | [] -> "");
+                   tp_endpoint   = (match List.rev layout.l_crit with
+                                    | h :: _ -> h.ch_dst | [] -> "");
+                   tp_hops       = hops;
+                   tp_text       =
+                     Printf.sprintf "nextpnr critical path, clock %s: %.1f ns\n%s"
+                       layout.l_crit_clk layout.l_crit_ns
+                       (String.concat "\n"
+                          (List.map (fun (c : chop) ->
+                               Printf.sprintf "  %6.2f ns  %s -> %s   (%s)"
+                                 c.ch_ns c.ch_src c.ch_dst c.ch_net)
+                             layout.l_crit)) }
+          end in
+        open_layout_window ?critical_path layout;
         set_status (Printf.sprintf
-          "nextpnr JSON: %d cells · %d nets · %d skip-net(s) highlighted from %s"
+          "nextpnr JSON: %d cells · %d nets · %d skip-net(s) from %s%s"
           (List.length layout.l_components) (List.length layout.l_nets)
           (Hashtbl.length layout.l_hi)
-          (match skip_log with Some f -> f | None -> "(no route log found)"))
+          (match skip_log with Some f -> f | None -> "(no route log found)")
+          (if layout.l_crit = [] then "  ·  no critical path in the log"
+           else Printf.sprintf "  ·  crit path %s = %.1f ns over %d hop(s)"
+                  layout.l_crit_clk layout.l_crit_ns (List.length layout.l_crit)))
       end
     with e ->
       error_dialog (Printf.sprintf "Failed to read nextpnr JSON:\n%s"
