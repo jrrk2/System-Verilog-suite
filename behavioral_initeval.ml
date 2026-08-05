@@ -26,6 +26,22 @@ let burn () =
 
 let mask_w w v = Z.logand v (Z.sub (Z.shift_left Z.one w) Z.one)
 
+(* OUT-OF-RANGE SHIFTS AND BIT SELECTS.
+ *
+ * Z.shift_right/shift_left reject a negative count outright, so a single
+ * out-of-range index anywhere in an initial block aborts the whole evaluation
+ * -- rgmii_lfsr died with `Z.shift_right: count argument must be positive` and
+ * took its CRC mask tables with it.  Verilog does not fault here: a shift's
+ * count is unsigned, so a "negative" one is astronomically large and the
+ * result is 0, and an out-of-range bit select reads x (0 in a 2-state
+ * evaluator).  Both agree on 0, which is also what the array-index path a few
+ * lines below already does.  Cap the magnitude too, so a wild count cannot
+ * turn into a multi-gigabyte Z value. *)
+let shift_cap = 1 lsl 20
+let safe_shr v n = if n < 0 || n > shift_cap then Z.zero else Z.shift_right v n
+let safe_shl v n = if n < 0 || n > shift_cap then Z.zero else Z.shift_left v n
+let to_shift z = try Z.to_int z with _ -> shift_cap + 1
+
 type env = {
   widths  : (string, int) Hashtbl.t;                (* scalar widths *)
   arrays  : (string, Z.t array) Hashtbl.t;          (* array name -> elems *)
@@ -60,16 +76,34 @@ let rec eval env (e : bexpr) : Z.t =
       (match Hashtbl.find_opt env.scalars nm with
        | Some v -> v
        | None -> Z.zero)
-  | BBinOp { op; lhs; rhs; _ } ->
+  | BBinOp { op; lhs; rhs; result_type } ->
       let a = eval env lhs and b = eval env rhs in
       let bool z = if z then Z.one else Z.zero in
+      (* VERILOG ARITHMETIC IS MODULO THE RESULT WIDTH, and the result width is
+         the expression's own, not 63-bit OCaml or unbounded Z.  Verilator
+         constant-folds `m[i][32-j-1]` into FIVE-BIT arithmetic -- the tree is
+         literally SUB(NEGATE(j[4:0]), 5'h1) -- so at j=0 the index is
+         (-0)-1 = -1, which is 31 mod 32 and exactly the bit meant.  Evaluating
+         that over Z gave a genuine -1: it used to raise
+         `Z.shift_right: count argument must be positive` and, once that was
+         guarded, silently read bit "-1" as 0.  Every reversed row of
+         rgmii_lfsr's CRC mask matrix then lost bit 0 (17 of 32 rows wrong) --
+         a WRONG CRC, which is worse than no CRC because it looks alive.
+         BUnOp BNeg already masks; do the same for the operators that can leave
+         the range, using the dtype-derived result width rather than width_of's
+         inference.  Bitwise ops of in-range values stay in range, and the
+         comparisons yield 0/1, so neither needs it. *)
+      let wrap v = match result_type with
+        | BInt { width = w; _ } when w > 0 && w <= 65536 -> mask_w w v
+        | _ -> v in
       (match op with
-       | BAdd -> Z.add a b | BSub -> Z.sub a b | BMul -> Z.mul a b
+       | BAdd -> wrap (Z.add a b) | BSub -> wrap (Z.sub a b)
+       | BMul -> wrap (Z.mul a b)
        | BDiv -> if Z.equal b Z.zero then Z.zero else Z.div a b
        | BMod -> if Z.equal b Z.zero then Z.zero else Z.rem a b
        | BAnd -> Z.logand a b | BOr -> Z.logor a b | BXor -> Z.logxor a b
-       | BShl -> Z.shift_left a (Z.to_int b)
-       | BShr | BAshr -> Z.shift_right a (Z.to_int b)
+       | BShl -> wrap (safe_shl a (to_shift b))
+       | BShr | BAshr -> safe_shr a (to_shift b)
        | BEq -> bool (Z.equal a b) | BNe -> bool (not (Z.equal a b))
        | BLt -> bool (Z.lt a b) | BLe -> bool (Z.leq a b)
        | BGt -> bool (Z.gt a b) | BGe -> bool (Z.geq a b))
@@ -89,12 +123,12 @@ let rec eval env (e : bexpr) : Z.t =
        | None ->
            (* bit-select of a scalar *)
            let v = eval env (BVar a) in
-           Z.of_int (Z.to_int (Z.logand (Z.shift_right v i) Z.one)))
+           Z.of_int (Z.to_int (Z.logand (safe_shr v i) Z.one)))
   | BSelect _ -> raise (Unsupported "BSelect on non-var")
   | BSlice { signal; msb; lsb } ->
       let lo = min msb lsb and hi = max msb lsb in
       let v = eval env signal in
-      mask_w (hi - lo + 1) (Z.shift_right v lo)
+      mask_w (hi - lo + 1) (safe_shr v lo)
   | BConcat es ->
       (* MSB-first *)
       List.fold_left (fun acc e ->
@@ -232,13 +266,20 @@ let eval_module (m : bmodule) : bmodule =
       List.iter (fun p -> List.iter (exec env) (proc_body p)) inits
     with
     | () ->
-        if Sys.getenv_opt "SVS_INITEVAL_DEBUG" <> None then
-          Hashtbl.iter (fun a () ->
-            let arr = Hashtbl.find env.arrays a in
-            Printf.eprintf "[initeval] %s.%s[0..3] = %s\n%!" m.name a
-              (String.concat " " (List.map (Z.format "%x")
-                 (Array.to_list (Array.sub arr 0 (min 4 (Array.length arr)))))))
-            env.awrites;
+        (* SVS_INITEVAL_DEBUG=<n> dumps the first n elements (default 4) --
+           four is enough to see a table is populated, nowhere near enough to
+           diff two front ends against each other. *)
+        (match Sys.getenv_opt "SVS_INITEVAL_DEBUG" with
+         | None -> ()
+         | Some s ->
+           let n = match int_of_string_opt s with Some n when n > 0 -> n | _ -> 4 in
+           Hashtbl.iter (fun a () ->
+             let arr = Hashtbl.find env.arrays a in
+             Printf.eprintf "[initeval] %s.%s[0..%d] = %s\n%!" m.name a
+               (min n (Array.length arr) - 1)
+               (String.concat " " (List.map (Z.format "%x")
+                  (Array.to_list (Array.sub arr 0 (min n (Array.length arr)))))))
+             env.awrites);
         (* substitute constant array reads; count dynamic leftovers *)
         let dynamic = ref [] in
         let rec sub e =
@@ -343,6 +384,8 @@ let lower_const_comb_memwrites (m : bmodule) : bmodule =
     | BArray _ -> Hashtbl.replace is_arr s.name ()
     | _ -> ()) m.signals;
   let exception Bail in
+  let bail_why = ref "" in
+  let bail w = bail_why := w; raise Bail in
   let try_lower body =
     (* store: vec -> per-bit symbolic exprs (None = untouched) *)
     let store : (string, bexpr option array) Hashtbl.t = Hashtbl.create 4 in
@@ -350,7 +393,7 @@ let lower_const_comb_memwrites (m : bmodule) : bmodule =
       match Hashtbl.find_opt store v with
       | Some a -> a
       | None ->
-          let w = try Hashtbl.find vec_w v with Not_found -> raise Bail in
+          let w = try Hashtbl.find vec_w v with Not_found -> bail ("slot " ^ v) in
           let a = Array.make w None in
           Hashtbl.add store v a; a in
     let rec subst e =
@@ -364,7 +407,7 @@ let lower_const_comb_memwrites (m : bmodule) : bmodule =
              | Some se -> se
              | None -> BSlice { signal = BVar v; msb = i; lsb = i })
           else BConst { value = Z.zero; width = 1 }
-      | BVar v when Hashtbl.mem store v -> raise Bail  (* whole-vec read *)
+      | BVar v when Hashtbl.mem store v -> bail ("whole-vec read " ^ v)
       | BBinOp r -> BBinOp { r with lhs = subst r.lhs; rhs = subst r.rhs }
       | BUnOp r -> BUnOp { r with operand = subst r.operand }
       | BSelect { array; index } -> BSelect { array = subst array; index = subst index }
@@ -388,8 +431,8 @@ let lower_const_comb_memwrites (m : bmodule) : bmodule =
                  | BAdd -> Z.add a b | BSub -> Z.sub a b | BMul -> Z.mul a b
                  | BDiv -> if Z.equal b Z.zero then Z.zero else Z.div a b
                  | BMod -> if Z.equal b Z.zero then Z.zero else Z.rem a b
-                 | BShl -> Z.shift_left a (Z.to_int b)
-                 | BShr | BAshr -> Z.shift_right a (Z.to_int b)
+                 | BShl -> safe_shl a (to_shift b)
+                 | BShr | BAshr -> safe_shr a (to_shift b)
                  | BEq -> bool (Z.equal a b) | BNe -> bool (not (Z.equal a b))
                  | BLt -> bool (Z.lt a b) | BLe -> bool (Z.leq a b)
                  | BGt -> bool (Z.gt a b) | BGe -> bool (Z.geq a b))
@@ -399,7 +442,7 @@ let lower_const_comb_memwrites (m : bmodule) : bmodule =
       | BSlice { signal; msb; lsb } ->
           let lo = min msb lsb and hi = max msb lsb in
           Option.map (fun v ->
-            Z.logand (Z.shift_right v lo)
+            Z.logand (safe_shr v lo)
               (Z.sub (Z.shift_left Z.one (hi - lo + 1)) Z.one))
             (const_of signal)
       | _ -> None in
@@ -414,32 +457,141 @@ let lower_const_comb_memwrites (m : bmodule) : bmodule =
                let i = Z.to_int zi in
                if i >= 0 && i < Array.length a then
                  a.(i) <- Some (subst rhs)
-           | None -> raise Bail)
+           | None -> bail "mem_write dynamic index")
+      (* Same per-bit accumulation, spelled differently by the verilator front
+         end.  A `state_out_reg[i] = ...` LHS is a Sel on a VECTOR, which
+         verilator_to_behavioral lowers to @slice_write (constant index) or
+         @part_sel_write_up (dynamic index, constant after unrolling), never to
+         @mem_write -- verible's spelling.  Accepting only @mem_write bailed on
+         the whole process, the blocking read-modify-write chain was left
+         unthreaded, and only the LAST write to each bit survived: state_out
+         came out a CONSTANT 3 whatever the inputs, exactly the failure this
+         pass was written to prevent. *)
+      | BCallStmt { func = ("@slice_write" | "@part_sel_write_up") as func;
+                    args = [BVar v; p1; p2; rhs] } when Hashtbl.mem vec_w v ->
+          (match const_of p1, const_of p2 with
+           | Some z1, Some z2 ->
+               let i1 = Z.to_int z1 and i2 = Z.to_int z2 in
+               let lo, hi =
+                 if func = "@slice_write" then (min i1 i2, max i1 i2)
+                 else (i1, i1 + i2 - 1)   (* base, width *) in
+               saw_memwrite := true;
+               (* substitute BEFORE updating any slot: the rhs reads the
+                  pre-assignment values of this same vector *)
+               let r = subst rhs in
+               let a = slot v in
+               for b = lo to hi do
+                 if b >= 0 && b < Array.length a then
+                   a.(b) <- Some (if hi = lo then r
+                                  else BSlice { signal = r;
+                                                msb = b - lo; lsb = b - lo })
+               done
+           | _ -> bail (func ^ " non-const bounds"))
       | BCallStmt { func; _ } when String.length func > 0 && func.[0] = '$' -> ()
-      | BAssign _ -> raise Bail   (* mixed writes: leave the process alone *)
+      | BAssign { lhs; _ } -> bail ("BAssign " ^ lhs)
       | BIf { condition; then_stmts; else_stmts } ->
           (match const_of (subst condition) with
            | Some c ->
                if Z.equal c Z.zero then List.iter go else_stmts
                else List.iter go then_stmts
-           | None -> raise Bail)
+           | None -> bail "if with non-const condition")
       | BBlock ss -> List.iter go ss
-      | _ -> raise Bail in
+      | other -> bail ("stmt " ^ (match other with
+          | BCallStmt { func; _ } -> "call " ^ func
+          | BWhile _ -> "while" | BFor _ -> "for" | BCase _ -> "case"
+          | _ -> "?")) in
     List.iter go body;
-    if not !saw_memwrite || Hashtbl.length store = 0 then raise Bail;
+    if not !saw_memwrite || Hashtbl.length store = 0 then bail "no per-bit writes";
+    (* A process need not drive the WHOLE vector.  Verilator splits `always @*`
+       blocks per driven bit (V3Split), so rgmii_lfsr's output loop arrives as
+       32 processes each accumulating ONE bit of state_out -- demanding all 32
+       bailed on every one of them, and the read-modify-write chain went
+       unthreaded exactly as if the pass did not exist.  Whole-vector coverage
+       still collapses to a single BAssign (the verible shape); a partial one
+       emits a constant-bounds @slice_write per driven bit, which keeps the
+       untouched bits untouched instead of feeding them back into themselves. *)
     Hashtbl.fold (fun v a acc ->
       let bits = Array.to_list a in
-      if List.exists (fun b -> b = None) bits then raise Bail;
-      let msb_first = List.rev_map (function Some e -> e | None -> assert false) bits in
-      BAssign { lhs = v; rhs = BConcat msb_first } :: acc) store []
+      if List.for_all (fun b -> b <> None) bits then
+        let msb_first = List.rev_map (function Some e -> e | None -> assert false) bits in
+        BAssign { lhs = v; rhs = BConcat msb_first } :: acc
+      else begin
+        let stmts = ref acc in
+        Array.iteri (fun i b -> match b with
+          | None -> ()
+          | Some e ->
+            let ix = BConst { value = Z.of_int i; width = 32 } in
+            stmts := BCallStmt { func = "@slice_write";
+                                 args = [BVar v; ix; ix; e] } :: !stmts) a;
+        !stmts
+      end) store []
   in
-  let processes = List.map (fun p ->
-    match p with
+  (* Which vectors does a body write? *)
+  let rec writes acc s = match s with
+    | BCallStmt { func = ("@mem_write" | "@slice_write" | "@part_sel_write_up");
+                  args = BVar v :: _ } -> if List.mem v acc then acc else v :: acc
+    | BAssign { lhs; _ } -> if List.mem lhs acc then acc else lhs :: acc
+    | BIf r -> List.fold_left writes (List.fold_left writes acc r.then_stmts) r.else_stmts
+    | BBlock ss -> List.fold_left writes acc ss
+    | _ -> acc in
+  let sole_target = function
     | BCombinational r ->
-        (match try_lower r.body with
-         | stmts -> BCombinational { r with body = stmts }
-         | exception _ -> p)
-    | _ -> p) m.processes in
+        (match List.fold_left writes [] r.body with
+         | [v] when Hashtbl.mem vec_w v -> Some v
+         | _ -> None)
+    | _ -> None in
+  (* MERGE VERILATOR'S PER-BIT SPLIT PROCESSES.
+     Verilator's V3Split breaks `always @*` into one process per driven bit, so
+     rgmii_lfsr's output loop arrives as 32 processes each accumulating a
+     single bit of state_out.  Lowered separately they each cover 1/32 of the
+     vector, and a partial result has to be written back with @slice_write --
+     which no downstream pass threads through a COMBINATIONAL process, so the
+     accumulation was lost all over again and state_out stayed a constant.
+     Merging the group first restores the one-process/whole-vector shape the
+     verible front end produces, and the existing whole-vector BAssign path
+     then applies unchanged.  Only groups writing exactly ONE shared vector are
+     merged, and only when the merged body lowers cleanly; otherwise every
+     member is left exactly as it was. *)
+  let merged : (string, bstmt list) Hashtbl.t = Hashtbl.create 4 in
+  let groups : (string, int) Hashtbl.t = Hashtbl.create 4 in
+  List.iter (fun p -> match sole_target p with
+    | Some v -> Hashtbl.replace groups v (1 + (try Hashtbl.find groups v with Not_found -> 0))
+    | None -> ()) m.processes;
+  Hashtbl.iter (fun v n ->
+    if n > 1 then begin
+      let body = List.concat_map (fun p ->
+        if sole_target p = Some v then (match p with BCombinational r -> r.body | _ -> [])
+        else []) m.processes in
+      match try_lower body with
+      | stmts -> Hashtbl.replace merged v stmts
+      | exception _ ->
+        if Sys.getenv_opt "SVS_INITEVAL_DEBUG" <> None then
+          Printf.eprintf "[initeval] %s: merged group for %s NOT lowered (%s)\n%!"
+            m.name v !bail_why
+    end) groups;
+  let emitted : (string, unit) Hashtbl.t = Hashtbl.create 4 in
+  let processes = List.filter_map (fun p ->
+    match sole_target p with
+    | Some v when Hashtbl.mem merged v ->
+        if Hashtbl.mem emitted v then None      (* folded into the first one *)
+        else begin
+          Hashtbl.replace emitted v ();
+          match p with
+          | BCombinational r ->
+              Some (BCombinational { r with body = Hashtbl.find merged v })
+          | other -> Some other
+        end
+    | _ ->
+      Some (match p with
+        | BCombinational r ->
+            (match try_lower r.body with
+             | stmts -> BCombinational { r with body = stmts }
+             | exception _ ->
+               if Sys.getenv_opt "SVS_INITEVAL_DEBUG" <> None then
+                 Printf.eprintf "[initeval] %s: comb process %s NOT lowered (%s)\n%!"
+                   m.name r.name !bail_why;
+               p)
+        | _ -> p)) m.processes in
   { m with processes }
 
 let eval_program (p : bprogram) : bprogram =
