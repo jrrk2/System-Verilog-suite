@@ -2244,7 +2244,18 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
                 Hashtbl.replace partial base ((lsb, msb, wire) :: prev);
                 box_out_nets := base :: !box_out_nets;
                 Some (port, wire)
-            | BConcat parts ->
+            | BConcat parts0 ->
+                (* Verilator's frontend nests concats -- a CARRY4 CO output
+                   arrives as {n_1, {n_2, n_3}} where the verible path gives a
+                   flat {n_1, n_2, n_3}.  Nesting is semantically identical
+                   (concatenation is associative), so flatten before the
+                   element check rather than rejecting it; otherwise the two
+                   front ends disagree on a design neither has any trouble
+                   with, and the module fails to emit. *)
+                let rec flatten e = match e with
+                  | BConcat ps -> List.concat_map flatten ps
+                  | x -> [ x ] in
+                let parts = List.concat_map flatten parts0 in
                 (* A struct-typed instance OUTPUT scalarized into per-field
                    nets: `{f1,f2,f3}` is MSB-first (f1 = high bits).  How a
                    struct-typed output like ibex id_stage's exc_cause_o
@@ -2923,6 +2934,21 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
               | Some (w, b, digits) when w > 0 && w <= 4096 ->
                   let digits =
                     String.concat "" (String.split_on_char '_' digits) in
+                  (* SIGNED sized literals put an `s` BEFORE the base letter:
+                     `32'sh10`, `32'sd16`.  Scanning `%d'%c%s` then reads the
+                     base as 's' and the whole thing falls through unexpanded
+                     and reaches Vivado QUOTED.  That is how the verilator
+                     front end's MMCM CLKOUT1_DIVIDE = 32'sh10 arrived as the
+                     string "32'sh10": Vivado could not read 16 out of it, took
+                     the default divide of 1, and derived a 1.000 ns period for
+                     the PCS userclk -- so a design that closes timing was
+                     reported at WNS -0.771 against a 1 GHz clock that does not
+                     exist.  Step past the sign marker; signedness itself does
+                     not change the bit pattern. *)
+                  let b, digits =
+                    if (b = 's' || b = 'S') && digits <> ""
+                    then digits.[0], String.sub digits 1 (String.length digits - 1)
+                    else b, digits in
                   let base = match Char.lowercase_ascii b with
                     | 'b' -> Some 2 | 'o' -> Some 8
                     | 'h' -> Some 16 | 'd' -> Some 10 | _ -> None in
