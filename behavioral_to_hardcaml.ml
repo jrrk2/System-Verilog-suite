@@ -365,7 +365,22 @@ let rec expr_to_signal ctx = function
         if sw = common_w then s
         else if sw > common_w then Signal.select s (common_w - 1) 0
         else Signal.uresize s common_w in
-      let s_lhs = pad s_lhs0 and s_rhs = pad s_rhs0 in
+      (* A SHIFT'S RHS IS A COUNT, NOT AN OPERAND.  Width-coercing it to the
+         other operand's width TRUNCATES it: `(a & 4'1) << 32'3` has a 1-bit
+         lhs (the const-narrowing rule above computes `a & 4'1` at a's width),
+         so the count 3 truncated to one bit became 1 and the bit landed at
+         position 1 instead of 3.  That is the whole of the VHDL per-bit vector
+         bug -- `q(3) <= a; q(2) <= '0'; q(1) <= '0'; q(0) <= '0';` lowers to a
+         read-modify-write per bit, the bit-3 datum was shifted to position 1,
+         and the subsequent `'0'` writes then masked it away, so q read as a
+         CONSTANT ZERO with the input unused.  Vivado's write_vhdl emits vectors
+         built bit-by-bit as a matter of course, so this silently flattened any
+         such module.  Widening never lost anything, and shift lowering already
+         handles a wide count (Signal.to_int for a constant, log_shift_clamped
+         otherwise), so leave the count alone. *)
+      let is_shift = match op with BShl | BShr | BAshr -> true | _ -> false in
+      let s_lhs = pad s_lhs0
+      and s_rhs = if is_shift then s_rhs0 else pad s_rhs0 in
       let result_width = width_of_btype result_type in
       (* Optional dispatch to Hardcaml_circuits prefix-sum / Wallace
          trees when LIB_MAP_ADDER / LIB_MAP_MUL is set.  Default falls
@@ -1266,6 +1281,10 @@ let thread_body ?(blocking_vars = [])
              (coalesce_comb_mem_writes / lower_mem_writes_in_seq); only
              packed-vector-style writes fold here. *)
           let set_field name lsb_expr fw data =
+            if Sys.getenv_opt "SVS_DEBUG_SETFIELD" <> None then
+              Printf.eprintf "[set_field] %s lsb=%s fw=%d w=%s\n%!"
+                name (Behavioral_ir.string_of_bexpr lsb_expr) fw
+                (match width_of name with Some w -> string_of_int w | None -> "?");
             match width_of name with
             | None -> None
             | Some w when fw >= 1 && fw <= w ->
@@ -1303,8 +1322,12 @@ let thread_body ?(blocking_vars = [])
                                       result_type = ty } in
                 let data_sh = BBinOp { op = BShl; lhs = data_m;
                                        rhs = lsb_expr; result_type = ty } in
-                Some (BBinOp { op = BOr; lhs = cleared; rhs = data_sh;
-                               result_type = ty })
+                let res = BBinOp { op = BOr; lhs = cleared; rhs = data_sh;
+                                   result_type = ty } in
+                if Sys.getenv_opt "SVS_DEBUG_SETFIELD" <> None then
+                  Printf.eprintf "[set_field] -> %s\n%!"
+                    (Behavioral_ir.string_of_bexpr res);
+                Some res
             | _ -> None in
           let u32 = BInt { width = 32; signed = Unsigned } in
           let folded =
