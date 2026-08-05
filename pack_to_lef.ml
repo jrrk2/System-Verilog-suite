@@ -680,54 +680,152 @@ let pack (m : bmodule) : result =
         | None -> ())
     m.instances;
 
-  (* 3a. leftover LUTs -> FILL THE SLICE.  Every un-absorbed LUT used to become
-        its own SLICE_LOGIC holding a single A6LUT.  Measured on ethmin that put
-        3064 of 3486 LUT-bearing slices at exactly ONE LUT (mean 1.25/slice
-        against Vivado's 3.65 on the same netlist) and spread the design over
-        4692 slices where Vivado used 1669.  That 2.8x spread is what puts
-        100-140 tile hops on the critical path and holds eth_clk at 68-92 MHz
-        against a 125 MHz target -- packing, not the router, is the limit.
+  (* 3a. leftover LUTs -> FILL THE SLICE, fracturing where legal.
 
-        Four LUT6 may share a slice unconditionally: a SLICE has 24 independent
-        input pins (A1-A6 .. D1-D6) and four independent outputs, so unlike FFs
-        (which share one CLK/CE/SR and must be grouped by control set) LUTs
-        impose NO compatibility constraint.  Group in netlist order, which keeps
-        logically related LUTs -- yosys emits them near their consumers -- in the
-        same slice rather than scattering them.
+        Every un-absorbed LUT used to become its own SLICE_LOGIC holding a
+        single A6LUT.  Measured on ethmin that put 3064 of 3486 LUT-bearing
+        slices at exactly ONE LUT (mean 1.25/slice against Vivado's 3.65 on the
+        SAME netlist) and spread the design over 4692 slices where Vivado used
+        1669.  That 2.8x spread is what puts 100-140 tile hops on the critical
+        path and holds eth_clk far below its 125 MHz target -- packing, not the
+        router, is the limit.
 
-        NOT applied to LUTs that hard_map/slicem_map claim (SRL, distributed
-        RAM): those need a specific site type, and stealing them into a generic
-        SLICE_LOGIC would place them illegally. *)
+        Two levels:
+
+        (a) four LUT6 per slice.  Unconditional: a SLICE has 24 independent
+            input pins (A1-A6 .. D1-D6) and four independent outputs, so unlike
+            FFs (one shared CLK/CE/SR, hence control-set grouping) LUTs impose
+            no compatibility constraint at all.
+
+        (b) FRACTURING: a LUT6 site holds TWO luts -- O6 and O5 -- but they
+            share physical pins A1-A5, so a pair is legal only if BOTH use <=5
+            inputs AND their input sets unify to <=5 distinct nets.  Arbitrary
+            pairs do not qualify.  Greedy, pairing only LUTs that already share
+            a signal (indexed by net, so this stays near-linear) and preferring
+            the tightest union: 1067 pairs out of 3076 candidates on ethmin,
+            taking 4675 LUT6 sites down to 3608.
+
+        Order follows netlist order, which keeps logically related LUTs -- yosys
+        emits them near their consumers -- in the same slice.  Cells that
+        hard_map/slicem_map claim (SRL, distributed RAM) are left alone: they
+        need a specific site type and would be placed illegally here.
+
+        (b) IS OFF BY DEFAULT -- it MEASURED WORSE.  On the golden ethmin netlist
+        it paired 278 sites (1510 LUTs -> 1232) and the result was:
+
+                          packing only   + fracturing
+            SKIPS                    0            342
+            eth_clk           120.35 MHz     102.28 MHz
+
+        The failures are ordinary FF->LUT arcs (BQ -> C1, AQ -> ...), not site
+        conflicts, so the pairing itself is legal: concentrating the same logic
+        into fewer slices simply asks more of each switchbox than the
+        interconnect can feed.  Density and routability trade off, and 4 LUTs
+        per slice is where this router stops winning -- which is plausibly why
+        Vivado also settles at 3.65 rather than pushing toward 8.
+
+        Set TOPO_LUT_FRACTURE=1 to re-enable (worth retrying with a per-region
+        cap, or only for LUTs whose sinks are already in the same slice). *)
+  let frac_on = (try Sys.getenv "TOPO_LUT_FRACTURE" = "1" with Not_found -> false) in
+  let lut_items =
+    List.filter_map (fun (i : binstance) ->
+        if Hashtbl.mem absorbed i.inst_name
+           || i.module_name = "GND" || i.module_name = "VCC"
+           || hard_map i.module_name <> None || slicem_map i.module_name <> None
+        then None
+        else
+          let u = String.uppercase_ascii i.module_name in
+          if starts_with u "LUT" || u = "INV" then begin
+            let ports = List.filter_map (fun (p, arr) ->
+                if Array.length arr > 0 then Some (p, arr.(0)) else None)
+                (Hashtbl.find inst_ports i.inst_name) in
+            let ins = List.sort_uniq compare
+                (List.filter_map (fun (p, nk) ->
+                     if String.uppercase_ascii p = "O" then None else Some nk) ports) in
+            Some (i.inst_name, ports, ins)
+          end else None)
+      m.instances in
+
+  let ports_of = Hashtbl.create 1024 and ins_of = Hashtbl.create 1024 in
+  List.iter (fun (n, ports, ins) ->
+      Hashtbl.replace ports_of n ports; Hashtbl.replace ins_of n ins) lut_items;
+
+  (* greedy fracture pairing *)
+  let partner = Hashtbl.create 1024 and taken = Hashtbl.create 1024 in
+  let npair = ref 0 in
+  if frac_on then begin
+    let by_net = Hashtbl.create 4096 in
+    List.iter (fun (n, _, ins) ->
+        if List.length ins <= 5 then
+          List.iter (fun k ->
+              Hashtbl.replace by_net k (n :: (try Hashtbl.find by_net k with Not_found -> [])))
+            ins) lut_items;
+    (* widest first: a 5-input LUT has the fewest legal partners, so let it
+       choose before the 1- and 2-input ones soak up the sharing. *)
+    let order = List.sort (fun (_, _, a) (_, _, b) ->
+        compare (List.length b) (List.length a)) lut_items in
+    List.iter (fun (n, _, ins) ->
+        if List.length ins <= 5 && not (Hashtbl.mem taken n) then begin
+          let best = ref None in
+          List.iter (fun k ->
+              List.iter (fun o ->
+                  if o <> n && not (Hashtbl.mem taken o) then
+                    match Hashtbl.find_opt ins_of o with
+                    | Some oi when List.length oi <= 5 ->
+                      let lu = List.length (List.sort_uniq compare (ins @ oi)) in
+                      if lu <= 5 then
+                        (match !best with
+                         | Some (_, bl) when bl <= lu -> ()
+                         | _ -> best := Some (o, lu))
+                    | _ -> ())
+                (try Hashtbl.find by_net k with Not_found -> []))
+            ins;
+          match !best with
+          | Some (o, _) ->
+            Hashtbl.replace taken n (); Hashtbl.replace taken o ();
+            Hashtbl.replace partner n o; incr npair
+          | None -> ()
+        end) order
+  end;
+
+  (* emit: each unit (a fractured pair or a lone LUT) takes one lane *)
+  let emitted = Hashtbl.create 1024 in
   let lut_group = ref [] and lut_cnt = ref 0 and lut_slice = ref 0 in
   let flush_luts () =
     if !lut_group <> [] then begin
       let items = List.rev !lut_group in
-      let bels = List.mapi (fun k (nm, _) -> (nm, lane_letter k ^ "6LUT")) items in
-      let conns =
-        List.concat (List.mapi (fun k (_, ports) ->
-            let l = lane_letter k in
-            List.map (fun (p, nk) -> (l ^ p, nk)) ports) items) in
+      let bels = List.concat (List.mapi (fun k (n, _, second) ->
+          let l = lane_letter k in
+          (n, l ^ "6LUT") ::
+          (match second with Some (o, _) -> [ (o, l ^ "5LUT") ] | None -> [])) items) in
+      let conns = List.concat (List.mapi (fun k (_, ports, second) ->
+          let l = lane_letter k in
+          List.map (fun (p, nk) -> (l ^ p, nk)) ports
+          @ (match second with
+             | Some (_, oports) -> List.map (fun (p, nk) -> (l ^ "5" ^ p, nk)) oports
+             | None -> [])) items) in
       add ~bels (Printf.sprintf "lut_slice_%d" !lut_slice) "SLICE_LOGIC" conns;
       incr lut_slice; lut_group := []; lut_cnt := 0
     end in
-  List.iter (fun (i : binstance) ->
-      if not (Hashtbl.mem absorbed i.inst_name)
-         && i.module_name <> "GND" && i.module_name <> "VCC"
-         && hard_map i.module_name = None && slicem_map i.module_name = None then begin
-        let u = String.uppercase_ascii i.module_name in
-        if starts_with u "LUT" || u = "INV" then begin
-          let ports = List.filter_map (fun (p, arr) ->
-              if Array.length arr > 0 then Some (p, arr.(0)) else None)
-              (Hashtbl.find inst_ports i.inst_name) in
-          lut_group := (i.inst_name, ports) :: !lut_group;
-          incr lut_cnt;
-          Hashtbl.replace absorbed i.inst_name ();
-          bump "LUT packed into shared slice";
-          if !lut_cnt >= 4 then flush_luts ()
-        end
-      end)
-    m.instances;
+  List.iter (fun (n, ports, _) ->
+      if not (Hashtbl.mem emitted n) then begin
+        Hashtbl.replace emitted n ();
+        let second =
+          match Hashtbl.find_opt partner n with
+          | Some o when not (Hashtbl.mem emitted o) ->
+            Hashtbl.replace emitted o ();
+            Hashtbl.replace absorbed o (); bump "LUT fractured (O5)";
+            Some (o, Hashtbl.find ports_of o)
+          | _ -> None in
+        Hashtbl.replace absorbed n (); bump "LUT packed into shared slice";
+        lut_group := (n, ports, second) :: !lut_group;
+        incr lut_cnt;
+        if !lut_cnt >= 4 then flush_luts ()
+      end) lut_items;
   flush_luts ();
+  if !npair > 0 then
+    Printf.printf "lut-fracture: %d pair(s) share a LUT6 site (%d LUTs -> %d sites)\n"
+      !npair (List.length lut_items) (List.length lut_items - !npair);
 
   (* 3. leftover LUT / FF -> SLICE_LOGIC / SLICE_FF ------------------------- *)
   List.iter (fun (i : binstance) ->
