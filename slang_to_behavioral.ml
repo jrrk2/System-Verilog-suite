@@ -357,13 +357,44 @@ let rec expr_to_bexpr j =
       in
       BReplicate { count; value }
   | "ElementSelect" ->
-      let arr = match assoc "value" j with
+      let vj = assoc "value" j in
+      let arr = match vj with
         | Some j' -> expr_to_bexpr j'
         | None -> BConst { value = Z.zero; width = 1 } in
       let idx = match assoc "selector" j with
         | Some j' -> expr_to_bexpr j'
         | None -> BConst { value = Z.zero; width = 1 } in
-      BSelect { array = arr; index = idx }
+      (* A BIT-SELECT OF A PACKED VECTOR IS A SLICE, NOT AN ELEMENT SELECT.
+         slang spells `d[0]` on `logic [3:0] d` the same way it spells an
+         unpacked array element, so emitting BSelect for both gave
+         `@mem_write(q, 32'3, d[32'0])` where verible gives
+         `@mem_write(q, 32'3, d[0:0])` -- the same meaning in a shape the Z3
+         path does not treat alike, so a module whose only unusual feature was
+         a bit-by-bit driven vector mitered DIFFER against every other front
+         end while agreeing with all of them on the register count.  slang's
+         JSON carries the operand type, and an unpacked dimension shows up as
+         `$[`, so the two cases are distinguishable.  Only a CONSTANT index
+         becomes a BSlice (its bounds are compile-time); a dynamic bit-select
+         of a vector stays a BSelect, which the scalar path handles. *)
+      let packed_operand =
+        match vj with
+        | Some j' ->
+            (match assoc "type" j' with
+             | Some (`String ty) ->
+                 (* `logic[3:0]` packed; `logic[7:0]$[0:3]` has an unpacked dim *)
+                 let has_unpacked =
+                   let n = String.length ty in
+                   let rec go i =
+                     i + 1 < n && ((ty.[i] = '$' && ty.[i+1] = '[') || go (i+1)) in
+                   n > 1 && go 0 in
+                 not has_unpacked
+             | _ -> false)
+        | None -> false in
+      (match idx, packed_operand with
+       | BConst { value; _ }, true ->
+           let k = Z.to_int value in
+           BSlice { signal = arr; msb = k; lsb = k }
+       | _ -> BSelect { array = arr; index = idx })
   | "RangeSelect" ->
       let arr = match assoc "value" j with
         | Some j' -> expr_to_bexpr j'
