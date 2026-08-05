@@ -35,7 +35,7 @@ let () =
     "--keep-pass", Arg.Set keep_pass, "preserve passing .sv files too";
     "--emit-only", Arg.Set only_emit, "just emit the .sv to stdout (debug)";
     "--features", Arg.Set_string features_str,
-      "<spec> simple|struct|func|gen|mem2d|mixed (comma-list ok)";
+      "<spec> simple|struct|func|gen|mem2d|seq|mixed (comma-list ok)";
   ] in
   Arg.parse speclist (fun _ -> ()) "random_sv_gen [opts]"
 
@@ -399,6 +399,101 @@ let emit_mem2d ~name seed =
     (depth_log2-1) (cols_log2-1) (dw-1) (dw-1)
     (dw-1) ((1 lsl depth_log2)-1) ((1 lsl cols_log2)-1)
 
+(* SEQUENTIAL mode -- the gap this generator was missing.
+ *
+ * The sv-tests corpus is a LANGUAGE corpus: of its 652 synthesizable tests
+ * only 6 contain any sequential logic and none is larger than a toy, so a
+ * front-end census over it scores every reader a clean sheet on exactly the
+ * axis that breaks in practice.  Every front-end/importer bug found while
+ * building the Vivado -rtl oracle was a STATE bug:
+ *
+ *   - $sdffe / $sdffce dropped entirely by Rtlil_to_behavioral (sync reset
+ *     WITH enable), losing 11 of 27 registers silently;
+ *   - per-bit writes into a vector mis-placed by a truncated shift count;
+ *   - generate-block scopes flattened together, collapsing N unrolled
+ *     iterations that all declare the same local name onto one;
+ *   - non-zero-based ranges indexed at the wrong bit.
+ *
+ * So this mode emits, in one module, a register of every reset/enable shape
+ * (none / sync / async, active high / low, with and without enable -- the
+ * four-way that distinguishes $sdff, $sdffe, $sdffce and $adff), a vector
+ * built by PER-BIT writes at indices >= 2, a generate bank whose iterations
+ * each declare the same scope-local register name, and a non-zero-based
+ * range register.  All of it plainly synthesisable, so every reader should
+ * agree; where two disagree, the disagreement is the point. *)
+let emit_seq ~name seed =
+  Random.init seed;
+  let w = 4 + rand_int 5 in                 (* 4..8 *)
+  let g = 2 + rand_int 3 in                 (* 2..4 generate iterations *)
+  let b = 2 + rand_int 3 in                 (* 2..4 bits per bank slice *)
+  let lo = 1 + rand_int 4 in                (* non-zero-based low index *)
+  let hi = lo + w - 1 in
+  let async = coin () in
+  let rst_hi = coin () in                   (* active-high reset? *)
+  let use_en = coin () in
+  (* enable OUTSIDE reset is $sdffce -- but only legal for a SYNCHRONOUS
+     reset.  With an async reset the reset must dominate the sensitivity
+     list, so `if (en) begin if (!rst) ...` is not synthesisable and yosys
+     rightly rejects it ("Multiple edge sensitive events found for this
+     signal").  Generating it tested nothing but each reader's error path. *)
+  let en_first = coin () && not async in
+  let rstval = rand_int (1 lsl (min w 16)) in
+  let buf = Buffer.create 2048 in
+  let p fmt = Printf.ksprintf (Buffer.add_string buf) fmt in
+  let rst_lvl = if rst_hi then "" else "!" in
+  let edge = if async then
+      (if rst_hi then " or posedge rst" else " or negedge rst") else "" in
+  p "// random_sv_gen seed=%d mode=seq w=%d gen=%dx%d nz=[%d:%d] %s%s%s\n"
+    seed w g b hi lo
+    (if async then "async" else "sync")
+    (if rst_hi then "/hi" else "/lo")
+    (if use_en then (if en_first then "/en>rst" else "/rst>en") else "/noen");
+  p "module %s (\n" name;
+  p "  input  logic clk,\n  input  logic rst,\n";
+  if use_en then p "  input  logic en,\n";
+  p "  input  logic [%d:0] d,\n" (w-1);
+  p "  output logic [%d:0] q,\n" (w-1);
+  p "  output logic [%d:0] qbit,\n" (w-1);
+  p "  output logic [%d:0] qgen,\n" (g*b-1);
+  p "  output logic [%d:%d] qnz\n" hi lo;
+  p ");\n";
+  (* 1. the reset/enable four-way *)
+  p "  always_ff @(posedge clk%s)\n" edge;
+  if use_en && en_first then begin
+    p "    if (%sen) begin\n" (if rst_hi then "" else "");
+    p "      if (%srst) q <= %d'd%d;\n" rst_lvl w rstval;
+    p "      else      q <= d;\n";
+    p "    end\n"
+  end else begin
+    p "    if (%srst) q <= %d'd%d;\n" rst_lvl w rstval;
+    if use_en then p "    else if (en) q <= d;\n"
+    else p "    else q <= d;\n"
+  end;
+  (* 2. per-bit writes -- indices >= 2 are the ones a truncated shift count
+        mis-places, and bit 0 written last is what then masks the damage *)
+  p "  always_ff @(posedge clk) begin\n";
+  for i = w - 1 downto 0 do
+    p "    qbit[%d] <= d[%d];\n" i ((i + 1) mod w)
+  done;
+  p "  end\n";
+  (* 3. generate bank: every iteration declares the SAME local name *)
+  p "  genvar gi;\n  generate\n";
+  p "    for (gi = 0; gi < %d; gi = gi + 1) begin : bank\n" g;
+  p "      logic [%d:0] acc;\n" (b-1);
+  p "      always_ff @(posedge clk)\n";
+  p "        if (%srst) acc <= %d'd0;\n" rst_lvl b;
+  p "        else       acc <= d[%d:0] + gi[%d:0];\n" (b-1) (b-1);
+  p "      assign qgen[gi*%d +: %d] = acc;\n" b b;
+  p "    end\n  endgenerate\n";
+  (* 4. non-zero-based range *)
+  p "  logic [%d:%d] nz;\n" hi lo;
+  p "  always_ff @(posedge clk)\n";
+  p "    if (%srst) nz <= %d'd0;\n" rst_lvl w;
+  p "    else       nz <= d;\n";
+  p "  assign qnz = nz;\n";
+  p "endmodule\n";
+  Buffer.contents buf
+
 (* Const-fn struct config — exercises the symbolic-execution path in
  * Verible_elaborate.eval_function. A package defines a constant
  * function returning a packed struct; the top module uses that as a
@@ -713,6 +808,7 @@ let emit_for_mode ~name ~seed mode =
   | "func"   -> emit_func ~name seed
   | "gen"    -> emit_gen ~name seed
   | "mem2d"  -> emit_mem2d ~name seed
+  | "seq"    -> emit_seq ~name seed
   | "cfg_struct"    -> emit_cfg_struct ~name seed
   | "cfg_chain"     -> emit_cfg_chain ~name seed
   | "cfg_ternary"   -> emit_cfg_ternary ~name seed
@@ -740,7 +836,7 @@ let pick_mode s =
   match active_modes with
   | [] -> "simple"
   | ["mixed"] ->
-      let modes = ["simple"; "struct"; "func"; "gen"; "mem2d";
+      let modes = ["simple"; "struct"; "func"; "gen"; "mem2d"; "seq";
                    "cfg_struct"; "cfg_chain"; "cfg_ternary";
                    "cfg_recursive"; "ssa_stress"] in
       List.nth modes (s mod List.length modes)
