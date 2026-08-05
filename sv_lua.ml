@@ -104,6 +104,49 @@ let find_yosys () =
     "yosys";
   ]
 
+(* Produce verilator's elaborated AST JSON from SOURCES.
+ *
+ * The verilator front end used to demand a pre-built `--json-only` dump, which
+ * made it the odd one out: every other reader takes sources, so any sweep over
+ * a corpus had to special-case it (or leave it out, which is worse -- it is one
+ * of the stronger elaborators).  slang_to_behavioral already shells out to its
+ * own binary; do the same here.  A single .json argument still bypasses this,
+ * so existing callers that captured a dump keep working.
+ *
+ * --timescale supplies a default for filesets where only some files carry a
+ * `timescale directive, which verilator otherwise rejects outright; timescale
+ * is irrelevant to the synthesisable BIR. *)
+let find_verilator () =
+  match Sys.getenv_opt "VERILATOR_BIN" with
+  | Some s when Sys.file_exists s -> Some s
+  | _ ->
+    List.find_opt (fun p ->
+      if String.length p > 0 && p.[0] = '/' then Sys.file_exists p
+      else Sys.command (Printf.sprintf "command -v %s > /dev/null 2>&1" p) = 0)
+      ["/usr/local/bin/verilator"; "/usr/bin/verilator"; "verilator"]
+
+let verilator_json_of_sources ~top ~files =
+  let verilator = match find_verilator () with
+    | Some v -> v
+    | None -> failwith "verilator not found (set VERILATOR_BIN)" in
+  let dir = Filename.temp_file "vltdir_" "" in
+  (try Sys.remove dir with _ -> ());
+  Unix.mkdir dir 0o755;
+  let cmd = Printf.sprintf
+    "%s --json-only --json-only-output %s/ast.json -Wno-fatal \
+       --timescale 1ns/1ps --top-module %s %s > /dev/null 2>&1"
+    (Filename.quote verilator) (Filename.quote dir) (Filename.quote top)
+    (String.concat " " (List.map Filename.quote files)) in
+  let rc = Sys.command cmd in
+  let direct = Filename.concat dir "ast.json" in
+  if Sys.file_exists direct then direct
+  else begin
+    (* older verilator ignores --json-only-output and writes obj_dir/V<top>.tree.json *)
+    let alt = Printf.sprintf "%s/obj_dir/V%s.tree.json" dir top in
+    if Sys.file_exists alt then alt
+    else failwith (Printf.sprintf "verilator produced no AST json (rc=%d)" rc)
+  end
+
 let run_yosys_to_rtlil ~top ~files ~out =
   let yosys = match find_yosys () with
     | Some y -> y
@@ -114,11 +157,24 @@ let run_yosys_to_rtlil ~top ~files ~out =
     Printf.fprintf oc "plugin -i slang\n";
     Printf.fprintf oc "read_slang --top %s %s\n" top
       (String.concat " " files);
-    Printf.fprintf oc "hierarchy -top %s\nproc\nflatten\n" top
+    Printf.fprintf oc "hierarchy -top %s\nproc\n" top
   end else begin
     Printf.fprintf oc "read_verilog -sv %s\n" (String.concat " " files);
-    Printf.fprintf oc
-      "hierarchy -top %s\nproc\nopt -fast\nflatten\nopt -fast\n" top
+    (* opt_clean, NOT `opt -fast`.  opt runs opt_merge, which collapses two
+       structurally identical registers into one -- correct for synthesis and
+       fatal for correspondence: on a generated case where `nz <= d` and a
+       generate-bank `acc <= d + 0` are the same logic with the same reset, it
+       turned 6 registers into 5, so the RTLIL readers disagreed with every
+       source-level reader for a reason that had nothing to do with either.
+       opt_clean does the dead-cell/wire hygiene without merging. *)
+    (* `proc` ONLY -- no flatten, no opt.
+       opt merges structurally identical FFs (6 registers became 5 on a
+       generated case), and flatten dissolves the submodule boundary, so the
+       RTLIL readers reported one module where every source-level reader
+       reported two.  Both destroy the correspondence this front end exists to
+       provide.  Leaving the hierarchy intact makes it behave like the other
+       readers, and the SVS side flattens for Z3 when it wants to. *)
+    Printf.fprintf oc "hierarchy -top %s\nproc\n" top
   end;
   Printf.fprintf oc "write_rtlil %s\n" out;
   close_out oc;
@@ -169,10 +225,14 @@ let run_synlig_to_rtlil ~top ~files ~out =
      the register SET no longer matches the RTL, defeating register correspondence.
      `proc` + `flatten` (+ opt_clean = unused-cell removal, no FF merge) keeps one
      $dff per source register, isolating Surelog's elaboration from synthesis opt. *)
-  if Sys.getenv_opt "SYNLIG_MIN" <> None then
-    Printf.fprintf oc "hierarchy -top %s\nproc\nflatten\nopt_clean\n" top
+  (* No-merge is now the DEFAULT (it was behind SYNLIG_MIN): every use of this
+     front end in SVS is a miter or a correspondence check, and the note above
+     is exactly right -- `opt` merges FFs and defeats both.  SYNLIG_OPT=1 gets
+     the old synthesis-style script back. *)
+  if Sys.getenv_opt "SYNLIG_OPT" <> None then
+    Printf.fprintf oc "hierarchy -top %s\nproc\nopt -fast\nflatten\nopt -fast\n" top
   else
-    Printf.fprintf oc "hierarchy -top %s\nproc\nopt -fast\nflatten\nopt -fast\n" top;
+    Printf.fprintf oc "hierarchy -top %s\nproc\n" top;
   Printf.fprintf oc "write_rtlil %s\n" out;
   close_out oc;
   let rc = Sys.command
@@ -237,8 +297,57 @@ let check_verilator_version () =
           (fst verilator_min) (snd verilator_min) line)
   end
 
-let load_frontend ~frontend ~top ~files : bprogram =
+(* sv2v as a composable PRE-PASS, not a front end.
+ *
+ * sv2v converts SystemVerilog to Verilog-2005; it produces no AST of its own,
+ * so it is not a reader.  What it IS good for is putting SV in reach of readers
+ * that only speak Verilog, and -- measured on axis_gmii_rx -- it preserves
+ * register names EXACTLY through yosys: 27/27 by name and width, zero anonymous
+ * `$`-names, and the correspondence survives `flatten` (which prefixes by
+ * instance path, `axis_gmii_rx_inst.crc_cnt`).  That makes sv2v+yosys the
+ * best-behaved name oracle available, better on that axis than Vivado -rtl,
+ * which needs `_reg`/`_reg_n` canonicalisation and still invents unpaired
+ * `p_N_in` registers.
+ *
+ * Paired with YOSYS specifically, as the front end "sv2v".  Every other reader
+ * here (verible, slang, verilator, synlig, sv-parser) speaks SystemVerilog
+ * natively, so a conversion in front of them buys nothing and only adds a
+ * translation to disbelieve.  yosys's own `read_verilog -sv` is the one with
+ * partial SV support -- it was the weakest reader in the coverage census at
+ * 65.6% -- so it is the one that gains.
+ *
+ * CAVEAT worth knowing before trusting a register census through it: sv2v
+ * expands memories to lists of registers (it says so, e.g. "Replacing memory
+ * \lfsr_mask_data with list of registers"), so a design with inferred RAM
+ * reads with a very different register count than the same design read
+ * directly. *)
+let find_sv2v () =
+  match Sys.getenv_opt "SV2V_BIN" with
+  | Some s when Sys.file_exists s -> Some s
+  | _ ->
+    let home = try Sys.getenv "HOME" with Not_found -> "" in
+    List.find_opt (fun p ->
+      if String.length p > 0 && p.[0] = '/' then Sys.file_exists p
+      else Sys.command (Printf.sprintf "command -v %s > /dev/null 2>&1" p) = 0)
+      [home ^ "/sv2v/bin/sv2v"; "/usr/local/bin/sv2v"; "sv2v"]
+
+let sv2v_convert ~files =
+  let sv2v = match find_sv2v () with
+    | Some s -> s
+    | None -> failwith "sv2v not found (set SV2V_BIN)" in
+  let out = Filename.temp_file "sv2v_" ".v" in
+  let cmd = Printf.sprintf "%s %s > %s 2>/dev/null"
+    (Filename.quote sv2v)
+    (String.concat " " (List.map Filename.quote files))
+    (Filename.quote out) in
+  let rc = Sys.command cmd in
+  if rc <> 0 then failwith (Printf.sprintf "sv2v exit %d" rc);
+  out
+
+let rec load_frontend ~frontend ~top ~files : bprogram =
   match frontend with
+  (* sv2v -> yosys: the SV that yosys's own reader cannot take *)
+  | "sv2v" -> load_frontend ~frontend:"yosys" ~top ~files:[sv2v_convert ~files]
   | "verible" ->
       Verible_to_behavioral.convert_files ~top files |> post_load
   | "verible-ext" ->
@@ -256,6 +365,11 @@ let load_frontend ~frontend ~top ~files : bprogram =
       post_load p
   | "verilator" ->
       check_verilator_version ();
+      (* sources -> run verilator ourselves; a lone .json is used as-is *)
+      let files = match files with
+        | [j] when Filename.check_suffix j ".json" -> [j]
+        | [] -> failwith "verilator frontend needs at least one file"
+        | srcs -> [verilator_json_of_sources ~top ~files:srcs] in
       (match files with
        | [j] ->
            (match Verilator_to_behavioral.convert_verilator_json_to_behavioral j with
@@ -352,7 +466,7 @@ let load_frontend ~frontend ~top ~files : bprogram =
                   end in
                 post_load p
             | None -> failwith "verilator JSON parse failed")
-       | _ -> failwith "verilator frontend takes a single .json")
+       | _ -> failwith "verilator frontend: internal — expected one json")
   | "synlig" ->
       (* synlig (yosys fork using Surelog SV frontend).  Same RTLIL
          path as the yosys frontend; different read script. *)
@@ -2192,6 +2306,72 @@ let lcyclesim prog_h spec =
       (try Gui_sim.run_spec ~n_cycles:!n_cycles modes m
        with e -> Printf.sprintf "cyclesim ERROR: %s" (Printexc.to_string e))
 
+(* NAME-BASED register correspondence for the Vivado -rtl oracle.
+ *
+ * `synth_design -rtl` preserves register names, but not verbatim: where the
+ * RTL declares `reg m_axis_tdata_reg` and drives `assign m_axis_tdata =
+ * m_axis_tdata_reg`, Vivado names the register after the PORT and drops the
+ * `_reg`, while a source-level front end keeps the declared name.  Vivado also
+ * spells an inverted copy `<name>_reg_n`, and that one runs the OTHER way
+ * (Vivado `crc_state_reg_n` vs our `crc_state`), so a one-directional strip
+ * does not do it.  Measured on the SGMII diagnostic: raw name match was 20/27
+ * on axis_gmii_rx and 7/12 on axis_gmii_tx; canonicalising both sides takes
+ * those to 27/27 and 12/12.
+ *
+ * This is a NAME matcher, deliberately distinct from [reg_correspond]'s
+ * simulation-based matching: when the names really do correspond it is exact
+ * and free, and simulation matching is the fallback for when they do not.
+ *
+ * A canonical form shared by two registers on the SAME side is ambiguous and
+ * is skipped rather than guessed, and a pair whose WIDTHS disagree is rejected
+ * -- a name that matches at the wrong width is a coincidence, not a
+ * correspondence. *)
+let reg_canon_name n =
+  let n = if String.length n >= 2 && n.[0] = '\\' then String.sub n 1 (String.length n - 1) else n in
+  let strip suf s =
+    let l = String.length suf and k = String.length s in
+    if k > l && String.sub s (k - l) l = suf then Some (String.sub s 0 (k - l)) else None in
+  match strip "_reg_n" n with
+  | Some b -> b
+  | None -> (match strip "_reg" n with Some b -> b | None -> n)
+
+let reg_name_map (ref_m : bmodule) (tgt_m : bmodule) : (string * string) list =
+  let names m =
+    let ctx = Behavioral_registers.analyze_module m in
+    List.map (fun (r : Behavioral_registers.register_info) ->
+      (r.Behavioral_registers.reg_name, r.Behavioral_registers.reg_width))
+      ctx.Behavioral_registers.registers in
+  let index l =
+    let h = Hashtbl.create 64 and dup = Hashtbl.create 8 in
+    List.iter (fun (n, w) ->
+      let c = reg_canon_name n in
+      if Hashtbl.mem h c then Hashtbl.replace dup c () else Hashtbl.replace h c (n, w)) l;
+    Hashtbl.iter (fun c () -> Hashtbl.remove h c) dup;
+    h in
+  let rh = index (names ref_m) in
+  let tl = names tgt_m in
+  let tdup = index tl in
+  List.filter_map (fun (tn, tw) ->
+    let c = reg_canon_name tn in
+    match Hashtbl.find_opt rh c, Hashtbl.find_opt tdup c with
+    | Some (rn, rw), Some _ when rw = tw && rn <> tn -> Some (tn, rn)
+    | _ -> None) tl
+
+let lreg_canon_names tgt_h ref_h =
+  let n, tm, tp = find_mod tgt_h in
+  let _, rm, _ = find_mod ref_h in
+  let mp = reg_name_map rm tm in
+  if Sys.getenv_opt "REGCORR_DEBUG" <> None then begin
+    Printf.eprintf "[regcanon] %s<-%s: %d register(s) renamed\n%!"
+      tm.name rm.name (List.length mp);
+    List.iter (fun (a, b) -> Printf.eprintf "[regcanon]   %s -> %s\n%!" a b) mp
+  end;
+  let f x = match List.assoc_opt x mp with Some r -> r | None -> x in
+  let tm' = rename_module f tm in
+  let cp = { tp with modules =
+    List.map (fun (mm : bmodule) -> if mm.name = tm.name then tm' else mm) tp.modules } in
+  hadd (Mod (n, tm', cp))
+
 let lreg_correspond tgt_h ref_h =
   let n, tm, tp = find_mod tgt_h in
   let _, rm, _ = find_mod ref_h in
@@ -3329,6 +3509,21 @@ let lregister_analyse mod_h =
   Printf.sprintf "module %s: %d registers" m.name
     (List.length ctx.Behavioral_registers.registers)
 
+(* Register NAMES, not just a count: the whole premise of using a Vivado
+   `synth_design -rtl` elaboration as an oracle is that it preserves register
+   names, so the first thing to measure against another front end's read of the
+   same design is how many register names actually COINCIDE.  Emitted as
+   "<name>:<width>" per line so a caller can diff two flows by name and width
+   without re-deriving either. *)
+let lregister_names mod_h =
+  let _, m, _ = find_mod mod_h in
+  let ctx = Behavioral_registers.analyze_module m in
+  String.concat "\n"
+    (List.map (fun (r : Behavioral_registers.register_info) ->
+       Printf.sprintf "%s:%d" r.Behavioral_registers.reg_name
+         r.Behavioral_registers.reg_width)
+       ctx.Behavioral_registers.registers)
+
 let lcdc_analyse mod_h =
   let _, m, _ = find_mod mod_h in
   let report = Cdc_analysis.analyse m in
@@ -3738,6 +3933,10 @@ module MakeLib
         "ffrip",          V.efunc (V.string **->> V.string) (wrap1 lffrip);
         "register_analyse", V.efunc (V.string **->> V.string)
                              (wrap1 lregister_analyse);
+        "register_names", V.efunc (V.string **->> V.string)
+                             (wrap1 lregister_names);
+        "reg_canon_names", V.efunc (V.string **-> V.string **->> V.string)
+                             (wrap2 lreg_canon_names);
         "cdc_analyse",    V.efunc (V.string **->> V.string)
                            (wrap1 lcdc_analyse);
         "prep_for_z3",    V.efunc (V.string **->> V.string)
