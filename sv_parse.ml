@@ -974,6 +974,17 @@ incs = rwlst attr incs;}
       (* $countbits / $countones / $isunknown / $onehot* — usually
        * synthesisable but rarely used in this corpus; stub for now. *)
       "COUNTBITS"; "COUNTONES"; "ISUNKNOWN"; "ONEHOT"; "ONEHOT0";
+      (* An ARGUMENT of $display/$sformat/$write.  The format call itself is
+         already dropped as non-synthesisable, but verilator emits each argument
+         as its own SFORMATARG node and those were reaching the bomb -- 19 of
+         the 28 unknown-node aborts in a 137-test sv-tests sweep, which alone
+         put the verilator reader 15 points below where it belongs.  Nothing
+         downstream of a format argument exists in hardware. *)
+      "SFORMATARG";
+      (* Verilator's wrapper around a STATIC-variable initialiser.  Same
+         reasoning as CRESET above: BIR signals carry their initial_value, so
+         the wrapper node has nothing left to express. *)
+      "INITIALSTATICSTMT";
     ] in
     if List.mem tag nonsynth_tags then
       (* Drop in a 1-bit zero literal stand-in. *)
