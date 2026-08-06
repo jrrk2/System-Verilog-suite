@@ -2489,6 +2489,35 @@ let lmemlower prog_h =
   let p', _ = Behavioral_memlower.lower_program p in
   hadd (Prog (label, p'))
 
+let lcdc_check prog_h macro =
+  let _label, p = find_prog prog_h in
+  let xs = Behavioral_cdc_check.check_boundary p ~macro in
+  let _ = Behavioral_cdc_check.report xs in
+  let count v = List.length (List.filter (fun x -> x.Behavioral_cdc_check.x_verdict = v) xs) in
+  (* Machine-readable: a caller (the splitter, the selftest) has to be able to
+     GATE on this, not read it. *)
+  Printf.sprintf "crossings=%d unsafe=%d unproven=%d" (List.length xs)
+    (count Behavioral_cdc_check.Unsafe)
+    (count Behavioral_cdc_check.Unproven)
+
+(* Per-clock-domain split.  Returns a NEW prog handle only when the resulting
+ * cut is proven safe; a refused cut returns the empty string, because handing
+ * back a program whose boundaries nobody can time is the exact failure this
+ * pass exists to prevent.  DOMAIN_SPLIT_FORCE=1 returns it anyway, loudly, for
+ * inspecting a cut you are still debugging. *)
+let ldomain_split prog_h top periods =
+  let label, p = find_prog prog_h in
+  let periods = Behavioral_domain_split.parse_periods periods in
+  let o = Behavioral_domain_split.split ~periods p ~top in
+  Behavioral_domain_split.report o;
+  if o.Behavioral_domain_split.o_refusals = [] then
+    hadd (Prog (label, o.Behavioral_domain_split.o_prog))
+  else if Sys.getenv_opt "DOMAIN_SPLIT_FORCE" <> None then begin
+    print_string "[domain-split] DOMAIN_SPLIT_FORCE=1 -- returning a cut that is NOT proven safe\n";
+    hadd (Prog (label, o.Behavioral_domain_split.o_prog))
+  end
+  else ""
+
 let lssa prog_h =
   let label, p = find_prog prog_h in
   let p' = { p with modules = List.map Behavioral_ssa.module_to_ssa p.modules } in
@@ -3605,6 +3634,16 @@ let lflatten prog_h =
   let label, p = find_prog prog_h in
   hadd (Prog (label, Behavioral_flatten.flatten_program p))
 
+(* The force_ff variant, which the per-clock-domain split needs: the default
+ * flatten leaves any child containing a register standing, and a REGISTER-
+ * BEARING child straddling two clocks is precisely what blocks a domain cut.
+ * Kept separate rather than made the default because inlining stateful
+ * children is exactly what the compositional miters must NOT do -- they rely
+ * on child boundaries surviving. *)
+let lflatten_ff prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, Behavioral_flatten.flatten_program ~force_ff:true p))
+
 let loptimize prog_h =
   let label, p = find_prog prog_h in
   let p', _ = Behavioral_optimize.optimize_full p in
@@ -4036,6 +4075,12 @@ module MakeLib
                            (wrap1 lblocking_subst);
         "meminfer",       V.efunc (V.string **->> V.string) (wrap1 lmeminfer);
         "memlower",       V.efunc (V.string **->> V.string) (wrap1 lmemlower);
+        "cdc_check",      V.efunc (V.string **-> V.string **->> V.string) (wrap2 lcdc_check);
+        (* domain_split(prog, top, periods) -- periods is "clk=ns,clk=ns" or a
+           file of "<clock> <ns>" lines; "" means none, and a cone feeding
+           several domains is then replicated rather than guessed at. *)
+        "domain_split",   V.efunc (V.string **-> V.string **-> V.string **->> V.string)
+                           (wrap3 ldomain_split);
         "ssa",            V.efunc (V.string **->> V.string) (wrap1 lssa);
         "flatten_z3",     V.efunc (V.string **-> V.string **->> V.string)
                            (wrap2 lflatten_z3);
@@ -4063,6 +4108,7 @@ module MakeLib
         "parse_v_cells",  V.efunc (V.string **->> V.string)
                            (wrap1 lparse_v_cells);
         "flatten",        V.efunc (V.string **->> V.string) (wrap1 lflatten);
+        "flatten_ff",     V.efunc (V.string **->> V.string) (wrap1 lflatten_ff);
         "optimize",       V.efunc (V.string **->> V.string) (wrap1 loptimize);
         "arch_subst",     V.efunc (V.string **->> V.string) (wrap1 larch_subst);
         "optimize_logic", V.efunc (V.string **->> V.string) (wrap1 loptimize_logic);
