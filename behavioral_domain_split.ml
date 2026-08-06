@@ -151,6 +151,24 @@ let sanitise s =
    claim no writes: a spurious driver would collide with the real one and turn
    a sound split into a refusal, whereas a missing one is reported by name --
    and the undriven check below knows to exempt hard-block pins. *)
+(* Which pins of a body-less cell drive, decided by the DESIGN rather than by a
+   cell library we do not have.  A net on such a pin that nothing else in the
+   module drives, and that is not fed from outside, has exactly one candidate
+   driver left -- the cell.  Populated per split by [infer_blackbox_drivers].
+
+   Getting this wrong is not a warning.  A RAMB18E1's DOADO landing on the
+   input side of the module that contains the RAM makes Vivado drop the driver
+   ("Input port ... has an internal driver"), and the whole design downstream
+   constant-folds: ethmin_core synthesised to 2 leaf cells, with no errors and
+   no critical warnings. *)
+(* NOT keyed by instance name: flattening a generate loop leaves all 16 of
+   picosoc's RAMB18E1s sharing one inst_name, so a per-instance table held only
+   the last one's pins and the other fifteen kept their outputs on the input
+   side.  These two sets are all the rule needs, and they are the same for every
+   instance. *)
+let bb_known_defs : SS.t ref = ref SS.empty
+let bb_top_inputs : SS.t ref = ref SS.empty
+
 let inst_uses_defs ~lookup (i : binstance) =
   let names e = ss_of_dce (Behavioral_dce.collect_uses_expr e) in
   match lookup i with
@@ -159,7 +177,12 @@ let inst_uses_defs ~lookup (i : binstance) =
         List.fold_left (fun a (_, e) -> SS.union a (names e)) SS.empty
           i.port_connections
       in
-      (all, SS.empty)
+      let d =
+        SS.filter
+          (fun n -> not (SS.mem n !bb_known_defs || SS.mem n !bb_top_inputs))
+          all
+      in
+      (SS.diff all d, d)
   | Some (child : bmodule) ->
       let dir p =
         match List.find_opt (fun (s : bsignal) -> s.name = p) child.signals with
@@ -173,10 +196,36 @@ let inst_uses_defs ~lookup (i : binstance) =
           | _ -> (SS.union u (names e), d))
         (SS.empty, SS.empty) i.port_connections
 
+(* Array and part-select writes reach the IR as `@mem_write` / `@slice_write` /
+   `@part_sel_write_up|down` pseudo-calls whose FIRST argument is the target,
+   and the shared use/def collector counts that argument as a USE only.  So a
+   register file written solely through them -- picorv32's cpuregs, its
+   decoded_imm_j -- has no recorded definition anywhere, and the split then
+   classifies it as an INPUT of the module that writes it.  Vivado says what
+   that means: "procedural assignment to a non-register". *)
+let pseudo_defs_of_process p =
+  let acc = ref SS.empty in
+  let rec stmt = function
+    | BCallStmt { func; args = BVar a :: _ } when func <> "" && func.[0] = '@' ->
+        acc := SS.add a !acc
+    | BIf { then_stmts; else_stmts; _ } ->
+        List.iter stmt then_stmts; List.iter stmt else_stmts
+    | BCase { cases; default; _ } ->
+        List.iter (fun (_, ss) -> List.iter stmt ss) cases;
+        List.iter stmt default
+    | BBlock ss -> List.iter stmt ss
+    | BWhile { body; _ } -> List.iter stmt body
+    | BFor { body; _ } -> List.iter stmt body
+    | _ -> ()
+  in
+  (match p with
+   | BCombinational { body; _ } | BSequential { body; _ } -> List.iter stmt body);
+  !acc
+
 let item_uses_defs ~lookup = function
   | Proc p ->
       let u, d = Behavioral_dce.collect_uses_defs_process p in
-      (ss_of_dce u, ss_of_dce d)
+      (ss_of_dce u, SS.union (ss_of_dce d) (pseudo_defs_of_process p))
   | Inst i -> inst_uses_defs ~lookup i
 
 (* --- assigning items to domains ------------------------------------------- *)
@@ -203,7 +252,7 @@ let clockish_name p =
 let rec clock_pins ~lookup ?(depth = 0) (m : bmodule) : SS.t =
   if depth > 16 then SS.empty
   else
-    let canon = Behavioral_cdc_check.clock_aliases m in
+  let canon = Behavioral_cdc_check.clock_aliases m in
     let ports =
       SS.of_list
         (List.filter_map
@@ -275,6 +324,31 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
   in
   let canon = Behavioral_cdc_check.clock_aliases m in
   let ana = Behavioral_cdc_check.analyse ~lookup:lookup_name m in
+  (* Decide what the body-less cells drive before anything reads a def set:
+     everything else in the module first, and whatever it does NOT drive -- and
+     the top does not supply -- is what a black box drives.  A cell library
+     would be better; we have none for RAMB18E1 or GTXE2, and "who else could
+     possibly be driving this net" is an answer the design itself gives. *)
+  bb_known_defs := SS.empty;
+  bb_top_inputs :=
+    SS.of_list
+      (List.filter_map
+         (fun (s : bsignal) -> if s.direction = `Input then Some s.name else None)
+         m.signals);
+  bb_known_defs :=
+    (let from_procs =
+       List.fold_left
+         (fun acc p ->
+           let _, d = Behavioral_dce.collect_uses_defs_process p in
+           SS.union (SS.union acc (ss_of_dce d)) (pseudo_defs_of_process p))
+         SS.empty m.processes
+     in
+     List.fold_left
+       (fun acc (i : binstance) ->
+         match lookup i with
+         | None -> acc
+         | Some _ -> let _, d = inst_uses_defs ~lookup i in SS.union acc d)
+       from_procs m.instances);
   let refusals = ref [] in
   let refuse fmt = Printf.ksprintf (fun s -> refusals := s :: !refusals) fmt in
 
@@ -733,30 +807,8 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
      in the source too; reporting those is reporting the design, not the
      transformation.  The condition is "driven before, undriven after". *)
   let pseudo_defs =
-    (* Array writes reach the IR as `@mem_write` / `@slice_write` /
-       `@part_sel_write_up|down` pseudo-calls whose FIRST argument is the array,
-       and the shared use/def collector counts that argument as a use only.  So
-       a register file written only through them (picorv32's cpuregs) reads as
-       having no driver anywhere. *)
-    let acc = ref SS.empty in
-    let rec stmt = function
-      | BCallStmt { func; args = BVar a :: _ } when func <> "" && func.[0] = '@' ->
-          acc := SS.add a !acc
-      | BIf { then_stmts; else_stmts; _ } ->
-          List.iter stmt then_stmts; List.iter stmt else_stmts
-      | BCase { cases; default; _ } ->
-          List.iter (fun (_, ss) -> List.iter stmt ss) cases;
-          List.iter stmt default
-      | BBlock ss -> List.iter stmt ss
-      | BWhile { body; _ } -> List.iter stmt body
-      | BFor { body; _ } -> List.iter stmt body
-      | _ -> ()
-    in
-    List.iter
-      (function
-        | BCombinational { body; _ } | BSequential { body; _ } -> List.iter stmt body)
-      m.processes;
-    !acc
+    List.fold_left (fun acc p -> SS.union acc (pseudo_defs_of_process p))
+      SS.empty m.processes
   in
   let driven_before =
     List.fold_left
