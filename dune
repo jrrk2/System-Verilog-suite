@@ -57,8 +57,9 @@
           
           
           vhdl_semantic_checker
-          vhdl_parse vhdl_elaborate vhdl_expr_to_ir vhdl_process_extract vhdl_to_ir vhdl_to_ir_direct vhdl_to_ir_iterate vhdl_ir_to_opt_ir interactive_client interactive_client_v2 nlview_to_verilog)
- (libraries svs_place_core str yojson zarith unix base fpga_synth hardcaml hardcaml_circuits z3 vhd_front ver_front lua-ml linenoise lef_def lablgtk3 edif2_lib)
+          vhdl_parse vhdl_elaborate vhdl_expr_to_ir vhdl_process_extract vhdl_to_ir vhdl_to_ir_direct vhdl_to_ir_iterate vhdl_ir_to_opt_ir interactive_client interactive_client_v2 nlview_to_verilog
+          opendcp_xml cell_census)
+ (libraries svs_place_core str yojson zarith unix base fpga_synth hardcaml hardcaml_circuits z3 vhd_front ver_front lua-ml linenoise lef_def lablgtk3 edif2_lib xml-light)
  (preprocess (pps ppx_deriving_yojson)))
 
 (env

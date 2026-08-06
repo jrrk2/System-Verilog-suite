@@ -3506,6 +3506,62 @@ let lmodule_names prog_h =
   let _, p = find_prog prog_h in
   String.concat "," (List.map (fun (m : bmodule) -> m.name) p.modules)
 
+(* --- physical-database inspection ---------------------------------------
+ * The open flow's DCP reconstruction (RapidWright json2dcp) used to segfault
+ * Vivado, and every diagnosis was a throwaway script whose counting was twice
+ * WRONG in ways that misdirected the search.  These bind the typed readers so a
+ * recipe asks structural questions instead. *)
+
+(* Consistency checks over one opendcp XML (dcp2xml output).  One line per
+ * finding, naming the offending cell/net -- never a bare count. *)
+let lopendcp_check path =
+  let db = Opendcp_xml.load path in
+  let fs = Opendcp_xml.check db in
+  let b = Buffer.create 4096 in
+  Buffer.add_string b
+    (Printf.sprintf "opendcp %s part=%s top=%s cells=%d nets=%d findings=%d\n"
+       (Filename.basename path) db.part db.top
+       (List.length db.cells) (List.length db.nets) (List.length fs));
+  List.iter
+    (fun (f : Opendcp_xml.finding) ->
+       Buffer.add_string b
+         (Printf.sprintf "%s\t%s\t%s\n" f.f_check f.f_where f.f_detail))
+    fs;
+  Buffer.contents b
+
+(* Join two opendcp XMLs on a canonical cell name and report the differences
+ * that matter (type, placement, logical pin SET).  A pure permutation of LUT
+ * input pins is expected between two placers and is deliberately not reported. *)
+let lopendcp_compare a_path b_path =
+  let a = Opendcp_xml.load a_path and b = Opendcp_xml.load b_path in
+  let d = Opendcp_xml.compare_db a b in
+  let bf = Buffer.create 4096 in
+  Buffer.add_string bf
+    (Printf.sprintf "joined=%d only_a=%d only_b=%d type_diff=%d loc_diff=%d pin_diff=%d\n"
+       d.d_joined d.d_only_a d.d_only_b
+       (List.length d.d_type_diff) (List.length d.d_loc_diff)
+       (List.length d.d_pin_diff));
+  List.iter (fun (n, x, y) ->
+      Buffer.add_string bf (Printf.sprintf "type\t%s\t%s\t%s\n" n x y)) d.d_type_diff;
+  List.iter (fun (n, s) ->
+      Buffer.add_string bf (Printf.sprintf "pins\t%s\t%s\n" n s)) d.d_pin_diff;
+  Buffer.contents bf
+
+(* Cell census of any physical/netlist format, keyed by cell TYPE -- the only
+ * key .v / .json / .edf / .xml all agree on. *)
+let lcell_census path = Cell_census.to_string ~label:path (Cell_census.of_file path)
+
+let lcell_census_compare a_path b_path =
+  Cell_census.compare_to_string ~a_label:(Filename.basename a_path)
+    ~b_label:(Filename.basename b_path)
+    (Cell_census.of_file a_path) (Cell_census.of_file b_path)
+
+(* Census of a PARSED program, so a Verilog netlist can be compared against the
+ * other three formats through whichever front end the recipe chose. *)
+let lcell_census_prog prog_h =
+  let nm, p = find_prog prog_h in
+  Cell_census.to_string ~label:nm (Cell_census.of_behavioral p)
+
 (* Structural sweep for the input-port-driver malformation (a frontend/pass bug
  * that redirects a write onto a module INPUT port — invisible to the Z3 miter,
  * which models inputs as free and drops the write, yielding a vacuous
@@ -4005,6 +4061,16 @@ module MakeLib
                              (wrap1 ldrop_xil_prims);
         "register_names", V.efunc (V.string **->> V.string)
                              (wrap1 lregister_names);
+        "opendcp_check", V.efunc (V.string **->> V.string)
+                             (wrap1 lopendcp_check);
+        "opendcp_compare", V.efunc (V.string **-> V.string **->> V.string)
+                             (fun a b -> lopendcp_compare a b);
+        "cell_census", V.efunc (V.string **->> V.string)
+                             (wrap1 lcell_census);
+        "cell_census_prog", V.efunc (V.string **->> V.string)
+                             (wrap1 lcell_census_prog);
+        "cell_census_compare", V.efunc (V.string **-> V.string **->> V.string)
+                             (fun a b -> lcell_census_compare a b);
         "reg_canon_names", V.efunc (V.string **-> V.string **->> V.string)
                              (wrap2 lreg_canon_names);
         "cdc_analyse",    V.efunc (V.string **->> V.string)
