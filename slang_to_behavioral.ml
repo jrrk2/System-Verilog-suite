@@ -1281,7 +1281,11 @@ let convert_files ~top files : bprogram option =
          scale defined but others do" error.  Timescale is irrelevant
          to the synthesisable BIR. *)
       let cmd = Printf.sprintf
-        "%s --ast-json %s --timescale 1ns/1ps --top %s %s 2>/dev/null"
+        (* --allow-use-before-declare: see the note in sv_lua's read_slang
+           invocation -- Vivado-written netlists put assigns ahead of the wire
+           declarations they read, which slang rejects by default. *)
+        "%s --ast-json %s --allow-use-before-declare --timescale 1ns/1ps \
+           --top %s %s 2>/dev/null"
         (Filename.quote slang)
         (Filename.quote json_path)
         (Filename.quote top)

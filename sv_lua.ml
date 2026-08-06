@@ -162,7 +162,13 @@ let run_yosys_to_rtlil ~top ~files ~out =
      case where the plugin is unavailable. *)
   if Sys.getenv_opt "YOSYS_READ_VERILOG" = None then begin
     Printf.fprintf oc "plugin -i slang\n";
-    Printf.fprintf oc "read_slang --top %s %s\n" top
+    (* --allow-use-before-declare: Vivado's write_verilog emits an assign
+       BEFORE the wire it reads is declared (pcs_pma_flat.v uses
+       \core_resets_i/pma_reset_pipe at line 225, declares it at 308).
+       verible and verilator tolerate it; slang is strict and rejected the whole
+       file, which took out yosys, sv2v and slang on any module pulling in the
+       flattened PCS.  Machine-generated vendor netlist, nothing to fix in it. *)
+    Printf.fprintf oc "read_slang --allow-use-before-declare --top %s %s\n" top
       (String.concat " " files);
     Printf.fprintf oc "hierarchy -top %s\nproc\n" top
   end else begin
@@ -351,6 +357,102 @@ let sv2v_convert ~files =
   if rc <> 0 then failwith (Printf.sprintf "sv2v exit %d" rc);
   out
 
+(* Drop Xilinx PRIMITIVE module definitions so their instances stay UNRESOLVED.
+ *
+ * A strict reader (verilator, slang, yosys-slang, synlig) cannot elaborate
+ * without a definition for every instantiated module, so it must be handed cell
+ * models -- unisim_comp.v or yosys's cells_* -- that the verible parse never
+ * reads.  Keeping those definitions afterwards makes the flows asymmetric in
+ * BOTH directions: with real bodies the strict reader has behaviour verible
+ * lacks, and with bodyless stubs it has an EMPTY module where verible gets an
+ * augment_xil_models model.  Either way a primitive-bearing module miters as
+ * DIFFER for setup reasons, and an EMITTED netlist gets hollow RAMB18E1 shells
+ * instead of real BRAMs.  Dropping the definitions leaves the instances
+ * unresolved, exactly as the verible parse does.
+ *
+ * Hoisted out of the verilator branch so any strict front end can use it --
+ * needed to build ethmin through yosys-slang, which requires unisim_comp.v to
+ * elaborate at all.  SVS_KEEP_PRIMS=1 (or the old SVS_VERILATOR_KEEP_PRIMS=1)
+ * keeps them. *)
+let drop_xil_prims ?(tag="frontend") p =
+  if Sys.getenv_opt "SVS_KEEP_PRIMS" <> None
+     || Sys.getenv_opt "SVS_VERILATOR_KEEP_PRIMS" <> None then p
+  else begin
+  let prims = Lazy.force Bir_to_edif.xil_json_ports in
+  (* Verilator specialises parameterised primitives
+     (FDPE__Iz153, IBUFDS__pi1), which miss an exact oracle
+     lookup while still being primitives.  Strip only the
+     LAST "__" suffix and require the remainder to be a real
+     oracle entry -- Fpga_prim_expand.norm_clone cuts at the
+     FIRST "__", which mangles design module names into
+     spurious oracle hits (it dropped 207 modules instead of
+     the ~11 primitives and regressed clocking/gt_common). *)
+  let base n =
+    let rec last i acc =
+      if i + 1 >= String.length n then acc
+      else last (i + 1)
+             (if n.[i] = '_' && n.[i+1] = '_' then Some i else acc) in
+    match last 1 None with
+    | Some i -> String.sub n 0 i
+    | None -> n in
+  let keep (m : Behavioral_ir.bmodule) =
+    not (Hashtbl.mem prims m.name)
+    && not (Hashtbl.mem prims (base m.name)) in
+  let kept = List.filter keep p.Behavioral_ir.modules in
+  let dropped =
+    List.length p.Behavioral_ir.modules - List.length kept in
+  if dropped > 0 then
+    Printf.eprintf
+      "[%s] dropped %d primitive module definition(s) \
+       so they stay unresolved (matches the verible frontend; \
+       SVS_KEEP_PRIMS=1 to keep)\n%!" tag dropped;
+  (* Dropping the primitive DEFINITIONS is not enough: the
+     instances still reference the specialised name, so the
+     emitted netlist says MMCME2_ADV__CJz1_CHz2 and yosys
+     rejects it -- "referenced in module clkgen_vc707 ... is
+     not part of the design".  The specialisation is only a
+     parameter binding (kept separately via
+     SVS_CIRC_KEEP_PARAMS), so rewrite instances of a dropped
+     primitive back to the base name, which is exactly what
+     the verible frontend produces. *)
+  (* Carry the specialisation's parameter values onto the
+     instance: verilator bakes them into the specialised
+     MODULE, so renaming alone loses them and Vivado falls
+     back to defaults -- MMCM CLKFBOUT_MULT_F reverted to 5
+     and DRC rejected the VCO, and the program ROM came back
+     with 12 non-zero INIT words instead of 72. *)
+  let modparams = Hashtbl.create 64 in
+  List.iter (fun (m : Behavioral_ir.bmodule) ->
+      if m.params <> [] then
+        Hashtbl.replace modparams m.name m.params)
+    p.Behavioral_ir.modules;
+  let renamed = ref 0 and carried = ref 0 in
+  let fix_inst (i : Behavioral_ir.binstance) =
+    let b = base i.module_name in
+    if b <> i.module_name && Hashtbl.mem prims b then begin
+      incr renamed;
+      let extra =
+        match Hashtbl.find_opt modparams i.module_name with
+        | None -> []
+        | Some ps ->
+          List.filter (fun (n, _) ->
+              not (List.mem_assoc n i.param_values)) ps in
+      carried := !carried + List.length extra;
+      { i with module_name = b;
+               param_values = i.param_values @ extra }
+    end else i in
+  let kept =
+    List.map (fun (m : Behavioral_ir.bmodule) ->
+        { m with Behavioral_ir.instances =
+                   List.map fix_inst m.instances }) kept in
+  if !renamed > 0 then
+    Printf.eprintf
+      "[%s] rewrote %d specialised primitive instance(s) to their \
+       base name (%d parameter value(s) carried over)\n%!"
+      tag !renamed !carried;
+  { p with Behavioral_ir.modules = kept }
+  end
+
 let rec load_frontend ~frontend ~top ~files : bprogram =
   match frontend with
   (* sv2v -> yosys: the SV that yosys's own reader cannot take *)
@@ -394,83 +496,7 @@ let rec load_frontend ~frontend ~top ~files : bprogram =
                    as the verible parse does, so augment_xil_models supplies the
                    SAME model to both sides and the boundary cut pairs.
                    SVS_VERILATOR_KEEP_PRIMS=1 restores the old behaviour. *)
-                let p =
-                  if Sys.getenv_opt "SVS_VERILATOR_KEEP_PRIMS" <> None then p
-                  else begin
-                    let prims = Lazy.force Bir_to_edif.xil_json_ports in
-                    (* Verilator specialises parameterised primitives
-                       (FDPE__Iz153, IBUFDS__pi1), which miss an exact oracle
-                       lookup while still being primitives.  Strip only the
-                       LAST "__" suffix and require the remainder to be a real
-                       oracle entry -- Fpga_prim_expand.norm_clone cuts at the
-                       FIRST "__", which mangles design module names into
-                       spurious oracle hits (it dropped 207 modules instead of
-                       the ~11 primitives and regressed clocking/gt_common). *)
-                    let base n =
-                      let rec last i acc =
-                        if i + 1 >= String.length n then acc
-                        else last (i + 1)
-                               (if n.[i] = '_' && n.[i+1] = '_' then Some i else acc) in
-                      match last 1 None with
-                      | Some i -> String.sub n 0 i
-                      | None -> n in
-                    let keep (m : Behavioral_ir.bmodule) =
-                      not (Hashtbl.mem prims m.name)
-                      && not (Hashtbl.mem prims (base m.name)) in
-                    let kept = List.filter keep p.Behavioral_ir.modules in
-                    let dropped =
-                      List.length p.Behavioral_ir.modules - List.length kept in
-                    if dropped > 0 then
-                      Printf.eprintf
-                        "[verilator] dropped %d primitive module definition(s) \
-                         so they stay unresolved (matches the verible frontend; \
-                         SVS_VERILATOR_KEEP_PRIMS=1 to keep)\n%!" dropped;
-                    (* Dropping the primitive DEFINITIONS is not enough: the
-                       instances still reference the specialised name, so the
-                       emitted netlist says MMCME2_ADV__CJz1_CHz2 and yosys
-                       rejects it -- "referenced in module clkgen_vc707 ... is
-                       not part of the design".  The specialisation is only a
-                       parameter binding (kept separately via
-                       SVS_CIRC_KEEP_PARAMS), so rewrite instances of a dropped
-                       primitive back to the base name, which is exactly what
-                       the verible frontend produces. *)
-                    (* Carry the specialisation's parameter values onto the
-                       instance: verilator bakes them into the specialised
-                       MODULE, so renaming alone loses them and Vivado falls
-                       back to defaults -- MMCM CLKFBOUT_MULT_F reverted to 5
-                       and DRC rejected the VCO, and the program ROM came back
-                       with 12 non-zero INIT words instead of 72. *)
-                    let modparams = Hashtbl.create 64 in
-                    List.iter (fun (m : Behavioral_ir.bmodule) ->
-                        if m.params <> [] then
-                          Hashtbl.replace modparams m.name m.params)
-                      p.Behavioral_ir.modules;
-                    let renamed = ref 0 and carried = ref 0 in
-                    let fix_inst (i : Behavioral_ir.binstance) =
-                      let b = base i.module_name in
-                      if b <> i.module_name && Hashtbl.mem prims b then begin
-                        incr renamed;
-                        let extra =
-                          match Hashtbl.find_opt modparams i.module_name with
-                          | None -> []
-                          | Some ps ->
-                            List.filter (fun (n, _) ->
-                                not (List.mem_assoc n i.param_values)) ps in
-                        carried := !carried + List.length extra;
-                        { i with module_name = b;
-                                 param_values = i.param_values @ extra }
-                      end else i in
-                    let kept =
-                      List.map (fun (m : Behavioral_ir.bmodule) ->
-                          { m with Behavioral_ir.instances =
-                                     List.map fix_inst m.instances }) kept in
-                    if !renamed > 0 then
-                      Printf.eprintf
-                        "[verilator] rewrote %d specialised primitive instance(s) to their \
-                         base name (%d parameter value(s) carried over)\n%!"
-                        !renamed !carried;
-                    { p with Behavioral_ir.modules = kept }
-                  end in
+                let p = drop_xil_prims ~tag:"verilator" p in
                 post_load p
             | None -> failwith "verilator JSON parse failed")
        | _ -> failwith "verilator frontend: internal — expected one json")
@@ -582,6 +608,13 @@ let lparse_all frontend files =
    Fall back to a UNIQUE `<top>__<suffix>` match.  Unique is the important
    part: with several specialisations alive the right one is a real choice the
    caller has to make, so list them rather than guess. *)
+(* Expose drop_xil_prims to recipes.  A strict-reader flow supplies cell models
+   to elaborate at all and must drop them again before emitting, or the netlist
+   gets bodyless primitive shells. *)
+let ldrop_xil_prims prog_h =
+  let label, p = find_prog prog_h in
+  hadd (Prog (label, drop_xil_prims ~tag:"frontend" p))
+
 let lpick prog_h top =
   let _, p = find_prog prog_h in
   match List.find_opt (fun (m : bmodule) -> m.name = top) p.modules with
@@ -3968,6 +4001,8 @@ module MakeLib
         "ffrip",          V.efunc (V.string **->> V.string) (wrap1 lffrip);
         "register_analyse", V.efunc (V.string **->> V.string)
                              (wrap1 lregister_analyse);
+        "drop_xil_prims", V.efunc (V.string **->> V.string)
+                             (wrap1 ldrop_xil_prims);
         "register_names", V.efunc (V.string **->> V.string)
                              (wrap1 lregister_names);
         "reg_canon_names", V.efunc (V.string **-> V.string **->> V.string)

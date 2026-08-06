@@ -3386,6 +3386,408 @@ let stitch_gt_pad_buffers (j : Y.t) : Y.t =
 
    Collapsing the mux instead is NOT viable: a MUXF8 data input must be driven
    by a MUXF7, so deleting the F7 just moves the illegality up a level. *)
+(* REPLICATE A MUXF7 SHARED BY SEVERAL MUXF8s.
+ *
+ * A MUXF7 output reaches an F8MUX only over the dedicated intra-slice path, so
+ * one MUXF7 can feed at most ONE MUXF8 -- they must sit in the same slice, and
+ * a slice has one F8MUX.  When synthesis shares a MUXF7 between two MUXF8s the
+ * netlist is unbuildable as written: pack_to_lef's mux grouping absorbs the
+ * MUXF7 into the FIRST MUXF8's slice (its `not (already absorbed)` guard stops
+ * the second claiming it), and the second consumer is then physically
+ * unreachable.  Measured: net core.rx_ack_..._MUXF8_O_I0 driven by an F7BMUX
+ * in SLICE_X8Y73 with a second sink at SLICE_X9Y74/F8MUX, which the router can
+ * only skip:
+ *
+ *     SKIP_FAILED_ARCS: failed to route arc 1 of net '...MUXF8_O_I0'
+ *     (SITEWIRE/SLICE_X8Y73/F7BMUX_OUT -> SITEWIRE/SLICE_X9Y74/F7AMUX_OUT)
+ *
+ * No placement fixes this -- the two consumers are in different slices by
+ * necessity.  Give each its own copy: clone the MUXF7 and its two driving LUTs
+ * for every consumer after the first, so each MUXF8 group packs a private
+ * subtree.  The clones' LUT inputs stay on the original source nets (extra
+ * fanout on ordinary routing, which is routable; the F7->F8 hop is not). *)
+let replicate_shared_muxf7 (j : Y.t) : Y.t =
+  let module U = Yojson.Safe.Util in
+  let ncl = ref 0 in
+  let ty_of cj = try cj |> U.member "type" |> U.to_string with _ -> "" in
+  let bits_of e = match e with
+    | `List l -> List.filter_map (function `Int i -> Some i | _ -> None) l
+    | _ -> [] in
+  let do_mod mj =
+    match mj |> U.member "cells" with
+    | `Assoc cells when cells <> [] ->
+      let byname = Hashtbl.create 4096 in
+      List.iter (fun (cn, cj) -> Hashtbl.replace byname cn cj) cells;
+      let maxbit = ref 1 in
+      List.iter (fun (_, cj) ->
+          match cj |> U.member "connections" with
+          | `Assoc cs -> List.iter (fun (_, e) ->
+              List.iter (fun b -> if b > !maxbit then maxbit := b) (bits_of e)) cs
+          | _ -> ()) cells;
+      (* driver of each bit, and the MUXF8 consumers of each bit *)
+      let drv = Hashtbl.create 4096 in
+      let f8_users : (int, (string * string) list ref) Hashtbl.t = Hashtbl.create 256 in
+      List.iter (fun (cn, cj) ->
+          let dirs = try cj |> U.member "port_directions" |> U.to_assoc with _ -> [] in
+          match cj |> U.member "connections" with
+          | `Assoc cs ->
+            List.iter (fun (p, e) ->
+                let out = (match List.assoc_opt p dirs with
+                           | Some (`String "output") -> true | _ -> false) in
+                List.iter (fun b ->
+                    if out then Hashtbl.replace drv b (cn, p)
+                    else if ty_of cj = "MUXF8" && (p = "I0" || p = "I1") then begin
+                      let l = try Hashtbl.find f8_users b
+                              with Not_found -> let r = ref [] in Hashtbl.replace f8_users b r; r in
+                      l := (cn, p) :: !l
+                    end) (bits_of e)) cs
+          | _ -> ()) cells;
+      let extra = ref [] and rewire = ref [] in
+      Hashtbl.iter (fun b users ->
+          match Hashtbl.find_opt drv b with
+          | Some (mn, _) when ty_of (Hashtbl.find byname mn) = "MUXF7"
+                              && List.length !users > 1 ->
+            (* keep the first consumer on the original; clone for the rest *)
+            List.iteri (fun i (ucell, uport) ->
+                if i > 0 then begin
+                  let clone_cell src suffix =
+                    let cj = Hashtbl.find byname src in
+                    let nm = Printf.sprintf "%s_rep%d_%s" src i suffix in
+                    (nm, cj) in
+                  (* new output bit for the cloned mux *)
+                  incr maxbit; let nb = !maxbit in
+                  let (m7name, m7j) = clone_cell mn "m7" in
+                  (* clone the two feeding LUTs, giving each a fresh output net *)
+                  let conns = try m7j |> U.member "connections" |> U.to_assoc with _ -> [] in
+                  let conns' = List.map (fun (p, e) ->
+                      if p = "O" then (p, `List [ `Int nb ])
+                      else match p, bits_of e with
+                        | ("I0" | "I1"), [ ib ] ->
+                          (match Hashtbl.find_opt drv ib with
+                           | Some (ln, _) when (let lt = String.uppercase_ascii (ty_of (Hashtbl.find byname ln)) in
+                                                String.length lt >= 3 && String.sub lt 0 3 = "LUT") ->
+                             incr maxbit; let lb = !maxbit in
+                             let lj = Hashtbl.find byname ln in
+                             let lconns = try lj |> U.member "connections" |> U.to_assoc with _ -> [] in
+                             let lconns' = List.map (fun (lp, le) ->
+                                 if String.uppercase_ascii lp = "O" then (lp, `List [ `Int lb ]) else (lp, le)) lconns in
+                             let lname = Printf.sprintf "%s_rep%d_%s" ln i p in
+                             extra := (lname, `Assoc (List.map (fun (k, v) ->
+                                 if k = "connections" then (k, `Assoc lconns') else (k, v))
+                                 (U.to_assoc lj))) :: !extra;
+                             (p, `List [ `Int lb ])
+                           | _ -> (p, e))
+                        | _ -> (p, e)) conns in
+                  extra := (m7name, `Assoc (List.map (fun (k, v) ->
+                      if k = "connections" then (k, `Assoc conns') else (k, v))
+                      (U.to_assoc m7j))) :: !extra;
+                  rewire := (ucell, uport, nb) :: !rewire;
+                  incr ncl
+                end) (List.rev !users)
+          | _ -> ()) f8_users;
+      let cells' = List.map (fun (cn, cj) ->
+          let rs = List.filter (fun (u, _, _) -> u = cn) !rewire in
+          if rs = [] then (cn, cj)
+          else match cj |> U.member "connections" with
+            | `Assoc cs ->
+              let cs' = List.map (fun (p, e) ->
+                  match List.find_opt (fun (_, up, _) -> up = p) rs with
+                  | Some (_, _, nb) -> (p, `List [ `Int nb ])
+                  | None -> (p, e)) cs in
+              (cn, `Assoc (List.map (fun (k, v) ->
+                   if k = "connections" then (k, `Assoc cs') else (k, v)) (U.to_assoc cj)))
+            | _ -> (cn, cj)) cells in
+      `Assoc (List.map (fun (k, v) ->
+          if k = "cells" then (k, `Assoc (cells' @ List.rev !extra)) else (k, v))
+          (U.to_assoc mj))
+    | _ -> mj in
+  let out = match j |> U.member "modules" with
+    | `Assoc mods ->
+      `Assoc (List.map (fun (k, v) ->
+          if k = "modules" then (k, `Assoc (List.map (fun (mn, mj) -> (mn, do_mod mj)) mods))
+          else (k, v)) (U.to_assoc j))
+    | _ -> j in
+  if !ncl > 0 then
+    Printf.eprintf "[place_lef] replicated %d shared MUXF7 subtree(s) for extra MUXF8 consumers\n%!" !ncl;
+  out
+
+(* REPLICATE A CARRY CHAIN SHARED BY TWO SUCCESSORS.
+ *
+ * Same fault as the shared MUXF7, in the other dedicated-path structure.  A
+ * CARRY4's CO[3] reaches CIN only over the cascade to the slice DIRECTLY ABOVE
+ * in the same column, so it can feed exactly one successor.  `opt_merge
+ * -share_all` merges the near-identical alu_lts/alu_ltu comparator chains and
+ * produces a CO[3] with two CI consumers -- unbuildable:
+ *
+ *     SKIP_FAILED_ARCS: net 'core.soc.cpu.alu_lts_CARRY4_CO_CO[7]'
+ *     (SITEWIRE/SLICE_X5Y66/CARRY4_CO3 -> SITEWIRE/SLICE_X6Y66/CIN)
+ *
+ * opt_merge cannot simply be dropped: without it abc leaves a reset inverter
+ * per flop, every SR net has fanout 1, and placement cannot reunite them --
+ * measured 72 unroutable SRUSEDMUX arcs versus this ONE.  So keep the merge and
+ * undo the illegal sharing here.
+ *
+ * Cloning only the shared CARRY4 would not help: its own CI is fed by the
+ * previous CARRY4's CO[3], another dedicated link, so the sharing would just
+ * move one rung up.  Walk back to the chain ROOT (a CARRY4 whose CI is not
+ * driven by another CARRY4's CO[3]) and clone the whole run, plus each rung's
+ * S/DI driving LUTs, so the second consumer gets a private chain it can place
+ * in its own column.  The root's CI/CYINIT stays on the original net -- that
+ * one is ordinary routing. *)
+let replicate_shared_carry (j : Y.t) : Y.t =
+  let module U = Yojson.Safe.Util in
+  let nch = ref 0 and nrung = ref 0 in
+  let ty_of cj = try cj |> U.member "type" |> U.to_string with _ -> "" in
+  let bits_of e = match e with
+    | `List l -> List.filter_map (function `Int i -> Some i | _ -> None) l
+    | _ -> [] in
+  let do_mod mj =
+    match mj |> U.member "cells" with
+    | `Assoc cells when cells <> [] ->
+      let byname = Hashtbl.create 4096 in
+      List.iter (fun (cn, cj) -> Hashtbl.replace byname cn cj) cells;
+      let maxbit = ref 1 in
+      List.iter (fun (_, cj) -> match cj |> U.member "connections" with
+          | `Assoc cs -> List.iter (fun (_, e) ->
+              List.iter (fun b -> if b > !maxbit then maxbit := b) (bits_of e)) cs
+          | _ -> ()) cells;
+      let drv = Hashtbl.create 4096 in
+      List.iter (fun (cn, cj) ->
+          let dirs = try cj |> U.member "port_directions" |> U.to_assoc with _ -> [] in
+          match cj |> U.member "connections" with
+          | `Assoc cs -> List.iter (fun (p, e) ->
+              match List.assoc_opt p dirs with
+              | Some (`String "output") ->
+                List.iteri (fun i b -> Hashtbl.replace drv b (cn, p, i)) (bits_of e)
+              | _ -> ()) cs
+          | _ -> ()) cells;
+      let co3 cn = match (Hashtbl.find byname cn) |> U.member "connections" with
+        | `Assoc cs -> (match List.assoc_opt "CO" cs with
+            | Some e -> (match bits_of e with [_;_;_;b] -> Some b | _ -> None)
+            | None -> None)
+        | _ -> None in
+      let ci_of cn = match (Hashtbl.find byname cn) |> U.member "connections" with
+        | `Assoc cs -> (match List.assoc_opt "CI" cs with
+            | Some e -> (match bits_of e with b :: _ -> Some b | _ -> None)
+            | None -> None)
+        | _ -> None in
+      (* CI consumers per bit *)
+      let ci_users = Hashtbl.create 256 in
+      List.iter (fun (cn, cj) ->
+          if ty_of cj = "CARRY4" then
+            match ci_of cn with
+            | Some b -> let l = try Hashtbl.find ci_users b with Not_found ->
+                          let r = ref [] in Hashtbl.replace ci_users b r; r in
+                        l := cn :: !l
+            | None -> ()) cells;
+      let extra = ref [] and rewire = ref [] in
+      List.iter (fun (cn, cj) ->
+          if ty_of cj <> "CARRY4" then () else
+          match co3 cn with
+          | None -> ()
+          | Some b ->
+            let users = try !(Hashtbl.find ci_users b) with Not_found -> [] in
+            if List.length users > 1 then begin
+              (* chain from root down to cn *)
+              let rec back acc cur =
+                match ci_of cur with
+                | Some cb ->
+                  (match Hashtbl.find_opt drv cb with
+                   | Some (pn, "CO", 3) when ty_of (Hashtbl.find byname pn) = "CARRY4" ->
+                     back (cur :: acc) pn
+                   | _ -> cur :: acc)
+                | None -> cur :: acc in
+              let chain = back [] cn in
+              List.iteri (fun i ucell ->
+                  if i > 0 then begin
+                    incr nch;
+                    let prev_co = ref None in
+                    List.iter (fun rung ->
+                        incr nrung;
+                        let rj = Hashtbl.find byname rung in
+                        let rconns = try rj |> U.member "connections" |> U.to_assoc with _ -> [] in
+                        (* fresh CO bits for this clone *)
+                        let newco = List.map (fun _ -> incr maxbit; !maxbit)
+                            (match List.assoc_opt "CO" rconns with
+                             | Some e -> bits_of e | None -> []) in
+                        let rconns' = List.map (fun (p, e) ->
+                            match p with
+                            | "CO" when newco <> [] -> (p, `List (List.map (fun b -> `Int b) newco))
+                            | "O" -> (* sum outputs: fresh nets, unused by the clone *)
+                              (p, `List (List.map (fun _ -> incr maxbit; `Int !maxbit) (bits_of e)))
+                            | "CI" -> (match !prev_co with
+                                | Some pb -> (p, `List [ `Int pb ])   (* chain to our clone *)
+                                | None -> (p, e))                     (* root: original net *)
+                            | ("S" | "DI") ->
+                              (* clone the driving LUTs so the copy is independent *)
+                              (p, `List (List.map (fun ib ->
+                                   match Hashtbl.find_opt drv ib with
+                                   | Some (ln, _, _) when (let lt = String.uppercase_ascii
+                                                             (ty_of (Hashtbl.find byname ln)) in
+                                                           String.length lt >= 3 && String.sub lt 0 3 = "LUT")
+                                       && Hashtbl.mem byname ln ->
+                                     incr maxbit; let nb = !maxbit in
+                                     let lj = Hashtbl.find byname ln in
+                                     let lc = try lj |> U.member "connections" |> U.to_assoc with _ -> [] in
+                                     let lc' = List.map (fun (lp, le) ->
+                                         if String.uppercase_ascii lp = "O" then (lp, `List [ `Int nb ]) else (lp, le)) lc in
+                                     extra := (Printf.sprintf "%s_carrep%d" ln i,
+                                               `Assoc (List.map (fun (k, v) ->
+                                                   if k = "connections" then (k, `Assoc lc') else (k, v))
+                                                   (U.to_assoc lj))) :: !extra;
+                                     `Int nb
+                                   | _ -> `Int ib) (bits_of e)))
+                            | _ -> (p, e)) rconns in
+                        (match List.rev newco with b :: _ -> prev_co := Some b | [] -> ());
+                        extra := (Printf.sprintf "%s_carrep%d" rung i,
+                                  `Assoc (List.map (fun (k, v) ->
+                                      if k = "connections" then (k, `Assoc rconns') else (k, v))
+                                      (U.to_assoc rj))) :: !extra) chain;
+                    (match !prev_co with
+                     | Some pb -> rewire := (ucell, "CI", pb) :: !rewire
+                     | None -> ())
+                  end) (List.rev users)
+            end) cells;
+      let cells' = List.map (fun (cn, cj) ->
+          let rs = List.filter (fun (u, _, _) -> u = cn) !rewire in
+          if rs = [] then (cn, cj)
+          else match cj |> U.member "connections" with
+            | `Assoc cs ->
+              let cs' = List.map (fun (p, e) ->
+                  match List.find_opt (fun (_, up, _) -> up = p) rs with
+                  | Some (_, _, nb) -> (p, `List [ `Int nb ])
+                  | None -> (p, e)) cs in
+              (cn, `Assoc (List.map (fun (k, v) ->
+                   if k = "connections" then (k, `Assoc cs') else (k, v)) (U.to_assoc cj)))
+            | _ -> (cn, cj)) cells in
+      `Assoc (List.map (fun (k, v) ->
+          if k = "cells" then (k, `Assoc (cells' @ List.rev !extra)) else (k, v))
+          (U.to_assoc mj))
+    | _ -> mj in
+  let out = match j |> U.member "modules" with
+    | `Assoc mods ->
+      `Assoc (List.map (fun (k, v) ->
+          if k = "modules" then (k, `Assoc (List.map (fun (mn, mj) -> (mn, do_mod mj)) mods))
+          else (k, v)) (U.to_assoc j))
+    | _ -> j in
+  if !nch > 0 then
+    Printf.eprintf "[place_lef] replicated %d shared carry chain(s), %d rung(s)\n%!" !nch !nrung;
+  out
+
+(* MATERIALISE CONSTANT DRIVERS ON WIDE-MUX INPUTS.
+ *
+ * A MUXF7/MUXF8 whose I0/I1 is tied to a constant has no cell driving that
+ * pin.  nextpnr's packer therefore INVENTS one -- `$PACKER_GND_NET$LUT$10`,
+ * a SLICE_LUTX chain child of the mux -- and place_lef, which only stamps
+ * cells present in the JSON, never placed it.  The analytical placer then
+ * ends with it unbound and aborts:
+ *
+ *     ERROR: Found unbound cell $PACKER_GND_NET$LUT$10
+ *
+ * The two existing chain-binding hooks in nextpnr do not reach it: they bind
+ * children RELATIVE to a placed parent for carry S/DI feed-throughs, and this
+ * child needs the specific LUT site that feeds its mux.  Rather than teach
+ * nextpnr a third special case, give the packer nothing to invent: put a real
+ * LUT1 in the netlist driving that pin, so it is an ordinary cell that
+ * place_lef stamps like any other.
+ *
+ * INIT is 2'h0 for a 0 and 2'h3 for a 1 (LUT1 truth table, output independent
+ * of I0).
+ *
+ * I0 is driven from a FLIP-FLOP Q, not from the constant it replaced and not
+ * left dangling.  Tying it to the constant makes the timing engine see the
+ * const network arriving at a cell that drives it ("combinatorial loops"), and
+ * leaving it unconnected invites the packer to tie it to a constant itself --
+ * which recreates the very cell this pass exists to eliminate.  The value is a
+ * don't-care (INIT ignores I0), so ANY driven net works; pick the flip-flop
+ * whose name shares the longest prefix with the mux so the extra load stays
+ * local instead of crossing the die. *)
+let materialise_const_drivers (j : Y.t) : Y.t =
+  let module U = Yojson.Safe.Util in
+  let nadded = ref 0 in
+  let is_widemux t = t = "MUXF7" || t = "MUXF8" in
+  let do_mod mj =
+    match mj |> U.member "cells" with
+    | `Assoc cells when cells <> [] ->
+      (* highest net id in use, so new nets get fresh ids *)
+      let maxbit = ref 1 in
+      let scan_bits e = match e with
+        | `List l -> List.iter (function `Int i -> if i > !maxbit then maxbit := i | _ -> ()) l
+        | _ -> () in
+      List.iter (fun (_, cj) ->
+          match cj |> U.member "connections" with
+          | `Assoc conns -> List.iter (fun (_, e) -> scan_bits e) conns
+          | _ -> ()) cells;
+      (match mj |> U.member "netnames" with
+       | `Assoc nets -> List.iter (fun (_, nj) -> scan_bits (nj |> U.member "bits")) nets
+       | _ -> ());
+      (* flip-flop Q bits, for a don't-care but DRIVEN LUT input *)
+      let ff_qs = ref [] in
+      List.iter (fun (cn, cj) ->
+          let ty = try cj |> U.member "type" |> U.to_string with _ -> "" in
+          if String.length ty >= 2 && String.sub ty 0 2 = "FD" then
+            match cj |> U.member "connections" with
+            | `Assoc conns ->
+              (match List.assoc_opt "Q" conns with
+               | Some (`List [ `Int b ]) -> ff_qs := (cn, b) :: !ff_qs
+               | _ -> ())
+            | _ -> ()) cells;
+      let common_len a b =
+        let n = min (String.length a) (String.length b) in
+        let rec go i = if i < n && a.[i] = b.[i] then go (i + 1) else i in go 0 in
+      let pick_ff_for cn =
+        List.fold_left (fun best (fn, b) ->
+            let l = common_len cn fn in
+            match best with
+            | Some (bl, _) when bl >= l -> best
+            | _ -> Some (l, b)) None !ff_qs
+        |> function Some (_, b) -> Some b | None -> None in
+      let extra = ref [] in
+      let cells' = List.map (fun (cn, cj) ->
+          let ty = try cj |> U.member "type" |> U.to_string with _ -> "" in
+          if not (is_widemux ty) then (cn, cj)
+          else match cj |> U.member "connections" with
+            | `Assoc conns ->
+              let conns' = List.map (fun (p, e) ->
+                  if p <> "I0" && p <> "I1" then (p, e)
+                  else match e with
+                    | `List [ `String ("0" | "1" as k) ] ->
+                      incr maxbit;
+                      let nb = !maxbit in
+                      let lname = Printf.sprintf "%s_const_%s" cn p in
+                      let init = if k = "0" then "2'h0" else "2'h3" in
+                      extra := (lname, `Assoc [
+                          "hide_name", `Int 0;
+                          "type", `String "LUT1";
+                          "parameters", `Assoc [ "INIT", `String init ];
+                          "port_directions", `Assoc [ "I0", `String "input";
+                                                      "O", `String "output" ];
+                          "connections", `Assoc [
+                              "I0", (match pick_ff_for cn with
+                                     | Some q -> `List [ `Int q ]
+                                     | None -> `List [ `String k ]);
+                              "O", `List [ `Int nb ] ] ]) :: !extra;
+                      incr nadded;
+                      (p, `List [ `Int nb ])
+                    | _ -> (p, e)) conns in
+              (cn, `Assoc (List.map (fun (k, v) ->
+                   if k = "connections" then (k, `Assoc conns') else (k, v))
+                   (U.to_assoc cj)))
+            | _ -> (cn, cj)) cells in
+      `Assoc (List.map (fun (k, v) ->
+          if k = "cells" then (k, `Assoc (cells' @ List.rev !extra)) else (k, v))
+          (U.to_assoc mj))
+    | _ -> mj in
+  let out = match j |> U.member "modules" with
+    | `Assoc mods ->
+      `Assoc (List.map (fun (k, v) ->
+          if k = "modules" then (k, `Assoc (List.map (fun (mn, mj) -> (mn, do_mod mj)) mods))
+          else (k, v)) (U.to_assoc j))
+    | _ -> j in
+  if !nadded > 0 then
+    Printf.eprintf "[place_lef] materialised %d constant driver(s) on MUXF7/F8 inputs\n%!" !nadded;
+  out
+
 let split_degenerate_muxf (j : Y.t) : Y.t =
   let module U = Yojson.Safe.Util in
   let ncloned = ref 0 and nskipped = ref 0 in
@@ -3646,8 +4048,8 @@ let emit_clock_xdc (j : Y.t) =
     end
 
 let run floorplan_json netlist_json =
-  let j = insert_hold_buffers (normalise_init (split_degenerate_muxf
-            (stitch_gt_pad_buffers (cleanup_netlist (Y.from_file netlist_json))))) in
+  let j = insert_hold_buffers (normalise_init (materialise_const_drivers (replicate_shared_carry (replicate_shared_muxf7 (split_degenerate_muxf
+            (stitch_gt_pad_buffers (cleanup_netlist (Y.from_file netlist_json)))))))) in
   emit_clock_xdc j;
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
@@ -3658,7 +4060,7 @@ let run floorplan_json netlist_json =
    Packing goes through bmodule_of_yosys_tree so the placer sees EXACTLY the
    same netlist it would from the on-disk json. *)
 let run_inmem floorplan_json (j : Y.t) =
-  let j = insert_hold_buffers (split_degenerate_muxf (stitch_gt_pad_buffers (cleanup_netlist j))) in
+  let j = insert_hold_buffers (materialise_const_drivers (replicate_shared_muxf7 (split_degenerate_muxf (stitch_gt_pad_buffers (cleanup_netlist j))))) in
   run_gen floorplan_json
     ~get_bmod:(fun () -> Pack_to_lef.bmodule_of_yosys_tree j)
     ~get_j:(fun () -> j)
