@@ -116,6 +116,23 @@ let clock_buffers =
     [ "BUFG"; "BUFGCE"; "BUFH"; "BUFHCE"; "BUFR"; "BUFIO"; "BUFMR";
       "IBUF"; "IBUFG"; "IBUFDS"; "OBUF" ]
 
+(* A tie-off is not a clock.  A netlist ties unused clock pins to the constant
+   nets, so letting one into the alias graph merges every tied-off pin into one
+   "domain" -- and since a PORT name wins the representative election, that
+   domain gets named after whatever port happens to sit in the same class.  On
+   the flattened ethmin that produced a clock domain called `an_enable`, an
+   output the netlist drives with `assign an_enable = <const0>`, holding 14
+   instances whose only connection to each other was being tied off. *)
+let is_const_net n =
+  let base =
+    match String.rindex_opt n '.' with
+    | Some i -> String.sub n (i + 1) (String.length n - i - 1)
+    | None -> n
+  in
+  let l = String.lowercase_ascii base in
+  l = "gnd" || l = "vcc" || l = "<const0>" || l = "<const1>"
+  || (String.length l >= 6 && String.sub l 0 6 = "<const")
+
 let clock_aliases (m : bmodule) =
   let parent : (string, string) Hashtbl.t = Hashtbl.create 16 in
   let rec find x =
@@ -134,6 +151,7 @@ let clock_aliases (m : bmodule) =
          m.signals)
   in
   let union a b =
+    if is_const_net a || is_const_net b then () else
     let ra = find a and rb = find b in
     if ra <> rb then begin
       let keep, drop =

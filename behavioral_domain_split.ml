@@ -123,13 +123,18 @@ let sanitise s =
 (* --- what an item reads and writes ---------------------------------------- *)
 
 (* An instance's writes are its OUTPUT-port actuals, which needs the child's
-   interface.  With no child to look at (a black box: GTXE2, an encrypted
-   core), claim no writes: a spurious driver would collide with the real one
-   and turn a sound split into a refusal, whereas a missing one shows up as an
-   undriven input, which [check_undriven] reports by name. *)
+   interface.  [lookup] takes the INSTANCE, not the module name, so a cell with
+   no bmodule in the program can still be resolved from the primitive models --
+   on a netlist-shaped design nearly every instance is an FDRE or a LUT, and
+   treating those as opaque makes every register output look undriven.
+
+   With no body available at all (a hard block: GTXE2, an encrypted core),
+   claim no writes: a spurious driver would collide with the real one and turn
+   a sound split into a refusal, whereas a missing one is reported by name --
+   and the undriven check below knows to exempt hard-block pins. *)
 let inst_uses_defs ~lookup (i : binstance) =
   let names e = ss_of_dce (Behavioral_dce.collect_uses_expr e) in
-  match lookup i.module_name with
+  match lookup i with
   | None ->
       let all =
         List.fold_left (fun a (_, e) -> SS.union a (names e)) SS.empty
@@ -157,37 +162,100 @@ let item_uses_defs ~lookup = function
 
 (* --- assigning items to domains ------------------------------------------- *)
 
-let clockish p =
+(* Last-resort clock-pin test, for a cell whose body we do not have.  Spelling
+   is all that is left, so require the name to END in CLK/CLOCK rather than
+   merely contain it: a GTXE2_CHANNEL has CPLLREFCLKLOST and CLKRSVD among its
+   pins, and a substring test reports a transceiver as living in a dozen clock
+   domains, one of them a status output. *)
+let clockish_name p =
   let l = String.lowercase_ascii p in
-  let has sub =
-    let n = String.length sub and m = String.length l in
-    let rec go i = i + n <= m && (String.sub l i n = sub || go (i + 1)) in
-    go 0
+  let n = String.length l in
+  let ends s =
+    let m = String.length s in
+    n >= m && String.sub l (n - m) m = s
   in
-  has "clk" || has "clock" || l = "c"
+  l = "c" || l = "clk" || ends "clk" || ends "clock"
 
-(* The domains an instance belongs to, by its clock pins.  Zero or several
-   distinct ones (a true dual-clock BRAM, an MMCM) means it belongs to no
-   single domain and stays at the top. *)
-let inst_domains ~canon (i : binstance) =
-  List.fold_left
-    (fun acc (p, e) ->
-      if not (clockish p) then acc
-      else match e with BVar n -> SS.add (canon n) acc | _ -> acc)
-    SS.empty i.port_connections
+(* An instance's clock PINS, taken from what the cell actually clocks rather
+   than from what its pins are called.  A port is a clock pin if some register
+   inside the cell is clocked by it, transitively through the cell's own
+   instances.  Only where no body exists at all -- a hard block -- does this
+   fall back to [clockish_name]. *)
+let rec clock_pins ~lookup ?(depth = 0) (m : bmodule) : SS.t =
+  if depth > 16 then SS.empty
+  else
+    let canon = Behavioral_cdc_check.clock_aliases m in
+    let ports =
+      SS.of_list
+        (List.filter_map
+           (fun (s : bsignal) -> if s.direction <> `Internal then Some s.name else None)
+           m.signals)
+    in
+    let acc =
+      List.fold_left
+        (fun acc p ->
+          match p with
+          | BSequential { clock; _ } ->
+              let c = canon clock in
+              if SS.mem c ports then SS.add c acc else acc
+          | BCombinational _ -> acc)
+        SS.empty m.processes
+    in
+    List.fold_left
+      (fun acc (i : binstance) ->
+        match lookup i with
+        | None -> acc
+        | Some child ->
+            SS.fold
+              (fun cp acc ->
+                match List.assoc_opt cp i.port_connections with
+                | Some (BVar n) ->
+                    let c = canon n in
+                    if SS.mem c ports then SS.add c acc else acc
+                | _ -> acc)
+              (clock_pins ~lookup ~depth:(depth + 1) child)
+              acc)
+      acc m.instances
+
+(* The domains an instance belongs to.  Zero or several distinct ones (a true
+   dual-clock BRAM, an MMCM, a transceiver) means it belongs to no single
+   domain and stays at the top. *)
+let inst_domains ~canon ~lookup (i : binstance) =
+  let add acc = function
+    | BVar n when not (Behavioral_cdc_check.is_const_net n) -> SS.add (canon n) acc
+    | _ -> acc
+  in
+  match lookup i with
+  | Some child ->
+      let pins = clock_pins ~lookup child in
+      List.fold_left
+        (fun acc (p, e) -> if SS.mem p pins then add acc e else acc)
+        SS.empty i.port_connections
+  | None ->
+      List.fold_left
+        (fun acc (p, e) -> if clockish_name p then add acc e else acc)
+        SS.empty i.port_connections
 
 (* --- the split ------------------------------------------------------------ *)
 
 let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : string) :
     outcome =
-  let lookup n = List.find_opt (fun (m : bmodule) -> m.name = n) prog.modules in
+  let lookup_name n = List.find_opt (fun (m : bmodule) -> m.name = n) prog.modules in
+  (* Resolve an instance to a body: the program first, then the Xilinx
+     primitive models.  Without the second half a flattened netlist is a sea of
+     black boxes and the split can prove nothing about any of it. *)
+  let lookup (i : binstance) =
+    match lookup_name i.module_name with
+    | Some m -> Some m
+    | None -> Xil_prim_models.synth i
+  in
   let m =
-    match lookup top with
+    match lookup_name top with
     | Some m -> m
     | None -> failwith ("domain_split: no module named '" ^ top ^ "'")
   in
   let canon = Behavioral_cdc_check.clock_aliases m in
-  let ana = Behavioral_cdc_check.analyse ~lookup m in
+  let ana = Behavioral_cdc_check.analyse ~lookup:lookup_name m in
   let refusals = ref [] in
   let refuse fmt = Printf.ksprintf (fun s -> refusals := s :: !refusals) fmt in
 
@@ -280,7 +348,7 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
     m.processes;
   List.iter
     (fun i ->
-      match SS.elements (inst_domains ~canon i) with
+      match SS.elements (inst_domains ~canon ~lookup i) with
       | [ d ] -> place d (Inst i)
       | _ -> leftover := Inst i :: !leftover)
     m.instances;
@@ -304,7 +372,7 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
         match it with
         | Proc (BSequential { clock; _ }) -> SS.add (canon clock) acc
         | Proc (BCombinational _) -> acc
-        | Inst i -> SS.union acc (inst_domains ~canon i))
+        | Inst i -> SS.union acc (inst_domains ~canon ~lookup i))
       SS.empty !leftover
   in
   let blocked, groups =
@@ -317,8 +385,8 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
       let straddlers =
         List.filter_map
           (function
-            | Inst i when SS.mem g.g_clock (inst_domains ~canon i) ->
-                Some (i.module_name, SS.elements (inst_domains ~canon i))
+            | Inst i when SS.mem g.g_clock (inst_domains ~canon ~lookup i) ->
+                Some (i.module_name, SS.elements (inst_domains ~canon ~lookup i))
             | _ -> None)
           !leftover
       in
@@ -333,12 +401,29 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
                Printf.sprintf "%d x %s (on %s)" (count m) m (String.concat "+" ds))
              kinds)
       in
+      (* Only say "memory" when a memory is what straddles.  The advice that
+         follows is about async FIFOs, and attaching it to an MMCM or a
+         transceiver -- which straddle because generating or recovering several
+         clocks is their JOB -- would be nonsense dressed as guidance. *)
+      let is_memlike (n, _) =
+        let l = String.lowercase_ascii n in
+        let has sub =
+          let a = String.length sub and b = String.length l in
+          let rec go i = i + a <= b && (String.sub l i a = sub || go (i + 1)) in
+          go 0
+        in
+        has "ram" || has "mem" || has "fifo" || has "bram"
+      in
       if kinds = [] then
         refuse "domain '%s' left unsplit: the top also holds registers on this clock, so cutting it would strand same-clock arcs across the boundary"
           g.g_clock
+      else if List.exists is_memlike kinds then
+        refuse
+          "domain '%s' left unsplit: %s straddles it and stays at the top, so cutting %s would strand same-clock arcs across the boundary. A dual-clock memory is the one structure a domain split cannot move: whichever side holds it, the other side's port arcs cross a cut nobody times. The exemplar's answer is an async FIFO -- gray pointers plus a stability argument -- which is a design change, not a transformation."
+          g.g_clock why g.g_clock
       else
         refuse
-          "domain '%s' left unsplit: %s straddles it and stays at the top, so cutting %s would strand same-clock arcs across the boundary. A dual-clock memory is the one structure a domain split cannot move; the exemplar's answer is an async FIFO -- gray pointers plus a stability argument -- which is a design change, not a transformation."
+          "domain '%s' left unsplit: %s straddles it and stays at the top, so cutting %s would strand same-clock arcs across the boundary"
           g.g_clock why g.g_clock;
       leftover := !leftover @ g.g_items)
     blocked;
@@ -531,11 +616,29 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
                 dm.signals)))
       (SS.union leftover_d top_in) built
   in
+  (* Pins of a body-less hard block.  [inst_uses_defs] deliberately claims no
+     writes for those, so their outputs would every one of them read as
+     undriven -- 20-odd of them on the flattened ethmin, all of them the
+     transceiver's.  We do not know these are driven; we know we cannot tell,
+     and reporting a guess as a finding is worse than not reporting it. *)
+  let opaque_pins =
+    List.fold_left
+      (fun acc it ->
+        match it with
+        | Inst i when lookup i = None ->
+            List.fold_left
+              (fun a (_, e) -> SS.union a (ss_of_dce (Behavioral_dce.collect_uses_expr e)))
+              acc i.port_connections
+        | _ -> acc)
+      SS.empty
+      (!leftover @ List.concat_map (fun g -> g.g_items) groups)
+  in
   List.iter
     (fun ((dm : bmodule), _) ->
       List.iter
         (fun (s : bsignal) ->
-          if s.direction = `Input && not (SS.mem s.name driven) then
+          if s.direction = `Input && not (SS.mem s.name driven)
+             && not (SS.mem s.name opaque_pins) then
             refuse "module '%s' input '%s' has no driver after the split" dm.name s.name)
         dm.signals)
     built;
