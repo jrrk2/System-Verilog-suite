@@ -3027,6 +3027,57 @@ let extract_assign ~pkgs ~params ~arrays tok =
 
 (* Recognised statement shapes inside an `always_*` body. Anything
  * else becomes BBlock []. *)
+(* Tasks declared in the CURRENT module whose body is empty.  Refilled per
+   module by [collect_noop_tasks] before the always blocks are converted.
+
+   The reason this table exists at all: `picorv32.v` defines
+
+       task empty_statement; begin end endtask
+
+   solely so that `` `define assert(expr) empty_statement `` expands to
+   something legal in non-formal builds, and then calls it from a dozen places.
+   The call is a bare `reference_or_call ;` — a statement shape this frontend
+   does not model, because it does not model tasks — so it lands in the
+   statement catch-all, which (rightly) refuses to drop an unmodelled statement
+   quietly.  Refusing is correct in general and wrong here: the callee's body is
+   empty, so the call provably carries no logic.  Checking the body is what
+   makes the difference between "we know this is nothing" and "we hope it was
+   nothing", and only the first is safe to drop in silence. *)
+let noop_tasks : (string, unit) Hashtbl.t = Hashtbl.create 8
+
+let first_symbol tok =
+  let found = ref None in
+  walk (fun t ->
+      match t with
+      | SymbolIdentifier s when !found = None -> found := Some s
+      | _ -> ())
+    tok;
+  !found
+
+(* Scan a module body for empty-bodied task declarations.
+   `task_declaration1(Task, lifetime, id, ports, ;, body, Endtask, label)`. *)
+let collect_noop_tasks m_body =
+  Hashtbl.reset noop_tasks;
+  List.iter
+    (fun t ->
+      match t with
+      | TUPLE9 (STRING _, _task, _lifetime, id, _ports, _semi, body, _end, _label) -> (
+          let has_logic =
+            collect_by
+              (has_tag (fun tg ->
+                   prefix_is "statement" tg || prefix_is "assignment" tg
+                   || prefix_is "conditional_statement" tg
+                   || prefix_is "case_statement" tg || prefix_is "loop_statement" tg
+                   || prefix_is "for_loop_statement" tg))
+              body
+            <> []
+          in
+          match first_symbol id with
+          | Some n when not has_logic -> Hashtbl.replace noop_tasks n ()
+          | _ -> ())
+      | _ -> ())
+    (collect_by (has_tag (fun tg -> prefix_is "task_declaration" tg)) m_body)
+
 (* True when a statement's payload is a system task call ($display etc.).
    Those are simulation constructs with no synthesised hardware. *)
 let rec stmt_is_system_task = function
@@ -3871,6 +3922,19 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
          net/var declarations by the signal-width extraction — so this carries
          no PROCEDURAL logic and is a no-op here.  (Must precede the catch-all,
          which would otherwise hard-fail on it in strict mode.) *)
+      BBlock []
+  | TUPLE3 (STRING t, payload, _semi) when prefix_is "statement3" t ->
+      (* `reference_or_call ;` — a bare call statement.  Droppable ONLY when
+         the callee is a task this module declares with an empty body (see
+         [noop_tasks]); any other call may assign through an output argument,
+         so it stays a reported loss rather than a quiet one. *)
+      let callee = first_symbol payload in
+      (match callee with
+       | Some n when Hashtbl.mem noop_tasks n -> ()
+       | _ ->
+           lossage_warn "verible:stmt"
+             (Printf.sprintf "call statement '%s;' dropped to empty block (tasks are not modelled)"
+                (match callee with Some n -> n | None -> "?")));
       BBlock []
   | _ ->
       (* Master statement catch-all: an unhandled procedural statement shape
@@ -6283,6 +6347,10 @@ let convert_module ~pkgs (mdecl : module_decl)
       initial_nodes
   in
   let assign_procs = assign_procs @ initial_procs in
+  (* mdecl_body, NOT mdecl.m_body: strip_function_decls has already deleted
+     every task_declaration from the latter, so the scan would find nothing and
+     silently conclude that no task is a no-op. *)
+  collect_noop_tasks mdecl_body;
   let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
   let instances = extract_instances ~pkgs ~params ~arrays:array_names mdecl.m_body in
   (* RULE: any array that ever takes a WHOLE-array write (`arr = <expr>`, a

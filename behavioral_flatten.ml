@@ -256,13 +256,30 @@ let inline_instance ?(force_ff=false) ~child (parent : bmodule) (i : binstance) 
       @ List.map (fun (k, v) -> (k, BVar v)) renamed_internal
     in
     let rewrite_stmt = substitute_port_inputs_stmt all_subst in
+    (* A BSequential's clock and reset are NAME FIELDS, not expressions in the
+       body, so the body rewrite above does not touch them.  Left alone, an
+       inlined register keeps the CHILD's name for its clock -- `clk` when the
+       parent's net is `clk_sys` -- and since only the child's INTERNAL signals
+       are brought into the parent, that name now refers to nothing at all.
+       The register is silently unclocked, and any later analysis reads it as
+       an extra clock domain that does not exist.  Map both through the same
+       port substitution as the body. *)
+    let rewrite_name n =
+      match List.assoc_opt n all_subst with
+      | Some (BVar v) -> v
+      | _ -> n
+    in
     let rewrite_proc = function
       | BCombinational c ->
           BCombinational { c with body = List.map rewrite_stmt c.body;
                                   name = i.inst_name ^ "." ^ c.name }
       | BSequential s ->
           BSequential { s with body = List.map rewrite_stmt s.body;
-                               name = i.inst_name ^ "." ^ s.name }
+                               name = i.inst_name ^ "." ^ s.name;
+                               clock = rewrite_name s.clock;
+                               reset = Option.map rewrite_name s.reset;
+                               (* in-cycle blocking temps are child names too *)
+                               blocking_vars = List.map rewrite_name s.blocking_vars }
     in
     (* Bring child's internal signals into the parent (renamed). *)
     let new_signals =
