@@ -38,6 +38,17 @@
  *     exporting the far side's read port (rx_rd_addr in / rx_rd_data out),
  *     with the FIFO occupancy argument -- not something to infer.
  *
+ * A HARD BLOCK SPANNING DOMAINS -- a dual-clock BRAM, an MMCM, a transceiver --
+ * goes to the fastest domain it touches, and its pins on the other domains
+ * cross the cut.  It is one object; it cannot be in two modules; and leaving it
+ * at the top means NEITHER domain can be cut at all, which is what the pass
+ * used to do.  Choosing the fastest decides which arc crosses: the tight
+ * constraint stays inside the module that enforces it, and what crosses belongs
+ * to the slower domain, with the most slack to absorb a boundary nobody times.
+ * That is least-bad, not safe, so every arc it creates is listed in
+ * [o_constraints] as a path the caller must constrain across the cut.  A
+ * crossing the rule did NOT cause is still a refusal.
+ *
  * A COMBINATIONAL CONE FEEDING SEVERAL DOMAINS goes to the FASTEST of them --
  * the one with the shortest clock period.  A cone is timed by the flop it
  * drives, so a cone driving both a 125 MHz and a 25 MHz flop has to fit inside
@@ -75,7 +86,15 @@ type outcome = {
   o_domains : (string * int) list;  (* clock -> item count *)
   o_leftover : int;              (* items kept at the top *)
   o_shared : (string * string) list;  (* multi-domain cone -> where it went, and why *)
-  o_refusals : string list;      (* empty = the cut is proven safe *)
+  (* hard block -> (module, domain it went to, that domain's period, all its
+     domains).  An empty domain means it stayed at the top for want of a
+     period. *)
+  o_hardblocks : (string * string * float * string list) list;
+  (* arcs that cross a generated boundary BECAUSE a hard block had to be put on
+     one side of it -- the known price of the fastest-domain rule, and a list
+     of paths the caller must constrain across the cut *)
+  o_constraints : string list;
+  o_refusals : string list;      (* empty = nothing beyond o_constraints to settle *)
 }
 
 (* --- clock periods -------------------------------------------------------- *)
@@ -303,11 +322,109 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
     let looked = List.map (fun d -> (d, List.assoc_opt d periods)) ds in
     if List.exists (fun (_, p) -> p = None) looked then None
     else
+      (* by period, then by NAME: two clocks at the same period are common (a
+         125 MHz refclk and a 125 MHz recovered clock) and which one wins must
+         not depend on the order the domains happened to be discovered in *)
       match
-        List.sort (fun (_, a) (_, b) -> compare a b) looked
+        List.sort (fun (n1, a) (n2, b) -> compare (a, n1) (b, n2)) looked
       with
       | (d, Some p) :: _ -> Some (d, p)
       | _ -> None
+  in
+  (* A hard block spanning several domains goes to the FASTEST of them, for the
+     same reason a shared cone does -- and with a consequence a cone does not
+     have.  Its pins on the other domains become ports of the module it lands
+     in, so those arcs cross the cut.  That is unavoidable: the block is one
+     object, it cannot be in two modules, and keeping it at the top means
+     NEITHER domain can be cut at all.  Choosing the fastest decides WHICH arc
+     crosses: the tight constraint stays inside the module that enforces it,
+     and the arc left crossing belongs to the slower domain, which has the most
+     slack to absorb a boundary nobody times.  Least-bad, not safe -- so every
+     resulting crossing is enumerated below as a path needing a cross-module
+     constraint, never quietly blessed. *)
+  let hardblocks = ref [] in
+  (* Nets reaching a hard block we placed by the fastest-domain rule.  NOT keyed
+     by the domain that ended up holding the block: the arc it creates leaves
+     one module and enters the other, so it shows up on BOTH boundaries and has
+     to be recognised at both. *)
+  let hb_nets = ref SS.empty in
+  let note_hb_nets (i : binstance) =
+    hb_nets :=
+      List.fold_left
+        (fun a (_, e) -> SS.union a (ss_of_dce (Behavioral_dce.collect_uses_expr e)))
+        !hb_nets i.port_connections
+  in
+  List.iter
+    (fun i ->
+      match SS.elements (inst_domains ~canon ~lookup i) with
+      | [ d ] -> place d (Inst i)
+      | [] -> (
+          (* No clock pin at all: a combinational cell.  On a netlist-shaped
+             design that is most of the instances, and dropping them at the top
+             leaves a LUT sitting between two registers of the same domain in
+             the module below -- a same-clock arc across the cut for no reason
+             other than the cell being an instance rather than a process.  Place
+             it the way a combinational process is placed: by the domain it
+             FEEDS.  Where it feeds several, the fastest, for the same reason as
+             a cone; with no period to rank them, the top keeps it, because
+             duplicating a cell is a heavier thing to do silently than
+             duplicating a process. *)
+          let _, defs = inst_uses_defs ~lookup i in
+          match SS.elements (capture_domains defs) with
+          | [ d ] -> place d (Inst i)
+          | [] -> leftover := Inst i :: !leftover
+          | ds -> (
+              match fastest ds with
+              | Some (d, _) -> place d (Inst i)
+              | None -> leftover := Inst i :: !leftover))
+      | ds -> (
+          match fastest ds with
+          | Some (d, per) ->
+              place d (Inst i);
+              note_hb_nets i;
+              hardblocks := (i.module_name, d, per, ds) :: !hardblocks
+          | None ->
+              leftover := Inst i :: !leftover;
+              hardblocks := (i.module_name, "", 0.0, ds) :: !hardblocks))
+    m.instances;
+  let hardblocks = List.rev !hardblocks in
+
+  (* Where a net goes once the instances are placed.  A cone feeding a hard
+     block has an UNNAMEABLE capture domain -- the block's insides are opaque --
+     so [capture_domains] reports it as feeding nothing and the top would keep
+     it.  On the flattened board design that is ~880 cones, all of them the
+     PCS's reset and control logic feeding transceiver pins, every one of them
+     then sitting at the top between registers of the domain it belongs to.  So
+     placing the instances FIRST buys a second answer to "what does this cone
+     feed": the domain of the instance it feeds. *)
+  let sink_domain : (string, SS.t) Hashtbl.t = Hashtbl.create 256 in
+  List.iter
+    (fun g ->
+      List.iter
+        (function
+          | Inst i ->
+              List.iter
+                (fun (_, e) ->
+                  SS.iter
+                    (fun n ->
+                      let cur =
+                        match Hashtbl.find_opt sink_domain n with
+                        | Some s -> s
+                        | None -> SS.empty
+                      in
+                      Hashtbl.replace sink_domain n (SS.add g.g_clock cur))
+                    (ss_of_dce (Behavioral_dce.collect_uses_expr e)))
+                i.port_connections
+          | Proc _ -> ())
+        g.g_items)
+    (Hashtbl.fold (fun _ g acc -> g :: acc) groups []);
+  let feeds_domains defs =
+    SS.fold
+      (fun n acc ->
+        match Hashtbl.find_opt sink_domain n with
+        | Some s -> SS.union acc s
+        | None -> acc)
+      defs SS.empty
   in
   List.iter
     (fun p ->
@@ -315,11 +432,21 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
       | BSequential { clock; _ } -> place (canon clock) (Proc p)
       | BCombinational _ -> (
           let _, defs = Behavioral_dce.collect_uses_defs_process p in
-          let doms = capture_domains (ss_of_dce defs) in
+          let defs = ss_of_dce defs in
+          (* Registers first, instances only as a fallback.  Unioning the two
+             would drag a cone into the domain of whatever hard block it
+             happens to touch: every clk_sys cone feeding the picosoc BRAM's
+             port A would follow the BRAM into rx_clk, taking the SoC's address
+             decode with it.  A cone that reaches a register belongs with that
+             register; the instance answer is for cones that reach no nameable
+             register at all. *)
+          let by_reg = capture_domains defs in
+          let doms = if SS.is_empty by_reg then feeds_domains defs else by_reg in
           match SS.elements doms with
           | [] ->
-              (* feeds no register at all: an output driver or dead logic.
-                 Nothing to be same-clock with, so the top can keep it. *)
+              (* feeds no register and no placed instance: an output driver or
+                 dead logic.  Nothing to be same-clock with, so the top keeps
+                 it. *)
               leftover := Proc p :: !leftover
           | [ d ] -> place d (Proc p)
           | ds -> (
@@ -346,12 +473,6 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
                           (List.filter (fun d -> List.assoc_opt d periods = None) ds)))
                     :: !shared)))
     m.processes;
-  List.iter
-    (fun i ->
-      match SS.elements (inst_domains ~canon ~lookup i) with
-      | [ d ] -> place d (Inst i)
-      | _ -> leftover := Inst i :: !leftover)
-    m.instances;
 
   let groups = Hashtbl.fold (fun _ g acc -> g :: acc) groups [] in
   let groups = List.sort (fun a b -> compare a.g_clock b.g_clock) groups in
@@ -557,7 +678,8 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
        funcs = m.funcs; mems; attrs = [ ("keep_hierarchy", "yes") ] },
      SS.elements inputs @ SS.elements outputs)
   in
-  let built = List.map module_of g_ud in
+  let built = List.map (fun (g, ud) -> (g, module_of (g, ud))) g_ud in
+  let built_mods = List.map (fun (_, bm) -> bm) built in
 
   (* --- 4. the new top ------------------------------------------------------ *)
   let domain_insts =
@@ -567,7 +689,7 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
         { inst_name = "u_" ^ sanitise g.g_clock; module_name = g.g_module;
           param_values = []; param_strs = [];
           port_connections = List.map (fun p -> (p, BVar p)) ports })
-      g_ud built
+      g_ud built_mods
   in
   let kept_signals =
     let needed =
@@ -595,17 +717,53 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
           (fun (mm : bmem) ->
             not (List.exists (fun ((dm : bmodule), _) ->
                      List.exists (fun (x : bmem) -> x.mname = mm.mname) dm.mems)
-                   built))
+                   built_mods))
           m.mems }
   in
   let prog' =
     { prog with
       modules =
         List.map (fun (mm : bmodule) -> if mm.name = top then new_top else mm) prog.modules
-        @ List.map fst built }
+        @ List.map fst built_mods }
   in
 
   (* --- 5. an input nobody drives is a broken cut, not a warning ------------- *)
+  (* ...but only if the SPLIT is what un-drove it.  picorv32 leaves pcpi_rd and
+     friends unconnected when the co-processor interface is off, so they float
+     in the source too; reporting those is reporting the design, not the
+     transformation.  The condition is "driven before, undriven after". *)
+  let pseudo_defs =
+    (* Array writes reach the IR as `@mem_write` / `@slice_write` /
+       `@part_sel_write_up|down` pseudo-calls whose FIRST argument is the array,
+       and the shared use/def collector counts that argument as a use only.  So
+       a register file written only through them (picorv32's cpuregs) reads as
+       having no driver anywhere. *)
+    let acc = ref SS.empty in
+    let rec stmt = function
+      | BCallStmt { func; args = BVar a :: _ } when func <> "" && func.[0] = '@' ->
+          acc := SS.add a !acc
+      | BIf { then_stmts; else_stmts; _ } ->
+          List.iter stmt then_stmts; List.iter stmt else_stmts
+      | BCase { cases; default; _ } ->
+          List.iter (fun (_, ss) -> List.iter stmt ss) cases;
+          List.iter stmt default
+      | BBlock ss -> List.iter stmt ss
+      | BWhile { body; _ } -> List.iter stmt body
+      | BFor { body; _ } -> List.iter stmt body
+      | _ -> ()
+    in
+    List.iter
+      (function
+        | BCombinational { body; _ } | BSequential { body; _ } -> List.iter stmt body)
+      m.processes;
+    !acc
+  in
+  let driven_before =
+    List.fold_left
+      (fun acc it -> let _, d = item_uses_defs ~lookup it in SS.union acc d)
+      (SS.union top_in pseudo_defs)
+      (!leftover @ List.concat_map (fun g -> g.g_items) groups)
+  in
   let driven =
     List.fold_left
       (fun acc ((dm : bmodule), _) ->
@@ -614,7 +772,7 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
              (List.filter_map
                 (fun (s : bsignal) -> if s.direction = `Output then Some s.name else None)
                 dm.signals)))
-      (SS.union leftover_d top_in) built
+      (SS.union (SS.union leftover_d top_in) pseudo_defs) built_mods
   in
   (* Pins of a body-less hard block.  [inst_uses_defs] deliberately claims no
      writes for those, so their outputs would every one of them read as
@@ -638,21 +796,59 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
       List.iter
         (fun (s : bsignal) ->
           if s.direction = `Input && not (SS.mem s.name driven)
-             && not (SS.mem s.name opaque_pins) then
+             && not (SS.mem s.name opaque_pins)
+             && SS.mem s.name driven_before then
             refuse "module '%s' input '%s' has no driver after the split" dm.name s.name)
         dm.signals)
-    built;
+    built_mods;
 
   (* --- 6. do not trust the split: prove each generated boundary ------------- *)
+  (* A crossing on a net that reaches a hard block placed by the fastest-domain
+     rule is not a surprise: it is the known price of that rule, since the
+     block's other-domain pins had to cross something.  Those are collected as
+     paths REQUIRING a cross-module constraint, named one by one so the list can
+     be turned into set_max_delay entries.  They are not silently downgraded and
+     they are not called safe.  A crossing the policy did not cause stays a
+     refusal -- nobody decided to accept that one. *)
+  let constraints = ref [] in
   List.iter
-    (fun ((dm : bmodule), _) ->
+    (fun (_g, ((dm : bmodule), _)) ->
       let xs = Behavioral_cdc_check.check_boundary prog' ~macro:dm.name in
       List.iter
         (fun (x : Behavioral_cdc_check.crossing) ->
-          if x.Behavioral_cdc_check.x_verdict <> Behavioral_cdc_check.Safe then
-            refuse "%s.%s: %s (%s)" dm.name x.Behavioral_cdc_check.x_signal
-              (Behavioral_cdc_check.verdict_str x.Behavioral_cdc_check.x_verdict)
-              x.Behavioral_cdc_check.x_why)
+          let port = x.Behavioral_cdc_check.x_signal in
+            (* Whose problem each crossing is.
+
+               UNSAFE is ours: a same-clock FF->FF arc across a boundary we
+               drew, provably timed by nobody.  That is a refusal -- unless the
+               net reaches a hard block we PLACED, in which case the arc is the
+               accepted price of the fastest-domain rule and is listed instead.
+
+               UNPROVEN is nobody's to settle here: the verdict exists precisely
+               because a domain could not be named -- a transceiver's insides, a
+               clock that never reaches an interface -- and the cone carries
+               that all the way downstream, so it lands on nets that never touch
+               the block themselves.  No analysis at this level can decide those,
+               and refusing them means refusing every design with a GT in it.
+               They are enumerated, individually, as paths the designer must
+               constrain or waive.  Enumerated is the point: a count is not a
+               list, and a list is what turns into set_max_delay lines. *)
+            let placed = SS.mem port !hb_nets in
+            match x.Behavioral_cdc_check.x_verdict with
+            | Behavioral_cdc_check.Unproven ->
+                constraints :=
+                  Printf.sprintf "%s %s.%s -- %s"
+                    (if placed then "[placed]" else "[opaque]") dm.name port
+                    x.Behavioral_cdc_check.x_why
+                  :: !constraints
+            | Behavioral_cdc_check.Unsafe when placed ->
+                constraints :=
+                  Printf.sprintf "[placed] %s.%s -- SAME-CLOCK arc created by placing a hard block on one side"
+                    dm.name port
+                  :: !constraints
+            | Behavioral_cdc_check.Unsafe ->
+                refuse "%s.%s: UNSAFE (%s)" dm.name port x.Behavioral_cdc_check.x_why
+            | Behavioral_cdc_check.Safe -> ())
         xs)
     built;
 
@@ -661,6 +857,8 @@ let split ?(periods : (string * float) list = []) (prog : bprogram) ~(top : stri
     o_domains = List.map (fun g -> (g.g_clock, List.length g.g_items)) groups;
     o_leftover = List.length !leftover;
     o_shared = List.rev !shared;
+    o_hardblocks = hardblocks;
+    o_constraints = List.rev !constraints;
     o_refusals = List.rev !refusals;
   }
 
@@ -673,7 +871,43 @@ let report (o : outcome) =
       (List.length o.o_shared);
     List.iter (fun (c, w) -> Printf.printf "  %-28s %s\n" c w) o.o_shared
   end;
-  if o.o_refusals = [] then print_string "[domain-split] cut PROVEN safe\n"
+  if o.o_hardblocks <> [] then begin
+    (* one line per KIND, not per instance: sixteen identical BRAMs are one
+       fact about the design *)
+    let kinds =
+      List.sort_uniq compare
+        (List.map (fun (n, d, p, ds) -> (n, d, p, ds)) o.o_hardblocks)
+    in
+    Printf.printf "[domain-split] %d hard block(s) spanning domains:\n"
+      (List.length o.o_hardblocks);
+    List.iter
+      (fun (n, d, p, ds) ->
+        let count =
+          List.length (List.filter (fun (n', _, _, _) -> n' = n) o.o_hardblocks)
+        in
+        if d = "" then
+          Printf.printf "  %2d x %-16s STAYS AT THE TOP -- no period for %s\n" count n
+            (String.concat "," ds)
+        else
+          Printf.printf "  %2d x %-16s -> %s (fastest of %s, %.3f ns)\n" count n d
+            (String.concat "," ds) p)
+      kinds
+  end;
+  if o.o_constraints <> [] then begin
+    Printf.printf
+      "[domain-split] %d arc(s) MUST be timed by a cross-module constraint (set_max_delay\n\
+      \              across the boundary): [placed] = a hard block we put on one side, so its\n\
+      \              other-domain pins cross; [opaque] = a path into a block nobody can see\n\
+      \              inside, so no analysis can settle it:\n"
+      (List.length o.o_constraints);
+    List.iter (fun c -> Printf.printf "  %s\n" c) o.o_constraints
+  end;
+  if o.o_refusals = [] then
+    if o.o_constraints = [] then print_string "[domain-split] cut PROVEN safe\n"
+    else
+      Printf.printf
+        "[domain-split] cut proven safe APART from the %d listed arc(s), which need the constraint above\n"
+        (List.length o.o_constraints)
   else begin
     Printf.printf "[domain-split] REFUSED -- %d problem(s):\n"
       (List.length o.o_refusals);

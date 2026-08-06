@@ -150,6 +150,24 @@ let clock_aliases (m : bmodule) =
          (fun s -> if s.direction <> `Internal then Some s.name else None)
          m.signals)
   in
+  (* Which of two names for the same clock to keep.  A port wins, because a
+     clock named on an interface is the one a constraint can refer to.  Failing
+     that, prefer the name with the fewest hierarchy separators and then the
+     shorter one: after flattening, one clock carries both `eth_clk` and
+     `eth.i_pcs_pma.inst.core_clocking_i/clkout0`, and a plain lexicographic
+     tie-break picks the second ('.' sorts below '_').  The user then has to
+     write THAT into the period spec, which is a bad enough interface to be
+     worth four lines of comparison. *)
+  let depth n =
+    String.fold_left (fun a c -> if c = '.' || c = '/' then a + 1 else a) 0 n
+  in
+  let nicer a b =
+    let da = depth a and db = depth b in
+    if da <> db then da < db
+    else if String.length a <> String.length b then
+      String.length a < String.length b
+    else a <= b
+  in
   let union a b =
     if is_const_net a || is_const_net b then () else
     let ra = find a and rb = find b in
@@ -158,7 +176,7 @@ let clock_aliases (m : bmodule) =
         match SS.mem ra ports, SS.mem rb ports with
         | true, false -> ra, rb
         | false, true -> rb, ra
-        | _ -> if ra <= rb then ra, rb else rb, ra
+        | _ -> if nicer ra rb then ra, rb else rb, ra
       in
       Hashtbl.replace parent keep keep;
       Hashtbl.replace parent drop keep
