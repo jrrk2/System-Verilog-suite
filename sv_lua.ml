@@ -3541,6 +3541,18 @@ let lopendcp_compare a_path b_path =
        d.d_joined d.d_only_a d.d_only_b
        (List.length d.d_type_diff) (List.length d.d_loc_diff)
        (List.length d.d_pin_diff));
+  Buffer.add_string bf
+    (Printf.sprintf "sites: only_a=%d only_b=%d differing=%d\n"
+       (List.length d.d_site_only_a) (List.length d.d_site_only_b)
+       (List.length d.d_site_diff));
+  List.iter (fun (nm, np, nr) ->
+      Buffer.add_string bf (Printf.sprintf "site-only-a\t%s\tpips=%d routes=%d\n" nm np nr))
+    d.d_site_only_a;
+  List.iter (fun (nm, np, nr) ->
+      Buffer.add_string bf (Printf.sprintf "site-only-b\t%s\tpips=%d routes=%d\n" nm np nr))
+    d.d_site_only_b;
+  List.iter (fun (nm, ds) ->
+      Buffer.add_string bf (Printf.sprintf "site\t%s\t%s\n" nm ds)) d.d_site_diff;
   List.iter (fun (n, x, y) ->
       Buffer.add_string bf (Printf.sprintf "type\t%s\t%s\t%s\n" n x y)) d.d_type_diff;
   List.iter (fun (n, s) ->

@@ -33,6 +33,22 @@ type cell = {
   c_props : (string * string) list;
 }
 
+type sitepip = { sp_bel : string; sp_in : string; sp_out : string }
+
+type siteroute = { sr_net : string; sr_bel : string; sr_pin : string }
+
+(* A placed site, with the intra-site state Vivado records for it.  Modelled
+   because a whole class of import defects lives here and nowhere else -- the
+   slice output mux, the IOB's routing bels, the GT's 420 intra-site nets -- and
+   answering "does our site look like Vivado's" with grep over the XML produced
+   three wrong conclusions in one session. *)
+type site = {
+  s_name  : string;
+  s_type  : string;
+  s_pips  : sitepip list;
+  s_routes: siteroute list;
+}
+
 type net = {
   n_name    : string;
   n_type    : string;
@@ -46,6 +62,7 @@ type db = {
   top   : string;
   cells : cell list;
   nets  : net list;
+  sites : site list;
 }
 
 (* ---------------------------------------------------------------- parsing *)
@@ -95,9 +112,27 @@ let parse_net el =
     n_srcpins = List.rev !src;
     n_snkpins = List.rev !snk }
 
+let parse_site el =
+  let pips = ref [] and routes = ref [] in
+  Xml.iter
+    (fun ch ->
+       match String.lowercase_ascii (Xml.tag ch) with
+       | "sitepip" ->
+           pips := { sp_bel = attr_or "" "bel" ch;
+                     sp_in  = attr_or "" "in" ch;
+                     sp_out = attr_or "" "out" ch } :: !pips
+       | "siteroute" ->
+           routes := { sr_net = attr_or "" "net" ch;
+                       sr_bel = attr_or "" "srcbel" ch;
+                       sr_pin = attr_or "" "srcpin" ch } :: !routes
+       | _ -> ())
+    el;
+  { s_name = attr_or "" "name" el; s_type = attr_or "" "type" el;
+    s_pips = List.rev !pips; s_routes = List.rev !routes }
+
 let load path =
   let root = Xml.parse_file path in
-  let cells = ref [] and nets = ref [] in
+  let cells = ref [] and nets = ref [] and sites = ref [] in
   Xml.iter
     (fun sec ->
        match String.lowercase_ascii (Xml.tag sec) with
@@ -106,6 +141,7 @@ let load path =
              (fun si ->
                 if String.lowercase_ascii (Xml.tag si) = "siteinst" then begin
                   let site = attr_or "" "name" si in
+                  sites := parse_site si :: !sites;
                   Xml.iter
                     (fun c ->
                        if String.lowercase_ascii (Xml.tag c) = "cell" then
@@ -122,7 +158,7 @@ let load path =
        | _ -> ())
     root;
   { part = attr_or "" "part" root; top = attr_or "" "top" root;
-    cells = List.rev !cells; nets = List.rev !nets }
+    cells = List.rev !cells; nets = List.rev !nets; sites = List.rev !sites }
 
 (* ------------------------------------------------------------ diagnostics *)
 
@@ -328,6 +364,9 @@ let canon s =
   Buffer.contents b
 
 type diff = {
+  d_site_only_a : (string * int * int) list;  (* site, npips, nroutes *)
+  d_site_only_b : (string * int * int) list;
+  d_site_diff   : (string * string) list;     (* site, description *)
   d_joined     : int;
   d_only_a     : int;
   d_only_b     : int;
@@ -378,7 +417,42 @@ let compare_db a b =
              | Some (Some _) -> acc | _ -> acc + 1)
          | None -> acc)
       h 0 in
-  { d_joined = !joined;
+  (* Site-level comparison.  Sites join on their NAME, which is a device
+     coordinate and therefore identical across tools -- unlike cell names, which
+     only join at ~36% between two different synthesisers.  So this half of the
+     comparison is trustworthy even when the cell half is not. *)
+  let sidx d = List.fold_left (fun m st -> (st.s_name, st) :: m) [] d.sites in
+  let sa = sidx a and sb = sidx b in
+  let site_only x y =
+    List.filter_map
+      (fun (nm, st) ->
+         if List.mem_assoc nm y then None
+         else Some (nm, List.length st.s_pips, List.length st.s_routes))
+      x in
+  let sdiff =
+    List.filter_map
+      (fun (nm, st) ->
+         match List.assoc_opt nm sb with
+         | None -> None
+         | Some st2 ->
+             let np1 = List.length st.s_pips and np2 = List.length st2.s_pips in
+             let nr1 = List.length st.s_routes and nr2 = List.length st2.s_routes in
+             (* Compare the SHAPE (bel/in/out, bel/pin), not the net names --
+                escape_name rewrites '/' to '_', so every site route's net name
+                differs cosmetically between a golden and an imported DCP. *)
+             let shape l = List.sort compare (List.map (fun r -> (r.sr_bel, r.sr_pin)) l) in
+             let pshape l = List.sort compare (List.map (fun q -> (q.sp_bel, q.sp_in, q.sp_out)) l) in
+             if np1 = np2 && nr1 = nr2 && shape st.s_routes = shape st2.s_routes
+                && pshape st.s_pips = pshape st2.s_pips then None
+             else Some (nm, Printf.sprintf "sitepips %d vs %d, siteroutes %d vs %d%s"
+                              np1 np2 nr1 nr2
+                              (if shape st.s_routes <> shape st2.s_routes
+                               then " (route SHAPE differs)" else "")))
+      sa in
+  { d_site_only_a = site_only sa sb;
+    d_site_only_b = site_only sb sa;
+    d_site_diff = sdiff;
+    d_joined = !joined;
     d_only_a = count ha hb;
     d_only_b = count hb ha;
     d_type_diff = List.rev !ty;
