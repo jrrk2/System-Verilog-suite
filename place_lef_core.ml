@@ -2031,16 +2031,90 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      TOPO_STAMP_ALL=1 -- nextpnr places those from the XDC. *)
   let stamp_all = Sys.getenv_opt "TOPO_STAMP_ALL" <> None in
   let skip_kind = function "GT" | "MMCM" | "BUFG" | "BUFH" | "IO" -> true | _ -> false in
+  (* TOPO_BELS_SKIP_CARREP=1 -- for consumers that hold the ORIGINAL netlist.
+     ------------------------------------------------------------------------
+     When a CARRY4's CO[3] feeds more than one downstream CARRY4 CI, the carry
+     prepass above REPLICATES the whole chain, one clone per extra user, because
+     COUT->CIN is a dedicated point-to-point wire that reaches only the slice
+     directly above.  Those clones (<cell>_carrep<i>) exist in the netlist WE
+     place and nowhere else.
+
+     Hand this placement to a tool reading the PRE-prepass netlist -- Vivado, in
+     ethmin/vivado_route_ethmin.tcl -- and the CO net still fans out to every
+     consumer, while the positions we supply were computed as if each consumer
+     had its own clone.  At most one of them can then be reached through the
+     cascade and the rest are physically unroutable:
+
+       [DRC RTSTAT-2] Partially routed nets: ... alu_lts_CARRY4_CO_CO_1..._n_0
+       [DRC RTSTAT-5] Partial antennas:      ... the same net
+
+     A consumer's placement is meaningless in a netlist that has no clone, so
+     the consumer's own placer should put those few chains where ITS netlist
+     says they belong.
+
+     BUT THE STAMPS MUST STILL BE WRITTEN.  bels.txt is not just "the placement
+     we hand Vivado" -- carry_stamp.py reads it to build the JSON that NEXTPNR
+     routes.  An earlier version of this omitted the stamps outright and thereby
+     deleted 11 cells' placement from the open flow: 3 packed cells (2 replica
+     chains + the consumer they feed, whose pc_bels carry 8 cloned S-LUTs).
+     nextpnr then had them as free cells, and its analytic placer SPUN AT 100%
+     CPU INDEFINITELY on those 7 clusters -- a hang that looked like a router
+     problem and was self-inflicted.
+
+     So bels.txt stays COMPLETE and the names go to a side file instead
+     (TOPO_CARREP_SKIP_OUT, default <bels>.carrep_skip).  A consumer that holds
+     the un-replicated netlist reads that list and declines those names;
+     everything else, nextpnr included, is unaffected. *)
+  let skip_carrep = getenv_int "TOPO_BELS_SKIP_CARREP" 0 <> 0 in
+  let contains s sub =
+    let ls = String.length sub and ln = String.length s in
+    ls > 0 && (let rec go j = j + ls <= ln
+                              && (String.sub s j ls = sub || go (j + 1)) in go 0) in
+  (* net driven by each packed cell's CO, so a consumer can be traced to a clone *)
+  let co_driver : (Pack_to_lef.netkey, string) Hashtbl.t = Hashtbl.create 256 in
+  if skip_carrep then
+    Array.iter (fun c ->
+        if contains c.Pack_to_lef.pc_lef "SLICE_CARRY" then
+          match List.assoc_opt "CO" c.Pack_to_lef.pc_conns with
+          | Some nk -> Hashtbl.replace co_driver nk c.Pack_to_lef.pc_name
+          | None -> ()) cells;
+  let n_repl = ref 0 and n_cons = ref 0 in
+  let skip_cell c =
+    if not skip_carrep then false
+    else if contains c.Pack_to_lef.pc_name "_carrep" then (incr n_repl; true)
+    else if contains c.Pack_to_lef.pc_lef "SLICE_CARRY" then
+      match List.assoc_opt "CI" c.Pack_to_lef.pc_conns with
+      | Some nk ->
+        (match Hashtbl.find_opt co_driver nk with
+         | Some drv when contains drv "_carrep" -> incr n_cons; true
+         | _ -> false)
+      | None -> false
+    else false in
   let ob = open_out bels_path in
-  let nb = ref 0 in
+  let skip_path = getenv_default "TOPO_CARREP_SKIP_OUT" (bels_path ^ ".carrep_skip") in
+  let os_ = if skip_carrep then Some (open_out skip_path) else None in
+  let nb = ref 0 and nskip = ref 0 in
   Array.iter (fun c ->
       if stamp_all || not (skip_kind (kind_of_lef c.Pack_to_lef.pc_lef)) then
       match cell_site.(Hashtbl.find name2id c.Pack_to_lef.pc_name) with
-      | Some site -> List.iter (fun (prim, suffix) ->
-          Printf.fprintf ob "%s\t%s/%s\n" prim site.sname suffix; incr nb) c.Pack_to_lef.pc_bels
+      | Some site ->
+        (* every stamp is written -- the open flow needs all of them *)
+        List.iter (fun (prim, suffix) ->
+            Printf.fprintf ob "%s\t%s/%s\n" prim site.sname suffix; incr nb) c.Pack_to_lef.pc_bels;
+        (* ...and the replica-tainted ones are ALSO named in the side file *)
+        (match os_ with
+         | Some oc when skip_cell c ->
+           List.iter (fun (prim, _) -> Printf.fprintf oc "%s\n" prim; incr nskip)
+             c.Pack_to_lef.pc_bels
+         | _ -> ())
       | None -> ()) cells;
   close_out ob;
+  (match os_ with Some oc -> close_out oc | None -> ());
   Printf.printf "placement -> %s ; %d BEL stamps -> %s\n" placed_path !nb bels_path;
+  if skip_carrep then
+    Printf.printf "  [bels] carry-replica advisory: %d replica cell(s) + %d consumer CARRY4(s) \
+                   = %d primitive(s) -> %s (bels.txt itself is COMPLETE)\n"
+      !n_repl !n_cons !nskip skip_path;
 
   (* ===== FEEDTHROUGH INSERTION (OCaml, driven by this placer's data) =========
      For LOGIC nets (skip clock/const) whose driver->sink arc exceeds a
