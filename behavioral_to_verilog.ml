@@ -3,6 +3,31 @@
 open Behavioral_ir
 
 (* Sanitize signal names for Verilog *)
+(* A name that is not a legal simple identifier has to be emitted as a Verilog
+   ESCAPED identifier -- backslash, the name, a terminating space.  Flattening
+   builds names like `soc.memory.membit__0__doa` from the instance path, and
+   `logic [0:0] soc.memory.membit__0__doa;` is not Verilog at all: every tool
+   downstream rejects the file on the first declaration.
+
+   Escaping rather than rewriting '.' to '_': the rewrite is not injective.  A
+   design that already has `soc_mem_addr` alongside a flattened `soc.mem_addr`
+   would silently end up with the two shorted together, which is the kind of
+   corruption that shows up as a wrong bitstream and not as an error. *)
+let needs_escape s =
+  s = ""
+  || (let c = s.[0] in
+      not ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_'))
+  || String.exists
+       (fun c ->
+         not
+           ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c = '_' || c = '$'))
+       s
+
+(* The trailing space is part of the token: it is what ENDS an escaped
+   identifier, so `\a.b [3]` is the escaped name `a.b` indexed at 3. *)
+let escape_id s = if needs_escape s then "\\" ^ s ^ " " else s
+
 let sanitize_name name =
   (* Preserve brackets only if they're at the end and look like array indexing: signal[N]
      Otherwise sanitize them *)
@@ -16,19 +41,21 @@ let sanitize_name name =
       let is_index = String.length between > 0 &&
         String.fold_left (fun acc c -> acc && (c >= '0' && c <= '9')) true between in
       if is_index && open_bracket > 0 then
-        (* Valid array indexing - preserve it, but sanitize everything before the bracket *)
+        (* Valid array indexing - preserve it, but sanitize everything before the bracket.
+           Only the BASE is escaped; the index stays outside the escaped token,
+           which is what the terminating space is for. *)
         let base = String.sub name 0 open_bracket in
         let sanitized_base = String.map (fun c -> if c = '@' then '_' else c) base in
-        sanitized_base ^ "[" ^ between ^ "]"
+        escape_id sanitized_base ^ "[" ^ between ^ "]"
       else
         (* Not valid array indexing - sanitize everything *)
-        String.map (fun c -> if c = '@' || c = '[' || c = ']' then '_' else c) name
+        escape_id (String.map (fun c -> if c = '@' || c = '[' || c = ']' then '_' else c) name)
     with Not_found ->
       (* No opening bracket - sanitize *)
-      String.map (fun c -> if c = '@' || c = '[' || c = ']' then '_' else c) name
+      escape_id (String.map (fun c -> if c = '@' || c = '[' || c = ']' then '_' else c) name)
   else
     (* No closing bracket at end - sanitize any brackets *)
-    String.map (fun c -> if c = '@' || c = '[' || c = ']' then '_' else c) name
+    escape_id (String.map (fun c -> if c = '@' || c = '[' || c = ']' then '_' else c) name)
 
 (* Generate Verilog type declarations *)
 let rec verilog_of_type = function

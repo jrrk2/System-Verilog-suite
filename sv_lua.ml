@@ -3817,9 +3817,16 @@ let lname h =
 let lemit_verilog h =
   match Hashtbl.find_opt lhash h with
   | Some (Prog (_, p)) -> Behavioral_to_verilog.verilog_of_program p
-  | Some (Mod  (_, m, _)) ->
-      Behavioral_to_verilog.verilog_of_program
-        { modules=[m]; library_cells=[] }
+  | Some (Mod  (_, m, p)) ->
+      (* Emit the one module, but resolve names against the module's OWN
+         program.  Wrapping it in `{modules=[m]}` blinded every lookup the
+         emitter does on the way out -- notably the guard that refuses to pass
+         `#(.STACKADDR(4096))` to a module whose parameters have already been
+         baked into its specialised name.  With no program to consult, the
+         guard concluded "library cell, keep all params" and emitted overrides
+         that Vivado rejects outright.  A single-module emit is a narrower
+         VIEW of the program, not a different program. *)
+      Behavioral_to_verilog.verilog_of_module p m
   | _ -> failwith ("emit_verilog: not a program/module handle: " ^ h)
 
 let lemit_vhdl h =
