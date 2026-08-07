@@ -111,6 +111,123 @@ let run_gen floorplan_json ~get_bmod ~get_j =
        Printf.eprintf "reserved %d sites (%d in floorplan) from %s\n"
          (Hashtbl.length reserved) !n path
    | None -> ());
+  (* TOPO_MACRO_SOFT: a frozen macro's own BELs must be excluded -- a core cell
+     cannot legally sit on one -- but the tiles AROUND them are a different
+     question.  Their interconnect is heavily used by the macro's fixed pips,
+     so a core cell placed among them is more likely to fail to route than the
+     same cell elsewhere; that is a REASON TO PREFER elsewhere, not a reason to
+     forbid.  Forbidding measured worse: reserving the bounding box put 1425
+     perfectly good slices out of reach, squeezed the core into a narrow column
+     and produced 105 unrouted arcs, against 4 when only the macro's own sites
+     were taken.
+
+     So: a cost, not a wall.  Each site within TOPO_MACRO_SOFT_R tiles of a
+     macro cell costs TOPO_MACRO_SOFT_W extra, and the annealer spends that
+     only where the wirelength it saves is worth more.  W=0 (default) is off. *)
+  let macro_pen : (int * int, float) Hashtbl.t = Hashtbl.create 4096 in
+  let macro_soft_w = getenv_float "TOPO_MACRO_SOFT_W" 0.0 in
+  (match Sys.getenv_opt "TOPO_MACRO_SOFT" with
+   | Some path when macro_soft_w > 0.0 ->
+       let r = getenv_int "TOPO_MACRO_SOFT_R" 1 in
+       let seeds = Hashtbl.create 1024 in
+       (try let ic = open_in path in
+          (try while true do
+             let line = input_line ic in
+             if String.length line > 0 && line.[0] <> '#' then
+               match String.split_on_char '\t' line with
+               | _ :: site :: _ ->
+                   let site = match String.index_opt site '/' with
+                     | Some i -> String.sub site 0 i | None -> site in
+                   Hashtbl.replace seeds site ()
+               | _ -> ()
+           done with End_of_file -> ()); close_in ic
+        with Sys_error _ -> ());
+       (* the file names sites; the floorplan knows where they are *)
+       let pts = ref [] in
+       Hashtbl.iter (fun _k lref -> List.iter (fun s ->
+           if Hashtbl.mem seeds s.sname then pts := (s.sx, s.sy) :: !pts) !lref) fp;
+       (* dilate by r, cost falling off with distance so the edge is not a cliff *)
+       List.iter (fun (x, y) ->
+           for dx = -r to r do for dy = -r to r do
+             let d = abs dx + abs dy in
+             if d <= r then begin
+               let k = (x + dx, y + dy) in
+               let v = macro_soft_w *. (1.0 -. float d /. float (r + 1)) in
+               let cur = try Hashtbl.find macro_pen k with Not_found -> 0.0 in
+               if v > cur then Hashtbl.replace macro_pen k v
+             end
+           done done) !pts;
+       Printf.eprintf
+         "macro soft penalty: %d seed site(s), radius %d, weight %.2f -> %d penalised tile(s)\n"
+         (List.length !pts) r macro_soft_w (Hashtbl.length macro_pen);
+       if !pts = [] then
+         Printf.eprintf
+           "  WARNING: none of %s's sites are in the floorplan -- the penalty covers NOTHING\n"
+           path
+   | Some _ -> Printf.eprintf "TOPO_MACRO_SOFT set but TOPO_MACRO_SOFT_W is 0 -- penalty OFF\n"
+   | None -> ());
+  let macro_cost x y =
+    if Hashtbl.length macro_pen = 0 then 0.0
+    else try Hashtbl.find macro_pen (x, y) with Not_found -> 0.0 in
+
+  (* TOPO_KEEPOUT_FROM: same kind of file, but reserve the whole BOUNDING BOX of
+     the macro's sites rather than only the sites it happens to occupy.
+     TOPO_RESERVED_SITES leaves the free slices INSIDE a frozen macro available,
+     which looks like better density and is a trap: the macro's routing is
+     frozen too, so core logic dropped between its cells competes for the very
+     interconnect those fixed pips already own, and the router discovers it far
+     too late.  A macro is a region, not a set of sites.
+
+     TOPO_KEEPOUT_MARGIN (default 0) widens the box by N tiles if the frozen
+     routing needs elbow room beyond the cells themselves. *)
+  (match Sys.getenv_opt "TOPO_KEEPOUT_FROM" with
+   | Some path ->
+       let x0 = ref max_int and x1 = ref min_int in
+       let y0 = ref max_int and y1 = ref min_int in
+       let sites = Hashtbl.create 4096 in
+       (try let ic = open_in path in
+          (try while true do
+             let line = input_line ic in
+             if String.length line > 0 && line.[0] <> '#' then
+               match String.split_on_char '\t' line with
+               | _ :: site :: _ ->
+                   (* accept both `SITE` and `SITE/BEL` *)
+                   let site = match String.index_opt site '/' with
+                     | Some i -> String.sub site 0 i
+                     | None -> site in
+                   Hashtbl.replace sites site ()
+               | _ -> ()
+           done with End_of_file -> ()); close_in ic
+        with Sys_error _ -> ());
+       (* the floorplan knows where each site is; the file only names them *)
+       Hashtbl.iter (fun _k lref -> List.iter (fun s ->
+           if Hashtbl.mem sites s.sname then begin
+             if s.sx < !x0 then x0 := s.sx;
+             if s.sx > !x1 then x1 := s.sx;
+             if s.sy < !y0 then y0 := s.sy;
+             if s.sy > !y1 then y1 := s.sy
+           end) !lref) fp;
+       if !x0 > !x1 then
+         Printf.eprintf
+           "TOPO_KEEPOUT_FROM %s: none of its %d site(s) are in the floorplan -- \
+            NOTHING was reserved.  A keep-out that silently covers nothing is \
+            worse than none: the build proceeds and the collision appears later \
+            as a bind failure.\n"
+           path (Hashtbl.length sites)
+       else begin
+         let m = getenv_int "TOPO_KEEPOUT_MARGIN" 0 in
+         let x0 = !x0 - m and x1 = !x1 + m and y0 = !y0 - m and y1 = !y1 + m in
+         let n = ref 0 and tot = ref 0 in
+         Hashtbl.iter (fun _k lref -> List.iter (fun s ->
+             incr tot;
+             if s.sx >= x0 && s.sx <= x1 && s.sy >= y0 && s.sy <= y1
+                && not s.used then (s.used <- true; incr n)) !lref) fp;
+         Printf.eprintf
+           "keep-out X%d..%d Y%d..%d (margin %d): %d site(s) of %d reserved for the \
+            frozen macro (%d of them beyond the macro's own cells)\n"
+           x0 x1 y0 y1 m (!n + Hashtbl.length sites) !tot !n
+       end
+   | None -> ());
   let bmod = get_bmod () in
   (* TOPO_EXCLUDE_SUBSTR: drop cells whose name contains this substring (used to
      hold a Vivado-frozen hard-IP macro, e.g. eth.eth_macro1., out of our
@@ -1753,6 +1870,8 @@ let run_gen floorplan_json ~get_bmod ~get_j =
         (* clock-domain attraction, O(1) per moved cell (fixed centroid) *)
         let dom_before =
           List.fold_left (fun a i -> a +. dom_cost i pos_x.(i) pos_y.(i)) 0.0 moved in
+        let mac_before =
+          List.fold_left (fun a i -> a +. macro_cost pos_x.(i) pos_y.(i)) 0.0 moved in
         (* congestion: accumulate the affected nets' OLD RUDY (negated) *)
         let cmap = Hashtbl.create 32 in
         let acc b a = Hashtbl.replace cmap b ((try Hashtbl.find cmap b with Not_found -> 0.0) +. a) in
@@ -1767,6 +1886,9 @@ let run_gen floorplan_json ~get_bmod ~get_j =
         let dom_after =
           List.fold_left (fun a i -> a +. dom_cost i pos_x.(i) pos_y.(i)) 0.0 moved in
         let ddom = dom_after -. dom_before in
+        let dmac =
+          (List.fold_left (fun a i -> a +. macro_cost pos_x.(i) pos_y.(i)) 0.0 moved)
+          -. mac_before in
         (* add the NEW RUDY -> cmap now holds per-bin demand delta *)
         if cong_on then List.iter (fun n -> net_rudy_acc n (1.0) acc) !nets;
         if ll_on then List.iter (fun n -> net_track_acc n (1.0) hacc vacc) !nets;
@@ -1799,7 +1921,7 @@ let run_gen floorplan_json ~get_bmod ~get_j =
             | _ -> acc in
           go 0.0 moved olds in
         ((after -. before) +. cong_w *. dcong +. site_w *. sdelta +. ll_w *. dtrack
-           +. coh_w *. dcoh +. ddom,
+           +. coh_w *. dcoh +. ddom +. dmac,
          olds, cmap, omap, hmap, vmap) in
       let accepted = ref 0 in
       refresh_dom ();

@@ -819,6 +819,16 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
   in
   let async_ok = Sys.getenv_opt "MEMLOWER_ASYNC_OK" = Some "1" in
   let fpga = Sys.getenv_opt "MEMLOWER_FPGA" = Some "1" in
+  (* Above this many bits, keeping an async-read RAM bit-blasted costs more than
+     it saves -- see the MEMLOWER_NO_LUTRAM note below. *)
+  let lutram_max_depth =
+    match Sys.getenv_opt "MEMLOWER_LUTRAM_MAX_DEPTH" with
+    | Some v -> (try int_of_string v with _ -> 4096)
+    | None -> 4096 in
+  let no_lutram_max_bits =
+    match Sys.getenv_opt "MEMLOWER_NO_LUTRAM_MAX_BITS" with
+    | Some v -> (try int_of_string v with _ -> 2048)
+    | None -> 2048 in
   (* FPGA ROM path: a sync-read BRom (case-statement lookup, e.g. progmem)
      -> an INIT-initialised read-only BRAM (write enable tied 0).  No
      writer required. *)
@@ -935,12 +945,23 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
        For RAM32M: ceil(width/2) instances in quad-port mode — port A holds
        the rs1 view, B holds rs2, D drives writes; ADDR* mux toggles the
        3 ports between write-broadcast (WE=1) and per-port read (WE=0). *)
-    if Sys.getenv_opt "MEMLOWER_NO_LUTRAM" <> None then
+    if Sys.getenv_opt "MEMLOWER_NO_LUTRAM" <> None
+       && mm.depth * mm.data_width <= no_lutram_max_bits then
       (* Keep async-read memories bit-blasted (FFs+muxes) instead of inferring
          distributed LUT-RAM primitives (RAM32X1D/RAM32M/…).  Small FIFO/queue
          storage (e.g. the depth-2 sync FIFO) is trivial as regs, and the
          resulting netlist is pure behavioural RTL — Verilatable with no unisim
-         library.  Used by the "after Hardcaml in Verilator" sim flow. *)
+         library.  Used by the "after Hardcaml in Verilator" sim flow.
+
+         BUT ONLY WHILE IT IS SMALL, which is what the rationale above actually
+         claims.  The flag used to be unconditional, and a 512x32 async FIFO
+         (16384 bits) came out as 16462 FDREs and a 512-way mux -- several times
+         the size of the whole SoC it sits in.  Nothing reports that: the
+         netlist is functional, so the build succeeds and only the utilisation
+         says anything is wrong.  Above the threshold, bit-blasting is not a
+         convenience, so lower to LUTRAM regardless of the flag.
+         MEMLOWER_NO_LUTRAM_MAX_BITS overrides (picorv32's 32x32 cpuregs is
+         1024 bits and stays bit-blasted at the default). *)
       skip "MEMLOWER_NO_LUTRAM — async-read RAM kept bit-blasted (no LUTRAM primitive)"
     else if mm.n_write_ports = 1 && mm.n_read_ports = 2 && mm.depth <= 32 then
       ram_m_lower_dual_port ~prim:"RAM32M" ~pb:2 ~depth_cap:32 ~addr_w:5
@@ -955,8 +976,14 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
       skip (Printf.sprintf
               "FPGA async-read needs 1W+1R or 1W+2R (2R depth<=64); got %dW+%dR (depth %d)"
               mm.n_write_ports mm.n_read_ports mm.depth)
-    else if mm.depth > 256 then
-      skip (Printf.sprintf "FPGA async-read depth %d > 256 (deeper LUTRAM tiling TODO)" mm.depth)
+    else if mm.depth > lutram_max_depth then
+      (* Depth beyond one primitive is TILED (see the DEPTH TILING note below),
+         so the old 256 ceiling is gone.  A cap remains only to stop an absurd
+         instance count arriving silently: 4096 x 32 would already be 1024
+         primitives, at which point BRAM is the right answer, not more LUTs. *)
+      skip (Printf.sprintf
+              "FPGA async-read depth %d > %d (raise MEMLOWER_LUTRAM_MAX_DEPTH, or use BRAM)"
+              mm.depth lutram_max_depth)
     else begin
       let writer = find_writing_process mname m.processes in
       let reader = find_reading_process mname m.processes in
@@ -995,11 +1022,20 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                 else if mm.depth <= 128 then "RAM128X1S", 128, 7
                 else                         "RAM256X1S", 256, 8)
            in
-           if dual && mm.depth > 128 then
-             skip (Printf.sprintf
-               "FPGA async-read 1W+1R distinct-address depth %d > 128 (no RAM256X1D)"
-               mm.depth)
-           else
+           (* ── DEPTH TILING ────────────────────────────────────────────
+              The widest dual-port LUTRAM is RAM128X1D (there is no
+              RAM256X1D), so a deeper 1W+1R memory used to be refused and
+              fell back to the bit-blast.  That fallback is not a mild
+              pessimisation: a 512x32 FIFO came out as 16462 FDREs and a
+              512-way mux -- several times the whole SoC -- and nothing in
+              the flow says so, because a functional netlist is still
+              produced.  This is exactly the shape an async FIFO wants, so
+              tile it instead: N banks of the primitive, the low address
+              bits into every bank, the high bits decoding which bank the
+              write enable reaches and which bank's output is selected. *)
+           let total_addr_bits = bits_needed mm.depth in
+           let bank_bits = max 0 (total_addr_bits - addr_w) in
+           let n_banks = 1 lsl bank_bits in
            let dw = mm.data_width in
            let orig_clk = match w_proc with BSequential s -> s.clock | _ -> "clk" in
            let read_pin = mname ^ "_dout" in
@@ -1020,27 +1056,51 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
            let pad_to_addr_w e =
              (* Pad/truncate the BIR address expression to addr_w bits.
                 bexpr widths are implicit in the suite, so we just feed it
-                in via a BConcat with zero-extension where needed. *)
-             let zext_const = BConst { value = Z.zero; width = max 1 (addr_w - bits_needed mm.depth) } in
-             if bits_needed mm.depth >= addr_w then e
-             else BConcat [ zext_const; e ]
+                in via a BConcat with zero-extension where needed.  When the
+                memory is TILED, addr_w is the TILE's address width and the
+                bits above it select the bank, so take the low slice. *)
+             if total_addr_bits > addr_w then
+               BSlice { signal = e; msb = addr_w - 1; lsb = 0 }
+             else if total_addr_bits = addr_w then e
+             else
+               let zext_const =
+                 BConst { value = Z.zero; width = max 1 (addr_w - total_addr_bits) } in
+               BConcat [ zext_const; e ]
            in
+           (* which bank an address falls in -- the bits above the tile *)
+           let bank_of e =
+             if bank_bits = 0 then None
+             else Some (BSlice { signal = e; msb = total_addr_bits - 1; lsb = addr_w })
+           in
+           let w_bank = bank_of w_addr and r_bank = bank_of r_addr in
+           let bank_const k =
+             BConst { value = Z.of_int k; width = max 1 bank_bits } in
            let a_expr = pad_to_addr_w w_addr in
            let dp_expr = pad_to_addr_w r_addr in
            (* Per-bit INIT: bit i of init[addr] -> position addr of INIT[i].
               yosys-JSON expects MSB-first binary string, so address 0 is
               at the rightmost (LSB) position. *)
-           let init_for_bit b =
+           (* Per-bit INIT, and now per-BANK: bank k holds addresses
+              [k*prim_depth, (k+1)*prim_depth), so its INIT string is that
+              slice of the initial values, re-based to 0. *)
+           let init_for_bit ~bank b =
              let buf = Bytes.make prim_depth '0' in
              List.iteri (fun addr v ->
-               if addr < prim_depth then
+               let local = addr - (bank * prim_depth) in
+               if local >= 0 && local < prim_depth then
                  let bit = if (v lsr b) land 1 = 1 then '1' else '0' in
-                 Bytes.set buf (prim_depth - 1 - addr) bit)
+                 Bytes.set buf (prim_depth - 1 - local) bit)
                mm.init_values;
              Bytes.to_string buf
            in
+           (* one output wire per (data bit, bank) *)
+           let out_name_of b k =
+             if n_banks = 1 then Printf.sprintf "%s_o_%d" mname b
+             else Printf.sprintf "%s_o_%d_b%d" mname b k
+           in
            let per_bit_outs =
-             List.init dw (fun b -> Printf.sprintf "%s_o_%d" mname b)
+             List.concat (List.init dw (fun b ->
+               List.init n_banks (fun k -> out_name_of b k)))
            in
            let new_sigs = read_sig ::
              List.map (fun nm ->
@@ -1048,13 +1108,17 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                ; direction = `Internal; initial_value = None; attrs = [] })
                per_bit_outs
            in
-           let instances = List.mapi (fun b out_name ->
-             { inst_name    = Printf.sprintf "%s_b%d" mname b
+           let instances = List.concat (List.init dw (fun b ->
+             List.init n_banks (fun k ->
+             let out_name = out_name_of b k in
+             { inst_name    =
+                 if n_banks = 1 then Printf.sprintf "%s_b%d" mname b
+                 else Printf.sprintf "%s_b%d_k%d" mname b k
              ; module_name  = prim
              ; param_values = []
              ; param_strs   =
                  (* plain binary digits, no `%d'b` prefix — see RAM32M note *)
-                 [ ("INIT", init_for_bit b) ]
+                 [ ("INIT", init_for_bit ~bank:k b) ]
              ; port_connections =
                  (* RAM32X1S/D and RAM64X1S/D expose their addresses as
                     individual 1-bit pins A0../DPRA0.. (that IS the Xilinx
@@ -1076,16 +1140,41 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                               (Printf.sprintf "DPRA%d" i,
                                BSlice { signal = dp_expr; msb = i; lsb = i }))
                           else []))
-                 @ [ ("WE",   we_expr)
+                 @ [ ("WE",
+                      (* a write only reaches the bank its address selects *)
+                      (match w_bank with
+                       | None -> we_expr
+                       | Some sel ->
+                         BBinOp { op = BAnd; lhs = we_expr
+                                ; rhs = BBinOp { op = BEq; lhs = sel
+                                               ; rhs = bank_const k
+                                               ; result_type = BBool }
+                                ; result_type = BBool }))
                    ; ("WCLK", BVar orig_clk)
                    ; ((if dual then "DPO" else "O"), BVar out_name) ]
-             }) per_bit_outs
+             })))
            in
            (* Driver concat: read_pin <= {o_(dw-1), ..., o_1, o_0}.       *)
+           let bit_expr b =
+             match r_bank with
+             | None -> BVar (out_name_of b 0)
+             | Some sel ->
+               (* select the bank the read address points at; the last bank is
+                  the else-arm so the chain is total *)
+               let rec chain k =
+                 if k = n_banks - 1 then BVar (out_name_of b k)
+                 else
+                   BCond { condition =
+                             BBinOp { op = BEq; lhs = sel; rhs = bank_const k
+                                    ; result_type = BBool }
+                         ; then_val = BVar (out_name_of b k)
+                         ; else_val = chain (k + 1) }
+               in chain 0
+           in
            let driver_stmts =
              [ BAssign
                  { lhs = read_pin
-                 ; rhs = BConcat (List.rev_map (fun n -> BVar n) per_bit_outs) } ]
+                 ; rhs = BConcat (List.rev (List.init dw bit_expr)) } ]
            in
            let driver =
              BCombinational
@@ -1135,8 +1224,8 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
              ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
            in
            Printf.eprintf
-             "[memlower] %s.%s: FPGA async-read → %d × %s (depth=%d, width=%d)\n"
-             m.name mname dw prim mm.depth dw;
+             "[memlower] %s.%s: FPGA async-read → %d × %s (%d bank(s) × %d bit(s), depth=%d, width=%d)\n"
+             m.name mname (dw * n_banks) prim n_banks dw mm.depth dw;
            `Lowered (m', None))
     end
   end

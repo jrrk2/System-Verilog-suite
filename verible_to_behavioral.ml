@@ -3201,6 +3201,17 @@ let rec stmt_is_system_task = function
   | TUPLE3 (a, b, _) -> stmt_is_system_task a || stmt_is_system_task b
   | _ -> false
 
+(* `(* full_case *)` on a case statement.  Verible keeps the attribute in the
+   token tree ahead of the case keyword; all we need to know is whether it is
+   there. *)
+let has_full_case tok =
+  let found = ref false in
+  walk (function
+      | SymbolIdentifier id when id = "full_case" -> found := true
+      | _ -> ())
+    tok;
+  !found
+
 let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
   let recurse_e = expr_to_bexpr ~pkgs ~params ~arrays in
   let recurse_s = stmt_to_bstmt ~pkgs ~params ~arrays in
@@ -3882,6 +3893,25 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                   List.map (fun lbl -> (recurse_e lbl, b)) (case_key_labels key) in
                 (cs @ arms_for_key, def))
             ([], []) arms in
+        (* `(* full_case *)`: the source is PROMISING no other selector value
+           occurs, so an absent default is not an omission.  Drop the attribute
+           and yosys sees an incomplete combinational case and infers a LATCH
+           for every variable the arms assign.
+
+           picorv32 does this ten times.  The emitted CPU came out with 68 LDCE
+           latches its source does not contain -- bad for timing on their own,
+           and they were what broke this flow's routing: place_lef does not
+           place latches, so they fell to nextpnr, which put them wherever space
+           was left.
+
+           Since no other value can occur, any default is correct; taking the
+           FIRST arm's body assigns exactly the same variables, so nothing is
+           left un-driven and no latch is inferred.  Only when there is no
+           default already. *)
+        let default =
+          if default <> [] then default
+          else if not (has_full_case tok) then default
+          else match cases with (_, b) :: _ -> b | [] -> [] in
         BCase { selector = sel; cases; default }
       end
   (* `case (sel) inside … endcase` — case_statement3 (TUPLE9 with the `Inside`
