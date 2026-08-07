@@ -1330,6 +1330,48 @@ let rec width_of_bexpr_ctx widths = function
        | _ -> None)
   | BSelect _ | BCall _ -> None
 
+(* Resolve a `$signed(x)` right-hand side against the width of what it is
+   assigned to.  Verilog extends the cast value to the target's width by
+   replicating its sign bit; the @signed marker the frontend leaves behind
+   carries no width of its own, so without this the value is simply truncated
+   in meaning -- the high bits read zero.
+
+   picorv32's B-type immediate is the case that shows: `decoded_imm <=
+   $signed({...13 bits...})` into a 32-bit register gave 0x00001ff8 where the
+   source means 0xfffffff8, so every backward branch went forward.  The marker
+   is stripped either way, so nothing downstream has to know about it. *)
+let resolve_signed_rhs widths target_width e =
+  (* width_of_bexpr_ctx has no case for a bit-SELECT, so a concat containing
+     one (`{instr[31], instr[7], instr[30:25], ...}` -- picorv32's B-type
+     immediate) has no width and the extension below is skipped.  Treating a
+     select of a declared vector as one bit is only assumed HERE, where the
+     alternative is to leave a signed value unextended, which is certainly
+     wrong; everywhere else the helper keeps its conservative None. *)
+  let rec width_here e =
+    match width_of_bexpr_ctx widths e with
+    | Some n -> Some n
+    | None -> (
+        match e with
+        | BSelect _ -> Some 1
+        | BConcat es ->
+            let ws = List.map width_here es in
+            if List.for_all Option.is_some ws then
+              Some (List.fold_left ( + ) 0 (List.map (Option.value ~default:0) ws))
+            else None
+        | _ -> None)
+  in
+  match e with
+  | BCall { func = "@signed"; args = [ x ] } -> (
+      match width_here x, target_width with
+      | Some xw, Some tw when xw < tw && xw > 0 ->
+          BConcat [ BReplicate { count = tw - xw;
+                                 value = BSlice { signal = x;
+                                                  msb = xw - 1; lsb = xw - 1 } };
+                    x ]
+      | _ -> x)
+  | e -> e
+
+
 let result_type_for op lhs rhs =
   let comparison = match op with
     | BEq | BNe | BLt | BLe | BGt | BGe -> true
@@ -2893,13 +2935,85 @@ let extract_assign ~pkgs ~params ~arrays tok =
                | BBinOp { op = (BAdd | BSub) as op; lhs = a; rhs = b; _ } ->
                    BBinOp { op; lhs = widen_arith w a; rhs = widen_arith w b;
                             result_type = BInt { width = w; signed = Unsigned } }
+               (* `$signed(x)` survives as an @signed marker, which this
+                  widening has to honour: the RHS of a concat-LHS assignment is
+                  extended to the LHS width, and for a signed value that means
+                  REPLICATING THE MSB, not padding with zeros.
+
+                  picorv32 assembles its jump immediate as
+
+                    {imm_j[31:20], imm_j[10:1], imm_j[11], imm_j[19:12], imm_j[0]}
+                        <= $signed({mem_rdata_latched[31:12], 1'b0});
+
+                  -- 21 signed bits into a 32-bit LHS.  Zero-extended (or, as
+                  here, not extended at all, since an unrecognised @signed call
+                  has no width and the guard let it through), imm_j[31:20] comes
+                  out 0x001 where it should be 0xfff, and every backward JAL
+                  jumps forward instead.  Observed as decoded_imm_j gold
+                  fff547e2 / emitted 001547e2, and downstream as a PC 0x2000
+                  past where it belonged. *)
+               | BCall { func = "@signed"; args = [ inner ] } ->
+                   let iw =
+                     match width_of_bexpr_ctx !cur_signal_widths inner with
+                     | Some n -> n | None -> w in
+                   if iw >= w then inner
+                   else
+                     BConcat [ BReplicate
+                                 { count = w - iw;
+                                   value = BSlice { signal = inner;
+                                                    msb = iw - 1; lsb = iw - 1 } };
+                               inner ]
                | e ->
                    let ew =
                      match width_of_bexpr_ctx !cur_signal_widths e with
                      | Some n -> n | None -> w in
                    if ew >= w then e
                    else BConcat [ BConst { value = Z.zero; width = w - ew }; e ] in
-             let rhs_e = if total_w > 1 then widen_arith total_w rhs_e else rhs_e in
+             (* Is the RHS a `$signed(...)` cast?  Ask the TOKEN, not the
+                converted expression: whether the @signed marker survives
+                expr_to_bexpr depends on which of several call shapes verible
+                produced, and this lowering is the one place where getting it
+                wrong is silent.  The first `$`-identifier in the RHS is the
+                outermost cast. *)
+             let rhs_signed =
+               let found = ref None in
+               walk (fun t ->
+                   match t with
+                   | SystemTFIdentifier id | SymbolIdentifier id
+                     when !found = None && String.length id > 0 && id.[0] = '$' ->
+                       found := Some id
+                   | _ -> ())
+                 rhs;
+               (if Sys.getenv_opt "SVS_SIGNED_DEBUG" <> None then
+                  Printf.eprintf "[concat-lhs] total_w=%d first_dollar=%s rhs_w=%s\n%!"
+                    total_w
+                    (match !found with Some x -> x | None -> "<none>")
+                    (match width_of_bexpr_ctx !cur_signal_widths rhs_e with
+                     | Some w -> string_of_int w | None -> "<unknown>"));
+               !found = Some "$signed"
+             in
+             let rhs_e =
+               if total_w > 1 then
+                 let widened = widen_arith total_w rhs_e in
+                 if not rhs_signed then widened
+                 else
+                   (* Sign-extend to the LHS width by replicating the MSB.
+                      picorv32's jump immediate is 21 signed bits assembled into
+                      a 32-bit LHS; zero-extended, imm_j[31:20] reads 0x001
+                      where it should read 0xfff and every backward JAL jumps
+                      forward.  Seen as decoded_imm_j gold fff547e2 / emitted
+                      001547e2, and on the board as a CPU that runs and then
+                      wanders off. *)
+                   match width_of_bexpr_ctx !cur_signal_widths rhs_e with
+                   | Some iw when iw < total_w ->
+                       BConcat [ BReplicate
+                                   { count = total_w - iw;
+                                     value = BSlice { signal = rhs_e;
+                                                      msb = iw - 1; lsb = iw - 1 } };
+                                 rhs_e ]
+                   | _ -> widened
+               else rhs_e
+             in
              let cursor = ref total_w in
              List.concat_map (fun ((name, _, sel) as p) ->
                let w = part_w p in
@@ -3230,6 +3344,53 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
          in
          let part_widths = List.map part_width infos in
          let total_w = List.fold_left (+) 0 part_widths in
+         (* Verilog extends the RHS to the LHS width BEFORE the fields are cut
+            out of it, and for a `$signed(...)` RHS that extension replicates
+            the MSB.  Slicing the un-extended value instead makes every field
+            above the RHS's own width read zero.
+
+            picorv32 assembles its jump immediate this way -- 21 signed bits
+            into a 32-bit concat LHS -- so imm_j[31:20] came out 0x001 where it
+            should be 0xfff, and every backward JAL jumped forward.  Seen as
+            decoded_imm_j gold fff547e2 / emitted 001547e2, and on the board as
+            a CPU that boots, runs, and wanders off.
+
+            The cast is read from the TOKEN: whether the @signed marker survives
+            expr_to_bexpr depends on which call shape verible produced, and this
+            is the one place where being wrong about it is silent. *)
+         let rhs_e =
+           let first_dollar =
+             let found = ref None in
+             walk (fun t ->
+                 match t with
+                 | SystemTFIdentifier id | SymbolIdentifier id
+                   when !found = None && String.length id > 0 && id.[0] = '$' ->
+                     found := Some id
+                 | _ -> ())
+               rhs;
+             !found
+           in
+           (* `$signed(x)` reaches here as an @signed BCall, which has no width
+              of its own -- so unwrap it and measure the value inside, or the
+              extension is skipped for exactly the case that needs it most. *)
+           let signed_call, base =
+             match rhs_e with
+             | BCall { func = "@signed"; args = [ x ] } -> true, x
+             | _ -> false, rhs_e
+           in
+           let is_signed = signed_call || first_dollar = Some "$signed" in
+           match width_of_bexpr_ctx !cur_signal_widths base with
+           | Some rw when rw < total_w ->
+               if is_signed then
+                 BConcat [ BReplicate
+                             { count = total_w - rw;
+                               value = BSlice { signal = base;
+                                                msb = rw - 1; lsb = rw - 1 } };
+                           base ]
+               else
+                 BConcat [ BConst { value = Z.zero; width = total_w - rw }; base ]
+           | _ -> base
+         in
          let cursor = ref total_w in
          let stmts = List.map2 (fun (n_opt, kind, _) w ->
            let nm = match n_opt with Some s -> s | None -> "?" in
@@ -3449,7 +3610,11 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
                      "verible_to_behavioral: WARNING >2 select dims on array \
                       write %s — inner selects dropped\n" name;
                    plain ())
-          | Some (name, _), `None -> BAssign { lhs = name; rhs = recurse_e rhs }
+          | Some (name, _), `None ->
+              BAssign { lhs = name;
+                        rhs = resolve_signed_rhs !cur_signal_widths
+                                (List.assoc_opt name !cur_signal_widths)
+                                (recurse_e rhs) }
           | None, _ ->
               (* LHS name could not be extracted — the whole assignment (a
                  register/signal write) would vanish silently.  Surface it. *)
@@ -6350,8 +6515,50 @@ let convert_module ~pkgs (mdecl : module_decl)
   (* mdecl_body, NOT mdecl.m_body: strip_function_decls has already deleted
      every task_declaration from the latter, so the scan would find nothing and
      silently conclude that no task is a no-op. *)
+  (* Resolve every surviving `$signed(...)` against the width of what it is
+     assigned to, in one place.  Doing it at the individual lowering sites does
+     not work: a plain `x <= $signed(y)`, a concat LHS, an op-assign and a
+     part-select write are four different code paths, and the emitted design is
+     wrong in the same way if any one of them is missed.  This is the choke
+     point every assignment passes through. *)
+  let resolve_signed_stmts stmts =
+    let w n = List.assoc_opt n !cur_signal_widths in
+    let rec stmt = function
+      | BAssign { lhs; rhs } ->
+          BAssign { lhs; rhs = resolve_signed_rhs !cur_signal_widths (w lhs) rhs }
+      | BCallStmt { func; args = BVar nm :: rest } when func <> "" && func.[0] = '@' ->
+          (* the last argument of a write pseudo-op is the value *)
+          let rest =
+            match List.rev rest with
+            | v :: front ->
+                List.rev (resolve_signed_rhs !cur_signal_widths (w nm) v :: front)
+            | [] -> []
+          in
+          BCallStmt { func; args = BVar nm :: rest }
+      | BIf { condition; then_stmts; else_stmts } ->
+          BIf { condition; then_stmts = List.map stmt then_stmts;
+                else_stmts = List.map stmt else_stmts }
+      | BCase { selector; cases; default } ->
+          BCase { selector;
+                  cases = List.map (fun (e, ss) -> (e, List.map stmt ss)) cases;
+                  default = List.map stmt default }
+      | BBlock ss -> BBlock (List.map stmt ss)
+      | BWhile { condition; body } -> BWhile { condition; body = List.map stmt body }
+      | BFor { init; condition; update; body } ->
+          BFor { init = stmt init; condition; update = stmt update;
+                 body = List.map stmt body }
+      | s -> s
+    in
+    List.map stmt stmts
+  in
+  let resolve_signed_proc = function
+    | BCombinational c -> BCombinational { c with body = resolve_signed_stmts c.body }
+    | BSequential sq -> BSequential { sq with body = resolve_signed_stmts sq.body }
+  in
   collect_noop_tasks mdecl_body;
-  let always_procs = extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body in
+  let always_procs =
+    List.map resolve_signed_proc
+      (extract_always ~pkgs ~params ~arrays:array_names mdecl.m_body) in
   let instances = extract_instances ~pkgs ~params ~arrays:array_names mdecl.m_body in
   (* RULE: any array that ever takes a WHOLE-array write (`arr = <expr>`, a
      BAssign with the bare array as lhs — e.g. a combinational `arr = '0`
