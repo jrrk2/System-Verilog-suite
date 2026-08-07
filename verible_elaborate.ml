@@ -364,6 +364,18 @@ let leaf_text = function
   | TK_HexDigits n -> Some ("'h" ^ n)
   | TK_BinDigits n -> Some ("'b" ^ n)
   | TK_OctDigits n -> Some ("'o" ^ n)
+  (* Decimal too.  Without this a SIZED DECIMAL literal renders to nothing at
+     all: `parameter [13:0] RX_WORD_BASE = 14'd1024` resolved to the empty
+     string, which the caller reads as a string-typed parameter and skips, so
+     the parameter never entered its module's integer scope.  A child then
+     instantiated with `.RX_WORD_BASE(RX_WORD_BASE)` could not resolve the
+     reference, was classified as a STRING override and specialised with the
+     parameter's own NAME as its value -- leaving the child on ITS default.
+     ethmin's DMA put the RX window at 0xC00 while the firmware read 0x400, so
+     no packet was ever seen: a design that built, met timing, and was dark.
+     `32'h1000` and a bare `2048` both survived, which is why this went unseen
+     -- only the sized-decimal spelling is affected. *)
+  | TK_DecDigits n -> Some ("'d" ^ n)
   (* STRING parameter values (.LFSR_CONFIG("GALOIS")): without this the
      deep rendering dropped the literal entirely, the override resolved
      to "" and the specialised clone LOST the parameter — downstream
@@ -2671,8 +2683,20 @@ let extract_module_port_param_defaults (body : token) : (string * token) list =
     in
     match pname, rhs with
     | Some name, Some r -> Some (name, r)
-    | _ -> None
+    | Some name, None ->
+        if Sys.getenv_opt "PARAM_DEBUG" <> None then
+          Printf.eprintf "[param-defaults] %s: NO trailing_assign found\n%!" name;
+        None
+    | None, _ ->
+        if Sys.getenv_opt "PARAM_DEBUG" <> None then
+          Printf.eprintf "[param-defaults] <unnamed parameter port>\n%!";
+        None
   ) nodes
+  |> fun res ->
+     if Sys.getenv_opt "PARAM_DEBUG" <> None then
+       Printf.eprintf "[param-defaults] %d port-param node(s) -> [%s]\n%!"
+         (List.length nodes) (String.concat "; " (List.map fst res));
+     res
 
 (* Pull `localparam`/`parameter` declarations from a module body, as
  * (name, rhs_token) pairs. The grammar tags both as
@@ -2883,17 +2907,55 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
      * can't resolve later localparams that reference the parameter. *)
     let defaults = extract_module_port_param_defaults mdecl.m_body in
     let scope = List.fold_left (fun sc (name, rhs_tok) ->
-      if List.mem_assoc name sc then sc
+      if List.mem_assoc name sc then begin
+        (if Sys.getenv_opt "PARAM_DEBUG" <> None then
+           Printf.eprintf "[int-scope] %-22s %-16s ALREADY %d (default skipped)\n%!"
+             mdecl.m_name name (List.assoc name sc));
+        sc
+      end
       else
         let s = resolve_value pkgs rhs_tok in
         (* A string-typed param DEFAULT (empty "" or a quoted literal) must not be
            Eval-coerced into the int scope: an empty default folds to a junk int
            (2^30) that then shadows the real string override during propagation. *)
         let st = String.trim s in
+        (* BOMB on a default that carried a value and rendered to NOTHING.
+           This is the shape that hid the sized-decimal bug for a whole
+           debugging session: `parameter [13:0] RX_WORD_BASE = 14'd1024` has an
+           unmistakable numeric literal in its token, leaf_text had no case for
+           that literal's token kind, the render came back empty, and the arm
+           below reads an empty render as "string-typed parameter, skip it".
+           The parameter then simply did not exist, its child was specialised
+           on its own default, and the board was dark.
+
+           An empty render is fine for a genuine string parameter (`= ""`).  It
+           is never fine for one whose token contains a number, so that is the
+           condition -- narrow enough that it cannot fire on the structural
+           tokens leaf_text drops on purpose. *)
+        (if st = "" then begin
+           let numeric = ref false in
+           walk (function
+               | TK_DecNumber _ | TK_DecDigits _ | TK_HexDigits _
+               | TK_BinDigits _ | TK_OctDigits _ | TK_UnBasedNumber _ ->
+                   numeric := true
+               | _ -> ())
+             rhs_tok;
+           if !numeric then
+             Behavioral_ir.lossage_warn "verible:param-default"
+               (Printf.sprintf
+                  "%s in module %s: default holds a numeric literal but rendered                    EMPTY -- leaf_text has no case for that token kind, so the                    parameter is about to be dropped as if it were a string"
+                  name mdecl.m_name)
+         end);
         if st = "" || (String.length st >= 1 && st.[0] = '"') then sc
         else match Eval.eval_string sc s with
-        | Some n -> (name, n) :: sc
-        | None -> sc
+        | Some n ->
+            if Sys.getenv_opt "PARAM_DEBUG" <> None then
+              Printf.eprintf "[int-scope] %-22s %-16s %S -> %d\n%!" mdecl.m_name name st n;
+            (name, n) :: sc
+        | None ->
+            if Sys.getenv_opt "PARAM_DEBUG" <> None then
+              Printf.eprintf "[int-scope] %-22s %-16s %S -> EVAL FAILED\n%!" mdecl.m_name name st;
+            sc
     ) scope defaults in
     (* Localparams from collect_by come in REVERSE parse-tree order
        (and Verible's parse-tree is itself reverse-of-source-order
