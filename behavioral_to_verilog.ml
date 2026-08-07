@@ -265,7 +265,7 @@ let rec verilog_of_expr = function
         (String.concat ", " (List.map verilog_of_expr args))
 
 (* Generate statement with indentation *)
-let rec verilog_of_stmt ?(nb=false) indent stmt =
+let rec verilog_of_stmt ?(nb=false) ?(blocking=[]) indent stmt =
   let ind = String.make (indent * 2) ' ' in
   (* In a sequential (clocked) block, register updates MUST be non-blocking so
      that cross-block ordering follows hardware edge semantics.  The BIR is in
@@ -273,17 +273,29 @@ let rec verilog_of_stmt ?(nb=false) indent stmt =
      Combinational blocks keep blocking `=`.  Emitting `=` everywhere is the bug
      that lagged dmi_jtag_tap's `td_o = tdo_mux` (falling-edge block) by one bit
      under Verilator's derived tck_n clock. *)
+  (* ...EXCEPT the variables the source assigned with a blocking `=` inside the
+     clocked block ([BSequential.blocking_vars]).  Those are in-cycle temps, not
+     registers: a later statement in the same block must see the value just
+     written, and emitting `<=` gives it LAST cycle's value instead.
+
+     This is not a subtlety.  picorv32 writes `current_pc = reg_next_pc;` and
+     then `reg_pc <= current_pc;` in the same block; emitted as two `<=` the CPU
+     latches a stale current_pc, so it resets its PC to 0 instead of
+     PROGADDR_RESET and never reaches the firmware.  That is an ethmin bitstream
+     that builds clean, meets timing, and is dark on the board. *)
+  let op_of n = if nb && not (List.mem n blocking) then "<=" else "=" in
   let op = if nb then "<=" else "=" in
+  ignore op;
   match stmt with
   | BAssign { lhs; rhs } ->
-      Printf.sprintf "%s%s %s %s;" ind (sanitize_name lhs) op (verilog_of_expr rhs)
+      Printf.sprintf "%s%s %s %s;" ind (sanitize_name lhs) (op_of lhs) (verilog_of_expr rhs)
 
   | BIf { condition; then_stmts; else_stmts } ->
       let if_part = Printf.sprintf "%sif (%s) begin" ind (verilog_of_expr condition) in
-      let then_part = String.concat "\n" (List.map (verilog_of_stmt ~nb (indent + 1)) then_stmts) in
+      let then_part = String.concat "\n" (List.map (verilog_of_stmt ~nb ~blocking (indent + 1)) then_stmts) in
       let else_part =
         if List.length else_stmts > 0 then
-          let else_stmts_str = String.concat "\n" (List.map (verilog_of_stmt ~nb (indent + 1)) else_stmts) in
+          let else_stmts_str = String.concat "\n" (List.map (verilog_of_stmt ~nb ~blocking (indent + 1)) else_stmts) in
           Printf.sprintf "\n%send else begin\n%s\n%send" ind else_stmts_str ind
         else
           Printf.sprintf "\n%send" ind
@@ -294,12 +306,12 @@ let rec verilog_of_stmt ?(nb=false) indent stmt =
       let case_header = Printf.sprintf "%scase (%s)" ind (verilog_of_expr selector) in
       let case_items = List.map (fun (value, stmts) ->
         let case_line = Printf.sprintf "%s  %s: begin" ind (verilog_of_expr value) in
-        let case_stmts = String.concat "\n" (List.map (verilog_of_stmt ~nb (indent + 2)) stmts) in
+        let case_stmts = String.concat "\n" (List.map (verilog_of_stmt ~nb ~blocking (indent + 2)) stmts) in
         Printf.sprintf "%s\n%s\n%s  end" case_line case_stmts ind
       ) cases in
       let default_part =
         if List.length default > 0 then
-          let default_stmts = String.concat "\n" (List.map (verilog_of_stmt ~nb (indent + 2)) default) in
+          let default_stmts = String.concat "\n" (List.map (verilog_of_stmt ~nb ~blocking (indent + 2)) default) in
           Printf.sprintf "\n%s  default: begin\n%s\n%s  end" ind default_stmts ind
         else ""
       in
@@ -311,17 +323,17 @@ let rec verilog_of_stmt ?(nb=false) indent stmt =
 
   | BWhile { condition; body } ->
       let while_header = Printf.sprintf "%swhile (%s) begin" ind (verilog_of_expr condition) in
-      let body_stmts = String.concat "\n" (List.map (verilog_of_stmt ~nb (indent + 1)) body) in
+      let body_stmts = String.concat "\n" (List.map (verilog_of_stmt ~nb ~blocking (indent + 1)) body) in
       Printf.sprintf "%s\n%s\n%send" while_header body_stmts ind
 
   | BFor { init; condition; update; body } ->
       (* Verilog doesn't have for loops in always blocks, convert to while *)
-      let init_stmt = verilog_of_stmt ~nb indent init in
-      let while_part = verilog_of_stmt ~nb indent (BWhile { condition; body = body @ [update] }) in
+      let init_stmt = verilog_of_stmt ~nb ~blocking indent init in
+      let while_part = verilog_of_stmt ~nb ~blocking indent (BWhile { condition; body = body @ [update] }) in
       Printf.sprintf "%s\n%s" init_stmt while_part
 
   | BBlock stmts ->
-      String.concat "\n" (List.map (verilog_of_stmt ~nb indent) stmts)
+      String.concat "\n" (List.map (verilog_of_stmt ~nb ~blocking indent) stmts)
 
   (* SVS-internal write pseudo-ops -> real Verilog l-value assignments so the
      behavioral netlist is simulatable.  Semantics mirror behavioral_initeval. *)
@@ -344,30 +356,30 @@ let rec verilog_of_stmt ?(nb=false) indent stmt =
       (match byte_write with
        | Some (lo, w, data) ->
            Printf.sprintf "%s%s[%s][%s +: %d] %s %s;" ind (sanitize_name a) ix
-             (verilog_of_expr lo) w op (verilog_of_expr data)
+             (verilog_of_expr lo) w (op_of a) (verilog_of_expr data)
        | None ->
-           Printf.sprintf "%s%s[%s] %s %s;" ind (sanitize_name a) ix op (verilog_of_expr v))
+           Printf.sprintf "%s%s[%s] %s %s;" ind (sanitize_name a) ix (op_of a) (verilog_of_expr v))
   | BCallStmt { func = "@slice_write"; args = [BVar nm; m; l; v] } ->
       (match m, l with
        | BConst { value = mv; _ }, BConst { value = lv; _ } ->
            let mi = Z.to_int mv and li = Z.to_int lv in
            let hi = max mi li and lo = min mi li in
            if hi = lo then
-             Printf.sprintf "%s%s[%d] %s %s;" ind (sanitize_name nm) hi op (verilog_of_expr v)
+             Printf.sprintf "%s%s[%d] %s %s;" ind (sanitize_name nm) hi (op_of nm) (verilog_of_expr v)
            else
-             Printf.sprintf "%s%s[%d:%d] %s %s;" ind (sanitize_name nm) hi lo op (verilog_of_expr v)
+             Printf.sprintf "%s%s[%d:%d] %s %s;" ind (sanitize_name nm) hi lo (op_of nm) (verilog_of_expr v)
        | _ ->
            (* non-constant bounds: upward indexed part-select from lsb *)
            Printf.sprintf "%s%s[%s +: 1] %s %s;" ind (sanitize_name nm)
-             (verilog_of_expr l) op (verilog_of_expr v))
+             (verilog_of_expr l) (op_of nm) (verilog_of_expr v))
   | BCallStmt { func = "@part_sel_write_up"; args = [BVar nm; base; w; v] } ->
       let ws = match w with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr w in
       let bs = match base with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr base in
-      Printf.sprintf "%s%s[%s +: %s] %s %s;" ind (sanitize_name nm) bs ws op (verilog_of_expr v)
+      Printf.sprintf "%s%s[%s +: %s] %s %s;" ind (sanitize_name nm) bs ws (op_of nm) (verilog_of_expr v)
   | BCallStmt { func = "@part_sel_write_down"; args = [BVar nm; base; w; v] } ->
       let ws = match w with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr w in
       let bs = match base with BConst { value; _ } -> Z.to_string value | _ -> verilog_of_expr base in
-      Printf.sprintf "%s%s[%s -: %s] %s %s;" ind (sanitize_name nm) bs ws op (verilog_of_expr v)
+      Printf.sprintf "%s%s[%s -: %s] %s %s;" ind (sanitize_name nm) bs ws (op_of nm) (verilog_of_expr v)
   | BCallStmt { func; args } ->
       if String.length func > 0 && func.[0] = '@' then begin
         (* A write pseudo-op whose l-value is NOT a plain signal (constant- or
@@ -469,7 +481,7 @@ let verilog_of_process proc =
       let body_stmts = String.concat "\n" (List.map (verilog_of_stmt 1) body) in
       Printf.sprintf "%s\n%s\n%s\nend\n" comment always_header body_stmts
 
-  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body } ->
+  | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
       let comment = Printf.sprintf "// Sequential process: %s" name in
       let clk_edge = match clock_edge with `Pos -> "posedge" | `Neg -> "negedge" in
       let sens_list = match (reset, reset_async) with
@@ -556,8 +568,8 @@ let verilog_of_process proc =
                  Printf.sprintf "  if (%s) begin\n%s\n  end else begin\n%s\n  end"
                    rst_check
                    (String.concat "\n"
-                      (List.map (verilog_of_stmt ~nb:true 2) resets @ extra))
-                   (String.concat "\n" (List.map (verilog_of_stmt ~nb:true 2) clocked))
+                      (List.map (verilog_of_stmt ~nb:true ~blocking:blocking_vars 2) resets @ extra))
+                   (String.concat "\n" (List.map (verilog_of_stmt ~nb:true ~blocking:blocking_vars 2) clocked))
              | None ->
                  let resets = List.map (fun n ->
                      (* Unpacked-array reset needs `'{default:'0}` (Vivado rejects
@@ -568,9 +580,9 @@ let verilog_of_process proc =
                  Printf.sprintf "  if (%s) begin\n%s\n  end else begin\n%s\n  end"
                    rst_check
                    (String.concat "\n" resets)
-                   (String.concat "\n" (List.map (verilog_of_stmt ~nb:true 2) body)))
+                   (String.concat "\n" (List.map (verilog_of_stmt ~nb:true ~blocking:blocking_vars 2) body)))
         | _ ->
-            String.concat "\n" (List.map (verilog_of_stmt ~nb:true 1) body)
+            String.concat "\n" (List.map (verilog_of_stmt ~nb:true ~blocking:blocking_vars 1) body)
       in
 
       Printf.sprintf "%s\n%s\n%s\nend\n" comment always_header body_with_reset
