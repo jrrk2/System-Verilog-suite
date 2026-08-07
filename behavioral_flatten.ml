@@ -37,6 +37,16 @@ open Behavioral_ir
  * 65K migrated instances per parent on cva6, hanging the run. *)
 let max_depth = 10
 
+(* Separator for the hierarchical names flattening builds (`soc$memory$doa`).
+   '$' rather than '.' because '$' is a legal character inside a Verilog
+   identifier and '.' is not: with a dot, every flattened net has to be emitted
+   as an escaped identifier (`\soc.memory.doa `), and any tool downstream that
+   does not handle escaped identifiers -- or that treats the dot as a hierarchy
+   reference -- gets it wrong.  With '$' the name is an ordinary identifier
+   everywhere.  Note [inst_dot_depth] still counts separators for the recursion
+   cap, so it counts this one. *)
+let hier_sep = '$'
+
 (* Compute the port shape (name → width) of a bmodule, for the I/O
  * ports only. Used to disambiguate sibling specialisations sharing a
  * base name. *)
@@ -99,12 +109,12 @@ let pick_specialised
       (match candidates with [m] -> Some m | _ -> None)
 
 (* Rename every BVar/BAssign reference in an expr or stmt that
- * touches an internal child-signal name — prefix with `pfx ^ "."`
+ * touches an internal child-signal name — prefix with `pfx ^ hier_sep`
  * to namespace it under the instance label. *)
 let prefix_internal pfx internals expr =
   let is_internal n = List.mem n internals in
   let rec map_e = function
-    | BVar n when is_internal n -> BVar (pfx ^ "." ^ n)
+    | BVar n when is_internal n -> BVar (pfx ^ String.make 1 hier_sep ^ n)
     | BVar _ as e -> e
     | BConst _ as e -> e
     | BBinOp { op; lhs; rhs; result_type } ->
@@ -126,7 +136,7 @@ let prefix_internal_stmt pfx internals stmt =
   let mp = prefix_internal pfx internals in
   let rec map_s = function
     | BAssign { lhs; rhs } ->
-        let lhs' = if List.mem lhs internals then pfx ^ "." ^ lhs else lhs in
+        let lhs' = if List.mem lhs internals then pfx ^ String.make 1 hier_sep ^ lhs else lhs in
         BAssign { lhs = lhs'; rhs = mp rhs }
     | BIf { condition; then_stmts; else_stmts } ->
         BIf { condition = mp condition;
@@ -245,8 +255,25 @@ let inline_instance ?(force_ff=false) ~child (parent : bmodule) (i : binstance) 
         else None
       ) i.port_connections
     in
+    (* A child port the instance does NOT connect -- an unused output like
+       picorv32's pcpi_rs2 when the co-processor interface is off, or one bound
+       to an expression we cannot alias -- is covered by neither substitution
+       above, so the inlined processes go on writing the bare CHILD port name
+       into a parent that never declares it.  Verilog's implicit nets then make
+       it a 1-bit wire and a 32-bit value is silently truncated; SystemVerilog
+       just refuses the file.  Namespace them like internals, which both
+       declares them and keeps two instances of the same child apart. *)
+    let unbound_ports =
+      List.filter
+        (fun p ->
+          (List.mem p outputs || List.mem p inputs)
+          && not (List.mem_assoc p output_aliases)
+          && not (List.mem_assoc p port_subst))
+        (inputs @ outputs)
+    in
     let renamed_internal =
-      List.map (fun n -> (n, i.inst_name ^ "." ^ n)) internals in
+      List.map (fun n -> (n, i.inst_name ^ String.make 1 hier_sep ^ n))
+        (internals @ unbound_ports) in
     (* Compose the rename maps: input-port reads inside child →
      * caller expr; output-port writes inside child → caller's
      * connected wire; internals → instance-prefixed. *)
@@ -272,10 +299,10 @@ let inline_instance ?(force_ff=false) ~child (parent : bmodule) (i : binstance) 
     let rewrite_proc = function
       | BCombinational c ->
           BCombinational { c with body = List.map rewrite_stmt c.body;
-                                  name = i.inst_name ^ "." ^ c.name }
+                                  name = i.inst_name ^ String.make 1 hier_sep ^ c.name }
       | BSequential s ->
           BSequential { s with body = List.map rewrite_stmt s.body;
-                               name = i.inst_name ^ "." ^ s.name;
+                               name = i.inst_name ^ String.make 1 hier_sep ^ s.name;
                                clock = rewrite_name s.clock;
                                reset = Option.map rewrite_name s.reset;
                                (* in-cycle blocking temps are child names too *)
@@ -284,8 +311,12 @@ let inline_instance ?(force_ff=false) ~child (parent : bmodule) (i : binstance) 
     (* Bring child's internal signals into the parent (renamed). *)
     let new_signals =
       List.filter_map (fun (s : bsignal) ->
-        if s.direction = `Internal then
-          Some { s with name = i.inst_name ^ "." ^ s.name }
+        (* Unbound ports come across too, as internals, carrying the child's
+           DECLARED WIDTH -- which is the whole point: the parent has no other
+           source for it. *)
+        if s.direction = `Internal || List.mem s.name unbound_ports then
+          Some { s with name = i.inst_name ^ String.make 1 hier_sep ^ s.name;
+                        direction = `Internal }
         else None
       ) child.signals
     in
@@ -308,7 +339,7 @@ let inline_instance ?(force_ff=false) ~child (parent : bmodule) (i : binstance) 
      * 2^10 = 1024. *)
     let inst_dot_depth s =
       let n = ref 0 in
-      String.iter (fun c -> if c = '.' then incr n) s;
+      String.iter (fun c -> if c = hier_sep then incr n) s;
       !n
     in
     let migrated_instances =
@@ -316,7 +347,7 @@ let inline_instance ?(force_ff=false) ~child (parent : bmodule) (i : binstance) 
       else
         List.map (fun (ci : binstance) ->
           { ci with
-            inst_name = i.inst_name ^ "." ^ ci.inst_name;
+            inst_name = i.inst_name ^ String.make 1 hier_sep ^ ci.inst_name;
             (* Rewrite the connected port-expressions: child's port
              * connections reference signals (input ports of the child,
              * which now map to the inlined-caller's connected exprs;
