@@ -454,6 +454,71 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      place_lef's packing suffix ($carry/$mux/...), so match full pc_name then the
      base (strip at '$'); a base may fracture into several packed cells. *)
   let net_w = Array.make !nnets 1.0 in
+
+  (* ── PLACE_XDC: real constraints, not just a criticality scalar ───────────
+     nextpnr's criticality is PER-NET and says nothing about WHICH CLOCK a net
+     belongs to.  A net at crit 0.9 in a 40 ns domain therefore competes for the
+     annealer's attention on equal terms with one at crit 0.9 in an 8 ns domain,
+     though a nanosecond saved in the second is worth five in the first.  On
+     ethmin that is not a corner case: clk_sys is 40 ns, eth.userclk2 is 8, and
+     userclk2 is the domain that FAILS.
+
+     So read the design's own XDC and scale each net by its domain's period:
+
+         w = 1 + K * crit^P * (T_min / T_net)
+
+     T_min is the tightest constrained period, so the critical domain keeps its
+     full weight and slack domains fall away in proportion.  With one clock, or
+     no XDC, this is exactly the previous behaviour.
+
+     Parsed: create_clock -period P (with -name and a get_ports/get_nets/
+     get_pins target), and set_clock_groups -asynchronous.  A net whose domain
+     is not named in the XDC keeps weight 1.0 rather than being guessed at. *)
+  let xdc_periods : (string, float) Hashtbl.t = Hashtbl.create 16 in
+  let xdc_tmin = ref infinity in
+  (match Sys.getenv_opt "PLACE_XDC" with
+   | Some xf when Sys.file_exists xf ->
+     let ic = open_in xf in
+     let per_re = Str.regexp ".*-period[ \t]+\\([0-9.]+\\)" in
+     (* the target is whatever is inside the last {...} on the line *)
+     let tgt_re = Str.regexp ".*{\\([^}]*\\)}" in
+     (try
+        while true do
+          let ln = input_line ic in
+          let l = String.trim ln in
+          if String.length l > 0 && l.[0] <> '#' then begin
+            let has s =
+              let n = String.length l and m = String.length s in
+              let rec go i = i + m <= n && (String.sub l i m = s || go (i + 1)) in go 0 in
+            if has "create_clock" && Str.string_match per_re l 0 then begin
+              let p = float_of_string (Str.matched_group 1 l) in
+              let tgt =
+                if Str.string_match tgt_re l 0 then String.trim (Str.matched_group 1 l)
+                else "" in
+              (* a target may list several objects; take each *)
+              List.iter (fun t ->
+                  let t = String.trim t in
+                  if t <> "" then Hashtbl.replace xdc_periods t p)
+                (String.split_on_char ' ' tgt);
+              (* ALSO index by the clock's -name.  The get_nets target is a
+                 DESIGN net name and place_lef's nets are anonymous (n7335), so
+                 matching on it resolves nothing -- measured 0 of 2448 cells.
+                 The -name is what emit_clock_xdc matches against BUFG CELL
+                 names, and cell names DO survive, which is the same reason
+                 criticality is keyed by driver cell rather than by net. *)
+              let nm_re = Str.regexp ".*-name[ \t]+\\([^ \t]+\\)" in
+              if Str.string_match nm_re l 0 then
+                Hashtbl.replace xdc_periods (Str.matched_group 1 l) p;
+              if p > 0.0 && p < !xdc_tmin then xdc_tmin := p
+            end
+          end
+        done
+      with End_of_file -> ());
+     close_in ic;
+     Printf.eprintf "[place_lef] PLACE_XDC %s: %d clock target(s), tightest period %.3f ns\n%!"
+       xf (Hashtbl.length xdc_periods) !xdc_tmin
+   | _ -> ());
+
   (match Sys.getenv_opt "PLACE_CRIT_FILE" with
    | Some cf when Sys.file_exists cf ->
      (* Recover the pre-packing cell name by removing a KNOWN packer suffix from
@@ -497,6 +562,50 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      let p = try float_of_string (Sys.getenv "PLACE_CRIT_P") with _ -> 1.0 in
      let cmin = try float_of_string (Sys.getenv "PLACE_CRIT_MIN") with _ -> 0.0 in
      let ic = open_in cf in
+     (* cell -> its clock domain's period, from PLACE_XDC.  A cell whose clock
+        net is not named in the XDC gets nan and is left unscaled: an unmatched
+        domain must not be silently demoted to "slow". *)
+     let cell_period = Array.make ncells Float.nan in
+     let dom_hit = ref 0 in
+     if Hashtbl.length xdc_periods > 0 then begin
+       let is_clk p = p = "CLK" || p = "C" || p = "WCLK"
+                      || (String.length p >= 4 && String.sub p 0 4 = "CLKA")
+                      || (String.length p >= 4 && String.sub p 0 4 = "CLKB") in
+       let contains hay ndl =
+         let n = String.length hay and m = String.length ndl in
+         m > 0 && (let rec go i = i + m <= n && (String.sub hay i m = ndl || go (i + 1)) in go 0) in
+       (* STEP 1: clock net -> period, via the BUFG that DRIVES it.  A clock
+          buffer's cell name carries the design's clock name; the net it drives
+          is the domain.  This is the join emit_clock_xdc uses. *)
+       let is_out p = p = "O" || p = "Q" || p = "CLKOUT0" || p = "CLKOUT1"
+                      || p = "CLKOUT2" || p = "CLKOUT3" in
+       let netkey_period : (Pack_to_lef.netkey, float) Hashtbl.t = Hashtbl.create 16 in
+       Array.iter (fun c ->
+           let lef = c.Pack_to_lef.pc_lef in
+           if lef = "BUFG" || lef = "BUFH" || lef = "MMCM" then
+             Hashtbl.iter (fun tgt per ->
+                 if contains c.Pack_to_lef.pc_name tgt then
+                   List.iter (fun (p, nk) ->
+                       if is_out p then match nk with
+                         | Pack_to_lef.Net _ -> Hashtbl.replace netkey_period nk per
+                         | _ -> ()) c.Pack_to_lef.pc_conns)
+               xdc_periods) cells;
+       Printf.eprintf "[place_lef] PLACE_XDC: %d clock net(s) identified by their buffer\n%!"
+         (Hashtbl.length netkey_period);
+       (* STEP 2: every cell clocked from one of those nets is in that domain *)
+       Array.iteri (fun i c ->
+           List.iter (fun (p, nk) ->
+               if is_clk p && Float.is_nan cell_period.(i) then
+                 match Hashtbl.find_opt netkey_period nk with
+                 | Some per -> cell_period.(i) <- per; incr dom_hit
+                 | None -> ()) c.Pack_to_lef.pc_conns) cells;
+       Printf.eprintf "[place_lef] PLACE_XDC: %d/%d cell(s) resolved to a constrained clock\n%!"
+         !dom_hit ncells
+     end;
+     let dom_scale i =
+       if Hashtbl.length xdc_periods = 0 || Float.is_nan cell_period.(i)
+          || !xdc_tmin <= 0.0 || Float.is_nan !xdc_tmin then 1.0
+       else !xdc_tmin /. cell_period.(i) in
      let matched = ref 0 and lines = ref 0 in
      (try while true do
         (match String.split_on_char '\t' (input_line ic) with
@@ -518,9 +627,11 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                         with Not_found -> [])
                      | None -> [])) in
              if ids <> [] then incr matched;
-             let w = if c < cmin then 1.0
-                     else 1.0 +. k *. (if p = 1.0 then c else Float.pow c p) in
              List.iter (fun idx ->
+               (* the criticality is the driver cell's, so its DOMAIN scales it *)
+               let w = if c < cmin then 1.0
+                       else 1.0 +. k *. dom_scale idx
+                              *. (if p = 1.0 then c else Float.pow c p) in
                List.iter (fun nid -> if net_w.(nid) < w then net_w.(nid) <- w)
                  cell_nets.(idx)) ids
            end
@@ -2152,7 +2263,19 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      pin-dictated clock/IO infrastructure (GT/MMCM/BUFG/BUFH/IO) unless
      TOPO_STAMP_ALL=1 -- nextpnr places those from the XDC. *)
   let stamp_all = Sys.getenv_opt "TOPO_STAMP_ALL" <> None in
-  let skip_kind = function "GT" | "MMCM" | "BUFG" | "BUFH" | "IO" -> true | _ -> false in
+  (* GT and IO are genuinely PIN-DICTATED: the XDC names a package pin, nextpnr
+     derives the site from it, and a stamp of ours would only be a second
+     opinion about a thing already decided.
+     BUFG/BUFH/MMCM are NOT.  No XDC constrains them, so withholding the stamp
+     does not defer to a constraint -- it leaves the cell FREE, and whichever
+     placer happens to run then chooses a clock site by accident.  Measured on
+     ethmin: 6 BUFGCTRL + 1 MMCME2_ADV arriving unplaced at nextpnr, having been
+     given sites by place_lef (they are in PLACED_OUT) that were then thrown
+     away.  That matters because BUFG site choice is not cosmetic -- promotion
+     into the centre clock column has cost 13.7 ns of a 23.5 ns path here.
+     So stamp the clock infrastructure and keep deferring only on GT/IO.
+     TOPO_STAMP_ALL=1 still forces everything, including GT/IO. *)
+  let skip_kind = function "GT" | "IO" -> true | _ -> false in
   (* TOPO_BELS_SKIP_CARREP=1 -- for consumers that hold the ORIGINAL netlist.
      ------------------------------------------------------------------------
      When a CARRY4's CO[3] feeds more than one downstream CARRY4 CI, the carry
@@ -3987,6 +4110,8 @@ let materialise_const_drivers (j : Y.t) : Y.t =
 let split_degenerate_muxf (j : Y.t) : Y.t =
   let module U = Yojson.Safe.Util in
   let ncloned = ref 0 and nskipped = ref 0 in
+  let nbuffered = ref 0 and nbuf = ref 0 in
+  let nexclusive = ref 0 in
   let bits_of e = match e with
     | `List l -> List.filter_map (function `Int i -> Some i | _ -> None) l
     | _ -> [] in
@@ -4015,6 +4140,41 @@ let split_degenerate_muxf (j : Y.t) : Y.t =
          List.iter (fun (_, nj) ->
              List.iter (fun b -> if b > !maxbit then maxbit := b)
                (bits_of (nj |> U.member "bits"))) nets
+       | _ -> ());
+      (* CONSUMERS PER BIT, split into "wide-mux data pins" and "everything
+         else".  A mux data LUT must live in the MUX'S OWN SLICE, and the
+         packer will only absorb it there if nothing has claimed it already --
+         but CARRY4 (pack_to_lef rule 1, line ~284) absorbs its S-LUTs BEFORE
+         the mux group (rule 1a, line ~473).  So a LUT shared between a
+         MUXF7 data pin and a CARRY4.S pin is ALWAYS lost to the carry chain,
+         and the mux's pin then has to be fed from another slice, which the
+         dedicated F7/F8 path cannot do: it fails to route on every seed.
+         Counting non-mux consumers is what lets us give the mux an exclusive
+         copy instead. *)
+      let nuse : (int, int) Hashtbl.t = Hashtbl.create 4096 in
+      let muxuse : (int, int) Hashtbl.t = Hashtbl.create 256 in
+      let bump t b = Hashtbl.replace t b (1 + (try Hashtbl.find t b with Not_found -> 0)) in
+      List.iter (fun (_cn, cj) ->
+          let ty = try cj |> U.member "type" |> U.to_string with _ -> "" in
+          let ismux = ty = "MUXF7" || ty = "MUXF8" in
+          let dirs = try cj |> U.member "port_directions" |> U.to_assoc with _ -> [] in
+          match cj |> U.member "connections" with
+          | `Assoc conns ->
+            List.iter (fun (p, e) ->
+                match List.assoc_opt p dirs with
+                | Some (`String "output") -> ()
+                | _ ->
+                  List.iter (fun b ->
+                      bump nuse b;
+                      if ismux && (p = "I0" || p = "I1") then bump muxuse b)
+                    (bits_of e))
+              conns
+          | _ -> ()) cells;
+      (* a module port is a consumer too *)
+      (match mj |> U.member "ports" with
+       | `Assoc ps ->
+         List.iter (fun (_, pj) ->
+             List.iter (bump nuse) (bits_of (pj |> U.member "bits"))) ps
        | _ -> ());
       let dt_of dn =
         match Hashtbl.find_opt byname dn with
@@ -4049,9 +4209,54 @@ let split_degenerate_muxf (j : Y.t) : Y.t =
                                  "attributes", `Assoc [] ]) :: !extranets;
           incr ncloned;
           Some fresh
-        (* A MUXF8 data pin is driven by a MUXF7, not a LUT.  Duplicating a
-           whole F7 subtree is a different (so far unobserved) problem -- count
-           it rather than emit something subtly wrong. *)
+        (* The driver is NOT a LUT -- a MUXF7 feeding a MUXF8 data pin, an FF,
+           a hard-block output.  Cloning it is not an option (duplicating an F7
+           subtree or a flop would change the design), but the pin still needs a
+           LUT of its own IN ITS OWN SLICE, so give it a neutral one: a LUT1
+           pass-through, INIT "10" (O = I0), on a fresh net.
+           Leaving it alone instead is unroutable BY CONSTRUCTION, and the
+           router says so identically on every seed:
+             failed to route arc 0 of net '...mii_msn_reg_LUT3_I0_O[1]'
+             (SITEWIRE/SLICE_X2Y52/C6LUT_O6 -> SITEWIRE/SLICE_X15Y81/A6LUT_O6)
+           i.e. asked to reach ANOTHER slice's LUT output.  Three seeds gave
+           4/5/4 skips on the SAME two nets -- exactly the 2 this branch had
+           been counting as "left alone". *)
+        (* DEFAULT OFF -- see the note above: a bare buffer does NOT fix this.
+           Tried 2026-08-10 and it made things WORSE: skips 4 -> 6 (the two
+           original nets still failed AND both $muxbuf outputs did), and
+           eth.userclk2 fell 155 -> 116.67 MHz, FAILING its 125 MHz target.
+           The constraint is not "a LUT exists" but "a LUT in the mux's OWN
+           slice": the clone path works because the recognition packer groups a
+           cloned LUT with its mux, while a freshly-named $muxbuf cell is not
+           associated with it and lands elsewhere, adding a hop instead of
+           removing one.  To finish this the buffer must be PACKED into the
+           mux's slice (BEL-stamped into the right lane), not merely created.
+           MUXSPLIT_BUF=1 re-enables it for that work. *)
+        | Some _ when Sys.getenv_opt "MUXSPLIT_BUF" = Some "1" ->
+          incr maxbit;
+          let fresh = !maxbit in
+          incr nbuf;
+          let nm = ref (Printf.sprintf "$muxbuf$%d" !nbuf) in
+          while Hashtbl.mem byname !nm do
+            incr nbuf; nm := Printf.sprintf "$muxbuf$%d" !nbuf
+          done;
+          let buf =
+            `Assoc [ "hide_name", `Int 1;
+                     "type", `String "LUT1";
+                     "parameters", `Assoc [ "INIT", `String "10" ];
+                     "attributes", `Assoc [];
+                     "port_directions",
+                       `Assoc [ "I0", `String "input"; "O", `String "output" ];
+                     "connections",
+                       `Assoc [ "I0", `List [ `Int b ]; "O", `List [ `Int fresh ] ] ] in
+          Hashtbl.replace byname !nm buf;
+          extra := (!nm, buf) :: !extra;
+          extranets := (!nm ^ ".O",
+                        `Assoc [ "hide_name", `Int 1;
+                                 "bits", `List [ `Int fresh ];
+                                 "attributes", `Assoc [] ]) :: !extranets;
+          incr nbuffered;
+          Some fresh
         | _ -> incr nskipped; None in
       (* Every wide-mux data pin needs a LUT of its OWN, in its own lane of its
          own slice.  Two pins sharing one driver is unsatisfiable whether they
@@ -4073,9 +4278,17 @@ let split_degenerate_muxf (j : Y.t) : Y.t =
                     | Some e ->
                       (match bits_of e with
                        | [ b ] ->
-                         if Hashtbl.mem claimed b then
+                         (* Clone when the driver is shared with ANY non-mux
+                            consumer (it will be absorbed elsewhere first), and
+                            also on the original mux-vs-mux contention, where
+                            the first claimant keeps the original. *)
+                         let total = (try Hashtbl.find nuse b with Not_found -> 0) in
+                         let nmux  = (try Hashtbl.find muxuse b with Not_found -> 0) in
+                         let stolen = total - nmux > 0 in
+                         if stolen || Hashtbl.mem claimed b then
                            (match clone_driver b with
                             | Some fresh ->
+                              if stolen then incr nexclusive;
                               Hashtbl.replace claimed fresh ();
                               rewire := (pin, fresh) :: !rewire
                             | None -> ())
@@ -4114,10 +4327,16 @@ let split_degenerate_muxf (j : Y.t) : Y.t =
           then (k, `Assoc (List.map (fun (mn, mj) -> (mn, do_mod mj)) mods))
           else (k, v)) (U.to_assoc j))
     | _ -> j in
-  if !ncloned > 0 || !nskipped > 0 then
+  if !ncloned > 0 || !nbuffered > 0 || !nskipped > 0 then
     Printf.eprintf
       "[muxsplit] %d wide-mux data pin(s) given their own LUT back \
-       (%d left alone: driver is not a LUT)\n%!" !ncloned !nskipped;
+       (%d by cloning the driver LUT, of which %d were shared with a non-mux \
+       consumer such as a CARRY4 S-pin that would have absorbed it first; \
+       %d via a LUT1 pass-through); \
+       %d LEFT ALONE (driver is not a LUT, or has none) -- each of those is a \
+       wide-mux data pin that must be driven from its OWN slice and cannot be, \
+       so it will fail to route on every seed\n%!"
+      (!ncloned + !nbuffered) !ncloned !nexclusive !nbuffered !nskipped;
   r
 
 (* Emit create_clock constraints for nextpnr, resolved from BUFG CELL names.

@@ -350,6 +350,126 @@ let pack (m : bmodule) : result =
       end)
     m.instances;
 
+  (* 1a0. DECOMPOSED RAM256X1S (ethmin/ram256x1s_dec.sv) -> ONE SLICEM_DRAM.
+        RAM256X1S is opaque to this packer -- slicem_map knows RAM32/RAM64/RAMD/
+        RAMS but not RAM128/RAM256, and it cannot just be added there because
+        those entries claim ONE A6LUT while a RAM256X1S fills a WHOLE SLICEM.
+        So the RTL spells it out as 4 x RAM64X1S + 2 x MUXF7 + 1 x MUXF8 (what
+        Vivado turns it into anyway) and this puts it back together.
+
+        Recognition is by NAME: every cell of one decomposed RAM shares a parent
+        path and carries an `r256_` leaf prefix, so the group is exactly the set
+        of `<path>.r256_*` cells.  Without this the generic path gives each
+        RAM64X1S its own slice, scattering one 256-byte buffer over four SLICEMs
+        and stranding the shared address nets.
+
+        THE LANE ORDER IS REVERSED, and not by choice.  nextpnr's F7AMUX reads
+        I0 from the SECOND lane (B) and I1 from the FIRST (A), and its F8MUX
+        takes I1 from the A/B pair (F7AMUX) and I0 from the C/D pair (F7BMUX)
+        -- the same convention the MUXF7 absorb path below documents.  Working
+        that through the RTL's connections (f7a: I0=a, I1=b; f8: I0=f7a,
+        I1=f7b) forces d->A, c->B, b->C, a->D with f7b on F7AMUX and f7a on
+        F7BMUX.  Assign them in the obvious order instead and the mux inputs
+        cross, which is the unroutable A6LUT_O6<->B6LUT_O6 failure. *)
+  let leaf_of n = match String.rindex_opt n '.' with
+    | Some i -> String.sub n (i + 1) (String.length n - i - 1) | None -> n in
+  let parent_of n = match String.rindex_opt n '.' with
+    | Some i -> String.sub n 0 i | None -> "" in
+  let r256_groups : (string, binstance list ref) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (i : binstance) ->
+      if starts_with (leaf_of i.inst_name) "r256_" then begin
+        let k = parent_of i.inst_name in
+        match Hashtbl.find_opt r256_groups k with
+        | Some r -> r := i :: !r
+        | None -> Hashtbl.replace r256_groups k (ref [ i ])
+      end)
+    m.instances;
+  Hashtbl.iter (fun _k members ->
+      let ms = !members in
+      let find sfx =
+        List.find_opt (fun (i : binstance) -> leaf_of i.inst_name = "r256_" ^ sfx) ms in
+      match find "a", find "b", find "c", find "d",
+            find "f7a", find "f7b", find "f8" with
+      | Some ra, Some rb, Some rc, Some rd, Some f7a, Some f7b, Some f8
+        when not (Hashtbl.mem absorbed ra.inst_name) ->
+        let n x = (x : binstance).inst_name in
+        let bels =
+          [ (n rd, "A6LUT"); (n rc, "B6LUT"); (n rb, "C6LUT"); (n ra, "D6LUT")
+          ; (n f7b, "F7AMUX"); (n f7a, "F7BMUX"); (n f8, "F8MUX") ] in
+        let conns = ref [] in
+        let put pin v = conns := (pin, v) :: !conns in
+        (* the four banks share WCLK and the low address; each has its own
+           bank-decoded WE, of which the LEF models one *)
+        (match port_bit (n ra) "WCLK" 0 with Some v -> put "WCLK" v | None -> ());
+        (match port_bit (n ra) "WE" 0 with Some v -> put "WE" v | None -> ());
+        for k = 0 to 5 do
+          match port_bit (n ra) (Printf.sprintf "A%d" k) 0 with
+          | Some v -> put (Printf.sprintf "A%d" k) v | None -> ()
+        done;
+        List.iteri (fun idx c ->
+            (match port_bit (n c) "D" 0 with
+             | Some v -> put (Printf.sprintf "DI%d" idx) v | None -> ());
+            (match port_bit (n c) "O" 0 with
+             | Some v -> put (Printf.sprintf "DO%d" idx) v | None -> ()))
+          [ ra; rb; rc; rd ];
+        (* the muxed output is what the rest of the design actually reads *)
+        (match port_bit (n f8) "O" 0 with Some v -> put "DO3" v | None -> ());
+        List.iter (fun c -> Hashtbl.replace absorbed (n c) ())
+          [ ra; rb; rc; rd; f7a; f7b; f8 ];
+        bump "RAM256-group->SLICEM_DRAM";
+        add ~bels (n ra ^ "$r256") "SLICEM_DRAM" (List.rev !conns)
+      | _ ->
+        (* An INCOMPLETE group must not pass quietly.  Recognition is by name and
+           needs all seven members; if one has been optimised away (a constant
+           data bit, an unread bank) the match fails and every RAM64X1S falls
+           through to the generic path -- one slice each, the 256-byte buffer
+           scattered over four SLICEMs and the shared address nets stranded.
+           That is a silent placement regression, so name what is missing. *)
+        let missing =
+          List.filter (fun s -> find s = None) ["a"; "b"; "c"; "d"; "f7a"; "f7b"; "f8"] in
+        bump "RAM256-group INCOMPLETE (scattered)";
+        Printf.eprintf
+          "[pack_to_lef] WARNING: r256 group '%s' has %d of 7 members (missing: %s) -- \
+           NOT packed into one SLICEM; its RAM64X1S will be scattered\n%!"
+          _k (List.length ms) (String.concat "," (List.map (fun s -> "r256_" ^ s) missing)))
+    r256_groups;
+
+  (* 1b. RAM256X1S (the UNDECOMPOSED macro) -> ONE SLICEM_DRAM ---------------
+     A RAM256X1S fills a whole SLICEM, which is why slicem_map cannot carry it:
+     those entries claim a single A6LUT.  Left unrecognised it is not stamped at
+     all, and nextpnr's dist-RAM packer then expands it into 4 address LUTs plus
+     an F7/F7/F8 tree with NOTHING to inherit -- 119 unplaced cells on ethmin.
+
+     nextpnr already knows how to honour a placement here: it hands the parent's
+     BEL to the base sub-cell it creates first, and the other three RAMS64E and
+     the mux tree are constr_abs_z children of that base, so the whole group
+     lands on one slice.  The base is created at z = height-1, the D lane -- the
+     same lane Vivado uses for the first RAMS64E of a RAM256X1S.  So stamping
+     the macro at D6LUT is exactly what makes the expansion land where we put
+     it, and the decomposed r256_ form above becomes unnecessary (nextpnr
+     refuses RAM64X1S outright anyway, pack_dram.cc "Cannot pack unsupported
+     primitive"). *)
+  List.iter (fun (i : binstance) ->
+      let u = String.uppercase_ascii i.module_name in
+      if starts_with u "RAM256X1S" && not (Hashtbl.mem absorbed i.inst_name) then begin
+        let n = i.inst_name in
+        let conns = ref [] in
+        let put pin v = conns := (pin, v) :: !conns in
+        (match port_bit n "WCLK" 0 with Some v -> put "WCLK" v | None -> ());
+        (match port_bit n "WE" 0 with Some v -> put "WE" v | None -> ());
+        for k = 0 to 5 do
+          match port_bit n "A" k with
+          | Some v -> put (Printf.sprintf "A%d" k) v | None -> ()
+        done;
+        (* one data in, and the muxed output the rest of the design reads *)
+        (match port_bit n "D" 0 with Some v -> put "DI0" v | None -> ());
+        (match port_bit n "O" 0 with Some v -> put "DO3" v | None -> ());
+        Hashtbl.replace absorbed n ();
+        bump "RAM256X1S->SLICEM_DRAM";
+        add ~bels:[ (n, "D6LUT") ] (n ^ "$r256macro") "SLICEM_DRAM" (List.rev !conns)
+      end)
+    m.instances;
+
   (* 1a. MUXF7/MUXF8 wide-mux -> ONE SLICE_MUX pc, absorbing the mux(es) + their
         driving LUT6.  A MUXF7's two data inputs come from two LUT6 in the SAME
         physical slice (dedicated F7 routing); a MUXF8 combines the two F7 muxes
@@ -590,7 +710,20 @@ let pack (m : bmodule) : result =
       match g "S" with Some n -> ("S", Some n) | None ->
       match g "PRE" with Some n -> ("PRE", Some n) | None ->
       match g "CLR" with Some n -> ("CLR", Some n) | None -> ("", None) in
-    (g "C", g "CE", srk, srn) in
+    (* CLOCK EDGE IS PART OF THE CONTROL SET.  A 7-series half-slice drives all
+       its FFs from one clock edge, so a negative-edge flop (FDRE_1/FDSE_1/
+       FDCE_1/FDPE_1) cannot share it with posedge flops.  Keyed on clock/CE/SR
+       alone they look identical and pack together, and nothing complains until
+       FASM -- after a full place AND route:
+         FF '...speed_is_100_fall_FDRE_1_Q' (type FDRE_1) at SLICE_X24Y84/BFF
+         disagrees with its half-slice on 'negedge_ff' -- control-set contention
+       ethmin has just 4 negedge flops against 2667 posedge, so splitting them
+       out costs nothing measurable. *)
+    let negedge =
+      let u = String.uppercase_ascii i.module_name in
+      let n = String.length u in
+      n > 2 && String.sub u (n - 2) 2 = "_1" in
+    (g "C", g "CE", srk, srn, negedge) in
   (* order the FF pass: critical-D FFs first (see PACK_CRIT_FILE above) *)
   let ff_pass_order =
     if Hashtbl.length pack_crit = 0 then m.instances

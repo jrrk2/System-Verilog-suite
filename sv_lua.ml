@@ -2924,14 +2924,25 @@ let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
        (Printf.sprintf "// create_circuit RTL emit failed for %s: %s\n"
           m.Behavioral_ir.name (Printexc.to_string e)));
   let text = Buffer.contents buf in
-  (* strip_inst_params drops every `#(...)` override — fine for the Verilator sim
-     variant (no parameterised primitives) but FATAL for the FPGA/synth emit: it
-     erases RAMB36E1 INIT (the program), MMCME2_ADV clock config, and BSCANE2
-     JTAG_CHAIN (nextpnr then bins both taps to BSCAN_X0Y0 and placement fails).
-     SVS_CIRC_KEEP_PARAMS=1 (set by the yosys open flow) preserves them. *)
+  (* PARAMETERS ARE KEPT BY DEFAULT.  strip_inst_params drops every `#(...)`
+     override, which is harmless only for the Verilator sim variant (no
+     parameterised primitives) and FATAL for anything synthesised: it erases
+     RAMB36E1 INIT (the PROGRAM), MMCME2_ADV clock config -- an MMCM then falls
+     back to CLKFBOUT_MULT_F=5 and Vivado's DRC rejects the VCO -- and BSCANE2
+     JTAG_CHAIN, after which nextpnr bins both taps to BSCAN_X0Y0 and placement
+     fails.
+
+     This used to be opt-IN via SVS_CIRC_KEEP_PARAMS=1, and every flow that
+     produced a usable netlist set it.  A switch that must be on for the output
+     to mean anything is not a switch: forgetting it produced a netlist that
+     looked complete, synthesised, placed, and was wrong in ways that only
+     surfaced at DRC or on silicon.  So the default is now KEEP, and the
+     stripping is opt-out via SVS_CIRC_STRIP_PARAMS=1 for the sim variant that
+     actually wants it.  SVS_CIRC_KEEP_PARAMS is still accepted and ignored, so
+     the flows that set it keep working. *)
   let text =
-    if Sys.getenv_opt "SVS_CIRC_KEEP_PARAMS" <> None then text
-    else strip_inst_params text in
+    if Sys.getenv_opt "SVS_CIRC_STRIP_PARAMS" <> None then strip_inst_params text
+    else text in
   (* remove __keep_ retention ports here (pre-yosys), matching bir_to_*; keeps
      spurious unconstrained pads / dangling OBUFs out of every downstream P&R. *)
   let text = strip_keep_ports text in
@@ -3385,6 +3396,16 @@ let lread_nextpnr_json path =
   let label = match p.modules with m :: _ -> m.name | [] -> "nextpnr" in
   hadd (Prog (label, p))
 
+(* Same, but SELECTING THE TOP BY NAME.  read_program already takes ?top; the
+   one-argument binding never passed it, so it returned whatever module came
+   first in the file.  A yosys/place_lef JSON carries the whole cells_xtra
+   blackbox library ahead of the design, so that is `$__ABC9_LUT7` -- 7 cells --
+   and the EDIF written from it is 9.7 KB for a 8982-cell design, with no error
+   anywhere.  Always name the top for a real netlist. *)
+let lread_nextpnr_json_top path top =
+  let p = Nextpnr_json_to_behavioral.read_program ~top path in
+  hadd (Prog (top, p))
+
 (* Physical routing-completeness report: which FF D-pins are not actually
  * reached by their net's ROUTING (the bypass-FFMUX defect signature). *)
 let lroute_check path = Nextpnr_json_to_behavioral.route_report path
@@ -3557,6 +3578,75 @@ let lopendcp_check path =
          (Printf.sprintf "%s\t%s\t%s\n" f.f_check f.f_where f.f_detail))
     fs;
   Buffer.contents b
+
+(* Pip-level routing comparison: what does Vivado use on the nets nextpnr could
+   not finish?  Reads the nextpnr log for its SKIP_FAILED_ARCS warnings, so the
+   failed set is derived from the run rather than typed in and left to rot. *)
+let lopendcp_routestats xml_path log_path =
+  (* pull the net names out of nextpnr's SKIP_FAILED_ARCS warnings:
+       ... failed to route arc N of net 'NAME' (src -> dst); leaving unrouted. *)
+  let contains hay needle =
+    let n = String.length hay and m = String.length needle in
+    let rec go i = i + m <= n && (String.sub hay i m = needle || go (i + 1)) in
+    m > 0 && go 0 in
+  let failed = ref [] and seen = Hashtbl.create 64 in
+  (try
+     let ic = open_in log_path in
+     (try
+        while true do
+          let line = input_line ic in
+          if contains line "failed to route arc" then
+            match String.index_opt line '\'' with
+            | None -> ()
+            | Some i ->
+              let rest = String.sub line (i + 1) (String.length line - i - 1) in
+              (match String.index_opt rest '\'' with
+               | None -> ()
+               | Some j ->
+                 let name = String.sub rest 0 j in
+                 if not (Hashtbl.mem seen name) then begin
+                   Hashtbl.replace seen name ();
+                   failed := name :: !failed
+                 end)
+        done
+      with End_of_file -> ());
+     close_in ic
+   with Sys_error e -> prerr_endline e);
+  let db = Opendcp_xml.load xml_path in
+  Opendcp_xml.route_stats db (List.rev !failed)
+
+(* Dump an opendcp XML's routing in nextpnr --fixed-routes format. *)
+let lopendcp_fixedroutes xml_path out_path =
+  let db = Opendcp_xml.load xml_path in
+  Opendcp_xml.write_fixed_routes db out_path
+
+(* Emit a nextpnr (yosys-dialect) JSON directly from the opendcp XML plus the
+ * EDIF that dcp2xml writes beside it -- replacing RapidWright's xml2json and
+ * the python post-passes that patched its output.  Placement, cell properties
+ * and routing come from the XML; logical connectivity comes from the EDIF,
+ * which is the only place it is recorded without reimplementing the per-bel
+ * site-pin naming convention. *)
+let lopendcp_nextpnr_json xml_path edif_path out_path =
+  let db = Opendcp_xml.load xml_path in
+  Opendcp_xml.write_nextpnr_json db edif_path out_path
+
+(* Wire-class histogram over every routed net in an opendcp XML.  The classes
+ * are what the DEF layer stack is built from, so being able to see the real
+ * distribution -- rather than guessing which segment lengths matter -- is what
+ * decides how many layers are worth modelling. *)
+let lopendcp_classes xml_path =
+  let db = Opendcp_xml.load xml_path in
+  let (total, rows) = Opendcp_xml.class_histogram db.Opendcp_xml.nets in
+  let b = Buffer.create 1024 in
+  Buffer.add_string b (Printf.sprintf "pip endpoints: %d\n" total);
+  List.iter (fun (k, n, share) ->
+      Buffer.add_string b (Printf.sprintf "  %-28s %7d  %5.1f%%\n" k n share)) rows;
+  Buffer.contents b
+
+(* Vivado's layout as LEF+DEF on the device plane, for viewing in OpenROAD. *)
+let lopendcp_def xml_path tilegrid_path out_base =
+  let db = Opendcp_xml.load xml_path in
+  Opendcp_xml.write_def db tilegrid_path out_base
 
 (* Join two opendcp XMLs on a canonical cell name and report the differences
  * that matter (type, placement, logical pin SET).  A pure permutation of LUT
@@ -4128,6 +4218,16 @@ module MakeLib
                              (wrap1 lregister_names);
         "opendcp_check", V.efunc (V.string **->> V.string)
                              (wrap1 lopendcp_check);
+        "opendcp_fixedroutes", V.efunc (V.string **-> V.string **->> V.string)
+                             (wrap2 lopendcp_fixedroutes);
+        "opendcp_routestats", V.efunc (V.string **-> V.string **->> V.string)
+                             (wrap2 lopendcp_routestats);
+        "opendcp_classes", V.efunc (V.string **->> V.string) (wrap1 lopendcp_classes);
+        "opendcp_def", V.efunc (V.string **-> V.string **-> V.string **->> V.string)
+                             (fun a b c -> lopendcp_def a b c);
+        "opendcp_nextpnr_json",
+                             V.efunc (V.string **-> V.string **-> V.string **->> V.string)
+                             (fun a b c -> lopendcp_nextpnr_json a b c);
         "opendcp_compare", V.efunc (V.string **-> V.string **->> V.string)
                              (fun a b -> lopendcp_compare a b);
         "cell_census", V.efunc (V.string **->> V.string)
@@ -4145,6 +4245,9 @@ module MakeLib
         "owner",          V.efunc (V.string **->> V.string) (wrap1 lowner);
         "read_nextpnr_json", V.efunc (V.string **->> V.string)
                               (wrap1 lread_nextpnr_json);
+        "read_nextpnr_json_top",
+                          V.efunc (V.string **-> V.string **->> V.string)
+                              (wrap2 lread_nextpnr_json_top);
         "read_edif",      V.efunc (V.string **->> V.string) (wrap1 lread_edif);
         "read_edif_structural",
                           V.efunc (V.string **->> V.string)

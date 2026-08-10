@@ -1374,6 +1374,31 @@ let hier_of (name : string) : string =
 (* stable colour per hierarchy: hash -> hue, fixed saturation/value so the
    groups stay distinguishable and the same subsystem keeps its colour between
    runs. *)
+(* Colour per FUNCTION CLASS, for a DEF written at BEL resolution: these are
+   the macro names opendcp_xml emits for what is packed into a site.  Returning
+   an option lets the caller tell "this is a known function" from "colour it by
+   hierarchy instead", so the site-level DEF is unaffected. *)
+let func_colour (m : string) : (float * float * float) option =
+  match m with
+  | "LUT6"   -> Some (0.20, 0.40, 0.85)
+  | "LUT5"   -> Some (0.40, 0.60, 0.95)
+  | "FF"     -> Some (0.85, 0.20, 0.20)
+  | "FF5"    -> Some (0.95, 0.45, 0.45)
+  | "CARRY4" -> Some (0.95, 0.60, 0.10)
+  | "MUXF7"  -> Some (0.65, 0.35, 0.80)
+  | "MUXF8"  -> Some (0.50, 0.20, 0.70)
+  | "DRAM"   -> Some (0.15, 0.65, 0.45)
+  | "SRL"    -> Some (0.10, 0.55, 0.55)
+  | "RAMB18" -> Some (0.20, 0.70, 0.30)
+  | "RAMB36" -> Some (0.10, 0.55, 0.20)
+  | "DSP48"  -> Some (0.80, 0.75, 0.10)
+  | "IOB"    -> Some (0.55, 0.35, 0.20)
+  | "BUFG"   -> Some (0.90, 0.30, 0.65)
+  | "MMCM"   -> Some (0.75, 0.45, 0.85)
+  | "GT"     -> Some (0.30, 0.30, 0.35)
+  | "SLICE_OTHER" | "OTHER" -> Some (0.60, 0.60, 0.60)
+  | _ -> None
+
 let hier_colour (k : string) : float * float * float =
   if k = "(top)" then (0.30, 0.50, 0.80)
   else begin
@@ -1430,7 +1455,18 @@ type layout = {
   l_die        : int * int * int * int;               (* x1 y1 x2 y2 in DBU *)
   l_components : placed list;
   l_macro_um   : (string, float * float) Hashtbl.t;   (* cell → (w,h) μm *)
+  (* LEF PIN geometry per macro: (pin, direction, rect in μm relative to the
+     macro origin).  Without it a cell can only be drawn as a blank box. *)
+  l_macro_pins : (string, (string * string * (float * float * float * float)) list)
+                   Hashtbl.t;
   l_nets       : lnet list;                           (* nextpnr routing overlay *)
+  (* DEF routing, in DBU.  A replayed vendor layout carries its whole routing in
+     the NETS section -- for ethmin that is 4770 nets, ~72k segments and ~62k
+     vias -- and it is the routing, not the 1022 site rectangles, that makes the
+     picture look like a chip.  Segments carry their layer so wire CLASS
+     (LOCAL/SINGLE/DOUBLE/QUAD/HEX/LONG) can be colour-coded. *)
+  l_segs       : (int * int * int * int * string) list;  (* x1 y1 x2 y2 layer *)
+  l_vias       : (int * int) list;                       (* pip sites *)
   l_hi         : (string, unit) Hashtbl.t;            (* net names to highlight *)
   l_crit       : chop list;                           (* worst critical path *)
   l_crit_clk   : string;                              (* which clock it belongs to *)
@@ -1459,9 +1495,13 @@ let def_die_re     =
    include F too — earlier `[NSEW][NSEWF]*` rejected `FS` etc. and
    silently dropped half the placements (every flipped row of
    clkbufs / DFFs in particular).                                  *)
+(* PLACED is not the only placement status.  A DEF that REPLAYS a vendor layout
+   marks its components FIXED (they are being shown, not seeded), and a hard
+   macro may be COVER.  Matching PLACED alone silently dropped every component of
+   such a file -- the window opened with 0 instances and no hint why. *)
 let def_comp_re    =
   Str.regexp
-    "[ \t]*-[ \t]+\\([^ \t]+\\)[ \t]+\\([^ \t]+\\).*PLACED[ \t]+\
+    "[ \t]*-[ \t]+\\([^ \t]+\\)[ \t]+\\([^ \t]+\\).*\\(PLACED\\|FIXED\\|COVER\\)[ \t]+\
      ([ \t]*\\(-?[0-9]+\\)[ \t]+\\(-?[0-9]+\\)[ \t]*)[ \t]+\
      \\([NSEWF][NSEWF]*\\)"
 
@@ -1483,19 +1523,31 @@ let parse_def path =
               , int_of_string (Str.matched_group 4 line))
      with Not_found -> ());
     if Str.string_match def_comp_re line 0 then
+      (* groups: 1 inst, 2 cell, 3 status (PLACED|FIXED|COVER), 4 x, 5 y, 6 orient.
+         Str has no non-capturing group, so adding the status alternation shifted
+         every index after it. *)
       comps := { p_inst   = Str.matched_group 1 line
                ; p_cell   = Str.matched_group 2 line
-               ; p_x      = int_of_string (Str.matched_group 3 line)
-               ; p_y      = int_of_string (Str.matched_group 4 line)
-               ; p_orient = Str.matched_group 5 line } :: !comps
+               ; p_x      = int_of_string (Str.matched_group 4 line)
+               ; p_y      = int_of_string (Str.matched_group 5 line)
+               ; p_orient = Str.matched_group 6 line } :: !comps
   ) lines;
+  (* Routing comes from the DEF LEXER in lef_def, not from another hand-rolled
+     tokeniser: it already handles STAR-repeated coordinates, comments and
+     quoted names, and it is the reader placement.ml uses. *)
+  let rt = try Lef_def.Placement.routing path
+           with _ -> { Lef_def.Placement.segs = []; vias = []; die = (0,0,0,0);
+                       units = 2000; design = "" } in
   {
     l_design     = !design;
     l_units      = !units;
     l_die        = !die;
     l_components = List.rev !comps;
     l_macro_um   = Hashtbl.create 256;
+    l_macro_pins = Hashtbl.create 256;
     l_nets       = [];
+    l_segs       = rt.Lef_def.Placement.segs;
+    l_vias       = rt.Lef_def.Placement.vias;
     l_hi         = Hashtbl.create 1;
     l_crit       = []; l_crit_clk = ""; l_crit_ns = 0.0;
   }
@@ -1504,23 +1556,42 @@ let lef_macro_re = Str.regexp "[ \t]*MACRO[ \t]+\\([^ \t]+\\)"
 let lef_size_re  =
   Str.regexp "[ \t]*SIZE[ \t]+\\([0-9.]+\\)[ \t]+BY[ \t]+\\([0-9.]+\\)"
 
-let parse_lef_into tbl path =
+let lef_pin_re = Str.regexp "[ \t]*PIN[ \t]+\\([^ \t]+\\)"
+let lef_dir_re = Str.regexp "[ \t]*DIRECTION[ \t]+\\([A-Z]+\\)"
+let lef_rect_re =
+  Str.regexp
+    "[ \t]*RECT[ \t]+\\(-?[0-9.]+\\)[ \t]+\\(-?[0-9.]+\\)[ \t]+\
+     \\(-?[0-9.]+\\)[ \t]+\\(-?[0-9.]+\\)"
+
+let parse_lef_into tbl pintbl path =
   let lines = layout_lines path in
-  let cur = ref "" in
+  let cur = ref "" and pin = ref "" and dir = ref "" in
   List.iter (fun line ->
     if Str.string_match lef_macro_re line 0
-    then cur := Str.matched_group 1 line
+    then (cur := Str.matched_group 1 line; pin := ""; dir := "")
     else if !cur <> "" && Str.string_match lef_size_re line 0 then begin
       let w = float_of_string (Str.matched_group 1 line) in
       let h = float_of_string (Str.matched_group 2 line) in
       Hashtbl.replace tbl !cur (w, h)
+    end
+    else if !cur <> "" && Str.string_match lef_pin_re line 0 then
+      (pin := Str.matched_group 1 line; dir := "")
+    else if !pin <> "" && Str.string_match lef_dir_re line 0 then
+      dir := Str.matched_group 1 line
+    else if !pin <> "" && Str.string_match lef_rect_re line 0 then begin
+      let f k = float_of_string (Str.matched_group k line) in
+      let r = (f 1, f 2, f 3, f 4) in
+      let prev = try Hashtbl.find pintbl !cur with Not_found -> [] in
+      Hashtbl.replace pintbl !cur ((!pin, !dir, r) :: prev);
+      (* one rect per pin is all the viewer needs *)
+      pin := ""
     end
   ) lines
 
 let load_layout def_path lef_paths =
   let l = parse_def def_path in
   List.iter (fun p ->
-    try parse_lef_into l.l_macro_um p
+    try parse_lef_into l.l_macro_um l.l_macro_pins p
     with _ -> ()) lef_paths;
   l
 
@@ -1915,7 +1986,10 @@ let parse_nextpnr_json path =
     l_die        = die;
     l_components = List.rev !comps;
     l_macro_um   = Hashtbl.create 4;
+    l_macro_pins = Hashtbl.create 4;
     l_nets       = List.rev !nets;
+    l_segs       = [];                 (* nextpnr routing arrives via l_nets *)
+    l_vias       = [];
     l_hi         = Hashtbl.create 256;
     l_crit       = []; l_crit_clk = ""; l_crit_ns = 0.0 }
 
@@ -2053,6 +2127,106 @@ let load_skips_into hi json_path =
        with _ -> ());
       Some f
 
+(* The box a component occupies, in DEF units.  Shared by the renderer and by
+   click hit-testing so the two cannot drift: a click must select the thing the
+   user actually sees under the cursor. *)
+let comp_box layout p =
+  let w_um, h_um =
+    try Hashtbl.find layout.l_macro_um p.p_cell
+    with Not_found -> (0.5, 1.4) in
+  let rotated = match p.p_orient with
+    | "E" | "W" | "FE" | "FW" -> true
+    | _ -> false in
+  let w_um, h_um = if rotated then (h_um, w_um) else (w_um, h_um) in
+  let u = float_of_int layout.l_units in
+  (float_of_int p.p_x, float_of_int p.p_y, w_um *. u, h_um *. u)
+
+(* Fit transform of the LAST render: (off_x, off_y, scale, x1, y1, dh).  A click
+   arrives in device coordinates and has to be pushed back through it. *)
+let last_fit : (float * float * float * int * int * float) option ref = ref None
+
+(* Which component covers a point, in DEF units.  SMALLEST box wins: at BEL
+   resolution the cells sit inside the site they were packed into, and the
+   specific one is what was clicked.  Kept separate from the event handling so
+   it can be exercised without a pointer -- see SV_GUI_HITTEST. *)
+let component_at layout dx dy =
+  let best = ref None in
+  List.iter
+    (fun p ->
+       let (bx, by, bw, bh) = comp_box layout p in
+       if dx >= bx && dx <= bx +. bw && dy >= by && dy <= by +. bh then
+         match !best with
+         | Some (_, a) when a <= bw *. bh -> ()
+         | _ -> best := Some (p, bw *. bh))
+    layout.l_components;
+  match !best with Some (p, _) -> Some p | None -> None
+
+(* Pin names collapsed to BUSES.  A RAMB36 carries several hundred pins --
+   DIADI0..DIADI31 and so on -- and listing them one per name is both unreadable
+   and long enough to push the drawing area out of the window.  Split each name
+   into <base><digits>, group by base and direction, and print contiguous
+   indices as base[hi:lo].  A base with a single member keeps its own name, so
+   O6 stays O6 rather than becoming O[6]. *)
+let collapse_pins pins =
+  let split n =
+    let l = String.length n in
+    let rec back i = if i > 0 && n.[i-1] >= '0' && n.[i-1] <= '9' then back (i-1) else i in
+    let i = back l in
+    if i = l || i = 0 then (n, None)
+    else (String.sub n 0 i, Some (int_of_string (String.sub n i (l - i)))) in
+  let groups = Hashtbl.create 32 in
+  let order = ref [] in
+  List.iter
+    (fun (n, d, _) ->
+       let (base, idx) = split n in
+       let key = (base, d) in
+       if not (Hashtbl.mem groups key) then order := key :: !order;
+       let prev = try Hashtbl.find groups key with Not_found -> [] in
+       Hashtbl.replace groups key ((idx, n) :: prev))
+    pins;
+  let ranges idxs =
+    let sorted = List.sort_uniq compare idxs in
+    let rec go acc lo prev = function
+      | [] -> List.rev ((lo, prev) :: acc)
+      | x :: tl when x = prev + 1 -> go acc lo x tl
+      | x :: tl -> go ((lo, prev) :: acc) x x tl in
+    match sorted with [] -> [] | x :: tl -> go [] x x tl in
+  let dirtag = function "INPUT" -> "in" | "OUTPUT" -> "out" | _ -> "?" in
+  List.rev_map
+    (fun (base, d) ->
+       let members = Hashtbl.find groups (base, d) in
+       match members with
+       | [ (_, n) ] -> Printf.sprintf "%s:%s" n (dirtag d)
+       | _ ->
+         let idxs = List.filter_map (fun (i, _) -> i) members in
+         if idxs = [] then Printf.sprintf "%s:%s" base (dirtag d)
+         else
+           let rs = ranges idxs in
+           let spell (lo, hi) =
+             if lo = hi then Printf.sprintf "%s[%d]" base lo
+             else Printf.sprintf "%s[%d:%d]" base hi lo in
+           Printf.sprintf "%s:%s"
+             (String.concat "," (List.map spell rs)) (dirtag d))
+    (List.sort compare !order)
+
+(* What the selection box shows for a component.  Top level so the headless
+   SV_GUI_HITTEST check exercises the SAME text the window displays. *)
+let describe_component layout p =
+  let u = float_of_int layout.l_units in
+  let pins =
+    match Hashtbl.find_opt layout.l_macro_pins p.p_cell with
+    | None | Some [] -> "(none in the LEF)"
+    | Some ps ->
+      let cols = collapse_pins ps in
+      Printf.sprintf "%d pin(s) in %d group(s)\n  %s"
+        (List.length ps) (List.length cols)
+        (String.concat "\n  " cols) in
+  Printf.sprintf
+    "Instance:  %s\nCell:      %s\nOrient:    %s\n\
+     Placed at: ( %d %d ) = site ( %.2f %.2f )\n\nPins: %s"
+    p.p_inst p.p_cell p.p_orient p.p_x p.p_y
+    (float_of_int p.p_x /. u) (float_of_int p.p_y /. u) pins
+
 let render_layout cr ~width ~height ?path layout =
   let (x1, y1, x2, y2) = layout.l_die in
   let dw = float_of_int (x2 - x1) and dh = float_of_int (y2 - y1) in
@@ -2071,6 +2245,7 @@ let render_layout cr ~width ~height ?path layout =
       (off_x +. float_of_int (x - x1) *. scale,
        off_y +. (dh -. float_of_int (y - y1)) *. scale)
     in
+    last_fit := Some (off_x, off_y, scale, x1, y1, dh);
     (* Die outline *)
     let (dx0, dy0) = xform x1 y2 in
     let (dx1, dy1) = xform x2 y1 in
@@ -2078,6 +2253,57 @@ let render_layout cr ~width ~height ?path layout =
     Cairo.set_line_width cr 1.5;
     Cairo.rectangle cr dx0 dy0 ~w:(dx1 -. dx0) ~h:(dy1 -. dy0);
     Cairo.stroke cr;
+    (* DEF routing, drawn UNDER the cells.  Colour is by wire class, which is
+       what a 7-series route is actually made of: LOCAL taps inside a tile, then
+       SINGLE/DOUBLE/QUAD/HEX/LONG as the span grows.  Segments are grouped by
+       layer and stroked once per group -- 72k individual strokes would crawl. *)
+    if layout.l_segs <> [] then begin
+      let layer_colour = function
+        | "SITE"   -> (0.55, 0.55, 0.55)
+        | "LOCAL"  -> (0.20, 0.60, 0.20)
+        | "SINGLE" -> (0.20, 0.40, 0.85)
+        | "DOUBLE" -> (0.85, 0.55, 0.10)
+        | "QUAD"   -> (0.80, 0.20, 0.20)
+        | "HEX"    -> (0.60, 0.20, 0.75)
+        | "LONG"   -> (0.10, 0.65, 0.70)
+        | _        -> (0.45, 0.45, 0.45)
+      in
+      let by_layer : (string, (int * int * int * int) list ref) Hashtbl.t =
+        Hashtbl.create 16 in
+      List.iter (fun (x1s, y1s, x2s, y2s, lay) ->
+        let l = (try Hashtbl.find by_layer lay with Not_found ->
+                   let r = ref [] in Hashtbl.add by_layer lay r; r) in
+        l := (x1s, y1s, x2s, y2s) :: !l) layout.l_segs;
+      (* Zoom is a Cairo transform applied OVER this render, so a fixed line
+         width is multiplied by it and the routing smears into blobs at exactly
+         the magnification where the detail matters.  Divide by the current
+         scale to keep hairlines one pixel on screen at any zoom. *)
+      let cscale =
+        let m = Cairo.get_matrix cr in
+        if m.Cairo.xx > 0.0 then m.Cairo.xx else 1.0 in
+      Cairo.set_line_width cr (0.6 /. cscale);
+      Hashtbl.iter (fun lay ss ->
+        let (r, g, b) = layer_colour lay in
+        Cairo.set_source_rgba cr r g b 0.65;
+        List.iter (fun (xa, ya, xb, yb) ->
+          let (px, py) = xform xa ya and (qx, qy) = xform xb yb in
+          Cairo.move_to cr px py; Cairo.line_to cr qx qy) !ss;
+        Cairo.stroke cr) by_layer;
+      (* Pips are NOT drawn by default.  A pip's position is only known to tile
+         resolution, so 62k of them land on a regular lattice and read as a
+         square grid ruled over the cells -- it hides the thing you are looking
+         at and tells you nothing the segments do not already show.  Set
+         SV_GUI_PIPS=1 to put them back. *)
+      if Sys.getenv_opt "SV_GUI_PIPS" <> None then begin
+        Cairo.set_source_rgba cr 0.15 0.15 0.15 0.5;
+        let vr = 0.7 /. cscale in
+        List.iter (fun (vx, vy) ->
+          let (px, py) = xform vx vy in
+          Cairo.rectangle cr (px -. vr) (py -. vr) ~w:(2.0 *. vr) ~h:(2.0 *. vr))
+          layout.l_vias;
+        Cairo.fill cr
+      end
+    end;
     (* Instances, COLOUR-CODED BY HIERARCHY so a subsystem's placement is
        visible at a glance -- e.g. whether the eth core sits as one compact
        block or is smeared across the die.  Cairo fills every queued path with
@@ -2088,28 +2314,60 @@ let render_layout cr ~width ~height ?path layout =
     let groups : (string, (float * float * float * float) list ref) Hashtbl.t =
       Hashtbl.create 32 in
     List.iter (fun p ->
-      let w_um, h_um =
-        try Hashtbl.find layout.l_macro_um p.p_cell
-        with Not_found -> (0.5, 1.4)         (* unknown cell fallback *)
-      in
-      let rotated = match p.p_orient with
-        | "E" | "W" | "FE" | "FW" -> true
-        | _ -> false
-      in
-      let w_um, h_um = if rotated then (h_um, w_um) else (w_um, h_um) in
+      let (_, _, w_um, h_um) = comp_box layout p in
+      let w_um = w_um /. units_f and h_um = h_um /. units_f in
       let w_dbu = w_um *. units_f in
       let h_dbu = h_um *. units_f in
       let (rx, ry) = xform p.p_x (p.p_y + int_of_float h_dbu) in
-      let k = hier_of p.p_inst in
+      (* A BEL-resolution DEF names the cell's FUNCTION as its macro, so colour
+         by that -- the point of the finer file is to tell a LUT from a flop
+         from carry inside one slice.  A macro the table does not know (the
+         site-level DEF's SLICE_LOGIC etc.) keeps the hierarchy colouring. *)
+      let k = match func_colour p.p_cell with
+        | Some _ -> p.p_cell
+        | None   -> hier_of p.p_inst in
       let l = (try Hashtbl.find groups k with Not_found ->
                  let r = ref [] in Hashtbl.add groups k r; r) in
       l := (rx, ry, w_dbu *. scale, h_dbu *. scale) :: !l)
       layout.l_components;
     Hashtbl.iter (fun k rects ->
-      let (r, g, b) = hier_colour k in
+      let (r, g, b) = match func_colour k with
+        | Some c -> c
+        | None   -> hier_colour k in
       Cairo.set_source_rgba cr r g b 0.55;
       List.iter (fun (x, y, w, h) -> Cairo.rectangle cr x y ~w ~h) !rects;
       Cairo.fill cr) groups;
+    (* PINS.  Only worth drawing once a cell is big enough on screen for them to
+       land on distinct pixels; below that they would just darken the box. *)
+    if Hashtbl.length layout.l_macro_pins > 0 then begin
+      let cscale =
+        let m = Cairo.get_matrix cr in
+        if m.Cairo.xx > 0.0 then m.Cairo.xx else 1.0 in
+      List.iter (fun p ->
+        match Hashtbl.find_opt layout.l_macro_pins p.p_cell with
+        | None | Some [] -> ()
+        | Some pins ->
+          let (_, h_um) =
+            try Hashtbl.find layout.l_macro_um p.p_cell
+            with Not_found -> (0.5, 1.4) in
+          let h_dbu = h_um *. units_f in
+          if h_dbu *. scale *. cscale > 14.0 then
+            List.iter (fun (_, dir, (x1p, y1p, x2p, y2p)) ->
+              let (px, py) =
+                xform (p.p_x + int_of_float (x1p *. units_f))
+                      (p.p_y + int_of_float (y2p *. units_f)) in
+              let w = (x2p -. x1p) *. units_f *. scale
+              and h = (y2p -. y1p) *. units_f *. scale in
+              (match dir with
+               | "OUTPUT" -> Cairo.set_source_rgba cr 0.85 0.10 0.10 0.9
+               | "INPUT"  -> Cairo.set_source_rgba cr 0.10 0.25 0.85 0.9
+               | _        -> Cairo.set_source_rgba cr 0.45 0.45 0.45 0.9);
+              Cairo.rectangle cr px py ~w:(max w (0.7 /. cscale))
+                                       ~h:(max h (0.7 /. cscale));
+              Cairo.fill cr)
+              pins)
+        layout.l_components
+    end;
     (* nextpnr routing overlay.  Small nets keep the driver->sink star.  A
        global buffer's star is useless -- 149 lines from one corner BUFGCTRL
        tell you nothing -- so above WIDE_FANOUT we drop the lines and plot the
@@ -2270,7 +2528,8 @@ let open_layout_window ?critical_path layout =
   let zoom = ref 1.0 and pan_x = ref 0.0 and pan_y = ref 0.0 in
   let drag = ref None in
   da#misc#set_can_focus true;
-  da#event#add [ `SCROLL; `BUTTON_PRESS; `BUTTON_RELEASE; `POINTER_MOTION; `BUTTON1_MOTION ];
+  da#event#add [ `SCROLL; `SMOOTH_SCROLL; `BUTTON_PRESS; `BUTTON_RELEASE;
+                 `POINTER_MOTION; `BUTTON1_MOTION ];
   ignore (da#misc#connect#draw ~callback:(fun cr ->
     let alloc = da#misc#allocation in
     (try
@@ -2285,30 +2544,106 @@ let open_layout_window ?critical_path layout =
        Printf.eprintf "[layout] render failed: %s\n%!"
          (Printexc.to_string e));
     true));
+  (* A TRACKPAD does not send UP/DOWN.  It sends `SMOOTH events carrying dx/dy
+     deltas, so a handler that only understands the discrete directions does
+     nothing at all under a two-finger gesture -- the view simply refuses to
+     move.  Treat the two devices the way the rest of the desktop does:
+       two-finger drag / wheel tilt  -> PAN along both axes
+       ctrl + either                 -> ZOOM about the pointer
+     A mouse wheel keeps its familiar plain-scroll-to-zoom, since that is what
+     it has always done here and there is no second axis to pan with. *)
   ignore (da#event#connect#scroll ~callback:(fun ev ->
     let mx = GdkEvent.Scroll.x ev and my = GdkEvent.Scroll.y ev in
-    let f = match GdkEvent.Scroll.direction ev with
-      | `UP -> 1.15 | `DOWN -> 1.0 /. 1.15 | _ -> 1.0 in
-    if f <> 1.0 then begin
-      zoom := !zoom *. f;
-      (* keep the point under the cursor fixed *)
-      pan_x := mx -. f *. (mx -. !pan_x);
-      pan_y := my -. f *. (my -. !pan_y);
-      da#misc#queue_draw ()
+    let ctrl = List.mem `CONTROL (Gdk.Convert.modifier (GdkEvent.Scroll.state ev)) in
+    let zoom_by f =
+      if f <> 1.0 then begin
+        zoom := !zoom *. f;
+        (* keep the point under the cursor fixed *)
+        pan_x := mx -. f *. (mx -. !pan_x);
+        pan_y := my -. f *. (my -. !pan_y);
+        da#misc#queue_draw ()
+      end in
+    (match GdkEvent.Scroll.direction ev with
+     | `SMOOTH ->
+         let dx = GdkEvent.Scroll.delta_x ev and dy = GdkEvent.Scroll.delta_y ev in
+         if ctrl then
+           (if dy <> 0.0 then zoom_by (exp (-. dy *. 0.12)))
+         else if dx <> 0.0 || dy <> 0.0 then begin
+           (* natural direction: content follows the fingers *)
+           pan_x := !pan_x -. dx *. 40.0;
+           pan_y := !pan_y -. dy *. 40.0;
+           da#misc#queue_draw ()
+         end
+     | `UP    -> zoom_by (if ctrl then 1.15 else 1.15)
+     | `DOWN  -> zoom_by (if ctrl then 1.0 /. 1.15 else 1.0 /. 1.15)
+     | `LEFT  -> pan_x := !pan_x +. 40.0; da#misc#queue_draw ()
+     | `RIGHT -> pan_x := !pan_x -. 40.0; da#misc#queue_draw ()
+     | _ -> ());
+    true));
+  (* CLICK TO IDENTIFY.  Button 1 also starts a pan, so what counts as a click
+     is decided on RELEASE: if the pointer never really moved, identify what is
+     under it instead of treating it as a (zero-length) drag.  The description
+     goes to the side panel, which is filled in further down -- hence the
+     forward reference rather than a popup, so clicking around never has to be
+     dismissed. *)
+  let press_at = ref None in
+  let show_sel = ref (fun (_ : string) -> ()) in
+  let def_of_device ex ey =
+    match !last_fit with
+    | None -> None
+    | Some (off_x, off_y, scale, x1, y1, dh) ->
+      (* device -> the view transform the draw callback applied -> DEF units *)
+      let ux = (ex -. !pan_x) /. !zoom and uy = (ey -. !pan_y) /. !zoom in
+      Some (float_of_int x1 +. (ux -. off_x) /. scale,
+            float_of_int y1 +. dh -. (uy -. off_y) /. scale) in
+  let describe = describe_component layout in
+  let identify_at ex ey =
+    match def_of_device ex ey with
+    | None -> ()
+    | Some (dx, dy) ->
+      (match component_at layout dx dy with
+       | None -> !show_sel "(nothing here)"
+       | Some p -> !show_sel (describe p)) in
+  ignore (da#event#connect#button_press ~callback:(fun ev ->
+    if GdkEvent.Button.button ev = 1 then begin
+      press_at := Some (GdkEvent.Button.x ev, GdkEvent.Button.y ev);
+      drag := Some (GdkEvent.Button.x ev -. !pan_x, GdkEvent.Button.y ev -. !pan_y)
     end;
     true));
-  ignore (da#event#connect#button_press ~callback:(fun ev ->
-    if GdkEvent.Button.button ev = 1 then
-      drag := Some (GdkEvent.Button.x ev -. !pan_x, GdkEvent.Button.y ev -. !pan_y);
+  ignore (da#event#connect#button_release ~callback:(fun ev ->
+    drag := None;
+    (match !press_at with
+     | Some (px, py) ->
+       let ex = GdkEvent.Button.x ev and ey = GdkEvent.Button.y ev in
+       if abs_float (ex -. px) < 3.0 && abs_float (ey -. py) < 3.0 then
+         identify_at ex ey
+     | None -> ());
+    press_at := None;
     true));
-  ignore (da#event#connect#button_release ~callback:(fun _ -> drag := None; true));
+  (* Hover names the thing under the pointer.  The hit test walks every
+     component, so it is only run when the pointer has actually moved to a new
+     one -- and never while dragging, where the answer would be discarded. *)
+  let hover = ref None in
   ignore (da#event#connect#motion_notify ~callback:(fun ev ->
     (match !drag with
      | Some (ox, oy) ->
          pan_x := GdkEvent.Motion.x ev -. ox;
          pan_y := GdkEvent.Motion.y ev -. oy;
          da#misc#queue_draw ()
-     | None -> ());
+     | None ->
+       (match def_of_device (GdkEvent.Motion.x ev) (GdkEvent.Motion.y ev) with
+        | None -> ()
+        | Some (dx, dy) ->
+          let who = match component_at layout dx dy with
+            | Some p -> Some (p.p_inst, p.p_cell)
+            | None -> None in
+          if who <> !hover then begin
+            hover := who;
+            match who with
+            | Some (inst, cell) ->
+              da#misc#set_tooltip_text (Printf.sprintf "%s\n%s" inst cell)
+            | None -> da#misc#set_tooltip_text ""
+          end));
     true));
   ignore (win#event#connect#key_press ~callback:(fun ev ->
     if GdkEvent.Key.keyval ev = GdkKeysyms._f then begin
@@ -2339,6 +2674,24 @@ let open_layout_window ?critical_path layout =
   let header = GMisc.label ~text:header_text
     ~xalign:0.0 ~justify:`LEFT ~packing:side#pack () in
   header#set_line_wrap true;
+  (* Selection box, directly under the header: a click fills this in rather
+     than raising a dialog, so browsing the layout is uninterrupted.
+
+     It lives in a SCROLLER with a fixed height and a capped line width.  A
+     label sizes to its content, so a wide cell (a RAMB36 has several hundred
+     pins) makes the side panel demand the whole window and the layout
+     disappears -- the widget must be allowed to overflow, not to grow. *)
+  let sel_scroll = GBin.scrolled_window
+    ~hpolicy:`AUTOMATIC ~vpolicy:`AUTOMATIC ~packing:side#pack () in
+  sel_scroll#misc#set_size_request ~height:240 ();
+  let sel = GMisc.label ~text:"Click a component to identify it."
+    ~xalign:0.0 ~yalign:0.0 ~justify:`LEFT () in
+  sel_scroll#add_with_viewport sel#coerce;
+  sel#set_line_wrap true;
+  sel#set_max_width_chars 44;
+  sel#set_selectable true;
+  sel#misc#modify_font_by_name "Monospace 9";
+  show_sel := (fun s -> sel#set_text s);
   let scrolled = GBin.scrolled_window
     ~hpolicy:`AUTOMATIC ~vpolicy:`AUTOMATIC
     ~packing:(side#pack ~expand:true ~fill:true) () in
@@ -2774,6 +3127,70 @@ let synthesise_inner (path, p : string * Behavioral_ir.bprogram)
     (List.length p'.library_cells) out_path in
   p', summary
 
+(* Open any LEF/DEF pair -- not only an ORFS results directory.  The DEF names
+   its own macros, so the library must come from the file beside it: prefer
+   <base>.lef, and only fall back to every *.lef in the directory when there is
+   no such file.  Reading them all unconditionally is what makes a second,
+   near-identical library (a free-placement variant of the same design, say)
+   collide on duplicate macro names. *)
+let open_lef_def_path path =
+    try
+      let dir = Filename.dirname path in
+      let base = Filename.remove_extension (Filename.basename path) in
+      let sibling = Filename.concat dir (base ^ ".lef") in
+      let lefs =
+        if Sys.file_exists sibling then [ sibling ]
+        else
+          List.filter (fun f -> Filename.check_suffix f ".lef")
+            (List.map (Filename.concat dir) (Array.to_list (Sys.readdir dir))) in
+      let layout = load_layout path lefs in
+      if layout.l_components = [] then
+        error_dialog
+          (Printf.sprintf
+             "%s parsed, but no components were placed.\n\n\
+              The COMPONENTS section must carry PLACED, FIXED or COVER \
+              coordinates."
+             (Filename.basename path))
+      else begin
+        let summary =
+          Printf.sprintf
+            "%s: %d instance(s), %d macro(s) with %d pin(s), %d LEF(s), \
+             %d segment(s), %d pip(s)"
+            (Filename.basename path) (List.length layout.l_components)
+            (Hashtbl.length layout.l_macro_um)
+            (Hashtbl.fold (fun _ ps n -> n + List.length ps)
+               layout.l_macro_pins 0)
+            (List.length lefs)
+            (List.length layout.l_segs) (List.length layout.l_vias) in
+        set_status summary;
+        (* Also on stderr: the status bar is invisible to a headless run. *)
+        prerr_endline summary;
+        (* SV_GUI_HITTEST="x,y" (DEF units) runs the same lookup a click does,
+           so the selection can be checked without a pointer. *)
+        (match Sys.getenv_opt "SV_GUI_HITTEST" with
+         | None -> ()
+         | Some spec ->
+           List.iter
+             (fun pt ->
+                match String.split_on_char ',' pt with
+                | [sx; sy] ->
+                  let dx = float_of_string (String.trim sx)
+                  and dy = float_of_string (String.trim sy) in
+                  (match component_at layout dx dy with
+                   | None -> Printf.eprintf "hit (%g,%g): nothing\n%!" dx dy
+                   | Some p ->
+                     Printf.eprintf "hit (%g,%g):\n%s\n%!" dx dy
+                       (describe_component layout p))
+                | _ -> ())
+             (String.split_on_char ';' spec));
+        open_layout_window layout
+      end
+    with e -> error_dialog (Printexc.to_string e)
+
+let do_open_lef_def () =
+  let path = chooser_dialog `OPEN "Open DEF (LEF taken from beside it)" in
+  if path <> "" then open_lef_def_path path
+
 let do_open_nextpnr_json () =
   let path = chooser_dialog `OPEN "Open nextpnr placement/routing JSON" in
   if path <> "" then
@@ -3194,12 +3611,19 @@ let () =
 
   (* File menu. *)
   let f = new GMenu.factory file_menu ~accel_group in
+  (* "Open..." dispatches on WHAT THE FILE IS.  Dropping a DEF into the text
+     buffer is not just unhelpful -- a layout DEF here runs to megabytes, so the
+     window fills with coordinates and the viewer never appears.  A .def opens in
+     the layout viewer; everything else is still text. *)
   ignore (f#add_item "Open..." ~key:GdkKeysyms._O
             ~callback:(fun () ->
               let p = open_file_dialog () in
               if p <> "" then
-                try set_text (read_file p); set_status ("Loaded " ^ p)
-                with e -> error_dialog (Printexc.to_string e)));
+                let ext = String.lowercase_ascii (Filename.extension p) in
+                if ext = ".def" then open_lef_def_path p
+                else
+                  try set_text (read_file p); set_status ("Loaded " ^ p)
+                  with e -> error_dialog (Printexc.to_string e)));
   ignore (f#add_item "Save text..." ~key:GdkKeysyms._S
             ~callback:(fun () ->
               let p = save_file_dialog () in
@@ -3247,6 +3671,7 @@ let () =
   ignore (t#add_item "Run ORFS layout..."  ~callback:do_orfs_run);
   ignore (t#add_item "Open ORFS run..."    ~callback:do_open_orfs_run);
   ignore (t#add_item "Open nextpnr placement/routing JSON..." ~callback:do_open_nextpnr_json);
+  ignore (t#add_item "Open LEF/DEF layout..." ~callback:do_open_lef_def);
 
   (* Schematic menu. *)
   let s = new GMenu.factory schematic_menu ~accel_group in
@@ -3307,4 +3732,14 @@ let () =
 
   load_scripts ();
   window#show ();
+
+  (* A .def named on the command line opens straight into the layout viewer.
+     This is also the only way to exercise the LEF/DEF reader without a human
+     driving the file chooser, so it is what the headless smoke test uses. *)
+  List.iter
+    (fun a ->
+       if Filename.check_suffix a ".def" then open_lef_def_path a)
+    (List.tl (Array.to_list Sys.argv));
+  if Sys.getenv_opt "SV_GUI_EXIT_AFTER_LOAD" <> None then exit 0;
+
   GMain.main ()

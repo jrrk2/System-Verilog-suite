@@ -1898,7 +1898,14 @@ let xil_unisims_dir =
    combinatorial loops.  Honours XIL_UNISIMS_VHD_DIR (its sibling secureip too). *)
 let xil_unisims_dirs =
   let sib sub = Filename.concat (Filename.dirname xil_unisims_dir) sub in
-  [ xil_unisims_dir; sib "secureip" ]
+  (* retarget/ holds the variants Vivado maps onto a base primitive rather than
+     modelling separately -- the negative-edge flops FDRE_1/FDSE_1/FDCE_1/FDPE_1
+     among them.  yosys emits those for any negedge flop, so leaving the
+     directory out means the interface lookup finds NOTHING, every pin defaults
+     to `input`, and the cell reaches the EDIF with no D port at all: Vivado
+     stops with "Cannot find port 'D' on instance ... of cell 'FDRE_1'".
+     primitive/ alone is not the whole unisim library. *)
+  [ xil_unisims_dir; sib "secureip"; sib "retarget" ]
 
 let xil_primitive_cache :
     (string, Behavioral_ir.library_port list) Hashtbl.t =
@@ -1979,6 +1986,18 @@ let builtin_prim_ports : (string * (string * [`Input|`Output]) list) list = [
   "FDC", [ "Q",`Output; "D",`Input; "C",`Input; "CLR",`Input ];
   "FDP", [ "Q",`Output; "D",`Input; "C",`Input; "PRE",`Input ];
   "FDS", [ "Q",`Output; "D",`Input; "C",`Input; "S",`Input ];
+  (* Negative-edge variants.  Their .vhd is in unisims/retarget/ rather than
+     primitive/, and although the bulk XIL_PRIM_PORTS_WRITE=all sweep reads it,
+     the per-name lookup does not resolve it -- so seed them here, which also
+     keeps them working on a machine with no Vivado at all.  Getting this wrong
+     is SILENT: with no interface every pin defaults to `input`, the cell is
+     emitted with no D port, and Vivado stops at link_design with
+     "Cannot find port 'D' on instance ... of cell 'FDRE_1'".  yosys emits these
+     for any negedge flop, so they turn up in ordinary designs. *)
+  "FDRE_1", [ "Q",`Output; "C",`Input; "CE",`Input; "D",`Input; "R",`Input ];
+  "FDSE_1", [ "Q",`Output; "C",`Input; "CE",`Input; "D",`Input; "S",`Input ];
+  "FDCE_1", [ "Q",`Output; "C",`Input; "CE",`Input; "D",`Input; "CLR",`Input ];
+  "FDPE_1", [ "Q",`Output; "C",`Input; "CE",`Input; "D",`Input; "PRE",`Input ];
 ]
 
 (* Write the resolved primitive-interface cache back to the JSON fallback so a

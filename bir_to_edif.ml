@@ -129,6 +129,11 @@ type net_key = { base : string; bit : int }
 
 type ctx = {
   ids       : (net_key, int) Hashtbl.t;
+  (* Continuous-assignment MERGES: an alias bit resolves to the net name of its
+     source instead of allocating one of its own.  EDIF has no `assign`, and an
+     alias is not a cell -- merging adds nothing to the design and, unlike a
+     buffer, cannot introduce a second driver. *)
+  alias     : (net_key, string) Hashtbl.t;
   next_id   : int ref;
   widths    : (string, int) Hashtbl.t;   (* declared ∪ slice-inferred: BVar expansion *)
   declw     : (string, int) Hashtbl.t;   (* declared only: bitbus_ref strip gate *)
@@ -136,6 +141,7 @@ type ctx = {
 
 let mk_ctx () = {
   ids     = Hashtbl.create 4096;
+  alias   = Hashtbl.create 1024;
   next_id = ref 100;
   widths  = Hashtbl.create 256;
   declw   = Hashtbl.create 256;
@@ -151,6 +157,13 @@ let alloc ctx (k : net_key) : int =
       i
 
 let net_name_of_id i = Printf.sprintf "n_%d" i
+
+(* Resolve a net_key to its EDIF net name, following a continuous-assignment
+   merge if one was recorded for this bit. *)
+let name_of ctx (k : net_key) : string =
+  match Hashtbl.find_opt ctx.alias k with
+  | Some n -> n
+  | None -> net_name_of_id (alloc ctx k)
 
 (* Special sentinel nets for constants — same names fpga_emit uses. *)
 let const_net = function
@@ -210,7 +223,7 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
       List.map (fun i ->
         match const_net base with
         | Some n -> n
-        | None   -> net_name_of_id (alloc ctx { base; bit = i }))
+        | None   -> name_of ctx { base; bit = i })
         (range lsb msb)
   | BSlice { signal; msb; lsb } ->
       (* Slice of a composite (flatten_struct emits a bus as a BConcat of nets,
@@ -230,14 +243,14 @@ let rec nets_of_conn ctx (e : bexpr) : string list =
                 (* of_circuit's `<base>__<i>` multi-bit-input naming -> bit i of
                    the vector `<base>`, else the reader orphans from the port
                    bit (driverless net). *)
-                [net_name_of_id (alloc ctx { base; bit })]
+                [name_of ctx { base; bit }]
             | None ->
                 let w = try Hashtbl.find ctx.widths nm with Not_found -> 1 in
-                List.init w (fun i -> net_name_of_id (alloc ctx { base = nm; bit = i }))))
+                List.init w (fun i -> name_of ctx { base = nm; bit = i })))
   | BSelect { array = BVar nm; index = BConst { value; _ } } ->
       (match const_net nm with
        | Some n -> [n]
-       | None   -> [net_name_of_id (alloc ctx { base = nm; bit = Z.to_int value })])
+       | None   -> [name_of ctx { base = nm; bit = Z.to_int value }])
   | _ ->
       failwith ("bir_to_edif: unsupported pin expression: "
                 ^ Behavioral_ir.string_of_bexpr e)
@@ -1051,7 +1064,74 @@ let write_edif_hier
     pp "        )\n        (contents\n";
     pp "          (instance n_GND_inst (viewref netlist (cellref GND (libraryref hdi_primitives))))\n";
     pp "          (instance n_VCC_inst (viewref netlist (cellref VCC (libraryref hdi_primitives))))\n";
-    let live_cells = List.filter (fun (i : binstance) -> not (is_skipped_cell i.module_name)) m.instances in
+    (* CONTINUOUS ASSIGNMENTS are MERGED, not turned into cells.
+       EDIF has no `assign`, and this writer used to walk cells and ports only
+       (m.processes was read solely to infer port directions), so every one of
+       yosys's assignments vanished and its target reached Vivado with no
+       driver -- 1920 of them in the ethmin gate netlist.
+       They cannot simply be removed upstream: `opt_clean -purge` clears only
+       17%, and of the rest just 58 are port aliases while 1184 are internal,
+       inherent to a hierarchical netlist carrying public names.  But none of
+       them is logic -- 743 bus gathers, 500 simple aliases, 272 slice aliases,
+       62 constant ties -- so the right EDIF form is to give the target bit the
+       SAME NET as its source.  A merge adds nothing to the design, and unlike
+       the buffer cell this replaces it cannot create a second driver.
+       Only pure aliases qualify (rhs a net/slice/select/concat/constant), and
+       BSequential is excluded outright: treating a register update as an alias
+       would be far worse than the bug being fixed. *)
+    let merged = ref 0 in
+    let pending =
+      let rec pure = function
+        | BVar _ | BConst _ -> true
+        | BSlice { signal; _ } -> pure signal
+        | BSelect { array; index = BConst _ } -> pure array
+        | BConcat es -> List.for_all pure es
+        | _ -> false in
+      (* Never merge a bit some CELL OUTPUT already drives.  A BAssign carries
+         only the base NAME, so a part-select write looks like a whole-signal
+         assignment: picorv32's `decoded_imm_j` has its 32 bits driven
+         individually by FDREs, and treating it as one gave 40 x
+         "[DRC MDRV-1] Multiple Driver Nets".  Checking the RESOLVED NET is
+         exact and assumes nothing about how the frontend lowered the write. *)
+      let inst_driven : (string, unit) Hashtbl.t = Hashtbl.create 1024 in
+      List.iter (fun (i : binstance) ->
+        let ports = prim_ports i.module_name in
+        List.iter (fun (pin, e) ->
+          match List.find_opt (fun (p, _, _) -> p = pin) ports with
+          | Some (_, `Output, _) ->
+              List.iter (fun nm -> Hashtbl.replace inst_driven nm ()) (nets_of_conn ctx e)
+          | _ -> ()) i.port_connections) m.instances;
+      List.concat_map (function
+        | BSequential _ -> []
+        | BCombinational c ->
+          List.concat_map (function
+            | BAssign { lhs; rhs } when pure rhs ->
+                let w = min (List.length (nets_of_conn ctx rhs))
+                            (try Hashtbl.find ctx.widths lhs with Not_found -> 1) in
+                List.filter_map (fun b ->
+                  let k = { base = lhs; bit = b } in
+                  if Hashtbl.mem inst_driven (name_of ctx k) then None
+                  else Some (k, rhs, b)) (List.init w (fun b -> b))
+            | _ -> []) c.body) m.processes in
+    (* Iterate to a fixpoint so CHAINS collapse (a = b; b = c -> both land on
+       c's net); nets_of_conn consults the map as it is built, so each pass
+       pushes the resolution one link further.  Bounded in case of a cycle. *)
+    let pass = ref 0 in
+    let changed = ref true in
+    while !changed && !pass < 8 do
+      incr pass; changed := false;
+      List.iter (fun (k, rhs, b) ->
+        match List.nth_opt (nets_of_conn ctx rhs) b with
+        | Some src when src <> name_of ctx k ->
+            Hashtbl.replace ctx.alias k src; changed := true
+        | _ -> ()) pending
+    done;
+    merged := List.length pending;
+    if !merged > 0 then
+      Printf.eprintf "[edif_hier] %s: %d continuous-assignment bit(s) merged (%d pass(es))\n"
+        m.name !merged !pass;
+    let live_cells =
+      List.filter (fun (i : binstance) -> not (is_skipped_cell i.module_name)) m.instances in
     List.iter (fun (i : binstance) ->
       let lib = if is_user i.module_name then "work" else "hdi_primitives" in
       pp "          (instance %s (viewref netlist (cellref %s (libraryref %s)))"
@@ -1089,8 +1169,12 @@ let write_edif_hier
     add_use ~driver:true "n_GND" "(portref G (instanceref n_GND_inst))";
     add_use ~driver:true "n_VCC" "(portref P (instanceref n_VCC_inst))";
     Hashtbl.iter (fun nm (dir, w, bits) ->
-      List.iteri (fun bit_i id ->
-        let net = net_name_of_id id in
+      List.iteri (fun bit_i _id ->
+        (* Resolve through the continuous-assignment merge, exactly as cell pins
+           do.  Allocating the port's own id here instead would leave an aliased
+           port on a different net from the logic it is assigned to, and the
+           merge would look like it had silently failed. *)
+        let net = name_of ctx { base = nm; bit = bit_i } in
         let pref = if w = 1 then Printf.sprintf "(portref %s)" (edif_safe_id nm)
                    else Printf.sprintf "(portref (member %s %d))" (edif_safe_id nm) (mem_idx ~w bit_i) in
         (* a module INPUT drives internal nets; an OUTPUT reads them *)

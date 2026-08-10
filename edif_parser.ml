@@ -12,6 +12,21 @@ type port_info = {
 
 type instance_info = {
   name: string;
+  vivado_name: string;  (* The quoted original from (instance (rename SAFE_ID
+                           "orig/name[3]") …) -- i.e. the name Vivado's own
+                           physical database uses, complete with '/' and '[]'.
+                           Equal to `name` when there is no rename.
+
+                           WHY BOTH.  `name` stays the EDIF-safe identifier
+                           because the Verilog/BIR consumers emit it as an
+                           identifier, where '/' and '[' are illegal.  But
+                           anything joining against Vivado's physical side (the
+                           opendcp XML, a placement file) needs the original:
+                           keyed on `name` an XML cell join matched 712 of 5812
+                           cells and 5093 cells silently lost their placement.
+                           parse_nets already draws this distinction for nets
+                           (net_info.name is the original, original_name the safe
+                           id); instances were asymmetric. *)
   cell_type: string;
   library: string;
   init: string option;  (* (property INIT (string "...")) — LUT truth table,
@@ -213,18 +228,21 @@ let parse_instances content =
       let inst_end = find_close (inst_start + 1) 1 in
       let inst_text = safe_sub content inst_start (inst_end - inst_start + 1) in
 
-      (* Extract instance name - handle both simple and rename formats *)
-      let inst_name =
+      (* Extract instance name - handle both simple and rename formats.
+         In (rename SAFE_ID "orig/name[3]") group 1 is the EDIF-safe identifier
+         and group 2 the original; keep BOTH, since the Verilog consumers need
+         the former and any join against Vivado's physical database needs the
+         latter. *)
+      let (inst_name, inst_vivado_name) =
         try
-          (* Try renamed format: (instance (rename old "new") ...) *)
           let _ = Str.search_forward (Str.regexp_case_fold "rename[ \t\n\r]+\\([^ ]+\\)[ \t\n\r]+\"\\([^\"]+\\)\"") inst_text 0 in
-          Str.matched_group 1 inst_text  (* Use original name *)
+          (Str.matched_group 1 inst_text, Str.matched_group 2 inst_text)
         with Not_found ->
           try
             (* Try simple format: (instance name ...) *)
             let _ = Str.search_forward (Str.regexp_case_fold "instance[ \t\n\r]+\\([^ (]+\\)") inst_text 0 in
-            Str.matched_group 1 inst_text
-          with _ -> ""
+            let n = Str.matched_group 1 inst_text in (n, n)
+          with _ -> ("", "")
       in
 
       (* Extract cellref and libraryref *)
@@ -295,7 +313,8 @@ let parse_instances content =
             in
             scan [] 0
           in
-          instances := { name = inst_name; cell_type; library; init;
+          instances := { name = inst_name; vivado_name = inst_vivado_name;
+                         cell_type; library; init;
                          properties } :: !instances
         with _ -> ());
 
@@ -418,9 +437,32 @@ let parse_library_cells content =
         true
       with Not_found -> false in
 
-      (* Only parse ports for primitive cells (no contents section) *)
-      if not has_contents then begin
-        let ports = parse_ports cell_text in
+      (* Record the INTERFACE of every cell, primitive or not.
+         A cell with (contents …) is a macro -- RAM256X1S, RAM32M, RAM64M are
+         defined here as RAMS64E/RAMD32 plus F7/F8 muxes.  Skipping those left
+         consumers with no interface for the macro at all, so a design that
+         instantiates one got a cell with NO connections: 362 ports across 16
+         RAM256X1S, 12 RAM32M and 10 RAM64M silently came out empty.
+         library_cells is only ever consumed as a port direction/width table,
+         never as an "is this a primitive" test, so recording macros too is
+         additive.  Parse the interface block alone -- the contents hold
+         (portref …) entries that must not be mistaken for declarations. *)
+      let iface_text =
+        if not has_contents then cell_text
+        else
+          try
+            let i = Str.search_forward (Str.regexp_case_fold "(interface") cell_text 0 in
+            let rec fc p depth =
+              if p >= String.length cell_text then p
+              else match cell_text.[p] with
+                | '(' -> fc (p + 1) (depth + 1)
+                | ')' -> if depth = 1 then p else fc (p + 1) (depth - 1)
+                | _ -> fc (p + 1) depth in
+            let e = fc (i + 1) 1 in
+            safe_sub cell_text i (e - i + 1)
+          with Not_found -> "" in
+      if iface_text <> "" then begin
+        let ports = parse_ports iface_text in
         if List.length ports > 0 then
           Hashtbl.replace cells cell_name ports
       end;
