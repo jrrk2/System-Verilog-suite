@@ -43,7 +43,7 @@ let kind_of_lef = function
   | s when String.length s >= 5 && String.sub s 0 5 = "SLICE" -> "SLICE"
   | "RAMB36" -> "BRAM" | "RAMB18" -> "BRAM18" | "DSP48" -> "DSP"
   | "IOB" -> "IO" | "BUFG" -> "BUFG" | "BUFH" -> "BUFH" | "MMCM" -> "MMCM"
-  | "GT" -> "GT"
+  | "GT_CHANNEL" -> "GT_CHANNEL" | "GT_COMMON" -> "GT_COMMON"
   | _ -> "SLICE"
 
 type site = { sname : string; mutable used : bool; sx : int; sy : int; sm : bool }
@@ -741,9 +741,24 @@ let run_gen floorplan_json ~get_bmod ~get_j =
       with Sys_error _ -> ())
    | _ -> ());
   let want_site_of (c : Pack_to_lef.packed_cell) =
-    List.fold_left (fun acc (prim, _) ->
-        match acc with Some _ -> acc | None -> Hashtbl.find_opt site_want prim)
-      None c.Pack_to_lef.pc_bels in
+    match
+      List.fold_left (fun acc (prim, _) ->
+          match acc with Some _ -> acc | None -> Hashtbl.find_opt site_want prim)
+        None c.Pack_to_lef.pc_bels
+    with
+    | Some _ as s -> s
+    | None ->
+      (* GT and IO cells carry NO bel suffix (pack_to_lef gives them []), so a
+         bels-only lookup can never pin them -- TOPO_SITE_IN silently did
+         nothing for exactly the two cells whose position the anchor centroid
+         depends on most.  Fall back to the packed cell's own name, minus the
+         "$site" pack_to_lef appends. *)
+      let n = c.Pack_to_lef.pc_name in
+      let n = match String.index_opt n '$' with
+        | Some i when String.length n - i >= 5 && String.sub n i 5 = "$site" ->
+          String.sub n 0 i
+        | _ -> n in
+      Hashtbl.find_opt site_want n in
   let hard = ref [] in
   Array.iteri (fun i c -> if kind_of_lef c.Pack_to_lef.pc_lef <> "SLICE" then hard := (i, c) :: !hard) cells;
   let hard = List.sort (fun (_, a) (_, b) ->
@@ -2275,7 +2290,7 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      into the centre clock column has cost 13.7 ns of a 23.5 ns path here.
      So stamp the clock infrastructure and keep deferring only on GT/IO.
      TOPO_STAMP_ALL=1 still forces everything, including GT/IO. *)
-  let skip_kind = function "GT" | "IO" -> true | _ -> false in
+  let skip_kind = function "GT_CHANNEL" | "GT_COMMON" | "IO" -> true | _ -> false in
   (* TOPO_BELS_SKIP_CARREP=1 -- for consumers that hold the ORIGINAL netlist.
      ------------------------------------------------------------------------
      When a CARRY4's CO[3] feeds more than one downstream CARRY4 CI, the carry

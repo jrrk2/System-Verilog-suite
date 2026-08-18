@@ -47,8 +47,14 @@ def kind_of(site, stype):
         # A design that really instantiates PLLE2_ADV will now find no site and
         # fail loudly, which is the right way round: no site beats a wrong one.
         return "PLL"
-    if site.startswith("GTXE2") or site.startswith("GTHE2") or site.startswith("GTPE2"):
-        return "GT"
+    # Split CHANNEL from COMMON for the same reason PLL is split from MMCM
+    # above: the sites are not interchangeable.  Lumped together, place_lef put
+    # ethmin's core_gt_common_i on GTXE2_CHANNEL_X1Y8 -- a site with no
+    # GTXE2_COMMON bel -- where Vivado uses GTXE2_COMMON_X1Y0.
+    if site.startswith(("GTXE2_CHANNEL", "GTHE2_CHANNEL", "GTPE2_CHANNEL")):
+        return "GT_CHANNEL"
+    if site.startswith(("GTXE2_COMMON", "GTHE2_COMMON", "GTPE2_COMMON")):
+        return "GT_COMMON"
     return None
 
 def slice_xy(site):

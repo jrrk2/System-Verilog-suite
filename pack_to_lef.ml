@@ -102,7 +102,13 @@ let io_map = function
   | "MMCME2_ADV" | "PLLE2_ADV" -> Some "MMCM"
   | "BUFG" | "BUFGCTRL" -> Some "BUFG"
   | "BUFH" | "BUFHCE" -> Some "BUFH"
-  | "GTXE2_CHANNEL" | "GTXE2_COMMON" | "GTHE2_CHANNEL" | "GTHE2_COMMON" -> Some "GT"
+  (* CHANNEL and COMMON are NOT interchangeable.  A GTXE2_COMMON site has no
+     GTXE2_CHANNEL bel and vice versa, so one kind for both lets a COMMON cell
+     bind to a CHANNEL site -- measured on ethmin: core_gt_common_i landed on
+     GTXE2_CHANNEL_X1Y8 where Vivado uses GTXE2_COMMON_X1Y0.  Same bug, same
+     fix, as the PLLE2_ADV/MMCME2_ADV split gen_floorplan.py already documents. *)
+  | "GTXE2_CHANNEL" | "GTHE2_CHANNEL" -> Some "GT_CHANNEL"
+  | "GTXE2_COMMON" | "GTHE2_COMMON" -> Some "GT_COMMON"
   | _ -> None
 
 (* Non-SLICE fabric hard cells -> their LEF site + BEL suffix. *)
