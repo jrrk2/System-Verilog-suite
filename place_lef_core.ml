@@ -2984,6 +2984,7 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      (* net-bit driver (cellname, type) via declared output directions *)
      let cs_drv = Hashtbl.create 8192 in
      let cs_gnd = Hashtbl.create 64 in
+     let cs_vcc = Hashtbl.create 64 in
      List.iter (fun (cn, _) ->
          let t = try Hashtbl.find ctype cn with Not_found -> "" in
          let dirs = try Hashtbl.find cdirs cn with Not_found -> [] in
@@ -2994,9 +2995,26 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                   || (dirs = [] && (p = "O" || p = "Q" || p = "CO" || p = "G" || p = "P")) in
               if isout then Array.iter (fun b -> match int_of b with
                   | Some i -> Hashtbl.replace cs_drv i (cn, t);
-                    if t = "GND" then Hashtbl.replace cs_gnd i ()
+                    if t = "GND" then Hashtbl.replace cs_gnd i ();
+                    if t = "VCC" then Hashtbl.replace cs_vcc i ()
                   | None -> ()) bits) tbl
           | None -> ())) cells_j'';
+     (* A constant reaches a CARRY4 pin in TWO forms and both must be caught:
+        as a net bit driven by a GND/VCC primitive (an int in cs_gnd/cs_vcc),
+        and -- with NEXTPNR_JSON_CONST_STRINGS=1, which this flow requires --
+        as the literal STRING bit "0"/"1" sitting straight on the pin.
+        carry_stamp.py has always tested both (is_gnd_bit/is_vcc_bit); the OCaml
+        port tested only the first, AFTER an int_of that discards strings.  So
+        every constant-tied DI was skipped outright: 0 DIgnd where the Python
+        emits 576, and 0 DIvcc where it emits 37.  Same shape as the const-string
+        bugs this codebase has hit before -- the string form is invisible to
+        anything that reaches for an int first. *)
+     let is_gnd_bit = function
+       | `String "0" -> true
+       | b -> (match int_of b with Some i -> Hashtbl.mem cs_gnd i | None -> false) in
+     let is_vcc_bit = function
+       | `String "1" -> true
+       | b -> (match int_of b with Some i -> Hashtbl.mem cs_vcc i | None -> false) in
      let cs_occ = Hashtbl.create 8192 in
      Hashtbl.iter (fun cn bel -> Hashtbl.replace cs_occ bel cn) belmap;
      (* rewrites: (cell,port,idx) -> new bit ; created buffer cells *)
@@ -3071,15 +3089,18 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                    | _ -> ()) ["CYINIT"; "CI"];
              !r in
            Array.iteri (fun k b ->
-               if k < 4 then match int_of b with
-               | None -> ()
-               | Some sb ->
+               (* Same rule as the DI loop below: classify the bit before
+                  demanding an integer, or "0"/"1" string consts vanish. *)
+               let is_gnd = is_gnd_bit b in
+               let is_vcc = is_vcc_bit b in
+               if k < 4 && (is_gnd || is_vcc || int_of b <> None) then
                  let slot6 = Printf.sprintf "%s/%s6LUT" site slot_l.(k) in
-                 let d = Hashtbl.find_opt cs_drv sb in
-                 let is_gnd = Hashtbl.mem cs_gnd sb in
+                 let d = match int_of b with
+                   | Some sb -> Hashtbl.find_opt cs_drv sb
+                   | None -> None in
                  (match d with
                   | Some (dn, dt) when String.length dt >= 3 && String.sub dt 0 3 = "LUT"
-                                       && not is_gnd ->
+                                       && not is_gnd && not is_vcc ->
                     (match Hashtbl.find_opt cs_occ slot6 with
                      | Some who when who <> dn ->
                        Printf.eprintf "carry-stamp: slot collision %s (%s vs %s)\n" slot6 who dn
@@ -3102,8 +3123,10 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                         | None -> ()))
                   | _ ->
                     if not (Hashtbl.mem cs_occ slot6) then begin
-                      let src, init = if is_gnd then (local_net (), "00")
-                                      else (Some sb, "10") in
+                      let src, init =
+                        if is_gnd then (local_net (), "00")
+                        else if is_vcc then (local_net (), "11")
+                        else (int_of b, "10") in
                       match src with
                       | None -> ()
                       | Some src ->
@@ -3114,18 +3137,22 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                     end)) sarr;
            let pending_gnd = ref [] in
            Array.iteri (fun k b ->
-               if k < 4 then match int_of b with
-               | None -> ()
-               | Some db ->
-                 let is_gnd = Hashtbl.mem cs_gnd db in
-                 let d = Hashtbl.find_opt cs_drv db in
+               (* Classify the bit BEFORE demanding an integer: a "0"/"1" string
+                  const has no bit id, and matching on int_of first threw those
+                  away -- which is why DIgnd/DIvcc emitted nothing at all. *)
+               let is_gnd = is_gnd_bit b in
+               let is_vcc = is_vcc_bit b in
+               if k < 4 && (is_gnd || is_vcc || int_of b <> None) then
+                 let d = match int_of b with
+                   | Some db -> Hashtbl.find_opt cs_drv db
+                   | None -> None in
                  let adoptable = (match d with
-                     | Some (_, dt) -> not is_gnd && is_lut15 dt
+                     | Some (_, dt) -> not is_gnd && not is_vcc && is_lut15 dt
                      | None -> false) in
                  let slot5 = Printf.sprintf "%s/%s5LUT" site slot_l.(k) in
                  if not adoptable && not (Hashtbl.mem cs_occ slot5) then begin
-                   if is_gnd then begin
-                     (* const-0: input = the occupant's first net -> shared A1.
+                   if is_gnd || is_vcc then begin
+                     (* const-0/const-1: input = the occupant's first net -> shared A1.
                         ILLEGAL when the occupant uses >=6 inputs (Vivado
                         18-608): the fractured LUT's O6 reads the upper INIT
                         half with A6 tied high, and the 5LUT OVERWRITES the
@@ -3148,10 +3175,17 @@ let run_gen floorplan_json ~get_bmod ~get_j =
                      match slot_in.(k) with
                      | Some src when occ_n < 6 ->
                        let nb = newbit () in
-                       mk_lut1 (Printf.sprintf "%s$DIgnd$%d" cn k) "00" src nb slot5;
+                       (* INIT 11 for VCC, 00 for GND -- carry_stamp.py notes
+                          that without the VCC case S="1" was mis-stamped as
+                          const-0 (wrong carry propagate) AND nextpnr still fed
+                          the VCC net through an unplaceable $PACKER_VCC_NET$LUT. *)
+                       mk_lut1 (Printf.sprintf "%s$DI%s$%d" cn (if is_vcc then "vcc" else "gnd") k)
+                         (if is_vcc then "11" else "00") src nb slot5;
                        Hashtbl.replace cs_rewire (cn, "DI", k) nb; incr n_dil
                      | _ -> pending_gnd := k :: !pending_gnd
-                   end else begin
+                   end else match int_of b with
+                   | None -> ()   (* non-const, non-integer: nothing to route *)
+                   | Some db -> begin
                      (* FF/LUT6-driven DI passthrough.  PIN-ALIGN with the 6LUT
                         occupant: nextpnr pin-maps each fractured LUT I0->A1,
                         I1->A2... per cell, so a lone LUT1 with a different net
