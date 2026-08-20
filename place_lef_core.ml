@@ -2384,7 +2384,20 @@ let run_gen floorplan_json ~get_bmod ~get_j =
      affected sink bits only, leaving GT/MMCM/params byte-identical) rather than
      round-tripping the lossy bmodule.  Enabled by TOPO_FEEDTHRU=<thresh>. *)
   (match Sys.getenv_opt "TOPO_FEEDTHRU" with
-   | None -> ()
+   | None ->
+     (* The pass is off, but STILL emit TOPO_FT_JSON if one was asked for.
+        carry_stamp consumes that file as its netlist input, so making its
+        existence depend on a tuning knob forces every caller to special-case
+        "the pass did nothing" -- and a caller that forgets dies on a missing
+        file that was never going to exist (johnson: 25 cells, no feedthroughs
+        needed, so TOPO_FEEDTHRU was never set).  A no-op feedthrough netlist
+        is still the correct netlist: write the input unchanged. *)
+     (match Sys.getenv_opt "TOPO_FT_JSON" with
+      | Some outj ->
+        Y.to_file outj (get_j ());
+        Printf.eprintf
+          "feedthroughs: pass disabled (TOPO_FEEDTHRU unset) -- wrote unmodified netlist -> %s\n%!" outj
+      | None -> ())
    | Some ths ->
      let thresh = (try int_of_string ths with _ -> 18) in
      let clu = getenv_int "TOPO_FEEDTHRU_CLU" 12 in

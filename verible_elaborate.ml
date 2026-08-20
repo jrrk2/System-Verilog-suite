@@ -310,7 +310,18 @@ let rec eval_cw tok : (int * int) option =
  * keywords. For composite trees we recurse into the first child. *)
 let rec value_of = function
   | TK_DecNumber n | TK_UnBasedNumber n
-  | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n -> n
+    (* TK_DecDigits belongs here beside its Bin/Hex/Oct siblings, and its
+       absence is the same defect the TK_RealTime comment below describes:
+       a SIZED decimal literal carries its digits as TK_DecDigits (only an
+       UNSIZED decimal is TK_DecNumber), so value_of fell through to the
+       default and returned the token TAG.  The based-literal case below
+       concatenates base ^ digits, so 3'd4 became "3'd" ^ "TK_DecDigits".
+       Measured on a GTXE2_CHANNEL: 157 of its 199 attributes are sized
+       decimal literals and ALL reached the netlist valueless -- every CPLL
+       divider, comma-alignment value and line-rate setting was garbage,
+       while the 42 string-valued attributes came through fine, so the
+       instantiation still looked fully populated. *)
+    | TK_BinDigits n | TK_HexDigits n | TK_OctDigits n | TK_DecDigits n -> n
   (* real / string / based-literal parameter values (e.g. an MMCM's
      CLKIN1_PERIOD(16.000000), BANDWIDTH("OPTIMIZED")).  The lexer carries the
      text in the token payload; without these cases value_of returns the token
