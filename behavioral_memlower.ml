@@ -972,10 +972,31 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
          rx_elastic_buffer and similar delay-line/FIFO memories. *)
       ram_m_lower_dual_port ~prim:"RAM64M" ~pb:1 ~depth_cap:64 ~addr_w:6
         ~m ~mm ~mname ~skip
-    else if mm.n_write_ports <> 1 || mm.n_read_ports <> 1 then
+    else if mm.n_write_ports <> 1 || mm.n_read_ports <> 1 then begin
+      (* MEMLOWER_DEBUG=1 dumps the write sites behind a multi-port rejection.
+         The interesting case is a BYTE-ENABLED write -- LiteX emits
+           sram[adr][i*8 +: 8] <= dat[i*8 +: 8];
+         which after unroll is N writes to ONE address on DISJOINT bit lanes,
+         i.e. N banks with concatenated read data, not N real write ports.
+         Knowing which intrinsic carries the lane decides whether that is
+         merged into one byte-enabled write or split into banks. *)
+      if Sys.getenv_opt "MEMLOWER_DEBUG" = Some "1" then begin
+        let w_body = match find_writing_process mname m.processes with
+          | Some i -> (match List.nth m.processes i with
+                       | BSequential s -> s.body | BCombinational c -> c.body)
+          | None -> [] in
+        let sites = collect_write_sites mname w_body in
+        Printf.eprintf "[memlower:debug] %s: %d @mem_write site(s)\n%!"
+          mname (List.length sites);
+        List.iter (fun (_, addr, data) ->
+            Printf.eprintf "[memlower:debug]   addr=%s\n                  data=%s\n%!"
+              (Behavioral_ir.string_of_bexpr addr)
+              (Behavioral_ir.string_of_bexpr data)) sites
+      end;
       skip (Printf.sprintf
               "FPGA async-read needs 1W+1R or 1W+2R (2R depth<=64); got %dW+%dR (depth %d)"
               mm.n_write_ports mm.n_read_ports mm.depth)
+    end
     else if mm.depth > lutram_max_depth then
       (* Depth beyond one primitive is TILED (see the DEPTH TILING note below),
          so the old 256 ceiling is gone.  A cap remains only to stop an absurd

@@ -51,6 +51,14 @@ open Behavioral_ir
 
 let is_const_int = function BConst _ -> true | _ -> false
 let const_value = function BConst { value; _ } -> Z.to_int value | _ -> 0
+
+(* A constant that does not FIT in an OCaml int cannot become a ROM entry:
+ * const_value would raise Z.Overflow.  litesoc hits this -- LiteDRAM at 32-bit
+ * with a 1:4 PHY ratio carries a 256-bit user data path, and a case over those
+ * values is not a small lookup table.  Excluding such a case from case_pairs
+ * makes the length check below abandon the ROM rewrite, which is the right
+ * answer: leave the logic alone rather than truncating a 256-bit constant. *)
+let const_fits = function BConst { value; _ } -> Z.fits_int value | _ -> false
 let const_width = function BConst { width; _ } -> width | _ -> 32
 
 (* Walk all expressions in a statement tree and collect names of
@@ -169,7 +177,8 @@ let try_extract_const_rom selector cases default =
            let case_pairs = List.filter_map (fun (k, ss) ->
              match body_target ss with
              | Some (lhs, rhs)
-               when lhs = lhs0 && is_const_int k && is_const_int rhs ->
+               when lhs = lhs0 && is_const_int k && is_const_int rhs
+                    && const_fits k && const_fits rhs ->
                  Some (const_value k, const_value rhs, const_width rhs)
              | _ -> None
            ) cases in
@@ -180,7 +189,7 @@ let try_extract_const_rom selector cases default =
                | _ ->
                    (match body_target default with
                     | Some (lhs, rhs)
-                      when lhs = lhs0 && is_const_int rhs ->
+                      when lhs = lhs0 && is_const_int rhs && const_fits rhs ->
                         Some (const_value rhs, const_width rhs)
                     | _ -> None)
              in
