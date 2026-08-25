@@ -304,6 +304,7 @@ let vhdl_of_port (s : bsignal) =
   let dir = match s.direction with
     | `Input -> "in"
     | `Output -> "out"
+    | `Inout -> "inout"
     | `Internal -> "in"
   in
   Printf.sprintf "    %s : %s %s" (sanitize s.name) dir (vhdl_of_type s.stype)

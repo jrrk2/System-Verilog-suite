@@ -2503,7 +2503,7 @@ let extract_port_decl ~pkgs ~params tok =
   walk (function
     | Input -> dir := `Input
     | Output -> dir := `Output
-    | Inout -> dir := `Input  (* bidirectional -> primary I/O linked var *)
+    | Inout -> dir := `Inout   (* bidirectional: kept, NOT downgraded *)
     | _ -> ()
   ) tok;
   (* Collect port names — but skip identifiers that live inside a
@@ -5910,7 +5910,7 @@ let convert_module ~pkgs (mdecl : module_decl)
       walk (function
         | Input -> dir := Some `Input
         | Output -> dir := Some `Output
-        | Inout -> dir := Some `Input  (* bidirectional -> primary I/O linked var *)
+        | Inout -> dir := Some `Inout  (* bidirectional: kept, NOT downgraded *)
         | _ -> ()) p1;
       let explicit_w = extract_range ~pkgs ~params p1 in
       let w_opt =
@@ -6204,7 +6204,9 @@ let convert_module ~pkgs (mdecl : module_decl)
    * width (>1 > 1).  *)
   let signals : bsignal list =
     let dir_rank = function
-      | `Output -> 2 | `Input -> 1 | `Internal -> 0 in
+      (* `Inout ranks highest: it is always an EXPLICIT declaration, and
+         losing it to a bare-name Input placeholder severs the drive half. *)
+      | `Inout -> 3 | `Output -> 2 | `Input -> 1 | `Internal -> 0 in
     let bsignal_width (s : bsignal) =
       match s.stype with
       | BInt { width; _ } -> width
@@ -7829,7 +7831,7 @@ let convert_module ~pkgs (mdecl : module_decl)
           let field = String.sub s.name (i+1) (String.length s.name - i - 1) in
           if List.mem base ports then
             (match dir_of base field with
-             | Some d -> { s with direction = d }
+             | Some d -> { s with direction = (d :> [`Input|`Output|`Internal|`Inout]) }
              | None -> s)
           else s
       | _ -> s) m.signals in

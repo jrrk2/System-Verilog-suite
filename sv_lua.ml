@@ -672,7 +672,7 @@ let cut_blackboxes ?(trusted : string list = []) (m : bmodule) (p : bprogram) : 
       | None -> None
       | Some mm -> Some (List.filter_map (fun (s : bsignal) ->
           match s.direction with
-          | `Input  -> Some (s.name, `Input,  0)
+          | `Input | `Inout -> Some (s.name, `Input,  0)
           | `Output -> Some (s.name, `Output, 0)
           | `Internal -> None) mm.signals) in
     let port_dirs name =
@@ -2476,6 +2476,51 @@ let lblocking_subst prog_h =
   let label, p = find_prog prog_h in
   hadd (Prog (label, Behavioral_blocking_subst.blocking_subst_program p))
 
+(* Report where a module's memories actually live in BIR: bmod.mems entries
+   (with/without init) AND BArray-typed signals.  Written because the litesoc
+   BIOS ROM turned up in NEITHER place that was assumed -- it is not a bmem with
+   init_values and not a BArray signal with a constant initial_value -- and a
+   ROM pre-pass cannot be written against a guess. *)
+let lmem_report prog_h =
+  let _, p = find_prog prog_h in
+  let buf = Buffer.create 1024 in
+  List.iter (fun (m : bmodule) ->
+    let arrays = List.filter (fun (s : bsignal) ->
+        match s.stype with BArray _ -> true | _ -> false) m.signals in
+    if m.mems <> [] || arrays <> [] then begin
+      Buffer.add_string buf (Printf.sprintf "module %s\n" m.name);
+      List.iter (fun (mm : bmem) ->
+        Buffer.add_string buf (Printf.sprintf
+          "  mem %-28s dw=%d aw=%d depth=%d init=%d nW=%d nR=%d sync_read=%b\n"
+          mm.mname mm.data_width mm.addr_width mm.depth
+          (List.length mm.init_values) mm.n_write_ports mm.n_read_ports
+          mm.read_is_sync);
+        (* First words of the harvested image.  Counts alone cannot tell a
+           CORRECT image from a corrupt one -- litesoc's BIOS ROM had the right
+           depth and the right init count while every word was wrong. *)
+        if mm.init_values <> [] then begin
+          let rec take n = function
+            | [] -> [] | _ when n = 0 -> []
+            | x :: tl -> x :: take (n - 1) tl in
+          Buffer.add_string buf (Printf.sprintf "      first8: %s\n"
+            (String.concat " "
+               (List.map (fun v -> Printf.sprintf "%08x" v)
+                  (take 8 mm.init_values))))
+        end) m.mems;
+      List.iter (fun (s : bsignal) ->
+        let sz, ew = match s.stype with
+          | BArray { element = BInt { width; _ }; size } -> size, width
+          | BArray { size; _ } -> size, 0
+          | _ -> 0, 0 in
+        Buffer.add_string buf (Printf.sprintf
+          "  arr %-28s size=%d elem_w=%d init=%s\n" s.name sz ew
+          (match s.initial_value with
+           | None -> "none"
+           | Some (BConst { width; _ }) -> Printf.sprintf "BConst(w=%d)" width
+           | Some _ -> "non-const"))) arrays
+    end) p.modules;
+  Buffer.contents buf
+
 let lmeminfer prog_h =
   let label, p = find_prog prog_h in
   hadd (Prog (label, Behavioral_meminfer.infer_program p))
@@ -2943,6 +2988,23 @@ let write_circ_verilog ~(dir : string) (m : Behavioral_ir.bmodule)
   let text =
     if Sys.getenv_opt "SVS_CIRC_STRIP_PARAMS" <> None then strip_inst_params text
     else text in
+  (* A BIDIRECTIONAL port cannot survive this route.  create_circuit exposes it
+     as `__keep_<port>`, which keeps the driving IOBUF alive -- but Hardcaml
+     PACKS a box's outputs into one wire per instance, so the pad net emerges as
+     a bit-select of a shared wire (`.IO(_16[1:1])`, with `.O` on bit 0) reached
+     through a multi-hop alias chain into a concat.  Folding that back into an
+     `inout` declaration is net-level rewriting, not the line filter below.
+     Stripping the port regardless is what produced litesoc's 32 severed DDR3 DQ
+     pads -- a netlist that synthesised, mapped, and only failed at place_design
+     with `[Place 30-69] ... unplaced after IO placer`.  Refuse instead, and name
+     the emitter that does handle it. *)
+  List.iter (fun (s : bsignal) ->
+    if s.direction = `Inout then
+      failwith (Printf.sprintf
+        "create_circuit: module %s has bidirectional port %s, which the Hardcaml \
+         route cannot represent -- emit it with svd.write_verilog \
+         (BIR->Verilog direct), which writes `inout` and leaves the IOBUF's .IO \
+         on the port net" m.name s.name)) m.signals;
   (* remove __keep_ retention ports here (pre-yosys), matching bir_to_*; keeps
      spurious unconstrained pads / dangling OBUFs out of every downstream P&R. *)
   let text = strip_keep_ports text in
@@ -4171,6 +4233,7 @@ module MakeLib
         "blocking_subst", V.efunc (V.string **->> V.string)
                            (wrap1 lblocking_subst);
         "meminfer",       V.efunc (V.string **->> V.string) (wrap1 lmeminfer);
+        "mem_report",     V.efunc (V.string **->> V.string) (wrap1 lmem_report);
         "memlower",       V.efunc (V.string **->> V.string) (wrap1 lmemlower);
         "cdc_check",      V.efunc (V.string **-> V.string **->> V.string) (wrap2 lcdc_check);
         (* domain_split(prog, top, periods) -- periods is "clk=ns,clk=ns" or a

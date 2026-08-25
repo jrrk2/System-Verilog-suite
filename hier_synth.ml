@@ -175,7 +175,9 @@ let child_inst_phantoms
       let dir =
         match cs.direction with
         | `Output -> `In
-        | `Input  -> `Out
+        (* An `Inout is read like an input here; hier_synth only sees CHILD
+           module ports and our bidirectional ports are top-level pads. *)
+        | `Input | `Inout -> `Out
         | `Internal ->
             failwith (Printf.sprintf
               "hier_synth: child %s port %s has direction Internal — invalid"
@@ -232,7 +234,7 @@ let auto_buffer_chain_wires
                 let role =
                   match cs.direction with
                   | `Output -> `Producer
-                  | `Input  -> `Consumer
+                  | `Input | `Inout -> `Consumer
                   | `Internal -> `Other in
                 List.map (fun d -> (d, role, i.inst_name, port)) deps
           ) i.port_connections) parent.instances in
@@ -415,6 +417,7 @@ let prepare_parent (parent : bmodule) (modules : bmodule list) =
           (match s.direction, dir with
            | `Input,  _    -> s
            | `Output, _    -> s
+           | `Inout,  _    -> s
            | `Internal, `In  -> { s with direction = `Input }
            | `Internal, `Out -> { s with direction = `Output })
     ) parent.signals in
@@ -486,7 +489,7 @@ let synth_one ~(modules : bmodule list) (m : bmodule) : module_netlist =
         Printf.eprintf "[hier_synth] %s signals at failure:\n" m.name;
         List.iter (fun (s : bsignal) ->
           Printf.eprintf "  %s : %s w=%d %s\n"
-            (match s.direction with `Input -> "in"
+            (match s.direction with `Input -> "in" | `Inout -> "inout"
              | `Output -> "out" | `Internal -> "int")
             s.name (signal_width s)
             (String.concat " "

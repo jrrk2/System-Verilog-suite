@@ -550,7 +550,7 @@ let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
   let port_signals = List.map (fun p ->
     { name = p.pname;
       stype = btype_for_width p.pwidth;
-      direction = p.pdir;
+      direction = (p.pdir :> [`Input|`Output|`Internal|`Inout]);
       initial_value = None;
       attrs = [] }) c.cports
   in

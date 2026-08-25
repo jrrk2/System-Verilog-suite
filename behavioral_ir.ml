@@ -103,7 +103,19 @@ type bprocess =
 type bsignal = {
   name: string;
   stype: btype;
-  direction: [`Input | `Output | `Internal];
+  (* `Inout` is a BIDIRECTIONAL top-level port and is READ like an `Input`
+   * everywhere that only cares about data flow into the module — every pass
+   * that does not emit ports should treat the two identically (see
+   * [is_input_dir]).  Only the emitters distinguish them: behavioral_to_verilog
+   * declares `inout` directly, and behavioral_to_hardcaml (which has no
+   * bidirectional signal) splits it into an input port plus a `__keep_<name>`
+   * retention output so the driving IOBUF survives Hardcaml's DCE.
+   *
+   * Downgrading `Inout` to `Input` in the front end -- which is what we used to
+   * do -- silently severed the DRIVE half of every tristate bus: litesoc's 32
+   * DDR3 DQ IOBUFs ended up with their .IO on a dangling internal wire and
+   * Vivado rejected all 32 with `[Place 30-69] ... unplaced after IO placer`. *)
+  direction: [`Input | `Output | `Internal | `Inout];
   initial_value: bexpr option;
   (* SystemVerilog `(* key = "value" *)` attributes attached to the
    * signal. sv_suite-specific keys: `sv_decomp_adder` /
@@ -112,6 +124,15 @@ type bsignal = {
    * (use_dsp, multstyle, etc.) survive but are ignored. *)
   attrs: (string * string) list [@default []];
 } [@@deriving yojson]
+
+(* Does this direction carry a value INTO the module?  True for `Input` and for
+ * `Inout` (whose read half is exactly an input).  Use this rather than
+ * `= `Input` in any pass that asks "is this driven from outside", so that
+ * adding a bidirectional port never silently drops it from an analysis. *)
+let is_input_dir = function `Input | `Inout -> true | _ -> false
+
+(* Is this a PORT rather than an internal signal? *)
+let is_port_dir = function `Input | `Output | `Inout -> true | `Internal -> false
 
 (* Module instance *)
 type binstance = {
@@ -437,6 +458,7 @@ let string_of_bmodule bmod =
     let dir = match s.direction with
       | `Input -> "input"
       | `Output -> "output"
+      | `Inout -> "inout"
       | `Internal -> "signal"
     in
     Printf.sprintf "  %s%s %s: %s"

@@ -875,6 +875,13 @@ let extract_signals stmts =
   let dir_of d = match String.uppercase_ascii d with
     | "INPUT" -> `Input
     | "OUTPUT" -> `Output
+    (* Verilator marks bidirectional ports "INOUT" exactly as it marks the
+       others, so falling through to `Internal DEMOTED them out of the module
+       interface altogether: litesoc's ddram_dq/dqs_p/dqs_n became internal
+       `logic` and the DDR3 data pins simply vanished from the port list.  (The
+       only other `Inout mappings in this file are in var_to_param, which is
+       task/function ARGUMENTS -- a different path entirely.) *)
+    | "INOUT" -> `Inout
     | _ -> `Internal
   in
   let var_of_node = function
@@ -1441,6 +1448,124 @@ let convert_ast ast =
       { modules = []; library_cells = [] }
 
 (* Main entry point: Convert Verilator JSON file to behavioral IR *)
+(* ------------------------------------------------------------------ *)
+(* $readmemh                                                            *)
+(*                                                                      *)
+(* sv_parse lists READMEM in `nonsynth_tags` and stubs it to a zero      *)
+(* literal -- correct for a testbench, wrong for a ROM image, which is   *)
+(* exactly how litesoc's 8191-word BIOS arrived with init=0 while the    *)
+(* verible front end harvested all of it.  The node IS in the JSON:      *)
+(*                                                                      *)
+(*   {"type":"READMEM", "filenamep":[{"type":"CONST","name":"\"x.init\""}], *)
+(*                      "memp":[{"type":"VARREF","name":"rom"}]}         *)
+(*                                                                      *)
+(* so rather than change the AST type or un-stub a tag that is right for *)
+(* every other use, pre-scan the raw tree and rebuild the same init      *)
+(* process verible emits: one unconditional assignment of the whole      *)
+(* array from a descending-index BConcat of constants.  meminfer folds   *)
+(* that into init_values and then drops the driver, so both front ends   *)
+(* converge on an identical BIR.                                         *)
+let readmem_pairs json =
+  let out = ref [] in
+  let rec walk j =
+    match j with
+    | `Assoc kvs ->
+        (match List.assoc_opt "type" kvs with
+         | Some (`String "READMEM") ->
+             let first_name key =
+               match List.assoc_opt key kvs with
+               | Some (`List (`Assoc f :: _)) ->
+                   (match List.assoc_opt "name" f with
+                    | Some (`String n) -> Some n | _ -> None)
+               | _ -> None in
+             (match first_name "filenamep", first_name "memp" with
+              | Some fn, Some mem ->
+                  (* the CONST name arrives quoted, sometimes doubly escaped *)
+                  let fn =
+                    let b = Buffer.create (String.length fn) in
+                    String.iter (fun c ->
+                      if c <> '"' && c <> '\\' then Buffer.add_char b c) fn;
+                    Buffer.contents b in
+                  out := (mem, fn) :: !out
+              | _ -> ())
+         | _ -> ());
+        List.iter (fun (_, v) -> walk v) kvs
+    | `List l -> List.iter walk l
+    | _ -> () in
+  walk json; List.rev !out
+
+(* Same search order as the verible path: the path as written, then
+   $MEM_INIT_DIR, then the directory of the JSON, then PWD.  Getting this wrong
+   is what produced the long-standing "SVS drops $readmemh" misdiagnosis -- the
+   file was there, the path was simply never canonicalised. *)
+let find_mem_file ~json_file path =
+  let base = Filename.basename path in
+  let dirs =
+    (match Sys.getenv_opt "MEM_INIT_DIR" with Some d -> [d] | None -> [])
+    @ [ Filename.dirname json_file;
+        Filename.concat (Filename.dirname json_file) "..";
+        Sys.getcwd () ] in
+  let cands = path :: List.concat_map (fun d ->
+    [Filename.concat d path; Filename.concat d base]) dirs in
+  List.find_opt Sys.file_exists cands
+
+let read_hex_words file =
+  let ic = open_in file in
+  let words = ref [] in
+  (try
+     while true do
+       let l = String.trim (input_line ic) in
+       if l <> "" && l.[0] <> '/' then
+         (try words := Z.of_string_base 16 l :: !words with _ -> ())
+     done
+   with End_of_file -> ());
+  close_in ic;
+  List.rev !words
+
+let attach_readmem_inits ~json ~json_file bprog =
+  let pairs = readmem_pairs json in
+  if pairs = [] then bprog
+  else begin
+    let modules = List.map (fun (m : bmodule) ->
+      let extra = List.filter_map (fun (mem, fn) ->
+        (* only for arrays this module actually declares *)
+        let decl = List.find_opt (fun (s : bsignal) ->
+          s.name = mem && (match s.stype with BArray _ -> true | _ -> false))
+          m.signals in
+        match decl with
+        | None -> None
+        | Some s ->
+            let dw = match s.stype with
+              | BArray { element = BInt { width; _ }; _ } -> width
+              | _ -> 32 in
+            (match find_mem_file ~json_file fn with
+             | None ->
+                 Printf.eprintf
+                   "[verilator_to_behavioral] $readmemh(%S) for %s.%s: file not \
+                    found (set MEM_INIT_DIR); memory left uninitialised\n%!"
+                   fn m.name mem;
+                 None
+             | Some path ->
+                 let words = read_hex_words path in
+                 if words = [] then None
+                 else begin
+                   Printf.eprintf
+                     "[verilator_to_behavioral] $readmemh %s -> %s.%s (%d words)\n%!"
+                     (Filename.basename path) m.name mem (List.length words);
+                   (* descending index order: element 0 of the concat is the
+                      HIGHEST address, matching what verible emits *)
+                   let parts = List.rev_map (fun v -> BConst { value = v; width = dw }) words in
+                   Some (BCombinational {
+                     name = "mem_init_" ^ mem;
+                     sensitivity = [BAny];
+                     body = [BAssign { lhs = mem; rhs = BConcat parts }];
+                   })
+                 end)) pairs in
+      if extra = [] then m else { m with processes = m.processes @ extra }
+    ) bprog.modules in
+    { bprog with modules }
+  end
+
 let convert_verilator_json_to_behavioral json_file =
   try
     if !debug then Printf.printf "Reading Verilator JSON: %s\n" json_file;
@@ -1471,6 +1596,7 @@ let convert_verilator_json_to_behavioral json_file =
 
     if !debug then Printf.printf "Successfully parsed Verilator JSON\n";
     let bprog = convert_ast ast in
+    let bprog = attach_readmem_inits ~json ~json_file bprog in
     Some bprog
   with
   | Sys_error msg ->

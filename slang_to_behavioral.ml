@@ -743,7 +743,7 @@ let extract_signals members_raw =
           Some {
             name;
             stype;
-            direction = dir;
+            direction = (dir :> [`Input|`Output|`Internal|`Inout]);
             initial_value = None; attrs = []; 
           }
     | _ -> None

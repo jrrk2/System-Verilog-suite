@@ -83,7 +83,7 @@ let dir_of_lib (lp : Behavioral_ir.library_port) : pin_dir =
 
 let _dir_of_bsig (s : Behavioral_ir.bsignal) : pin_dir option =
   match s.direction with
-  | `Input  -> Some PinIn
+  | `Input | `Inout -> Some PinIn
   | `Output -> Some PinOut
   | `Internal -> None
 
@@ -109,6 +109,7 @@ let symbol_for_instance
                  List.filter_map (fun (s : Behavioral_ir.bsignal) ->
                    match s.direction with
                    | `Input  -> Some (s.name, "input")
+                   | `Inout  -> Some (s.name, "inout")
                    | `Output -> Some (s.name, "output")
                    | `Internal -> None) m.signals
              | None ->
@@ -284,7 +285,7 @@ let build
   let module_ports =
     List.filter_map (fun (s : Behavioral_ir.bsignal) ->
       match s.direction with
-      | `Input  -> Some (s.name, `Input)
+      | `Input | `Inout -> Some (s.name, `Input)
       | `Output -> Some (s.name, `Output)
       | `Internal -> None) m.signals in
   List.iter (fun (name, dir) ->

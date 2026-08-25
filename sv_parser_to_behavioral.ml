@@ -1831,7 +1831,7 @@ let extract_kr_ports ~params module_node : bsignal list =
         Some {
           name = nm;
           stype = BInt { width; signed };
-          direction = dir;
+          direction = (dir :> [`Input|`Output|`Internal|`Inout]);
           initial_value = None;
           attrs = [];
         }

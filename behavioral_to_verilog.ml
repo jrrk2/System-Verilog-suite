@@ -463,21 +463,65 @@ let rec stmt_reads_var = function
   | _ -> false
 
 (* Generate process *)
+(* Every name assigned anywhere in a statement list. *)
+let rec collect_assigned acc s =
+  match s with
+  | BAssign { lhs; _ } -> lhs :: acc
+  | BBlock ss -> List.fold_left collect_assigned acc ss
+  | BIf { then_stmts; else_stmts; _ } ->
+      List.fold_left collect_assigned (List.fold_left collect_assigned acc then_stmts) else_stmts
+  | BCase { cases; default; _ } ->
+      let acc = List.fold_left (fun a (_, ss) -> List.fold_left collect_assigned a ss) acc cases in
+      List.fold_left collect_assigned acc default
+  | BWhile { body; _ } -> List.fold_left collect_assigned acc body
+  | BFor { init; update; body; _ } ->
+      List.fold_left collect_assigned (collect_assigned (collect_assigned acc init) update) body
+  | _ -> acc
+
+(* Names driven by more than one process, or by any clocked process.  Such a
+   name must stay procedural: a continuous assign would be a second driver. *)
+let multi_driven_names (processes : bprocess list) =
+  let tbl = Hashtbl.create 64 in
+  List.iter (fun p ->
+    let body, seq = match p with
+      | BCombinational c -> c.body, false
+      | BSequential s -> s.body, true in
+    let names = List.sort_uniq compare (List.fold_left collect_assigned [] body) in
+    List.iter (fun n ->
+      let prev = try Hashtbl.find tbl n with Not_found -> 0 in
+      (* a clocked driver counts as 2 so it can never be converted *)
+      Hashtbl.replace tbl n (prev + if seq then 2 else 1)) names) processes;
+  Hashtbl.fold (fun k n acc -> if n > 1 then k :: acc else acc) tbl []
+
 let verilog_of_process proc =
   match proc with
   | BCombinational { name; sensitivity; body } ->
       let comment = Printf.sprintf "// Combinational process: %s" name in
       let sens_list = String.concat " or " (List.map verilog_of_sensitivity sensitivity) in
-      (* A block with a pure-constant RHS (cfg_device_addr_mask = concat of
-         literals) reads no signal, so a star-sensitivity always gets an EMPTY
-         sensitivity list and xsim NEVER runs it - the signal stays X, leaving
-         the bus address-decode config X and stalling the CPU fetch.  Emit
-         always_comb for those (runs at time 0).  Keep the star-sensitivity form
-         for blocks that read signals, since always_comb rejects the SVS pattern
-         of one variable driven by several combinational blocks. *)
-      let always_header =
-        if List.exists stmt_reads_var body then Printf.sprintf "always @(%s) begin" sens_list
-        else "always_comb begin" in
+      (* ALWAYS always_comb, never a star-sensitivity block.
+ 
+         A star-sensitivity block does not run at time 0 -- it waits for an
+         event on something it reads.  Two ways that leaves a signal at X:
+         a pure-constant RHS reads nothing at all so the sensitivity list is
+         EMPTY (cfg_device_addr_mask, which stalled the CPU fetch), and -- the
+         case that cost a whole debug session -- a RHS that only reads a
+         register holding its power-on value, which never toggles.  That left
+         `litesoc_sdram_sel` at X, and with it the DFI mux, every OSERDESE2 fed
+         from it, and all 20 DDR3 pads, while golden's `assign` resolved at
+         once.  always_comb runs at time 0 in both cases.
+ 
+         The old worry was that always_comb forbids one variable being driven
+         by several combinational blocks.  That worry was never valid: such a
+         variable CANNOT occur in a well-formed design, because its value would
+         depend on the order the simulator happens to schedule the blocks, so it
+         has no defined meaning to preserve.  always_comb rejecting it is the
+         FEATURE.  If xvlog ever does reject one, that is SVS emitting something
+         ill-formed and the fix belongs upstream in the pass that produced it --
+         not here, weakening every other block to accommodate it.  (Confirmed
+         empty on litesoc besides: 540 blocks, 920 assigned names, zero such
+         variables per module.) *)
+      ignore sens_list;
+      let always_header = "always_comb begin" in
       let body_stmts = String.concat "\n" (List.map (verilog_of_stmt 1) body) in
       Printf.sprintf "%s\n%s\n%s\nend\n" comment always_header body_stmts
 
@@ -614,6 +658,20 @@ let verilog_of_instance prog inst =
   let is_vlit s =
     s <> "" && (String.contains s '\'' ||
                 String.for_all (fun c -> c >= '0' && c <= '9') s) in
+  (* An UNSIZED bit-vector parameter: a run of 0/1 digits carrying a primitive's
+     init image (RAMB INIT_00 is 256 bits, a LUT INIT 64).  It satisfies is_vlit
+     -- every character IS a decimal digit -- so it used to be emitted RAW, and
+     Vivado read those 256 characters as one decimal number:
+
+       ERROR: [Synth 8-522] parsing error: decimal constant 00101001...0110
+              is too large, using -1 instead
+
+     i.e. every BRAM in the design initialised to all-ones instead of its
+     contents, reported as an error but with synthesis carrying on.  Size it as
+     binary, matching Bir_to_verilog_netlist.v_param_value, which has always got
+     this right on the netlist path. *)
+  let is_bitvec s =
+    String.length s > 1 && String.for_all (fun c -> c = '0' || c = '1') s in
   (* A REAL literal (`5.000`, `20.000`, `0.500`) must be emitted RAW, not
      quoted: a `real`-typed parameter (MMCME2_ADV.CLKFBOUT_MULT_F/CLKIN1_PERIOD
      etc.) given the string "5.000" makes Vivado pack the string's ASCII bytes
@@ -631,6 +689,8 @@ let verilog_of_instance prog inst =
     !ok && !dot > 0 && !dot < n - 1 in
   let str_params = List.filter_map (fun (name, value) ->
     if not (keep name) then None
+    else if is_bitvec value then
+      Some (name, Printf.sprintf ".%s(%d'b%s)" name (String.length value) value)
     else if is_vlit value || is_real value then Some (name, Printf.sprintf ".%s(%s)" name value)
     else Some (name, Printf.sprintf ".%s(\"%s\")" name value)) param_strs in
   (* Dedup by parameter NAME, keeping the first occurrence.  The param
@@ -716,6 +776,17 @@ let unpacked_split sig_ =
       Some (verilog_of_type element, Printf.sprintf " [0:%d]" (size - 1))
   | _ -> None
 
+(* A bidirectional port must be a NET, not a variable: `inout logic [3:0] pad`
+   is illegal (SV LRM 23.2.2.3 -- an inout port may not be a variable), and
+   both Vivado and yosys reject it.  Swap the `logic` keyword for `wire` in the
+   type string of an `Inout declaration; every other direction is untouched. *)
+let net_type_for_inout type_str =
+  let logic = "logic" in
+  let ll = String.length logic and n = String.length type_str in
+  if n >= ll && String.sub type_str 0 ll = logic
+  then "wire" ^ String.sub type_str ll (n - ll)
+  else type_str
+
 let verilog_of_signal sig_ =
   let { name; stype; direction; initial_value; attrs = _ } = sig_ in
   (* Skip constant signals - they're handled as literals *)
@@ -733,6 +804,12 @@ let verilog_of_signal sig_ =
     let decl = match direction with
     | `Input -> Printf.sprintf "input  %s %s%s%s;" type_str sanitized_name arr_suffix init_str
     | `Output -> Printf.sprintf "output %s %s%s%s;" type_str sanitized_name arr_suffix init_str
+    (* A bidirectional pad.  This emitter writes the port DIRECTLY, so the
+       IOBUF driving it keeps its .IO on the port net -- no Hardcaml round
+       trip and none of the __keep_ retention machinery is needed. *)
+    | `Inout ->
+        Printf.sprintf "inout  %s %s%s%s;"
+          (net_type_for_inout type_str) sanitized_name arr_suffix init_str
     | `Internal -> Printf.sprintf "%s %s%s%s;" type_str sanitized_name arr_suffix init_str
     in
     Some decl
@@ -792,8 +869,11 @@ let verilog_of_module prog bmod =
         let dir_str = match s.direction with
           | `Input -> "input"
           | `Output -> "output"
+          | `Inout -> "inout"
           | `Internal -> "logic"  (* Should not happen in port list *)
         in
+        let type_str =
+          if s.direction = `Inout then net_type_for_inout type_str else type_str in
         Printf.sprintf "%s %s %s%s" dir_str type_str sanitized_name arr_suffix
       ) ports)
     else ""

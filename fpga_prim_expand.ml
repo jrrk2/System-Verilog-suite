@@ -181,7 +181,7 @@ let set_user_ports (mods : bmodule list) =
   List.iter (fun (m : bmodule) ->
     let ps = List.filter_map (fun (s : bsignal) ->
       match s.direction with
-      | `Input  -> Some (s.name, `Input,  btw s.stype)
+      | `Input | `Inout -> Some (s.name, `Input,  btw s.stype)
       | `Output -> Some (s.name, `Output, btw s.stype)
       | `Internal -> None) m.signals in
     Hashtbl.replace user_ports m.name ps) mods

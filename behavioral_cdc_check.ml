@@ -402,6 +402,10 @@ let rec analyse ~(lookup : string -> bmodule option) ?(exclude = "") ?(depth = 0
           match s.direction with
           | `Input -> hadd launch s.name (DS.singleton (Ext s.name))
           | `Output -> hadd capture s.name (DS.singleton (Ext s.name))
+          (* bidirectional: it opens the cone at BOTH ends *)
+          | `Inout ->
+              hadd launch s.name (DS.singleton (Ext s.name));
+              hadd capture s.name (DS.singleton (Ext s.name))
           | `Internal -> ())
         m.signals;
       saturate fwd launch;

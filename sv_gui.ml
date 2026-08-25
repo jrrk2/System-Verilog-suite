@@ -3352,6 +3352,7 @@ let auto_fill_missing
                 List.filter_map (fun (s : Behavioral_ir.bsignal) ->
                   match s.direction with
                   | `Input  -> Some (s.name, "input")
+                  | `Inout  -> Some (s.name, "inout")
                   | `Output -> Some (s.name, "output")
                   | `Internal -> None) mm.signals
             | None ->

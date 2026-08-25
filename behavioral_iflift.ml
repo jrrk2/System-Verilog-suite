@@ -46,7 +46,49 @@ let single_assign s =
   | BAssign { lhs; rhs } -> Some (lhs, rhs)
   | _ -> None
 
-let rec lift_stmt s = match s with
+(* Names assigned MORE THAN ONCE in a statement list.
+ *
+ * The enable-FF rewrites below turn a CONDITIONAL write into an
+ * UNCONDITIONAL one whose else-value is the register's OLD value
+ * (`lhs <= cond ? d : lhs`).  That is only sound when the lhs is written
+ * exactly once in the process.  SpinalHDL output (VexRiscv) routinely writes
+ * one register from several separate `if`s in the same always block:
+ *
+ *     if (a) x <= 1;   ...   if (b) x <= 2;
+ *
+ * With a=1,b=0 the original gives x=1.  Lift both and they become
+ * unconditional, so under non-blocking semantics the LAST assignment wins
+ * outright -- `x <= b ? 2 : x` -- and the `a` case is silently discarded.
+ * The register degenerates to `x <= x`, synthesis constant-folds it, and the
+ * FF disappears.  This cost VexRiscv 1324 -> 352 flip-flops (2053 -> 306
+ * LUTs) in one pass, leaving a litesoc bitstream that placed, routed, met
+ * timing and contained NO CPU. *)
+let rec count_assigns tbl s =
+  let bump lhs =
+    Hashtbl.replace tbl lhs (1 + (try Hashtbl.find tbl lhs with Not_found -> 0)) in
+  match s with
+  | BAssign { lhs; _ } -> bump lhs
+  | BBlock ss -> List.iter (count_assigns tbl) ss
+  | BIf { then_stmts; else_stmts; _ } ->
+      List.iter (count_assigns tbl) then_stmts;
+      List.iter (count_assigns tbl) else_stmts
+  | BCase { cases; default; _ } ->
+      List.iter (fun (_, ss) -> List.iter (count_assigns tbl) ss) cases;
+      List.iter (count_assigns tbl) default
+  | BWhile { body; _ } -> List.iter (count_assigns tbl) body
+  | BFor { init; update; body; _ } ->
+      count_assigns tbl init; count_assigns tbl update;
+      List.iter (count_assigns tbl) body
+  | _ -> ()
+
+let multi_assigned body =
+  let tbl = Hashtbl.create 64 in
+  List.iter (count_assigns tbl) body;
+  Hashtbl.fold (fun k n acc -> if n > 1 then k :: acc else acc) tbl []
+
+let rec lift_stmt ?(multi = []) s =
+  let lift_stmt = lift_stmt ~multi in
+  match s with
   | BIf { condition; then_stmts; else_stmts } ->
       let then' = List.map lift_stmt then_stmts in
       let else' = List.map lift_stmt else_stmts in
@@ -64,6 +106,7 @@ let rec lift_stmt s = match s with
        (* Then branch assigns, no else ⇒ enable FF / latch. *)
        | [t], [] ->
            (match single_assign t with
+            | Some (lt, _) when List.mem lt multi -> lifted ()
             | Some (lt, rt) ->
                 BAssign { lhs = lt;
                           rhs = BCond { condition;
@@ -74,6 +117,7 @@ let rec lift_stmt s = match s with
         * condition so the enable-FF encoding still applies. *)
        | [], [e] ->
            (match single_assign e with
+            | Some (le, _) when List.mem le multi -> lifted ()
             | Some (le, re) ->
                 BAssign { lhs = le;
                           rhs = BCond {
@@ -99,9 +143,11 @@ let rec lift_stmt s = match s with
 
 let lift_process = function
   | BCombinational c ->
-      BCombinational { c with body = List.map lift_stmt c.body }
+      let multi = multi_assigned c.body in
+      BCombinational { c with body = List.map (lift_stmt ~multi) c.body }
   | BSequential s ->
-      BSequential { s with body = List.map lift_stmt s.body }
+      let multi = multi_assigned s.body in
+      BSequential { s with body = List.map (lift_stmt ~multi) s.body }
 
 let lift_module (m : bmodule) =
   { m with processes = List.map lift_process m.processes }

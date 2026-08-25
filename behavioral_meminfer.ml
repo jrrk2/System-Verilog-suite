@@ -599,7 +599,7 @@ let infer_module (m : bmodule) =
      init_values (baked into the BRAM INIT at config, exactly like real
      hardware) and STRIP the driver below — otherwise it re-clamps mem to the
      boot image every cycle and the RAM is never writable. *)
-  let mem_init_words n =
+  let mem_init_words ?(depth = 0) ?(data_w = 0) n =
     let of_stmt = function
       | BAssign { lhs; rhs = BConcat parts }
         when lhs = n && parts <> []
@@ -607,6 +607,21 @@ let infer_module (m : bmodule) =
           (* MSB-first parts -> address order (word_0 first) via rev_map *)
           Some (List.rev_map (function
                   | BConst { value; _ } -> Z.to_int value | _ -> 0) parts)
+      (* A SINGLE FOLDED CONSTANT.  `initial $readmemh(...)` reaches BIR as an
+         ordinary process, and unroll/blocking_subst collapse it into ONE packed
+         literal assigned to the array -- not the BConcat of per-word constants
+         the arm above expects.  The data was therefore invisible: litesoc's
+         8191-word BIOS ROM arrived with init_values = [] even though meminfer
+         had correctly identified it (nW=0, nR=1, sync_read=true), and the whole
+         image then survived only as a 262112-bit constant that the Hardcaml
+         path bit-sliced 8191 times -- a literal yosys cannot even lex.
+         Word k occupies bits [k*data_w .. k*data_w+data_w-1]: the BConcat arm
+         is MSB-first and reverses, so word_0 is in the LOW bits either way. *)
+      | BAssign { lhs; rhs = BConst { value; width } }
+        when lhs = n && depth > 0 && data_w > 0 && data_w <= 62
+             && width >= depth * data_w ->
+          Some (List.init depth (fun k ->
+                  Z.to_int (Z.extract value (k * data_w) data_w)))
       | _ -> None in
     List.find_map (fun p ->
       let body = match p with BCombinational c -> c.body | BSequential s -> s.body in
@@ -626,7 +641,7 @@ let infer_module (m : bmodule) =
       addr_width = max 1 addr_w;
       depth;
       kind = BRam;
-      init_values = (match mem_init_words n with Some vs -> vs | None -> []);
+      init_values = (match mem_init_words ~depth ~data_w n with Some vs -> vs | None -> []);
       n_write_ports = count_write_ports n processes;
       n_read_ports = count_read_ports n processes;
       read_is_sync = not (read_is_async n processes) }
@@ -636,14 +651,14 @@ let infer_module (m : bmodule) =
      driver would clobber writes (RAM non-writable) and dangle once mem becomes
      a RAMB primitive. *)
   let ram_names = List.map (fun (n, _, _) -> n) ram_writes in
-  let is_mem_init_driver p =
+  let is_mem_init_driver names p =
     let body = match p with BCombinational c -> c.body | BSequential s -> s.body in
     match body with
     | [ BAssign { lhs; rhs = BConcat parts } ]
-      when List.mem lhs ram_names
+      when List.mem lhs names
            && List.for_all (function BConst _ -> true | _ -> false) parts -> true
     | _ -> false in
-  let processes = List.filter (fun p -> not (is_mem_init_driver p)) processes in
+  let processes = List.filter (fun p -> not (is_mem_init_driver ram_names p)) processes in
 
   (* Step 3: read-only memory inference — names appearing in BSelect
    * but never in @mem_write are marked as ROM with empty contents
@@ -680,13 +695,45 @@ let infer_module (m : bmodule) =
                  addr_width = addr_w;
                  depth;
                  kind = BRom;
-                 init_values = [];
+                 (* Harvest the image rather than declaring it empty.  A
+                    read-only array IS a ROM, and its contents arrive as a
+                    folded constant assignment (see mem_init_words): an
+                    `initial $readmemh(...)` becomes an ordinary process that
+                    unroll/blocking_subst collapse into one packed literal.
+                    Hardcoding [] here is what left litesoc's 8191-word BIOS
+                    ROM with no image despite being correctly identified as
+                    nW=0/nR=1/sync_read -- so memlower's BRom->BRAM path could
+                    never fire, and the data survived only as a 262112-bit
+                    constant the Hardcaml path bit-sliced 8191 times. *)
+                 init_values =
+                   (match mem_init_words ~depth ~data_w n with
+                    | Some vs -> vs | None -> []);
                  n_write_ports = 0;
                  n_read_ports = count_read_ports n processes;
                  read_is_sync = not (read_is_async n processes) }
     end
   ) reads
   in
+
+  (* A read-only array's init driver has to go the same way a RAM's does in
+     step 2, and for the same reason stated there: once the image is in
+     init_values the memory becomes a BRAM primitive, and the leftover
+     combinational driver assigns to an array that no longer exists.  Step 2
+     could not do this because ROMs are only identified HERE.  Left in, Vivado
+     rejects the netlist outright:
+
+       ERROR: [Synth 8-1031] rom is not declared
+       ERROR: [Synth 8-1031] mem is not declared
+
+     Drop it ONLY where the image was actually harvested -- with init_values
+     still empty the driver is the sole carrier of the contents, and removing
+     it would silently blank the ROM. *)
+  let rom_init_names =
+    List.filter_map (fun (mm : bmem) ->
+      if mm.init_values <> [] then Some mm.mname else None) read_only_roms in
+  let processes =
+    if rom_init_names = [] then processes
+    else List.filter (fun p -> not (is_mem_init_driver rom_init_names p)) processes in
 
   let new_mems = ram_mems @ rom_mems @ read_only_roms in
   { m with processes; mems = new_mems @ m.mems }

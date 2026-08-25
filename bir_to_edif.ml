@@ -320,7 +320,7 @@ let write_edif
     List.iter (fun (_, e) -> infer e) i.port_connections) m.instances;
 
   (* Pre-allocate net ids for top-level ports. *)
-  let port_bits : (string, [`Input|`Output|`Internal] * int * int list) Hashtbl.t =
+  let port_bits : (string, [`Input|`Output|`Internal|`Inout] * int * int list) Hashtbl.t =
     Hashtbl.create 32 in
   (* `__keep_<net>` outputs are synthetic FF-clock retention handles from
      of_circuit; they must NOT surface as top-level IO ports (Vivado NSTD-1/
@@ -457,7 +457,7 @@ let write_edif
       Hashtbl.replace driven net (who :: prev) in
     List.iter (fun c -> add_driver c "tie") ["n_GND"; "n_VCC"];
     Hashtbl.iter (fun nm (dir, _, bits) ->
-      if dir = `Input || is_keep_port nm then
+      if Behavioral_ir.is_input_dir dir || is_keep_port nm then
         List.iter (fun id -> add_driver (net_name_of_id id) ("port:" ^ nm)) bits)
       port_bits;
     let conn_nets (i : binstance) (pin, e) =
@@ -632,7 +632,10 @@ let write_edif
   pp "        (interface\n";
   Hashtbl.iter (fun nm (dir, w, _bits) ->
     if dir <> `Internal then begin
-      let dir_s = match dir with `Input -> "INPUT" | `Output -> "OUTPUT" | _ -> "INPUT" in
+      let dir_s = match dir with
+        | `Input -> "INPUT" | `Output -> "OUTPUT"
+        | `Inout -> "INOUT"          (* EDIF names this direction directly *)
+        | _ -> "INPUT" in
       if w = 1 then
         pp "          (port %s (direction %s))\n" (edif_safe_id nm) dir_s
       else
@@ -1048,16 +1051,18 @@ let write_edif_hier
     (* Interface = the reconciled user_ports (declared outputs + connected-port
        union), so the child's ports and the parent's connections use IDENTICAL
        widths (member refs on both sides). *)
-    let port_bits : (string, [`Input|`Output|`Internal] * int * int list) Hashtbl.t = Hashtbl.create 32 in
+    let port_bits : (string, [`Input|`Output|`Internal|`Inout] * int * int list) Hashtbl.t = Hashtbl.create 32 in
     List.iter (fun (pn, dir, w) ->
       if not (is_keep_port pn) && not (Hashtbl.mem port_bits pn) then
-        Hashtbl.add port_bits pn ((dir :> [`Input|`Output|`Internal]), w,
+        Hashtbl.add port_bits pn ((dir :> [`Input|`Output|`Internal|`Inout]), w,
           List.init w (fun i -> alloc ctx { base = pn; bit = i })))
       (try Hashtbl.find user_ports m.name with Not_found -> []);
     (* interface *)
     pp "    (cell %s (celltype GENERIC)\n      (view netlist (viewtype NETLIST)\n        (interface\n" (edif_safe_id m.name);
     Hashtbl.iter (fun nm (dir, w, _) ->
-      let d = match dir with `Input -> "INPUT" | `Output -> "OUTPUT" | _ -> "INPUT" in
+      let d = match dir with
+        | `Input -> "INPUT" | `Output -> "OUTPUT"
+        | `Inout -> "INOUT" | _ -> "INPUT" in
       if w = 1 then pp "          (port %s (direction %s))\n" (edif_safe_id nm) d
       else pp "          (port (array (rename %s \"%s[%d:0]\") %d) (direction %s))\n"
              (edif_safe_id nm) nm (w - 1) w d) port_bits;
@@ -1178,7 +1183,8 @@ let write_edif_hier
         let pref = if w = 1 then Printf.sprintf "(portref %s)" (edif_safe_id nm)
                    else Printf.sprintf "(portref (member %s %d))" (edif_safe_id nm) (mem_idx ~w bit_i) in
         (* a module INPUT drives internal nets; an OUTPUT reads them *)
-        add_use ~driver:(dir = `Input) ~who:(Printf.sprintf "port:%s[%d]" nm bit_i) net pref) bits) port_bits;
+        add_use ~driver:(Behavioral_ir.is_input_dir dir)
+          ~who:(Printf.sprintf "port:%s[%d]" nm bit_i) net pref) bits) port_bits;
     if Sys.getenv_opt "SVS_ERC" <> Some "0" then begin
       let lost = Hashtbl.fold (fun net rs acc -> if Hashtbl.mem net_has_driver net then acc else (net, rs) :: acc) net_readers [] in
       if lost <> [] then

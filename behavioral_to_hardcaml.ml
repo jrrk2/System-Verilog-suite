@@ -647,11 +647,39 @@ let rec expr_to_signal ctx = function
            let total_w = Signal.width s_array in
            let size = total_w / elem_w in
            if size <= 1 then s_array
-           else
+           else begin
+             (* CONSTANT-FOLD A CONSTANT ARRAY into per-element constants.
+                A BArray signal is one flat vector of size*elem_w bits, so a
+                ROM image arrives here as a single enormous constant and every
+                case below would be a SELECT OF IT.  Hardcaml emits that as one
+                literal plus `size` slices, and for litesoc's 8191-word BIOS
+                ROM that is a 262112-bit token which yosys cannot even lex:
+                  input buffer overflow, can't enlarge buffer because scanner
+                  uses REJECT
+                -- its Verilog frontend is flex with REJECT, so the input buffer
+                cannot grow.  The full-width value is never used: of 8213
+                references to that wire, 2 are the declaration and its alias and
+                8191 are 32-bit slices.  Folding here emits each element as its
+                own small constant and the giant literal never exists.
+                NB this does not make the ROM a MEMORY -- it stays a mux over
+                constants, because the gate-map path has no memory model (see
+                the `roms` field).  It removes the lexer blockage, not the mux. *)
+             (* SVS_ROM_DEBUG=1 names the array behind any oversized packed
+                vector, so the source of a giant literal can be located instead
+                of guessed at. *)
+             (if Sys.getenv_opt "SVS_ROM_DEBUG" = Some "1" && total_w > 4096 then
+                Printf.eprintf
+                  "[rom] BSelect on wide array: expr=%s total_w=%d elem_w=%d size=%d\n%!"
+                  (Behavioral_ir.string_of_bexpr array) total_w elem_w size);
+             let const_bits =
+               try Some (Bits.of_constant (Signal.to_constant s_array))
+               with _ -> None in
              let cases = List.init size (fun k ->
                let hi = (k + 1) * elem_w - 1 in
                let lo = k * elem_w in
-               Signal.select s_array hi lo) in
+               match const_bits with
+               | Some b -> Signal.of_constant (Bits.to_constant (Bits.select b hi lo))
+               | None -> Signal.select s_array hi lo) in
              (* Hardcaml's [mux] requires 2^width(sel) >= |cases|.
                 The BIR index is often narrower than ceil_log2(size)
                 (a 2-bit `i` reading a 64-entry array because i comes
@@ -675,7 +703,8 @@ let rec expr_to_signal ctx = function
                if iw = need_w then s_index
                else if iw > need_w then Signal.select s_index (need_w - 1) 0
                else Signal.uresize s_index need_w in
-             Signal.mux s_index cases)
+             Signal.mux s_index cases
+           end)
 
   | BSlice { signal; msb; lsb } ->
       let s = expr_to_signal ctx signal in
@@ -2188,7 +2217,8 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
     else begin
       let module_inputs =
         List.filter_map (fun (s : Behavioral_ir.bsignal) ->
-          if s.direction = `Input then Some s.name else None) bmod.signals in
+          if Behavioral_ir.is_input_dir s.direction then Some s.name else None)
+          bmod.signals in
       let sig_decl_width nm =
         match
           List.find_opt (fun (s : Behavioral_ir.bsignal) -> s.name = nm) bmod.signals
@@ -2371,7 +2401,7 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
      | BArray { element; _ } ->
          Hashtbl.replace ctx.array_elem_w s.name (width_of_btype element)
      | _ -> ());
-    if s.direction <> `Input
+    if s.direction <> `Input && s.direction <> `Inout
        && not (List.mem_assoc s.name ctx.variables)
        (* Skip nets driven by a black-box instance output (pre-created
           above as wires in ctx.signals): they must NOT get a competing
@@ -2888,7 +2918,43 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
 
   (* Build each opt-in instance now that the processes have computed its
      input drivers; drive the pre-created output wires from the Inst. *)
+  (* HARD BLOCKS WITH A SIDE EFFECT.
+     The guard below skips an instance with no output wires, because Hardcaml's
+     Instantiation needs something to return.  But some primitives exist for
+     their EFFECT, not their data: IDELAYCTRL calibrates every IDELAY/ODELAY in
+     its bank and its only output is RDY, which designs routinely leave
+     unconnected.  Dropping it is silent and fatal -- litesoc emitted 95
+     IDELAY/ODELAY cells and no IDELAYCTRL, and Vivado refused to place:
+       ERROR: [DRC PLIDC-10] IDELAYCTRL missing for IODELAYs: There are 95
+       IDELAY/ODELAY/IODELAY cells in the design which requires IDelayCtrl,
+       but there is no IDelayCtrl cell
+     So give such a primitive a dangling output wire purely so it survives
+     emission; the port name comes from the primitive's own I/O table. *)
+  (* Dangling outputs of side-effect boxes, retained as __keep_ ports below --
+     creating the wire is not enough, because Hardcaml builds its circuit
+     BACKWARDS FROM THE OUTPUTS and prunes anything unreachable, so the
+     instance disappeared again.  __keep_ is the existing answer to exactly
+     this (see the clock-tree retention below); sv_lua.strip_keep_ports removes
+     the ports before yosys sees them, leaving the box in place. *)
+  let side_effect_keeps = ref [] in
+  let side_effect_out = function
+    | "IDELAYCTRL" -> Some ("RDY", 1)
+    | "DCIRESET"   -> Some ("LOCKED", 1)
+    | "STARTUPE2"  -> Some ("EOS", 1)
+    | _ -> None in
   List.iter (fun ((i : Behavioral_ir.binstance), out_wires, ins) ->
+    let out_wires =
+      if out_wires <> [] then out_wires
+      else match side_effect_out i.module_name with
+        | Some (port, w) ->
+            let wire = Signal.wire w in
+            side_effect_keeps := (i.inst_name ^ "_" ^ port, wire) :: !side_effect_keeps;
+            Printf.eprintf
+              "[inst] %s %s has no connected outputs -- emitting anyway (side \
+               effect); %s retained via __keep_\n%!"
+              i.module_name i.inst_name port;
+            [ (port, wire) ]
+        | None -> [] in
     if out_wires <> [] then begin
       let inputs = List.map (fun (port, e) -> port, expr_to_signal ctx e) ins in
       let outputs = List.map (fun (port, w) -> port, Signal.width w) out_wires in
@@ -3139,7 +3205,32 @@ let create_circuit ?(emit_instances = false) ?(detect_loops = true)
           | Some sig_ -> Some (Signal.output (legalize_port_name ("__keep_" ^ name)) sig_)
           | None -> None
         end) !box_out_nets in
-      outputs @ extra
+      (* Side-effect boxes (IDELAYCTRL &c): their only output is dangling, so
+         they need a retention port of their own or Hardcaml prunes the box. *)
+      let se = List.map (fun (nm, sig_) ->
+          Signal.output (legalize_port_name ("__keep_" ^ nm)) sig_)
+          !side_effect_keeps in
+      (* BIDIRECTIONAL ports.  Hardcaml has no bidirectional signal, and the pad
+         net is driven by an IOBUF's .IO -- a box output that reaches no
+         declared output, so DCE would delete the buffer and strand the pad.
+         Expose it as `__keep_<port>` exactly like the clock-tree and
+         side-effect boxes; Sv_lua.strip_keep_ports then folds the retention
+         port back into an `inout` declaration.  (The BIR->Verilog emitter,
+         behavioral_to_verilog, needs none of this -- it writes `inout`
+         directly.  Prefer that path when the design has tristate buses.) *)
+      let inouts =
+        List.filter_map (fun (s : Behavioral_ir.bsignal) ->
+          if s.direction <> `Inout then None
+          else match List.assoc_opt s.name ctx.signals with
+            | Some sig_ ->
+                Some (Signal.output
+                        (legalize_port_name ("__keep_" ^ s.name)) sig_)
+            | None ->
+                Printf.eprintf
+                  "[create_circuit] WARNING: inout port %s has no driver; the \
+                   pad will be left unconnected\n%!" s.name;
+                None) bmod.signals in
+      outputs @ extra @ se @ inouts
     end in
 
   let config = { Circuit.Config.default with detect_combinational_loops = detect_loops } in

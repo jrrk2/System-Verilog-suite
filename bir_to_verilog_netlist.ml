@@ -177,7 +177,7 @@ let write_verilog
 
   (* Pre-allocate IDs for top-level ports so the wire IDs match between
    * EDIF and Verilog views. *)
-  let port_bits : (string, [`Input|`Output|`Internal] * int * int list) Hashtbl.t =
+  let port_bits : (string, [`Input|`Output|`Internal|`Inout] * int * int list) Hashtbl.t =
     Hashtbl.create 32 in
   List.iter (fun (s : bsignal) ->
     if s.direction <> `Internal then begin
@@ -269,6 +269,14 @@ let write_verilog
     match dir with
     | `Output -> pp "  assign %s = %s;\n" id bus
     | `Input  -> pp "  assign %s = %s;\n" bus id
+    (* This writer bridges a port to its internal nets with a ONE-WAY assign,
+       which cannot express a bidirectional pad -- either direction would
+       leave the other half severed (the exact litesoc DQ failure).  Refuse
+       loudly; behavioral_to_verilog emits `inout` natively. *)
+    | `Inout ->
+        failwith (Printf.sprintf
+          "bir_to_verilog_netlist: port %s is `Inout, which this netlist writer \
+           cannot represent -- emit via behavioral_to_verilog instead" nm)
     | _ -> ()
   ) port_bits;
   pp "\n";

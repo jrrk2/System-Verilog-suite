@@ -1960,6 +1960,9 @@ let bmodule_to_library_ports (m : Behavioral_ir.bmodule) :
   List.filter_map (fun (s : Behavioral_ir.bsignal) ->
     match s.direction with
     | `Internal -> None
+    (* library_port carries no bidirectional case, and the unisim port table
+       already classes IOBUF.IO as an output; follow that convention. *)
+    | `Inout -> None
     | (`Input | `Output) as d ->
         let width = match s.stype with
           | Behavioral_ir.BInt { width; _ } -> width
