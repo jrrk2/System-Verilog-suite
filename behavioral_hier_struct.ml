@@ -302,8 +302,20 @@ let collect_resolvable_assigns ~prefix ~port_actual ~is_local (m : bmodule)
           | _ -> []) body
     | _ -> []) m.processes
 
-let rec flatten_module ~by_name ~prefix ~assigns (m : bmodule)
+let rec flatten_module ~by_name ~prefix ~assigns ~sigw (m : bmodule)
                       ~(port_actual : string -> bexpr option) : binstance list =
+  (* Record every signal this module declares under its FLAT name, so widths
+     are carried through the flatten instead of being guessed afterwards from
+     string shapes.  Guessing conflated same-named signals in different
+     modules and silently widened primitive pins. *)
+  (* Record EVERY signal, not just the wide ones: the whole point is that an
+     exact hit is authoritative, and the nets that need protecting are the
+     NARROW ones a heuristic would otherwise widen. *)
+  List.iter (fun (s : bsignal) ->
+    match s.stype with
+    | BInt { width; _ } -> Hashtbl.replace sigw (pname prefix s.name) width
+    | BBool -> Hashtbl.replace sigw (pname prefix s.name) 1
+    | _ -> ()) m.signals;
   (* A name this module DECLARES is a real net and must never be reinterpreted
      as "<port>__<bit>" -- see rewrite_bexpr. *)
   let local_tbl = Hashtbl.create (List.length m.signals) in
@@ -340,7 +352,7 @@ let rec flatten_module ~by_name ~prefix ~assigns (m : bmodule)
                i.inst_name i.module_name pn (List.mem_assoc pn inst_port_rewritten));
           r
         in
-        flatten_module ~by_name ~assigns
+        flatten_module ~by_name ~assigns ~sigw
           ~prefix:new_inst_name
           ~port_actual:new_port_actual
           child
@@ -359,7 +371,8 @@ let flatten_structural (p : bprogram) ~top : bmodule =
     | None -> failwith ("flatten_structural: no module '" ^ top ^ "' in program")
   in
   let assigns = ref [] in
-  let prims0 = flatten_module ~by_name ~assigns ~prefix:"" ~port_actual:(fun _ -> None) top_mod in
+  let sigw : (string, int) Hashtbl.t = Hashtbl.create 4096 in
+  let prims0 = flatten_module ~by_name ~assigns ~sigw ~prefix:"" ~port_actual:(fun _ -> None) top_mod in
 
   (* Resolve the collected continuous assigns (net aliases / constant ties /
      bit-remaps to output ports) into cell-pin connectivity: a read of an
@@ -544,24 +557,52 @@ let flatten_structural (p : bprogram) ~top : bmodule =
      the width by matching the `__<signal>` suffix against every module's
      declared signals (child names carry Vivado's full escaped path, so
      the boundary match is precise; longest match wins). *)
-  let wide : (string, int) Hashtbl.t = Hashtbl.create 4096 in
+  (* Widths for the flat nets, in TWO tables -- and the split is the point.
+     A CHILD module's signal only ever appears in the flat netlist as
+     "<instpath>__<name>"; it is never reachable under its bare name.  So its
+     width may be consulted through the "__"-suffix rule ONLY.  Letting it
+     match by BARE name lets a child's wide PORT claim a same-named narrow net
+     in the TOP -- which is legal input, because Vivado sanitises different
+     originals to a single EDIF identifier and EDIF keeps port, instance and
+     net namespaces apart:
+
+       cell BmbToWishbone   port minimalhyperramsoc_bus_errors_reg_31_  [32 bits]
+       cell lowrisc_sonata  net  minimalhyperramsoc_bus_errors_reg_31_  [1 bit, FDRE Q]
+
+     With one shared table the max() below handed the 1-bit net a width of 32,
+     so the FDRE got a 32-bit Q; nextpnr then created Q0..Q31 on the packed
+     SLICE_FFX and the router died with "No wire found for port Q31" -- 9000
+     cells from the cause and looking exactly like an SRL cascade bug. *)
+  let wide_top  : (string, int) Hashtbl.t = Hashtbl.create 1024 in
+  let wide_hier : (string, int) Hashtbl.t = Hashtbl.create 4096 in
   List.iter (fun (m : bmodule) ->
+    let tbl = if m.name = top then wide_top else wide_hier in
     List.iter (fun (s : bsignal) ->
       match s.stype with
       | BInt { width; _ } when width > 1 ->
-          let prev = try Hashtbl.find wide s.name with Not_found -> 0 in
-          if width > prev then Hashtbl.replace wide s.name width
+          let prev = try Hashtbl.find tbl s.name with Not_found -> 0 in
+          if width > prev then Hashtbl.replace tbl s.name width
       | _ -> ()) m.signals) p.modules;
   let width_of_net nm =
     let n = String.length nm in
     let best = ref 1 in
-    Hashtbl.iter (fun sig_name w ->
+    (* AUTHORITATIVE: the width recorded for this exact flat name while
+       flattening.  When present it is the answer -- no string matching. *)
+    (match Hashtbl.find_opt sigw nm with
+     | Some w -> best := w
+     | None ->
+    (* exact match: TOP-level signals only *)
+    (match Hashtbl.find_opt wide_top nm with
+     | Some w when w > !best -> best := w
+     | _ -> ());
+    (* hierarchical match: any module's signal, seen as "<path>__<name>" *)
+    let try_suffix sig_name w =
       let sn = String.length sig_name in
-      let matches =
-        nm = sig_name
-        || (n > sn + 2 && String.sub nm (n - sn) sn = sig_name
-            && nm.[n - sn - 1] = '_' && nm.[n - sn - 2] = '_') in
-      if matches && w > !best then best := w) wide;
+      if n > sn + 2 && String.sub nm (n - sn) sn = sig_name
+         && nm.[n - sn - 1] = '_' && nm.[n - sn - 2] = '_' && w > !best
+      then best := w in
+    Hashtbl.iter try_suffix wide_hier;
+    Hashtbl.iter try_suffix wide_top);
     !best in
   let extra_signals =
     Hashtbl.fold (fun nm () acc ->
