@@ -2599,6 +2599,45 @@ let lflatten_struct prog_h top =
       if mn = "GND" || mn = "VCC" || List.mem mn covered || List.mem mn acc
       then acc else mn :: acc) [] m.instances |> List.rev in
   let lc = p.library_cells @ Vhdl_to_behavioral.lookup_xil_primitive_ports missing in
+  (* GUARD: a primitive pin whose connection is WIDER than the primitive's
+     declared port is a silent netlist corruption, and it reaches nextpnr as a
+     bel pin that does not exist.  Seen for real on a Vivado-EDIF import: a
+     child cell's 32-bit PORT and a top-level 1-bit NET shared an EDIF
+     identifier (legal -- EDIF keeps port and instance namespaces apart), the
+     flat name map aliased one onto the other, and an FDRE ended up with a
+     32-bit Q.  nextpnr then created Q0..Q31 on the packed SLICE_FFX and died
+     with "No wire found for port Q31" -- 2 cells out of 9249, far from the
+     cause.  Fail HERE, naming the cell, pin and both widths. *)
+  (* bexpr_width answers 1 for a bare BVar -- it cannot know the referenced
+     signal's width -- and the corrupt pin IS a bare BVar, so resolve names
+     against the flat module's signal table or the check is vacuous. *)
+  let sigw : (string, int) Hashtbl.t = Hashtbl.create 1024 in
+  List.iter (fun (sg : Behavioral_ir.bsignal) ->
+    match sg.stype with
+    | Behavioral_ir.BInt { width; _ } -> Hashtbl.replace sigw sg.name width
+    | _ -> ()) m.signals;
+  let rec width_of (e : Behavioral_ir.bexpr) =
+    match e with
+    | Behavioral_ir.BVar nm ->
+      (match Hashtbl.find_opt sigw nm with Some w -> w | None -> 1)
+    | Behavioral_ir.BConcat es ->
+      List.fold_left (fun a x -> a + width_of x) 0 es
+    | other -> Behavioral_hier_struct.bexpr_width other
+  in
+  List.iter (fun (i : Behavioral_ir.binstance) ->
+    match List.assoc_opt i.module_name lc with
+    | None -> ()
+    | Some ports ->
+      List.iter (fun (pin, e) ->
+        match List.find_opt (fun (lp : Behavioral_ir.library_port) ->
+                lp.port_name = pin) ports with
+        | Some lp ->
+          let w = width_of e in
+          if w > lp.port_width then
+            failwith (Printf.sprintf
+              "flatten_struct: instance %S (%s) pin %s is connected %d bits wide                but the primitive declares %d -- a name collision has aliased a                wider signal onto this pin; the netlist would be corrupt"
+              i.inst_name i.module_name pin w lp.port_width)
+        | None -> ()) i.port_connections) m.instances;
   hadd (Netlist (top, m, lc))
 
 (* Read a nextpnr-xilinx routed JSON (post-pack/place/route) and reconstruct
