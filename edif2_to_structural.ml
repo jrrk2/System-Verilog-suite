@@ -651,9 +651,39 @@ let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
       port_connections = pcs }
   ) user_insts in
 
+  (* DECLARE EVERY IDENTIFIER THIS FUNCTION INVENTS.  An identifier's width is
+     fixed when it is created, so it is stated here rather than reconstructed
+     later from the name.  Two kinds get invented above and are declared by no
+     EDIF (net ...): the "$svs_unconn$<inst>$<pin>$<bit>" placeholders for
+     ABSENT bus members, and the "VCC"/"GND" constant rails.  Both are 1 bit by
+     construction.  Leaving them undeclared forced the flattener to guess, and
+     guessing widths from name shapes is what silently turned an FDRE's Q into
+     a 32-bit bus. *)
+  let declared = Hashtbl.create (List.length signals) in
+  List.iter (fun (sg : bsignal) -> Hashtbl.replace declared sg.name ()) signals;
+  let invented = ref [] in
+  let note nm =
+    if not (Hashtbl.mem declared nm) then begin
+      Hashtbl.replace declared nm ();
+      invented := { name = nm;
+                    stype = BInt { width = 1; signed = Unsigned };
+                    direction = `Internal;
+                    initial_value = None;
+                    attrs = [] } :: !invented
+    end in
+  let rec note_expr (e : bexpr) =
+    match e with
+    | BVar nm -> note nm
+    | BConcat es -> List.iter note_expr es
+    | BSlice { signal; _ } -> note_expr signal
+    | BSelect { array; _ } -> note_expr array
+    | _ -> () in
+  List.iter (fun (i : binstance) ->
+    List.iter (fun (_, e) -> note_expr e) i.port_connections) instances;
+
   { name = c.cname;
     params = [];
-    signals;
+    signals = signals @ List.rev !invented;
     processes = sibling_procs;   (* see SIBLING PORTS above *)
     instances;
     funcs = [];

@@ -583,27 +583,30 @@ let flatten_structural (p : bprogram) ~top : bmodule =
           let prev = try Hashtbl.find tbl s.name with Not_found -> 0 in
           if width > prev then Hashtbl.replace tbl s.name width
       | _ -> ()) m.signals) p.modules;
+  (* The width of a flat net is RECORDED during the flatten (see sigw above),
+     never inferred.  There used to be a fallback here that guessed it by
+     string-matching the name against every wide signal in the program -- exact
+     match, or a "__"-delimited suffix -- and taking the MAXIMUM.  That guess
+     can only ever be too WIDE, it fails silently, and it produced a corrupt
+     netlist: a legal EDIF identifier reuse (Vivado sanitises different
+     originals to one identifier, and EDIF keeps port/instance/net namespaces
+     apart) let a child's 32-bit port claim a top-level 1-bit net, so an FDRE
+     came out with a 32-bit Q.  nextpnr duly built Q0..Q31 on the packed
+     SLICE_FFX and the router died 9000 cells away with "No wire found for port
+     Q31", which reads exactly like an SRL cascade fault.
+
+     So there is no fallback.  A miss means a net was referenced that no module
+     declared, which is a real defect in the caller -- fail here, where the net
+     can still be named, rather than emit a plausible width and corrupt the
+     netlist. *)
   let width_of_net nm =
-    let n = String.length nm in
-    let best = ref 1 in
-    (* AUTHORITATIVE: the width recorded for this exact flat name while
-       flattening.  When present it is the answer -- no string matching. *)
-    (match Hashtbl.find_opt sigw nm with
-     | Some w -> best := w
-     | None ->
-    (* exact match: TOP-level signals only *)
-    (match Hashtbl.find_opt wide_top nm with
-     | Some w when w > !best -> best := w
-     | _ -> ());
-    (* hierarchical match: any module's signal, seen as "<path>__<name>" *)
-    let try_suffix sig_name w =
-      let sn = String.length sig_name in
-      if n > sn + 2 && String.sub nm (n - sn) sn = sig_name
-         && nm.[n - sn - 1] = '_' && nm.[n - sn - 2] = '_' && w > !best
-      then best := w in
-    Hashtbl.iter try_suffix wide_hier;
-    Hashtbl.iter try_suffix wide_top);
-    !best in
+    match Hashtbl.find_opt sigw nm with
+    | Some w -> w
+    | None ->
+      failwith (Printf.sprintf
+        "flatten_structural: no declared width for flat net %S -- it is \
+         referenced by a primitive pin but no module declares it.  Widths are \
+         recorded during the flatten and are never guessed from the name." nm) in
   let extra_signals =
     Hashtbl.fold (fun nm () acc ->
       let base, _ = parse_bit nm in
