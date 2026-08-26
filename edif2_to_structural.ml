@@ -659,6 +659,28 @@ let convert_cell (cell_pw : (string, (string, int) Hashtbl.t) Hashtbl.t)
      construction.  Leaving them undeclared forced the flattener to guess, and
      guessing widths from name shapes is what silently turned an FDRE's Q into
      a 32-bit bus. *)
+  (* is_const_sentinel (behavioral_hier_struct) treats the NAMES "VCC", "GND",
+     "<const0>" and "<const1>" as the constant rails wherever they appear -- a
+     naming convention standing in for a type, exactly like assuming clk is a
+     clock.  It holds for Vivado EDIF, whose rails come from the GND/VCC
+     primitives (matched on cellref, which IS a type).  Make the assumption
+     falsifiable rather than silent: if the design itself DECLARES a net or
+     port with one of those names, constant-folding it would quietly delete
+     real logic, so refuse the design and say so.  Checked against the
+     EDIF-derived signals only -- the rails this function invents below are
+     added afterwards. *)
+  List.iter (fun (sg : bsignal) ->
+    match sg.name with
+    | "VCC" | "GND" | "<const0>" | "<const1>" ->
+      failwith (Printf.sprintf
+        "edif2_to_structural: cell %S declares a %s named %S.  SVS treats that          name as a constant rail wherever it appears, so importing this design          would silently fold real logic to a constant.  Rename the net."
+        c.cname
+        (match sg.direction with
+         | `Input | `Output | `Inout -> "port"
+         | `Internal -> "net")
+        sg.name)
+    | _ -> ()) signals;
+
   let declared = Hashtbl.create (List.length signals) in
   List.iter (fun (sg : bsignal) -> Hashtbl.replace declared sg.name ()) signals;
   let invented = ref [] in
