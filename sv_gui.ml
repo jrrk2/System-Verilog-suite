@@ -123,6 +123,27 @@ let chooser_dialog action title =
 let open_file_dialog () = chooser_dialog `OPEN "Open file"
 let save_file_dialog () = chooser_dialog `SAVE "Save file"
 
+(* Multi-select variant.  A design side is usually several files, and adding
+   them one dialog at a time is the kind of friction that stops a tool being
+   used at all. *)
+let open_files_dialog () =
+  let d = GWindow.file_chooser_dialog
+    ~action:`OPEN ~title:"Add source files" ~parent:(need_window ())
+    ~modal:true () in
+  d#set_select_multiple true;
+  d#add_button "Cancel" `CANCEL;
+  d#add_button "Add" `OK;
+  if !last_chooser_dir <> ""
+     && Sys.file_exists !last_chooser_dir
+     && Sys.is_directory !last_chooser_dir
+  then ignore (d#set_current_folder !last_chooser_dir);
+  let result = match d#run () with `OK -> d#get_filenames | _ -> [] in
+  d#destroy ();
+  (match result with
+   | f :: _ -> last_chooser_dir := Filename.dirname f; save_last_chooser_dir ()
+   | [] -> ());
+  result
+
 (* ---------- text buffer accessors ---------- *)
 
 let set_text s =
@@ -3653,14 +3674,43 @@ let () =
 
   (* Verify menu. *)
   let m = new GMenu.factory verify_menu ~accel_group in
-  ignore (m#add_item "Z3 miter: verible vs verilator..."
-            ~callback:(do_miter "verible" "verilator"));
-  ignore (m#add_item "Z3 miter: verible vs slang..."
-            ~callback:(do_miter "verible" "slang"));
-  ignore (m#add_item "Z3 miter: verilator vs slang..."
-            ~callback:(do_miter "verilator" "slang"));
-  ignore (m#add_item "Z3 miter: verible vs vhdl..."
-            ~callback:(do_miter "verible" "vhdl"));
+  (* Offer a frontend pairing only when BOTH its tools were actually found.
+     A menu entry for a frontend that is not installed is a trap: it looks
+     like a capability, and pays out a failure from three layers down. *)
+  let tool_sts = Tool_scan.get () in
+  let have fe =
+    match List.find_opt (fun (s : Tool_scan.status) ->
+            s.Tool_scan.st_spec.Tool_scan.fe = fe) tool_sts with
+    | Some s -> Tool_scan.usable tool_sts s
+    | None -> false in
+  let offered = ref 0 in
+  List.iter (fun (a, b) ->
+    if have a && have b then begin
+      incr offered;
+      ignore (m#add_item (Printf.sprintf "Z3 miter: %s vs %s..." a b)
+                ~callback:(do_miter a b))
+    end)
+    [ ("verible", "verilator"); ("verible", "slang");
+      ("verilator", "slang"); ("verible", "vhdl");
+      ("verible", "yosys"); ("verible", "synlig") ];
+  if !offered = 0 then begin
+    let it = m#add_item "Z3 miter: no frontend pair available" in
+    it#misc#set_sensitive false
+  end;
+  ignore (m#add_separator ());
+  (* The workbench is the miter with its three real steps exposed — load,
+     match the register spaces, then prove — plus counterexample debug.  The
+     four fixed pairings above are the shortcut for when nothing needs
+     matching. *)
+  ignore (m#add_item "Equivalence workbench (Z3)..."
+            ~callback:(fun () ->
+              with_errors "equivalence workbench" (fun () ->
+                Gui_equiv.open_window
+                  { Gui_equiv.cb_choose_files = open_files_dialog;
+                    cb_choose_open = open_file_dialog;
+                    cb_choose_save = save_file_dialog;
+                    cb_status = set_status;
+                    cb_error = error_dialog } ())));
   if Sys.getenv_opt "SV_DECOMP_GUI_SIM" = Some "1" then begin
     ignore (m#add_separator ());
     ignore (m#add_item "Simulate top (Cyclesim, 128 cycles)..."
@@ -3741,6 +3791,19 @@ let () =
     (fun a ->
        if Filename.check_suffix a ".def" then open_lef_def_path a)
     (List.tl (Array.to_list Sys.argv));
+  (* SV_GUI_EQUIV=1 opens the equivalence workbench at startup.  With
+     SV_GUI_EXIT_AFTER_LOAD=1 that is a headless smoke test of the whole
+     window construction (xvfb-run), which is the only way this code gets
+     exercised without a human clicking a menu.  SV_GUI_EQUIV=tools also opens
+     the external-tool picker. *)
+  if Sys.getenv_opt "SV_GUI_EQUIV" <> None then
+    Gui_equiv.open_window
+      ~show_tools:(Sys.getenv_opt "SV_GUI_EQUIV" = Some "tools")
+      { Gui_equiv.cb_choose_files = open_files_dialog;
+        cb_choose_open = open_file_dialog;
+        cb_choose_save = save_file_dialog;
+        cb_status = set_status;
+        cb_error = error_dialog } ();
   if Sys.getenv_opt "SV_GUI_EXIT_AFTER_LOAD" <> None then exit 0;
 
   GMain.main ()

@@ -1534,7 +1534,12 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
        push/pop, so a structural state mismatch on a few cones (SVS bit-blasts
        SRL/RAM into FF-chains while the other side black-boxes them) is
        localized instead of collapsing the whole design to one DIFFER. *)
-    if Sys.getenv_opt "Z3_MITER_PER_CONE" <> None then begin
+    (* An empty or "0" value means OFF.  There is no unsetenv in OCaml's Unix,
+       so a caller that switches per-cone mode off at runtime can only clear
+       the variable to "" — treating that as ON silently ran a per-cone check
+       when the caller asked for the flat one. *)
+    if (match Sys.getenv_opt "Z3_MITER_PER_CONE" with
+        | None | Some "" | Some "0" -> false | Some _ -> true) then begin
       Printf.printf "Per-cone miter over %d common outputs (FF-D cones + primary outs)...\n"
         (List.length common_outputs);
       let neq = ref 0 and ndiff = ref 0 and diffs = ref [] in

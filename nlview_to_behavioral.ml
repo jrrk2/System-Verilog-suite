@@ -250,7 +250,7 @@ let convert filename =
       {
         name = p.NetlistParser.name;
         stype = BInt { width = p.width; signed = Unsigned };
-        direction = (p.direction :> [`Input | `Output | `Internal]);
+        direction = (p.direction :> [`Inout |   `Input | `Output | `Internal]);
         initial_value = None; attrs = []; 
       }
     ) ports

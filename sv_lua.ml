@@ -92,17 +92,23 @@ let find_netlist h =
  * shared library functions (Verible_to_behavioral, Slang_to_behavioral,
  * Rtlil_to_behavioral, etc.) do the real work. *)
 
+(* YOSYS_BIN first, like every other external reader.  Without an override
+   there was no way to point the tool at a particular yosys — which also means
+   no way for a GUI "select this binary" to take effect. *)
 let find_yosys () =
   let home = try Sys.getenv "HOME" with Not_found -> "/root" in
-  List.find_opt (fun p ->
-    if String.length p > 0 && p.[0] = '/' then Sys.file_exists p
-    else Sys.command (Printf.sprintf "command -v %s > /dev/null" p) = 0
-  ) [
-    home ^ "/oss-cad-suite/bin/yosys";
-    "/usr/local/bin/yosys";
-    "/usr/bin/yosys";
-    "yosys";
-  ]
+  match Sys.getenv_opt "YOSYS_BIN" with
+  | Some s when s <> "" && Sys.file_exists s -> Some s
+  | _ ->
+    List.find_opt (fun p ->
+      if String.length p > 0 && p.[0] = '/' then Sys.file_exists p
+      else Sys.command (Printf.sprintf "command -v %s > /dev/null" p) = 0
+    ) [
+      home ^ "/oss-cad-suite/bin/yosys";
+      "/usr/local/bin/yosys";
+      "/usr/bin/yosys";
+      "yosys";
+    ]
 
 (* Produce verilator's elaborated AST JSON from SOURCES.
  *
@@ -116,7 +122,16 @@ let find_yosys () =
  * --timescale supplies a default for filesets where only some files carry a
  * `timescale directive, which verilator otherwise rejects outright; timescale
  * is irrelevant to the synthesisable BIR. *)
+(* SVS_VERILATOR_BIN, *not* VERILATOR_BIN, is our override.  VERILATOR_BIN
+   belongs to verilator's own perl driver, which uses it to find `verilator_bin`
+   — point it at the wrapper and the wrapper re-execs itself forever (a fork
+   bomb, observed as `verilator --get-supported DEV_ASAN` multiplying).  The
+   old name is still READ for compatibility with anyone who set it by hand;
+   nothing in SVS writes it. *)
 let find_verilator () =
+  match Sys.getenv_opt "SVS_VERILATOR_BIN" with
+  | Some s when s <> "" && Sys.file_exists s -> Some s
+  | _ ->
   match Sys.getenv_opt "VERILATOR_BIN" with
   | Some s when Sys.file_exists s -> Some s
   | _ ->

@@ -185,6 +185,162 @@ let cmd_miter args =
         "usage: sv_suite miter <a> <b> <top> <files…>";
       exit 2
 
+(* equiv: the GUI equivalence workbench, headless.
+ *
+ * The point of this verb is that a verdict shown in the workbench window can
+ * be reproduced — by someone else, in CI, from a Makefile — with the project
+ * file the window saved.  A checker whose answers only exist inside a GUI is
+ * not evidence of anything.
+ *
+ * Exit: 0 EQUIVALENT, 1 DIFFER, 2 anything else (inconclusive, uncomparable,
+ * error) — an INCONCLUSIVE must never look like a pass to a Makefile. *)
+let cmd_equiv args =
+  let usage () =
+    prerr_endline
+      ("usage: sv_suite equiv <project.json> [options]\n\
+      \       sv_suite equiv --a <fe>,<top>,<file>[,<file>…] \\\n\
+      \                      --b <fe>,<top>,<file>[,<file>…] [options]\n\
+       options:\n\
+      \  --mode flat|per-cone|hier   miter mode (default: the project's, else flat)\n\
+      \  --timeout <ms>              Z3 timeout per check (default 30000)\n\
+      \  --no-sim                    skip simulation-signature register matching\n\
+      \  --scan                      list every differing cone\n\
+      \  --list-regs                 print the register-matching table\n\
+      \  --explain <cone>            counterexample + first-divergence report\n\
+      \  --save <file>               write the report\n\
+      \  --save-project <file>       write a project file the GUI can open\n\
+      \  --tools                     scan for the external tools and print what\n\
+      \                              each frontend needs, found, and used\n\
+      \  --tool <fe>=<path>          select the binary for one frontend and\n\
+      \                              remember it (same picker as the GUI's Tools…)\n\
+       <fe> is one of the USABLE frontends found by the scan:\n\
+      \  " ^ String.concat ", " (Tool_scan.available_frontends ()));
+    exit 2 in
+  let parse_side tag spec =
+    match String.split_on_char ',' spec with
+    | fe :: top :: (_ :: _ as files) ->
+        { Equiv_core.s_tag = tag; s_frontend = fe; s_top = top;
+          s_files = files; s_post = "none" }
+    | _ -> usage () in
+  (* --tools / --tool are handled before anything else: they are how you get
+     OUT of a "that frontend is not installed" failure, so they must work even
+     when no design has been named. *)
+  let rec pre = function
+    | [] -> ()
+    | "--tool" :: v :: t ->
+        (match String.index_opt v '=' with
+         | None ->
+             prerr_endline "usage: --tool <frontend>=<path-to-binary>"; exit 2
+         | Some i ->
+             let fe = String.sub v 0 i
+             and path = String.sub v (i + 1) (String.length v - i - 1) in
+             (match Tool_scan.select fe path with
+              | Ok () -> Printf.printf "selected %s → %s\n" fe path
+              | Error e -> prerr_endline ("--tool: " ^ e); exit 2));
+        pre t
+    | _ :: t -> pre t in
+  pre args;
+  if List.mem "--tools" args then begin
+    print_string (Tool_scan.report (Tool_scan.get ~rescan:true ()));
+    exit 0
+  end;
+  let proj = ref None and a = ref None and b = ref None in
+  let mode = ref None and timeout = ref None and use_sim = ref true in
+  let scan = ref false and explain = ref None and save = ref None in
+  let list_regs = ref false in
+  let save_proj = ref None in
+  let rec go = function
+    | [] -> ()
+    | "--a" :: v :: t -> a := Some (parse_side "A" v); go t
+    | "--b" :: v :: t -> b := Some (parse_side "B" v); go t
+    | "--mode" :: v :: t ->
+        mode := Some (match v with
+          | "per-cone" -> Equiv_core.Per_cone
+          | "hier" | "hierarchical" -> Equiv_core.Hierarchical
+          | "flat" -> Equiv_core.Flat
+          | _ -> usage ()); go t
+    | "--timeout" :: v :: t -> timeout := Some (int_of_string v); go t
+    | "--no-sim" :: t -> use_sim := false; go t
+    | "--scan" :: t -> scan := true; go t
+    | "--list-regs" :: t -> list_regs := true; go t
+    | "--explain" :: v :: t -> explain := Some v; go t
+    | "--save" :: v :: t -> save := Some v; go t
+    | "--save-project" :: v :: t -> save_proj := Some v; go t
+    | "--tool" :: _ :: t -> go t          (* handled in [pre] *)
+    | "--tools" :: t -> go t
+    | f :: t when !proj = None && !a = None && String.length f > 0 && f.[0] <> '-' ->
+        proj := Some f; go t
+    | _ -> usage () in
+  go args;
+  let (sa, sb, overrides, pmode, ptmo) =
+    match !proj with
+    | Some p -> Equiv_core.load_project p
+    | None ->
+        (match !a, !b with
+         | Some x, Some y -> (x, y, [], Equiv_core.Flat, 30000)
+         | _ -> usage ()) in
+  let mode = match !mode with Some m -> m | None -> pmode in
+  let timeout = match !timeout with Some t -> t | None -> ptmo in
+  (* Writing the project from the CLI is what makes the GUI's persistence
+     testable, and lets a run be handed to someone else as one file. *)
+  (match !save_proj with
+   | Some f ->
+       Equiv_core.save_project f sa sb overrides mode timeout;
+       Printf.printf "wrote project %s\n%!" f
+   | None -> ());
+  (* A missing tool is a user-fixable condition, not a crash: print the
+     message (which names the fix) and exit, rather than an OCaml backtrace
+     with the "…" escaped into octal. *)
+  let load sp =
+    try Equiv_core.load_side sp with
+    | Failure m -> prerr_endline ("error: " ^ m); exit 2
+    | e -> prerr_endline ("error: " ^ Printexc.to_string e); exit 2 in
+  Printf.printf "[1/4] loading A (%s, top %s) …\n%!" sa.Equiv_core.s_frontend
+    sa.Equiv_core.s_top;
+  let a = load sa in
+  Printf.printf "[2/4] loading B (%s, top %s) …\n%!" sb.Equiv_core.s_frontend
+    sb.Equiv_core.s_top;
+  let b = load sb in
+  Printf.printf "[3/4] matching register spaces …\n%!";
+  let (pairs, b_left, stale) =
+    Equiv_core.match_registers ~use_sim:!use_sim ~overrides a b in
+  if stale <> [] then
+    List.iter (fun (an, bn) ->
+      Printf.eprintf "  ⚠ override %s → %s could not be applied (no such register)\n%!"
+        an bn) stale;
+  if !list_regs then print_string (Equiv_core.report_registers ~stale pairs b_left);
+  Printf.printf "[4/4] miter (%s, timeout %d ms) …\n%!"
+    (Equiv_core.mode_str mode) timeout;
+  let r = Equiv_core.run_miter ~mode ~timeout_ms:timeout a b pairs in
+  print_string r.Equiv_core.rr_log;
+  let report = Equiv_core.report_run a b pairs b_left r in
+  print_string report;
+  let extra = Buffer.create 1024 in
+  if !scan then begin
+    let (diff, unknown) = Equiv_core.differing_cones a b pairs in
+    Printf.bprintf extra "Differing cones (%d): %s\n" (List.length diff)
+      (String.concat ", " diff);
+    if unknown <> [] then
+      Printf.bprintf extra "Inconclusive cones (%d): %s\n" (List.length unknown)
+        (String.concat ", " unknown)
+  end;
+  (match !explain with
+   | None -> ()
+   | Some cone ->
+       (match Equiv_core.explain_cone a b pairs cone with
+        | Ok ce -> Buffer.add_string extra ("\n" ^ Equiv_core.report_ce ce)
+        | Error why -> Printf.bprintf extra "\ncounterexample: %s\n" why));
+  print_string (Buffer.contents extra);
+  (match !save with
+   | Some f ->
+       let oc = open_out f in
+       output_string oc report;
+       output_string oc (Buffer.contents extra);
+       close_out oc;
+       Printf.printf "wrote %s\n" f
+   | None -> ());
+  exit (Equiv_core.exit_code_of_verdict r.Equiv_core.rr_verdict)
+
 (* gate-miter: behavioral SV  ↔  gate-level SV (Liberty cells) *)
 let cmd_gate_miter args =
   let (top, beh, gate, lib_opt) = match args with
@@ -593,6 +749,9 @@ Verbs:
   parse       <frontend> <top> <files…>             dump BIR
   miter       <a> <b> <top> <files…>                Z3-equivalence between two frontends
   gate-miter  <top> <beh.sv> <gate.sv> [<lib>]      behavioral ↔ gate-level (Liberty cells)
+  equiv       <project.json> | --a <fe>,<top>,<files> --b …   equivalence workbench, headless
+                                                    (register matching + census + counterexample)
+  equiv --tools                                     scan for external tools; --tool fe=path selects one
   sweep       <a> <b> <flat.sv> [--top T] [--filter S]   per-entity miter across a flat design
   liberty     <file>                                dump Liberty + parse function exprs
   random      [-n N] [-seed S] [-out DIR] [-features M]  constrained-random generator
@@ -636,6 +795,7 @@ let () =
   | "parse"      :: rest -> cmd_parse rest
   | "miter"      :: rest -> cmd_miter rest
   | "gate-miter" :: rest -> cmd_gate_miter rest
+  | "equiv"      :: rest -> cmd_equiv rest
   | "sweep"      :: rest -> cmd_sweep rest
   | "liberty"    :: rest -> cmd_liberty rest
   | "random"     :: rest -> cmd_random rest

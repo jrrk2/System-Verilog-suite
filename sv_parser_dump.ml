@@ -120,15 +120,18 @@ let parse_text text =
  * `~/sv-parser/target/release/examples/parse_sv` — overridable via
  * the SV_PARSER_BIN environment variable for users with a non-
  * standard checkout. *)
-let default_sv_parser_bin =
+(* Read the env var at CALL time.  As a module-level `let` it was frozen at
+   program start, so a binary selected during the session (GUI tool picker, or
+   a putenv before the call) was ignored. *)
+let default_sv_parser_bin () =
   match Sys.getenv_opt "SV_PARSER_BIN" with
-  | Some p -> p
-  | None ->
+  | Some p when p <> "" -> p
+  | _ ->
       let home = try Sys.getenv "HOME" with Not_found -> "" in
       home ^ "/sv-parser/target/release/examples/parse_sv"
 
-let parse_file ?(bin = default_sv_parser_bin)
-               ?(incdirs = []) ?(defines = []) file =
+let parse_file ?bin ?(incdirs = []) ?(defines = []) file =
+  let bin = match bin with Some b -> b | None -> default_sv_parser_bin () in
   let inc_args =
     List.concat_map (fun d -> ["-i"; d]) incdirs in
   let def_args =

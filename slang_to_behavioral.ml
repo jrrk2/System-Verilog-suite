@@ -1259,13 +1259,31 @@ let convert_json (j : json) : bprogram =
 
 (* ─── Driver invocation ──────────────────────────────────────────── *)
 
+(* SLANG_BIN first, then the known checkout locations, then PATH.  This used
+   to be two hardcoded absolute paths with no PATH lookup and no override, so a
+   slang installed anywhere else simply "was not found" — and nothing the user
+   could set would change that. *)
 let find_slang () =
   let home = try Sys.getenv "HOME" with Not_found -> "/root" in
-  let candidates = [
-    home ^ "/sv-tests/third_party/tools/slang/build/bin/slang";
-    "/usr/local/bin/slang";
-  ] in
-  List.find_opt Sys.file_exists candidates
+  match Sys.getenv_opt "SLANG_BIN" with
+  | Some s when s <> "" && Sys.file_exists s -> Some s
+  | _ ->
+    let candidates = [
+      home ^ "/sv-tests/third_party/tools/slang/build/bin/slang";
+      home ^ "/slang/build/bin/slang";
+      "/usr/local/bin/slang";
+      "/usr/bin/slang";
+    ] in
+    (match List.find_opt Sys.file_exists candidates with
+     | Some s -> Some s
+     | None ->
+         (* PATH *)
+         (try
+            let ic = Unix.open_process_in "command -v slang 2>/dev/null" in
+            let r = (try String.trim (input_line ic) with End_of_file -> "") in
+            ignore (Unix.close_process_in ic);
+            if r = "" then None else Some r
+          with _ -> None))
 
 let convert_files ~top files : bprogram option =
   match find_slang () with
