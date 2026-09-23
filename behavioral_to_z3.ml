@@ -49,7 +49,7 @@ let rec expr_to_z3 expr =
       bv_var name width
 
   | BConst { value; width } ->
-      Z3.BitVector.mk_numeral ctx (string_of_int value) width
+      Z3.BitVector.mk_numeral ctx (Z.to_string value) width
 
   | BBinOp { op; lhs; rhs; result_type } ->
       let z3_lhs = expr_to_z3 lhs in

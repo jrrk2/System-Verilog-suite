@@ -525,6 +525,25 @@ let verify_rtlil_equiv rtlil_file1 rtlil_file2 =
       exit 1
 
 (* Print usage *)
+(* gate-clock: convert gated clocks to clock-enable flip-flops.
+   Reads Verilog/SV via the Verible frontend (which keeps module
+   instances -- an ICG stays a binstance -- unlike the gate-level RTLIL
+   reader), runs the Behavioral_gateclock pass, emits Verilog.
+   With --verify, logs every conversion (ICG/gate -> root clock + enable +
+   the flops moved onto a CE, and any sync-reset folded to a data reset-to-0)
+   for review -- the transform-aware acceptance evidence.  (The gated-clock =
+   clock-enable identity itself is a glitch-free-clock axiom; the Z3-checkable
+   content is the sync-reset fold, wired next.) *)
+let convert_gated_clocks rtlil_in verilog_out verify =
+  Printf.printf "=== Gated-clock -> clock-enable conversion ===\n\n";
+  Printf.printf "Reading %s (Verible frontend) ...\n%!" rtlil_in;
+  let prog = Verible_to_behavioral.convert_files_all [rtlil_in] in
+  if verify then Unix.putenv "GATECLOCK_DEBUG" "1";
+  Printf.printf "Converting gated clocks ...\n%!";
+  let prog' = Behavioral_gateclock.convert_program prog in
+  Behavioral_to_verilog.write_to_file verilog_out prog';
+  Printf.printf "Wrote %s\n" verilog_out
+
 let print_usage () =
   Printf.eprintf "SystemVerilog Decompiler - Unified Backend Selector\n\n";
   Printf.eprintf "Usage:\n";
@@ -542,6 +561,7 @@ let print_usage () =
   Printf.eprintf "  %s verify-rtlil <file.il>\n" Sys.argv.(0);
   Printf.eprintf "      Verify RTLIL file (self-equivalence check)\n\n";
   Printf.eprintf "  %s verify-rtlil-equiv <file1.il> <file2.il>\n" Sys.argv.(0);
+  Printf.eprintf "  %s gate-clock <in.v|.sv> <out.v> [--verify]\n" Sys.argv.(0);
   Printf.eprintf "      Verify two RTLIL files are equivalent\n\n";
   Printf.eprintf "  %s interactive\n" Sys.argv.(0);
   Printf.eprintf "      Start interactive console mode\n";
@@ -1073,6 +1093,11 @@ let () =
           let rtlil_file1 = Sys.argv.(2) in
           let rtlil_file2 = Sys.argv.(3) in
           verify_rtlil_equiv rtlil_file1 rtlil_file2
+      | "gate-clock" when Array.length Sys.argv >= 4 ->
+          let rtlil_in = Sys.argv.(2) in
+          let verilog_out = Sys.argv.(3) in
+          let verify = Array.length Sys.argv >= 5 && Sys.argv.(4) = "--verify" in
+          convert_gated_clocks rtlil_in verilog_out verify
       | "interactive" | "repl" | "i" ->
           Interactive.run ()
       | _ -> print_usage ()

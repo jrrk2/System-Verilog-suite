@@ -149,6 +149,14 @@ let find_ram_writes body =
           List.concat_map walk ss) cases in
         cs @ List.concat_map walk default
     | BBlock ss -> List.concat_map walk ss
+    (* Loop bodies count.  Rocket writes its caches as a for-loop over byte
+       lanes, and not descending here meant the array was never recognised as
+       a memory at all -- meminfer reported only `arr`, memlower had nothing
+       to lower, and 64x88 bits of tag array became LUT RAM.  Whether the
+       frontend unrolls such a loop or keeps it is an accident of the source
+       text; the memory underneath is the same either way. *)
+    | BWhile { body = ss; _ } -> List.concat_map walk ss
+    | BFor { body = ss; _ } -> List.concat_map walk ss
     | _ -> []
   in
   List.concat_map (fun p ->
@@ -446,23 +454,47 @@ let count_read_ports m_name processes =
  *
  * Reads use the same shape (see [count_read_ports] below).
  *)
+(* Write PORTS, not write sites.  A port is limited by how many DISTINCT
+   addresses may be written in one cycle, not by how many @mem_write calls
+   appear.  A byte-enabled write is emitted as one guarded call per lane,
+
+     if mask[0] then @mem_write(ram, addr, ...)
+     if mask[1] then @mem_write(ram, addr, ...)    (* the SAME addr *)
+     ... one per byte lane
+
+   and counting those separately made Rocket's 512x64 cache memory look
+   like 8W+1R.  No block RAM has eight write ports, so the FPGA path
+   declined it and 32 Kb that fits a single RAMB36E1 became 192 LUT RAMs.
+
+   Each statement therefore yields the SET of addresses it may write in one
+   cycle.  Siblings all execute, so their sets combine and equal addresses
+   collapse -- that is one port with a byte mask.  The arms of an if/case
+   are mutually exclusive, so they contribute whichever arm needs most. *)
 let count_write_sites_in_body m_name body =
+  let union a b =
+    List.fold_left
+      (fun acc x -> if List.exists (fun y -> y = x) acc then acc else x :: acc)
+      a b in
+  let widest a b = if List.length a >= List.length b then a else b in
   let rec stmt = function
+    | BCallStmt { func = "@mem_write"; args = (BVar n) :: addr :: _ }
+      when n = m_name -> [ addr ]
+    (* No address to compare: cannot prove it shares a port, so keep it
+       distinct rather than silently merging unrelated writes. *)
     | BCallStmt { func = "@mem_write"; args = (BVar n) :: _ }
-      when n = m_name -> 1
+      when n = m_name -> [ BVar ("@unknown_addr_" ^ m_name) ]
     | BIf { then_stmts; else_stmts; _ } ->
-        max (stmts then_stmts) (stmts else_stmts)
+        widest (stmts then_stmts) (stmts else_stmts)
     | BCase { cases; default; _ } ->
         let arms = List.map (fun (_, ss) -> stmts ss) cases in
-        let d = stmts default in
-        List.fold_left max d arms
+        List.fold_left widest (stmts default) arms
     | BBlock ss -> stmts ss
     | BWhile { body; _ } -> stmts body
     | BFor   { body; _ } -> stmts body
-    | _ -> 0
-  and stmts ss = List.fold_left (fun acc s -> acc + stmt s) 0 ss
+    | _ -> []
+  and stmts ss = List.fold_left (fun acc s -> union acc (stmt s)) [] ss
   in
-  stmts body
+  List.length (stmts body)
 
 let count_write_ports m_name processes =
   List.fold_left (fun acc p ->
@@ -474,13 +506,48 @@ let count_write_ports m_name processes =
 (* True if any read of `m_name` lives inside a BCombinational process —
  * that's the distributed/async-RAM pattern (Vivado infers LUT RAM).
  * False if every read is from a BSequential — block-RAM pattern. *)
+(* Signals assigned inside a clocked process, i.e. registers. *)
+let registered_signals processes =
+  let acc = ref [] in
+  let rec stmt = function
+    | BAssign { lhs; _ } -> if not (List.mem lhs !acc) then acc := lhs :: !acc
+    | BIf { then_stmts; else_stmts; _ } ->
+        List.iter stmt then_stmts; List.iter stmt else_stmts
+    | BCase { cases; default; _ } ->
+        List.iter (fun (_, ss) -> List.iter stmt ss) cases;
+        List.iter stmt default
+    | BBlock ss | BWhile { body = ss; _ } | BFor { body = ss; _ } ->
+        List.iter stmt ss
+    | _ -> ()
+  in
+  List.iter (function BSequential s -> List.iter stmt s.body | _ -> ()) processes;
+  !acc
+
 let read_is_async m_name processes =
   let found_async = ref false in
   let found_any = ref false in
+  let regs = registered_signals processes in
+  (* A read whose ADDRESS is a register is synchronous, whatever process the
+     array lookup itself sits in.  Rocket's SRAMs are written exactly this
+     way -- the address is captured on the clock and the array is then read
+     combinationally:
+
+       always @(posedge clk) reg_addr <= addr;
+       assign rdata = ram[reg_addr];
+
+     which is what a block RAM does in hardware.  Judged on the lookup alone
+     it looks asynchronous, and the memory was lowered to 256 x RAM128X1D
+     instead of one RAMB36E1. *)
+  let rec addr_is_registered = function
+    | BVar v -> List.mem v regs
+    | BSlice { signal; _ } -> addr_is_registered signal
+    | BConcat es -> es <> [] && List.for_all addr_is_registered es
+    | _ -> false
+  in
   let rec walk_e in_comb = function
-    | BSelect { array = BVar n; _ } when n = m_name ->
+    | BSelect { array = BVar n; index } when n = m_name ->
         found_any := true;
-        if in_comb then found_async := true
+        if in_comb && not (addr_is_registered index) then found_async := true
     | BBinOp { lhs; rhs; _ } -> walk_e in_comb lhs; walk_e in_comb rhs
     | BUnOp { operand; _ } -> walk_e in_comb operand
     | BSlice { signal; _ } -> walk_e in_comb signal

@@ -254,6 +254,12 @@ let find_writing_process m_name processes =
         List.exists (fun (_, ss) -> body_writes ss) cases
         || body_writes default || body_writes tl
     | BBlock ss :: tl -> body_writes ss || body_writes tl
+    (* Loop bodies, for the same reason find_ram_writes descends into them:
+       Rocket writes its caches from a for-loop over byte lanes, so without
+       this the process holding the write is invisible and the memory is
+       reported as having "no writing process". *)
+    | BWhile { body = ss; _ } :: tl -> body_writes ss || body_writes tl
+    | BFor { body = ss; _ } :: tl -> body_writes ss || body_writes tl
     | _ :: tl -> body_writes tl
   in
   let idx = ref None in
@@ -318,6 +324,21 @@ let rec strip_mem_writes m_name = function
       BCase { selector; cases = cs; default = d } :: strip_mem_writes m_name rest
   | BBlock ss :: rest ->
       BBlock (strip_mem_writes m_name ss) :: strip_mem_writes m_name rest
+  (* Loops, for the third time in this pass chain.  A write left inside an
+     unstripped loop body still drives the behavioural array after the BRAM
+     instances have been emitted, so the module ends up with both -- and the
+     surviving loop is what yosys rejects with "While loops are only allowed
+     in constant functions".  An emptied loop is dropped entirely: it existed
+     only to hold the writes. *)
+  | BWhile { condition; body } :: rest ->
+      (match strip_mem_writes m_name body with
+       | [] -> strip_mem_writes m_name rest
+       | b  -> BWhile { condition; body = b } :: strip_mem_writes m_name rest)
+  | BFor { init; condition; update; body } :: rest ->
+      (match strip_mem_writes m_name body with
+       | [] -> strip_mem_writes m_name rest
+       | b  -> BFor { init; condition; update; body = b } ::
+               strip_mem_writes m_name rest)
   | s :: rest -> s :: strip_mem_writes m_name rest
 
 (* Replace `BSelect (BVar m_name) _` with `BVar dout` in expressions
