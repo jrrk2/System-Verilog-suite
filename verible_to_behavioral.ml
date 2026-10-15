@@ -1486,7 +1486,14 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         else raise (Silent_zero_substitution
           (Printf.sprintf "sized literal Z.of_string %S%S failed" prefix digits))
     in
-    BConst { value; width }
+    (* an all-z literal (`1'bz`, `8'hzz`) is a high-impedance DRIVE, not 0:
+       keep it as the `@z` marker so Behavioral_iobuf_hoist can turn the
+       enclosing tristate assign into an IOBUF; anything that does not
+       understand the marker strips it back to 0 (strip_z_module). *)
+    let raw = String.concat "" (String.split_on_char '_' digits) in
+    if raw <> "" && String.for_all (fun c -> c = 'z' || c = 'Z') raw
+    then BCall { func = "@z"; args = [ BConst { value = Z.zero; width } ] }
+    else BConst { value; width }
   in
   match tok with
   | SymbolIdentifier id ->
@@ -1520,7 +1527,9 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
       let n2 = String.trim n in
       if n2 = "'1" then BConst { value = Z.minus_one; width = 0 }
       else if n2 = "'0" then BConst { value = Z.zero; width = 0 }
-      else if n2 = "'x" || n2 = "'z" || n2 = "'X" || n2 = "'Z" then
+      else if n2 = "'z" || n2 = "'Z" then
+        BCall { func = "@z"; args = [ BConst { value = Z.zero; width = 0 } ] }
+      else if n2 = "'x" || n2 = "'X" then
         BConst { value = Z.zero; width = 0 }
       else
         (try BConst { value = Z.of_string n; width = 32 }
@@ -7700,8 +7709,14 @@ let convert_module ~pkgs (mdecl : module_decl)
       let fix_assign lhs rhs =
         match Hashtbl.find_opt widths lhs with
         | Some lw when expr_signed rhs ->
+            (* `rw <= lw`, not `<`: a binop whose RESULT is already tagged with
+               the context width (y[8:0] = a[4:0] * b[3:0]) still has narrower
+               leaves, and every consumer (Z3's bvmul, hardcaml's *:) extends
+               those leaves UNSIGNED -- the three-way vote caught mul4s differing
+               from yosys-slang and verilator.  Pushing the width to the leaves
+               is a no-op when they already match. *)
             (match Behavioral_const.width_of_expr_with widths rhs with
-             | Some rw when rw < lw && rw > 0 -> Some (widen lw rhs)
+             | Some rw when rw <= lw && rw > 0 -> Some (widen lw rhs)
              | _ -> None)
         | _ -> None in
       let rec fs s = match s with

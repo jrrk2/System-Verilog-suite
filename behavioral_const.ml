@@ -27,12 +27,26 @@ type prop_context = {
   (* Known constant values for variables *)
   constants: (string, const_value) Hashtbl.t;
   mutable changes: int;  (* Track number of optimizations *)
+  (* In a CLOCKED body an assignment is non-blocking: a later read in the same
+     body still sees Q, so `r := const` must NOT make r a known constant.
+     [track] is false while propagating a BSequential body; only its
+     [blocking] vars (SV `=` inside always_ff) are tracked there. *)
+  mutable track: bool;
+  mutable blocking: string list;
 }
 
 let create_prop_context () = {
   constants = Hashtbl.create 50;
   changes = 0;
+  track = true;
+  blocking = [];
 }
+
+let in_seq_body ctx blocking f =
+  ctx.track <- false; ctx.blocking <- blocking;
+  let r = f () in
+  ctx.track <- true; ctx.blocking <- [];
+  r
 
 (* Evaluate binary operation on constants *)
 let eval_binop op v1 v2 =
@@ -134,6 +148,15 @@ let expr_to_const ctx = function
       (try Hashtbl.find ctx.constants var with Not_found -> CUnknown)
   | _ -> CUnknown
 
+(* A constant in CONDITION position: integers count too (`if (32'0)`,
+   `case (1'b1) ... (|32'0) & x:`), nonzero = true. *)
+let const_truth = function
+  | CBool b -> Some b
+  | CInt (v, _) -> Some (v <> 0)
+  | CUnknown -> None
+
+let width_of_rt = function BInt { width; _ } -> width | BBool -> 1 | _ -> 1
+
 (* Propagate constants through expression *)
 let rec propagate_expr ctx = function
   | BVar var as v ->
@@ -153,7 +176,16 @@ let rec propagate_expr ctx = function
       let lhs_const = expr_to_const ctx lhs' in
       let rhs_const = expr_to_const ctx rhs' in
 
+      let is_zero = function
+        | BConst { value; _ } -> Z.equal value Z.zero
+        | _ -> false in
       (match eval_binop op lhs_const rhs_const with
+       | CUnknown when op = BAnd && (is_zero lhs' || is_zero rhs') ->
+           (* x & 0 = 0 even when x is unknown (picorv32's
+              `ENABLE_IRQ && irq_state[1]` case-arm keys after parameter
+              substitution) *)
+           ctx.changes <- ctx.changes + 1;
+           BConst { value = Z.zero; width = width_of_rt result_type }
        | CUnknown ->
            (* Cannot fold, return expression with propagated operands *)
            BBinOp { op; lhs = lhs'; rhs = rhs'; result_type }
@@ -198,11 +230,11 @@ let rec propagate_expr ctx = function
       let condition' = propagate_expr ctx condition in
 
       (* Try to evaluate condition *)
-      (match expr_to_const ctx condition' with
-       | CBool true ->
+      (match const_truth (expr_to_const ctx condition') with
+       | Some true ->
            ctx.changes <- ctx.changes + 1;
            propagate_expr ctx then_val
-       | CBool false ->
+       | Some false ->
            ctx.changes <- ctx.changes + 1;
            propagate_expr ctx else_val
        | _ ->
@@ -218,15 +250,29 @@ let rec propagate_expr ctx = function
         args = List.map (propagate_expr ctx) args;
       }
 
+(* After a conditional, a variable is still a known constant only if EVERY
+   path leaves it with the same value.  Keep those keys of [ctx.constants]
+   that all tables in [others] agree on; drop the rest. *)
+let meet_into ctx (others : (string, const_value) Hashtbl.t list) =
+  let keys = Hashtbl.fold (fun k _ acc -> k :: acc) ctx.constants [] in
+  List.iter (fun k ->
+    let v = Hashtbl.find ctx.constants k in
+    if not (List.for_all (fun t ->
+              match Hashtbl.find_opt t k with Some v' -> v' = v | None -> false) others)
+    then Hashtbl.remove ctx.constants k) keys
+
 (* Propagate constants through statement *)
 let rec propagate_stmt ctx = function
   | BAssign { lhs; rhs } ->
       let rhs' = propagate_expr ctx rhs in
 
-      (* Track constant assignments *)
+      (* Track constant assignments (blocking semantics only) *)
       let const_val = expr_to_const ctx rhs' in
-      if const_val <> CUnknown then
-        Hashtbl.replace ctx.constants lhs const_val;
+      if const_val <> CUnknown && (ctx.track || List.mem lhs ctx.blocking) then
+        Hashtbl.replace ctx.constants lhs const_val
+      else if not ctx.track then
+        (* a non-blocking write invalidates nothing either: reads see Q *)
+        Hashtbl.remove ctx.constants lhs;
 
       BAssign { lhs; rhs = rhs' }
 
@@ -234,38 +280,72 @@ let rec propagate_stmt ctx = function
       let condition' = propagate_expr ctx condition in
 
       (* Try to eliminate dead branches *)
-      (match expr_to_const ctx condition' with
-       | CBool true ->
+      (match const_truth (expr_to_const ctx condition') with
+       | Some true ->
            ctx.changes <- ctx.changes + 1;
            BBlock (List.map (propagate_stmt ctx) then_stmts)
-       | CBool false ->
+       | Some false ->
            ctx.changes <- ctx.changes + 1;
            BBlock (List.map (propagate_stmt ctx) else_stmts)
        | _ ->
-           (* Cannot eliminate, propagate both branches *)
+           (* Cannot eliminate, propagate both branches; afterwards only the
+              constants BOTH branches agree on survive (the old code kept the
+              else-branch state, so `x = 0; if (c) x = 1;` left x "constant 0"
+              and a later `if (x)` was pruned -- picorv32 lost set_mem_do_rdata). *)
            let saved_constants = Hashtbl.copy ctx.constants in
 
            let then_stmts' = List.map (propagate_stmt ctx) then_stmts in
+           let after_then = Hashtbl.copy ctx.constants in
 
            Hashtbl.clear ctx.constants;
            Hashtbl.iter (fun k v -> Hashtbl.add ctx.constants k v) saved_constants;
 
            let else_stmts' = List.map (propagate_stmt ctx) else_stmts in
+           meet_into ctx [ after_then ];
 
            BIf { condition = condition'; then_stmts = then_stmts'; else_stmts = else_stmts' })
 
   | BCase { selector; cases; default } ->
       let selector' = propagate_expr ctx selector in
-
-      let cases' = List.map (fun (value, stmts) ->
+      let sel_const = expr_to_const ctx selector' in
+      (* each arm starts from the constants known BEFORE the case (arms are
+         alternatives, not a sequence) *)
+      let saved = Hashtbl.copy ctx.constants in
+      let restore () =
+        Hashtbl.clear ctx.constants;
+        Hashtbl.iter (fun k v -> Hashtbl.add ctx.constants k v) saved in
+      let ends = ref [] in
+      let cases' = List.filter_map (fun (value, stmts) ->
+        restore ();
         let value' = propagate_expr ctx value in
-        let stmts' = List.map (propagate_stmt ctx) stmts in
-        (value', stmts')
+        (* an arm whose constant key can never equal the constant selector is
+           dead whatever the arm order *)
+        let dead = match sel_const, expr_to_const ctx value' with
+          | CInt (s, _), CInt (k, _) -> s <> k
+          | CBool s, CInt (k, _) | CInt (k, _), CBool s -> (s <> (k <> 0))
+          | CBool s, CBool k -> s <> k
+          | _ -> false in
+        if dead then (ctx.changes <- ctx.changes + 1; None)
+        else begin
+          let stmts' = List.map (propagate_stmt ctx) stmts in
+          ends := Hashtbl.copy ctx.constants :: !ends;
+          Some (value', stmts')
+        end
       ) cases in
-
+      restore ();
       let default' = List.map (propagate_stmt ctx) default in
-
-      BCase { selector = selector'; cases = cases'; default = default' }
+      (* state after the case = meet over every arm, the default, and -- when
+         there is no default so no arm may match -- the pre-case state *)
+      let ends = Hashtbl.copy ctx.constants :: !ends in
+      let ends = if default = [] then saved :: ends else ends in
+      (match ends with
+       | first :: rest ->
+           Hashtbl.clear ctx.constants;
+           Hashtbl.iter (fun k v -> Hashtbl.add ctx.constants k v) first;
+           meet_into ctx rest
+       | [] -> ());
+      if cases' = [] then BBlock default'
+      else BCase { selector = selector'; cases = cases'; default = default' }
 
   | BWhile { condition; body } ->
       (* Variables written inside the loop body are not constant for
@@ -361,7 +441,7 @@ let propagate_process = function
 
   | BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body; blocking_vars } ->
       let ctx = create_prop_context () in
-      let body' = List.map (propagate_stmt ctx) body in
+      let body' = in_seq_body ctx blocking_vars (fun () -> List.map (propagate_stmt ctx) body) in
       (BSequential { name; clock; clock_edge; reset; reset_edge; reset_async; body = body'; blocking_vars }, ctx.changes)
 
 (* Propagate constants through module *)
@@ -460,7 +540,12 @@ let module_constants bmod =
   ) pairs;
   Hashtbl.fold (fun name rhss acc ->
     let const_of = function
-      | BConst { value; width } -> Some (CInt (Z.to_int value, width))
+      | BConst { value; width } ->
+          (* a literal beyond 63 bits (64-bit cycle counter reset values)
+             is not a foldable CInt; treat it as non-constant *)
+          (match Z.to_int value with
+           | v -> Some (CInt (v, width))
+           | exception Z.Overflow -> None)
       | _ -> None
     in
     let consts = List.map const_of rhss in
@@ -510,7 +595,7 @@ let propagate_module_with_globals bmod =
                       reset_async; body; blocking_vars } ->
           BSequential { name; clock; clock_edge; reset; reset_edge;
                         reset_async;
-                        body = List.map (propagate_stmt ctx) body;
+                        body = in_seq_body ctx blocking_vars (fun () -> List.map (propagate_stmt ctx) body);
                         blocking_vars }
     in
     total_changes := !total_changes + ctx.changes;
@@ -1070,3 +1155,96 @@ let strip_signed_module bmod =
 
 let strip_signed_program (prog : bprogram) : bprogram =
   { prog with modules = List.map strip_signed_module prog.modules }
+
+(* ========================================================================= *)
+(* Per-register constant folding (what yosys's opt_dff does for a DFF whose   *)
+(* D is a constant equal to its reset value).  A register every one of whose  *)
+(* writes -- in every branch of every clocked process, reset arm included --  *)
+(* assigns the SAME constant, that is never slice/indexed-written and never   *)
+(* written combinationally, is a wire: drop its assignments and drive it with *)
+(* `assign r = c`.  A declared initial value different from c blocks the      *)
+(* fold.  picorv32 with ENABLE_IRQ/ENABLE_TRACE off has eoi (32 bits),        *)
+(* trace_data (36) and trace_valid in this state after parameter folding.     *)
+(* ========================================================================= *)
+let fold_const_regs_module (bmod : bmodule) : bmodule =
+  let widths = signal_widths_of_module bmod in
+  (* writes per register: Some (set of constants) or None (= disqualified) *)
+  let writes : (string, Z.t list option) Hashtbl.t = Hashtbl.create 64 in
+  let disq r = Hashtbl.replace writes r None in
+  let note r v =
+    match Hashtbl.find_opt writes r with
+    | Some None -> ()
+    | Some (Some l) -> if not (List.exists (Z.equal v) l) then Hashtbl.replace writes r (Some (v :: l))
+    | None -> Hashtbl.replace writes r (Some [ v ]) in
+  let mask r v =
+    match Hashtbl.find_opt widths r with
+    | Some w when w > 0 && w < 1024 -> Z.logand v (Z.sub (Z.shift_left Z.one w) Z.one)
+    | _ -> v in
+  let rec scan_stmt ~seq = function
+    | BAssign { lhs; rhs } ->
+        if not seq then disq lhs
+        else (match rhs with
+              | BConst { value; _ } -> note lhs (mask lhs value)
+              | _ -> disq lhs)
+    | BCallStmt { args = BVar t :: _; func } when String.length func > 0 && func.[0] = '@' -> disq t
+    | BIf { then_stmts; else_stmts; _ } -> List.iter (scan_stmt ~seq) then_stmts; List.iter (scan_stmt ~seq) else_stmts
+    | BCase { cases; default; _ } ->
+        List.iter (fun (_, b) -> List.iter (scan_stmt ~seq) b) cases; List.iter (scan_stmt ~seq) default
+    | BBlock b | BWhile { body = b; _ } | BFor { body = b; _ } -> List.iter (scan_stmt ~seq) b
+    | _ -> () in
+  List.iter (function
+    | BSequential { body; blocking_vars; _ } ->
+        List.iter (scan_stmt ~seq:true) body;
+        List.iter disq blocking_vars
+    | BCombinational { body; _ } -> List.iter (scan_stmt ~seq:false) body) bmod.processes;
+  (* instance output pins also drive signals *)
+  List.iter (fun (i : binstance) ->
+    List.iter (fun (_, e) -> match e with BVar n -> disq n | _ -> ()) i.port_connections) bmod.instances;
+  let foldable =
+    Hashtbl.fold (fun r w acc ->
+      match w with
+      | Some [ c ] ->
+          (match List.find_opt (fun (s : bsignal) -> s.name = r) bmod.signals with
+           | Some { stype = BInt _; direction = (`Internal | `Output); initial_value; _ } ->
+               let init_ok = match initial_value with
+                 | None -> true
+                 | Some (BConst { value; _ }) -> Z.equal (mask r value) c
+                 | Some _ -> false in
+               if init_ok then (r, c) :: acc else acc
+           | _ -> acc)
+      | _ -> acc) writes [] in
+  if foldable = [] then bmod
+  else begin
+    let is_fold r = List.mem_assoc r foldable in
+    let rec strip = function
+      | [] -> []
+      | s :: rest -> (match strip_stmt s with Some s' -> s' :: strip rest | None -> strip rest)
+    and strip_stmt = function
+      | BAssign { lhs; _ } when is_fold lhs -> None
+      | BIf { condition; then_stmts; else_stmts } ->
+          let t = strip then_stmts and e = strip else_stmts in
+          if t = [] && e = [] then None else Some (BIf { condition; then_stmts = t; else_stmts = e })
+      | BCase { selector; cases; default } ->
+          let cases = List.map (fun (k, b) -> (k, strip b)) cases and default = strip default in
+          if List.for_all (fun (_, b) -> b = []) cases && default = [] then None
+          else Some (BCase { selector; cases; default })
+      | BBlock b -> (match strip b with [] -> None | b' -> Some (BBlock b'))
+      | s -> Some s in
+    let processes =
+      List.filter_map (function
+        | BSequential r ->
+            (match strip r.body with
+             | [] -> None
+             | body -> Some (BSequential { r with body }))
+        | p -> Some p) bmod.processes in
+    let drivers =
+      BCombinational { name = "__const_regs"; sensitivity = [ BAny ]
+                     ; body = List.map (fun (r, c) ->
+                         BAssign { lhs = r; rhs = BConst { value = c; width = (match Hashtbl.find_opt widths r with Some w -> w | None -> 1) } }) foldable } in
+    Printf.eprintf "[const_regs] %s: %d constant register(s) folded to wires: %s\n%!"
+      bmod.name (List.length foldable) (String.concat ", " (List.map fst foldable));
+    { bmod with processes = processes @ [ drivers ] }
+  end
+
+let fold_const_regs_program (p : bprogram) : bprogram =
+  { p with modules = List.map fold_const_regs_module p.modules }

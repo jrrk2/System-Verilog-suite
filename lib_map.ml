@@ -1156,12 +1156,27 @@ let dce ~root_nets (nl : netlist) : netlist =
       let i = String.index n '[' in
       String.sub n 0 i
     with Not_found -> n in
-  let live_for n =
-    Hashtbl.mem live n || Hashtbl.mem live (base_of n) in
   let bus_widths = Hashtbl.create 64 in
   List.iter (fun (n, w) -> Hashtbl.replace bus_widths n w) nl.wires;
   List.iter (fun (n, w) -> Hashtbl.replace bus_widths n w) nl.inputs;
   List.iter (fun (n, w) -> Hashtbl.replace bus_widths n w) nl.outputs;
+  (* A net is live if it was marked itself, if its whole bus was marked, or
+     -- for a BARE bus name -- if ANY of its bits was marked.  The sweep marks
+     per-bit names as it walks cell pins (`CState[3]`), but the bus-level
+     objects (`wire [3:0] CState`, `assign _n_13_ = _n_14_`) are keyed by the
+     bare name; without the any-bit test they were filtered out, leaving
+     every multi-bit register's D net undriven and its whole next-state cone
+     swept (uart_transmitter lost iTx2 + CState's driver; picorv32 shipped
+     284 of 1565 FFs).  Conservative: keeping a bus whose one bit is live
+     never drops logic. *)
+  let live_for n =
+    Hashtbl.mem live n || Hashtbl.mem live (base_of n)
+    || (base_of n = n
+        && (match Hashtbl.find_opt bus_widths n with
+            | Some w when w > 1 ->
+                let rec any i = i < w && (Hashtbl.mem live (Printf.sprintf "%s[%d]" n i) || any (i + 1)) in
+                any 0
+            | _ -> false)) in
 
   let mark_with_bits x =
     mark x;
@@ -1221,14 +1236,20 @@ let dce ~root_nets (nl : netlist) : netlist =
           List.iter push (extract_idents c.net)
       ) inst.conns in
     List.iter visit_inst (Hashtbl.find_all by_out_net net);
+    (* ALWAYS consult the base-name indexes, bare or per-bit.  When a reader
+       names a bit (`CState[0]`), [extract_idents] yields the bare name first;
+       [mark_with_bits] then marks every bit live WITHOUT queueing them, so
+       the per-bit names never pop and -- with the old `if bare <> net` guard
+       -- popping the bare name visited no per-bit driver either.  Every
+       multi-bit register's DFF cells thus survived (their Q bits were marked)
+       while their D cones were never walked and got swept: uart_transmitter
+       lost iTx2 and CState's driver, picorv32 shipped 284 of 1565 FFs. *)
     let bare = base_of net in
-    if bare <> net then
-      List.iter visit_inst (Hashtbl.find_all by_base_out_net bare);
+    List.iter visit_inst (Hashtbl.find_all by_base_out_net bare);
     List.iter (fun rhs -> List.iter push (extract_idents rhs))
       (Hashtbl.find_all assigns_by_lhs net);
-    if bare <> net then
-      List.iter (fun rhs -> List.iter push (extract_idents rhs))
-        (Hashtbl.find_all assigns_by_base bare)
+    List.iter (fun rhs -> List.iter push (extract_idents rhs))
+      (Hashtbl.find_all assigns_by_base bare)
   done;
 
   let inst_alive (i : instance) =
@@ -1236,6 +1257,18 @@ let dce ~root_nets (nl : netlist) : netlist =
       c.pin = i.cell.out_pin && live_for c.net) i.conns in
   let assign_alive (lhs, _) = live_for lhs in
   let wire_alive (n, _) = live_for n in
+  if Sys.getenv_opt "SVS_DCE_DEBUG" = Some "1" then begin
+    let nb l = List.length (List.filter (fun (_, w) -> w > 1) l) in
+    Printf.eprintf "[dce] wires %d (bus %d) -> %d (bus %d); assigns %d -> %d; insts %d -> %d\n%!"
+      (List.length nl.wires) (nb nl.wires)
+      (List.length (List.filter wire_alive nl.wires)) (nb (List.filter wire_alive nl.wires))
+      (List.length nl.assigns) (List.length (List.filter assign_alive nl.assigns))
+      (List.length nl.insts) (List.length (List.filter inst_alive nl.insts));
+    List.iter (fun (n, w) ->
+      if w > 1 && not (wire_alive (n, w)) then
+        Printf.eprintf "[dce]   dropped bus wire %s[%d] (bare live=%b bit0 live=%b)\n%!" n w
+          (Hashtbl.mem live n) (Hashtbl.mem live (n ^ "[0]"))) nl.wires
+  end;
   {
     nl with
     insts   = List.filter inst_alive nl.insts;

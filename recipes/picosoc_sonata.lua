@@ -63,6 +63,7 @@ prog = svd.iflift(prog)
 prog = svd.blocking_subst(prog)
 prog = svd.meminfer(prog)
 prog = svd.memlower(prog)
+prog = svd.dsp_infer(prog)   -- BMul -> DSP48E1 where it fits (GATE_MAP_DSP=0 disables)
 prog = svd.ssa(prog)
 print("  pipeline done")
 

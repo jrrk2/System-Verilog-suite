@@ -150,6 +150,10 @@ let lift_process = function
       BSequential { s with body = List.map (lift_stmt ~multi) s.body }
 
 let lift_module (m : bmodule) =
+  (* First move non-blocking slice writes onto a blocking next-state temp
+     (Behavioral_nba_slice) so a guarded `r[k] <= v` after a whole-register
+     NBA patches the pending value instead of the register's Q. *)
+  let m = Behavioral_nba_slice.rewrite_module m in
   { m with processes = List.map lift_process m.processes }
 
 let lift_program (p : bprogram) =

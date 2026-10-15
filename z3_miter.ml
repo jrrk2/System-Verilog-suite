@@ -73,6 +73,15 @@ let bv_var name width suffix =
    UNCOMPARABLE. *)
 exception Vacuous_comparison of string
 
+(* Strict interface mode.  By default a miter compares only the OUTPUTS the two
+   sides have in common, so a side that LOST a register (its `<q>__D` output
+   vanishes) or lost an output driver is never compared on that signal and can
+   be reported EQUIVALENT -- a netlist whose state register's D net was swept
+   proved "equivalent" this way.  With [strict_interfaces] set, any output
+   present on one side only raises [Interface_mismatch] naming it. *)
+let strict_interfaces = ref false
+exception Interface_mismatch of string
+
 (* Z3 returned UNKNOWN (timeout / incomplete theory).  This is NOT a
    difference, and collapsing it to `false` made a 30-second timeout
    indistinguishable from a real counterexample -- a hierarchical module then
@@ -927,8 +936,17 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
      (their `Q__D` boundary outputs vanish on one side).  Don't bail — compare
      only the COMMON outputs (the miter loop below filters).  A real primary-
      output difference still shows because those outputs are common. *)
-  if output_names1 <> output_names2 then
+  if output_names1 <> output_names2 then begin
     Printf.printf "⚠ Output interfaces differ (comparing common outputs only)\n";
+    let only l1 l2 = List.filter (fun n -> not (List.mem n l2)) l1 in
+    let o1 = only output_names1 output_names2 and o2 = only output_names2 output_names1 in
+    Printf.printf "  outputs only in D1: [%s]\n  outputs only in D2: [%s]\n"
+      (String.concat ", " o1) (String.concat ", " o2);
+    if !strict_interfaces then
+      raise (Interface_mismatch
+        (Printf.sprintf "outputs only in D1: [%s]; only in D2: [%s]"
+           (String.concat ", " o1) (String.concat ", " o2)))
+  end;
   begin
     Printf.printf "✓ Interfaces reconciled\n\n";
 

@@ -254,6 +254,8 @@ let rec verilog_of_expr = function
         (verilog_of_expr condition)
         (verilog_of_expr then_val)
         (verilog_of_expr else_val)
+  | BCall { func = "@z"; args = [ BConst { width; _ } ] } ->
+      if width <= 1 then "1'bz" else Printf.sprintf "{%d{1'bz}}" width
   | BCall { func = "@signed"; args = [x] } ->
       (* Verible's $signed-cast marker (kept for the behav-verilog path — see
          sv_lua.post_load).  Render as a real Verilog signed cast so signed

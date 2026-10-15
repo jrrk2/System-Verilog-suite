@@ -25,6 +25,7 @@ open Hardcaml
 let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
     ?(lutpack = false) ?(mfs2_var_elim = false) ?(mfs2_odc = false)
     ?(aig_balance = 0)
+    ?(backend : Fpga_opts.backend = (Fpga_opts.get ()).Fpga_opts.backend)
     ?(diff_clocks : (string * (string * string)) list = [])
     ~(k : int) ~(name : string) (l : Bir_to_aig.lowered)
   : Circuit.t =
@@ -128,8 +129,8 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
      any output inversion already folded — used where abc's exact-area beats
      the native cover (register/CSR-heavy cones). *)
   let abc_outs =
-    match Stdlib.Sys.getenv_opt "LUTCOVER_BACKEND" with
-    | Some "abc" ->
+    match backend with
+    | Fpga_opts.Abc ->
       let input_nodes =
         Array.filter_map g.Lut_cover.nodes ~f:(fun nd ->
           match nd.Lut_cover.gate with
@@ -137,7 +138,7 @@ let map_lowered ?(io = false) ?(mode : Lut_cover.cost_mode = `Area)
           | _ -> None)
       in
       Some (Abc_cover.map_graph g ~k ~name ~input_nodes ~resolve_input:signal_of_node)
-    | _ ->
+    | Fpga_opts.Native ->
       let chosen = Lut_cover.cover ~mode ~k g in
       (* Convert chosen cuts to packed_luts and optionally lutpack-fuse
          single-fanout parent-child pairs. *)

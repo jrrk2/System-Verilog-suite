@@ -52,6 +52,9 @@ child_prog = svd.memlower(child_prog)
 -- Map shift-register chains onto SRL16E/SRLC32E rather than bit-blasting them
 -- into FF chains (matches Vivado's SRL inference; big FF savings in PCS/PMA).
 child_prog = svd.srl_infer(child_prog)
+-- Multipliers that fit a DSP48E1 (25x18 signed / 24x17 unsigned) become one
+-- DSP instance each (Behavioral_dsp_infer); GATE_MAP_DSP=0 keeps the LUT array.
+child_prog = svd.dsp_infer(child_prog)
 print("  child pipeline done")
 
 -- 3. Gate-map the child (BIR -> AIG -> LUT cover -> Hardcaml Circuit)

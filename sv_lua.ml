@@ -711,6 +711,10 @@ let cut_blackboxes ?(trusted : string list = []) (m : bmodule) (p : bprogram) : 
     let iopad_dir pin : [ `Input | `Output ] = if pin = "O" then `Output else `Input in
     (* pin-direction oracle: JSON, then RAM, then IO-pad fallback *)
     let pin_dir name pin : [ `Input | `Output ] option =
+      (* the pad pin of an IO buffer is the external world: neither tied nor
+         compared (the port table lists it as an output, which would tie the
+         inout port itself to a free input) *)
+      if is_iopad name && (pin = "IO" || pin = "IOB") then None else
       match port_dirs name with
       | Some ps -> List.find_map (fun (pn, d, _) -> if pn = pin then Some d else None) ps
       | None ->
@@ -1413,6 +1417,11 @@ let merge_slice_processes (m : bmodule) : bmodule =
 
 let prep_for_z3 ?(trusted : string list = []) (m : bmodule) (p : bprogram) : bmodule =
   let p, _n = Behavioral_arch_subst.substitute_program p in
+  (* Both sides get the same IOBUF black box for a behavioural tristate pad
+     (the netlist side already carries it from gate_map), so cut_blackboxes
+     compares drive/direction and ties the sense -- three signals per pad. *)
+  let m = Behavioral_iobuf_hoist.hoist_one m in
+  let p = { p with modules = List.map (fun (mm : bmodule) -> if mm.name = m.name then m else mm) p.modules } in
   let result =
     match List.find_opt (fun (mm : bmodule) -> mm.name = m.name) p.modules with
     | None -> m
@@ -1492,12 +1501,24 @@ let miter_core ?(trusted : string list = [])
             miter constrained nothing.  Reporting DIFFER here manufactures
             exactly the false counterexamples this flow keeps chasing. *)
          Printf.sprintf "UNCOMPARABLE — %s" why
+     | Z3_miter.Interface_mismatch why ->
+         (* strict mode (svd.miter_strict): a signal one side lost is a
+            difference, not something to skip. *)
+         Printf.sprintf "DIFFER — interface mismatch: %s" why
      | e -> Printf.sprintf "ERROR — %s" (Printexc.to_string e))
 
 let lmiter a_h b_h =
   let (_, ma, pa) = find_mod a_h in
   let (_, mb, pb) = find_mod b_h in
   miter_core (ma, pa) (mb, pb)
+
+(* svd.miter_strict(a, b): like miter, but an output present on one side only
+   (a lost register's `<q>__D`, a dropped output driver) is a DIFFER, not a
+   silently skipped signal. *)
+let lmiter_strict a_h b_h =
+  Z3_miter.strict_interfaces := true;
+  Fun.protect ~finally:(fun () -> Z3_miter.strict_interfaces := false)
+    (fun () -> lmiter a_h b_h)
 
 (* ── Compositional bottom-up hierarchical miter ─────────────────────────
  * Compare two whole programs (two synthesis flows of the same RTL) module
@@ -2546,8 +2567,23 @@ let lsrl_infer prog_h =
 
 let lmemlower prog_h =
   let label, p = find_prog prog_h in
+  (* svd.memlower is the FPGA recipes' pass: target LUTRAM/BRAM by default
+     (Fpga_opts.fpga_mem); MEMLOWER_FPGA=0 forces the ASIC-macro path. *)
+  Behavioral_memlower.default_fpga := (Fpga_synth.Fpga_opts.get ()).Fpga_synth.Fpga_opts.fpga_mem;
   let p', _ = Behavioral_memlower.lower_program p in
   hadd (Prog (label, p'))
+
+(* svd.dsp_infer(prog): BMul -> DSP48E1 instances (Behavioral_dsp_infer).
+   A no-op when the profile has dsp_infer off. *)
+let ldsp_infer prog_h =
+  let label, p = find_prog prog_h in
+  let o = Fpga_synth.Fpga_opts.get () in
+  if not o.Fpga_synth.Fpga_opts.dsp_infer then hadd (Prog (label, p))
+  else hadd (Prog (label, Behavioral_dsp_infer.infer_program
+                            ~min_width:o.Fpga_synth.Fpga_opts.dsp_min_width p))
+
+(* svd.fpga_opts(): the effective FPGA flow profile, one line. *)
+let lfpga_opts () = Fpga_synth.Fpga_opts.describe (Fpga_synth.Fpga_opts.get ())
 
 let lcdc_check prog_h macro =
   let _label, p = find_prog prog_h in
@@ -3212,14 +3248,20 @@ let build_port_dir (m : Behavioral_ir.bmodule) (prog : Behavioral_ir.bprogram)
 
 let lgate_map mod_h k_lut io_flag =
   let _, m0, prog = find_mod mod_h in
+  (* tristate drives on inout pads -> IOBUF black boxes (Behavioral_iobuf_hoist) *)
+  let m0 = Behavioral_iobuf_hoist.hoist_one m0 in
+  let prog = { prog with modules = List.map (fun (mm : bmodule) -> if mm.name = m0.name then m0 else mm) prog.modules } in
   (* GATE_MAP_BIR_OPT=1: run the intra-module BIR cleanup (const-prop -> DCE ->
      CSE) on the module BEFORE create_circuit.  Without it the create_circuit /
      bir_to_aig lowering sees unoptimised BIR and produces a bloated AIG (the
      "front-end" half of the LUT gap vs yosys: 20x LUT1 buffers, redundant
      cones).  These passes exist (behavioral_optimize pipeline) but were only
      wired into the interactive/Z3 flows, not gate_map. *)
+  let opts = Fpga_synth.Fpga_opts.get () in
+  Fpga_synth.Fpga_opts.announce ();
+  Behavioral_to_hardcaml.balanced_case_default := opts.Fpga_synth.Fpga_opts.balanced_case;
   let m =
-    if Sys.getenv_opt "GATE_MAP_BIR_OPT" = Some "1" then begin
+    if opts.Fpga_synth.Fpga_opts.bir_opt then begin
       let on v = Sys.getenv_opt v = Some "1" in
       let single = { prog with modules = [ m0 ] } in
       (* const-prop and DCE are safe; CSE is opt-in (GATE_MAP_BIR_CSE) because it
@@ -3227,16 +3269,43 @@ let lgate_map mod_h k_lut io_flag =
       let single =
         if on "GATE_MAP_BIR_NOCP" then single
         else fst (Behavioral_const.propagate_to_fixpoint single) in
+      (* Constant-register folding (Behavioral_const.fold_ffs): a register whose
+         next state is a constant equal to its reset value is a wire -- what
+         yosys's opt_dff removes.  picorv32 with ENABLE_IRQ/ENABLE_TRACE off
+         carries eoi (32) + trace_data (36) + trace_valid this way.
+         GATE_MAP_BIR_NOFOLD=1 skips. *)
+      (* fold_const_regs turns constant registers into constant wires, which
+         exposes new constants to the propagator (irq_mask -> irq_pending ->
+         eoi ...); iterate the pair a few rounds. *)
+      let single =
+        if on "GATE_MAP_BIR_NOFOLD" then single
+        else begin
+          let rec rounds p n =
+            if n = 0 then p
+            else
+              let p' = Behavioral_const.fold_const_regs_program
+                         (Behavioral_const.fold_ffs_program p) in
+              let p'' = fst (Behavioral_const.propagate_to_fixpoint p') in
+              if p'' = p then p else rounds p'' (n - 1) in
+          rounds single 4
+        end in
       let single =
         if on "GATE_MAP_BIR_NODCE" then single
         else Behavioral_dce.eliminate_dead_program single in
       let single =
-        if on "GATE_MAP_BIR_CSE" then fst (Behavioral_cse.apply_cse_program single)
+        if opts.Fpga_synth.Fpga_opts.bir_cse then fst (Behavioral_cse.apply_cse_program single)
         else single in
       (match single.Behavioral_ir.modules with m' :: _ -> m' | [] -> m0)
     end
     else m0
   in
+  (* GATE_MAP_BIR_DUMP=<path>: the module BIR as gate_map sees it after the
+     pre-mapping optimisation (bisect the BIR passes vs the lowering). *)
+  (match Sys.getenv_opt "GATE_MAP_BIR_DUMP" with
+   | Some path when path <> "" ->
+       let oc = open_out_gen [Open_append; Open_creat] 0o644 path in
+       output_string oc (Behavioral_ir.string_of_bmodule m); output_string oc "\n"; close_out oc
+   | _ -> ());
   let port_dir = build_port_dir m prog in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in
   (* GATE_MAP_EMIT_CIRCUIT=<dir>: dump the create_circuit output (pre bir_to_aig /
@@ -3252,28 +3321,15 @@ let lgate_map mod_h k_lut io_flag =
        GATE_MAP_MODE = area | delay | mixed[:N]   (N = slack tolerance, default 1)
        GATE_MAP_LUTPACK=1   enable LUT packing (area recovery)
        GATE_MAP_MFS2=1      enable mfs2 don't-care optimisation *)
-  let mode : Fpga_synth.Lut_cover.cost_mode =
-    match Sys.getenv_opt "GATE_MAP_MODE" with
-    | Some "delay" -> `Delay
-    | Some s when String.length s >= 5 && String.sub s 0 5 = "mixed" ->
-        let tol =
-          if String.length s > 6 && s.[5] = ':'
-          then (try int_of_string (String.sub s 6 (String.length s - 6)) with _ -> 1)
-          else 1 in
-        `Mixed tol
-    | _ -> `Area in
-  let envflag v = Sys.getenv_opt v = Some "1" in
-  let lutpack = envflag "GATE_MAP_LUTPACK" in
-  let mfs2 = envflag "GATE_MAP_MFS2" in
-  let mfs2_var = envflag "GATE_MAP_MFS2_VAR" || mfs2 in
-  let mfs2_odc = envflag "GATE_MAP_MFS2_ODC" || mfs2 in
-  let aig_balance =
-    match Sys.getenv_opt "GATE_MAP_AIG_BALANCE" with
-    | Some s -> (try int_of_string s with _ -> 0)
-    | None -> 0 in
+  let mode = opts.Fpga_synth.Fpga_opts.mode in
+  let lutpack = opts.Fpga_synth.Fpga_opts.lutpack in
+  let mfs2_var = opts.Fpga_synth.Fpga_opts.mfs2_var in
+  let mfs2_odc = opts.Fpga_synth.Fpga_opts.mfs2_odc in
+  let aig_balance = opts.Fpga_synth.Fpga_opts.aig_balance in
   let mapped = Fpga_synth.Fpga_map.map_lowered
     ~io:(io_flag <> 0) ~k:k_lut ~name:m.name
-    ~mode ~lutpack ~mfs2_var_elim:mfs2_var ~mfs2_odc ~aig_balance l in
+    ~mode ~lutpack ~mfs2_var_elim:mfs2_var ~mfs2_odc ~aig_balance
+    ~backend:opts.Fpga_synth.Fpga_opts.backend l in
   hadd (Mapped (m.name, mapped))
 
 (* Emit EVERY module's create_circuit output as Verilog into [dir], one file per
@@ -4252,6 +4308,10 @@ module MakeLib
                        (wrap2 lpick);
         "miter",      V.efunc (V.string **-> V.string **->> V.string)
                        (wrap2 lmiter);
+        "miter_strict", V.efunc (V.string **-> V.string **->> V.string)
+                       (wrap2 lmiter_strict);
+        "dsp_infer",  V.efunc (V.string **->> V.string) (wrap1 ldsp_infer);
+        "fpga_opts",  V.efunc (V.unit **->> V.string) lfpga_opts;
         "miter_hier", V.efunc (V.string **-> V.string **-> V.string
                                **->> V.string)
                        (wrap3 lmiter_hier);

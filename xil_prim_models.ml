@@ -424,6 +424,38 @@ let ram32x1d_body ~init =
 (* ---------------------------------------------------------------------- *)
 (* Dispatch: binstance -> specialised body bmodule (or None if unknown).   *)
 (* ---------------------------------------------------------------------- *)
+(* ---------------------------------------------------------------------- *)
+(* DSP48E1, combinational configuration (every *REG parameter 0, which is   *)
+(* what Behavioral_dsp_infer and yosys's bare-$mul mapping emit):           *)
+(*   M = sext48(A[24:0]) * sext48(B[17:0])                                   *)
+(*   P = M + (OPMODE[6:4] == 3'b011 ? C : 0)                                 *)
+(* i.e. multiply (OPMODE 0000101) and multiply-add-C (OPMODE 0110101).      *)
+(* Cascade, carry, pattern-detect outputs and the pipeline registers are     *)
+(* not modelled; an instance using them should not be routed through this.  *)
+(* ---------------------------------------------------------------------- *)
+let dsp48e1_body () =
+  let w48 = BInt { width = 48; signed = Unsigned } in
+  let bit name i = BSlice { signal = v name; msb = i; lsb = i } in
+  let sx name hi =
+    BConcat [ BReplicate { count = 48 - (hi + 1); value = bit name hi };
+              BSlice { signal = v name; msb = hi; lsb = 0 } ] in
+  let m = BBinOp { op = BMul; lhs = sx "A" 24; rhs = sx "B" 17; result_type = w48 } in
+  let z_is_c = BBinOp { op = BEq; lhs = BSlice { signal = v "OPMODE"; msb = 6; lsb = 4 };
+                        rhs = BConst { value = Z.of_int 3; width = 3 }; result_type = b1 } in
+  let z = BCond { condition = z_is_c; then_val = v "C";
+                  else_val = BConst { value = Z.zero; width = 48 } } in
+  let p = BBinOp { op = BAdd; lhs = m; rhs = z; result_type = w48 } in
+  let signals =
+    [ sig_wide "A" 30 `Input (); sig_wide "B" 18 `Input (); sig_wide "C" 48 `Input ();
+      sig_wide "D" 25 `Input (); sig_wide "OPMODE" 7 `Input ();
+      sig_wide "ACIN" 30 `Input (); sig_wide "BCIN" 18 `Input (); sig_wide "PCIN" 48 `Input ();
+      sig_wide "ALUMODE" 4 `Input (); sig_wide "CARRYIN" 1 `Input ();
+      sig_wide "CARRYINSEL" 3 `Input (); sig_wide "INMODE" 5 `Input ();
+      sig_wide "P" 48 `Output () ] in
+  let proc = BCombinational { name = "comb"; sensitivity = [BAny];
+                              body = [ BAssign { lhs = "P"; rhs = p } ] } in
+  empty_mod "DSP48E1" signals [proc]
+
 let lut_arity = function
   | "LUT1" -> Some 1 | "LUT2" -> Some 2 | "LUT3" -> Some 3
   | "LUT4" -> Some 4 | "LUT5" -> Some 5 | "LUT6" -> Some 6 | _ -> None
@@ -476,6 +508,7 @@ let synth (i : binstance) : bmodule option =
             [("IS_D_INVERTED","D"); ("IS_CLR_INVERTED","CLR")] in
         Some (bare_ff_body ~ty:"FDC" ~ctrl:(Some "CLR") ~set_val:false ~init ~inv)
     | "CARRY4" -> Some (carry4_body ())
+    | "DSP48E1" -> Some (dsp48e1_body ())
     | "RAM64M" ->
         let ini key = match param_lookup i key with
           | Some s -> normalize_init ~k:6 s | None -> String.make 64 '0' in

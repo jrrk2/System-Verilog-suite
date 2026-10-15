@@ -563,6 +563,27 @@ let expand_instance ?canon ?(sigw : (string, int) Hashtbl.t = Hashtbl.create 0)
         List.mapi (fun b n -> BAssign { lhs = n; rhs = arr.(b) }) (out_nets i port) in
       let body = asg "O" o @ asg "CO" co in
       if body = [] then [], true else [ comb ("exp_carry_" ^ i.inst_name) body ], false
+  | "DSP48E1" ->
+      (* combinational configuration (all *REG = 0): P = sext(A[24:0]) *
+         sext(B[17:0]) + (OPMODE[6:4] == 3'b011 ? C : 0) -- same model as
+         Xil_prim_models.dsp48e1_body, so a DSP the mapper inferred is checked
+         against the source multiply rather than abstracted to a UF. *)
+      let w48 = BInt { width = 48; signed = Unsigned } in
+      let b1  = BInt { width = 1; signed = Unsigned } in
+      let bits name n = List.init n (fun b -> in_bit i name b) in       (* LSB first *)
+      let cat_lsb l = BConcat (List.rev l) in                              (* -> msb first *)
+      let sx l w = BConcat [ BReplicate { count = 48 - w; value = List.nth l (w - 1) }; cat_lsb l ] in
+      let m = BBinOp { op = BMul; lhs = sx (bits "A" 25) 25; rhs = sx (bits "B" 18) 18; result_type = w48 } in
+      let op = bits "OPMODE" 7 in
+      let z_is_c = BBinOp { op = BEq; lhs = cat_lsb [ List.nth op 4; List.nth op 5; List.nth op 6 ];
+                            rhs = BConst { value = Z.of_int 3; width = 3 }; result_type = b1 } in
+      let z = BCond { condition = z_is_c; then_val = cat_lsb (bits "C" 48);
+                      else_val = BConst { value = Z.zero; width = 48 } } in
+      let p = BBinOp { op = BAdd; lhs = m; rhs = z; result_type = w48 } in
+      let body = match out_nets i "P" with
+        | [ single ] when not (String.contains single ']') -> [ BAssign { lhs = single; rhs = p } ]
+        | nets -> List.mapi (fun b n -> BAssign { lhs = n; rhs = BSlice { signal = p; msb = b; lsb = b } }) nets in
+      if body = [] then [], true else [ comb ("exp_dsp_" ^ i.inst_name) body ], false
   | "GND" ->
       (match out_nets i "G" with
        | [ o ] -> [ comb ("exp_gnd_" ^ o) [ BAssign { lhs = o; rhs = zero } ] ], false

@@ -50,6 +50,14 @@
 
 open Behavioral_ir
 
+(* Target selection.  MEMLOWER_FPGA=1 / =0 forces LUTRAM-or-BRAM / ASIC-macro
+   lowering; unset, the flow's default applies: the ASIC synth pipeline leaves
+   [default_fpga] false, the FPGA (gate_map) flow sets it from Fpga_opts. *)
+let default_fpga = ref false
+let fpga_target () =
+  match Sys.getenv_opt "MEMLOWER_FPGA" with
+  | Some "1" -> true | Some "0" -> false | _ -> !default_fpga
+
 (* ──────────── helpers ──────────── *)
 
 (* Fold trivial muxes so two ADDRESS expressions that are the same signal can be
@@ -839,7 +847,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
     `Skipped
   in
   let async_ok = Sys.getenv_opt "MEMLOWER_ASYNC_OK" = Some "1" in
-  let fpga = Sys.getenv_opt "MEMLOWER_FPGA" = Some "1" in
+  let fpga = fpga_target () in
   (* Above this many bits, keeping an async-read RAM bit-blasted costs more than
      it saves -- see the MEMLOWER_NO_LUTRAM note below. *)
   let lutram_max_depth =
@@ -1377,7 +1385,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
   end
   else if
     mm.n_write_ports < 1
-    || (mm.n_write_ports > 1 && Sys.getenv_opt "MEMLOWER_FPGA" <> Some "1")
+    || (mm.n_write_ports > 1 && not (fpga_target ()))
   then
     skip
       (Printf.sprintf "w_ports=%d (1 in v2; FPGA allows byte-masked multi-write)"
@@ -1406,7 +1414,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
          | Some (we_expr, w_addr, w_data), Some r_addr ->
              let aw = bits_needed mm.depth in
              let dw = mm.data_width in
-             if Sys.getenv_opt "MEMLOWER_FPGA" = Some "1" then begin
+             if fpga_target () then begin
                (* ── FPGA path: byte-lane RAMB18E1 (Fpga_bram_resolve) ──
                   A single true-dual-port port serves read+write: each
                   cycle addr = we ? w_addr : r_addr (degenerates to a wire

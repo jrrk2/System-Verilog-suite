@@ -269,15 +269,28 @@ let dce_module (nl : netlist) : netlist * int =
           incr dropped; false
       | _ -> true
     ) nl.insts in
+  (* Only a wire that was the output of a DROPPED cell (and of nothing that
+     survives) becomes dead.  The old rule -- keep a wire iff some surviving
+     cell's output net is EXACTLY its name -- threw away every bus declaration
+     (cells drive `CState[3]`, never `CState`) and every assign-driven wire, so
+     the emitted Verilog referenced `CState[3]` / `_n_13_[2]` with no
+     declaration: yosys read it as a 1-bit implicit net (DFF Q tied to 1'x)
+     and OpenROAD was handed undeclared buses. *)
   let kept_out_nets = Hashtbl.create 1024 in
   List.iter (fun i ->
     List.iter (fun c ->
       if c.pin = i.cell.out_pin then Hashtbl.replace kept_out_nets c.net ()
     ) i.conns
   ) kept;
-  (* Wires that no surviving cell drives become dead. *)
+  let dropped_out_nets = Hashtbl.create 64 in
+  List.iter (fun i ->
+    List.iter (fun c ->
+      if c.pin = i.cell.out_pin && not (Hashtbl.mem kept_out_nets c.net)
+      then Hashtbl.replace dropped_out_nets c.net ()
+    ) i.conns
+  ) nl.insts;
   let kept_wires =
-    List.filter (fun (n, _) -> Hashtbl.mem kept_out_nets n) nl.wires in
+    List.filter (fun (n, _) -> not (Hashtbl.mem dropped_out_nets n)) nl.wires in
   { nl with insts = kept; wires = kept_wires }, !dropped
 
 (* Iterate [merge_module_once] → [dce_module] until no more merges.

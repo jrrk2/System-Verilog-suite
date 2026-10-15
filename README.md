@@ -221,7 +221,7 @@ at pre-flight.  Stages run in this order:
 | Stage | Module | Purpose |
 |---|---|---|
 | `Behavioral_to_hardcaml.create_circuit` | `behavioral_to_hardcaml.ml` | Lower a `bmodule` to a hardcaml `Circuit.t` — operators map to `Signal` ops, `BSequential` blocks to `Reg_spec`-clocked registers |
-| `Lib_map.map_circuit` | `lib_map.ml` | Tech-map hardcaml's `Comb_op` / `Mux` / `Eq` / `Add` / `Sub` / `Mul` / `Lt` nodes onto Liberty cells. Bit-blasts adders/subtractors as ripple-carry (or Brent-Kung under `SV_DECOMP_ARCH_SWAP=1`), multipliers as Array (b_w iterations of `gen_add`), gates as `AND2_X1`/`OR2_X1`/`XOR2_X1`/`INV_X1`/`MUX2_X1`. Set `LIB_MAP_DCE=1` for dead-code elimination |
+| `Lib_map.map_circuit` | `lib_map.ml` | Tech-map hardcaml's `Comb_op` / `Mux` / `Eq` / `Add` / `Sub` / `Mul` / `Lt` nodes onto Liberty cells. Bit-blasts adders/subtractors as ripple-carry (or Brent-Kung under `SV_DECOMP_ARCH_SWAP=1`), multipliers as Array (b_w iterations of `gen_add`), gates as `AND2_X1`/`OR2_X1`/`XOR2_X1`/`INV_X1`/`MUX2_X1`. Netlist DCE is on by default (`SV_DECOMP_NO_DCE=1` skips) |
 | `Hier_synth.synth_program` | `hier_synth.ml` | Per-module gate-level synth in dependency order. Children get phantom IO at their parent so each module synthesises standalone, while the cell-Verilog emit step splices each instance line back in alongside the parent's cells. Preserves both hier (instance lines) and flat (gate cells) views.  `HIER_SYNTH_TRACE=1` logs which module is being lowered (useful for localising upstream BIR bugs) |
 | `Mux_chain_flatten` (opt) | `mux_chain_flatten.ml` | Priority MUX2 chains → balanced one-hot AND-OR (depth O(log N)).  Off by default; flip on with `SV_DECOMP_MUX_FLATTEN=1`.  Constants routed through tie cells to keep DRT-0305 (POWER-net) clean |
 | `Kary_merge` | `kary_merge.ml` | Collapse same-family AND2/OR2 chains and trees into AND3/AND4/OR3/OR4.  *Duplicating* absorb — a high-fanout 2-input driver is inlined into every consumer, then `dce_module` sweeps it if all consumers absorbed it.  Iterates to fixed point (cap 16, override `SV_DECOMP_KARY_MAX_PASSES`).  Slack-aware: `SV_DECOMP_TIMING_REF=<6_finish.rpt>` falls back to single-fanout absorb on cells that were on the prior run's worst path, so widening a chain head from `OR2_X4` (40 ps) to `OR4_X4` (72 ps) only happens off the critical path.  `SV_DECOMP_NO_KARY_MERGE=1` skips entirely |
@@ -325,6 +325,100 @@ nextpnr places & routes at 250 MHz, and the xc7a50t bitstream is
 Scope boundary: `bir_to_aig` currently raises on memories / submodule
 instances, so block-RAM / DSP / hierarchy inference is the next step
 before a full SoC (picosoc) rides this path.
+
+### FPGA flow defaults, QoR harness and correctness gates (2026-10)
+
+**One profile record.** Every knob of the FPGA flow lives in
+`fpga_synth/fpga_opts.ml` (`Fpga_opts.get ()`), printed once per run as
+`[fpga_opts] profile=...`.  The default profile is the measured-best one;
+`SVS_PROFILE=legacy` restores the old everything-off behaviour, and each
+knob still accepts its environment override (`GATE_MAP_BIR_OPT=0`,
+`MEMLOWER_FPGA=0`, `LUTCOVER_BACKEND=native`, `GATE_MAP_DSP=0`,
+`GATE_MAP_MODE=mixed`, `BALANCED_CASE=1`, ...).  Defaults:
+
+| Knob | Default | Why |
+|---|---|---|
+| `bir_opt` (const-prop + constant-register fold + DCE before lowering) | on | picorv32 2088 -> ~1300 LUT; the single largest lever |
+| `fpga_mem` (memlower -> RAM32M / RAMB instead of ASIC macros) | on | picorv32's register file: 1024 FDRE + muxes -> 12 RAM32M |
+| `dsp_infer` (`BMul` -> DSP48E1, `Behavioral_dsp_infer`) | on, min width 4 | cascade_mac: 9 DSPs instead of ~1000 LUTs of array multiplier |
+| `backend` (LUT cover) | `abc` when a `yosys-abc` is found, else native | same AIG through abc `if`: 853 vs 1244 LUT on picorv32 |
+| abc script | resyn2 + `dch -f; if -K 6; mfs` (delay, then area recovery) | uart_transmitter depth 10 -> 4 for +3 LUT; `GATE_MAP_ABC_AREA=1` for area-only |
+| `balanced_case`, `lutpack`, `mfs2`, `aig_balance` | off | measured worse on area with no depth gain |
+
+**`svd.dsp_infer(prog)`** replaces each `a * b` whose operands fit a
+DSP48E1 (signed 25 x 18 / unsigned 24 x 17, context width <= 48) by a
+multiply-only DSP48E1 instance; the product is read back as a slice of P.
+Verilog's rule applies: signed only when both operands are signed.  The Z3
+side gets the matching model (`Xil_prim_models` "DSP48E1" and the
+hierarchical-miter expansion in `Fpga_prim_expand`), so a DSP netlist still
+proves against the source.  Not yet: >25x18 splitting, register absorption
+(AREG/MREG/PREG), the P += A*B accumulate form.
+
+**`test/qor/`** — the QoR + correctness regression (`run_qor.sh`,
+`designs.tsv`, `dsp_selftest.sh`, README there).  Per design it maps with
+this flow and with `yosys synth_xilinx` (SV read through the yosys-slang
+plugin, or sv2v with `YOSYS_SV2V=1`), reports LUT / FF / CARRY4 / DSP / RAM /
+MUXF / SRL and LUT depth, and gates the numbers on two formal checks: a
+three-way source vote (Verible vs yosys-slang RTLIL vs Verilator JSON, pairwise
+`svd.miter_hier`) and a hierarchical miter of the mapped netlist against a
+fresh parse of the source.
+
+Three defects the harness exposed and that are fixed:
+
+- **Non-blocking slice / bit writes** (`r[k] <= v` after `r <= e` in the same
+  clocked block) were lowered as a read-modify-write of the register's Q,
+  overriding the pending whole-register write.  `Behavioral_nba_slice` (run
+  from `Behavioral_iflift`) threads the pending value instead.  Found on
+  `slib_counter`; it also restored picorv32's 64-bit cycle/instruction
+  counters, which had been silently lost.
+- **Signed arithmetic leaves were not widened** to the context width by the
+  Verible frontend when the binop's result was already tagged with that width
+  (`y[8:0] = a[4:0] * b[3:0]` multiplied unsigned).  Attributed by the vote:
+  yosys-slang and Verilator agreed, Verible differed.
+- **The BIR constant propagator** tracked `r := c` in clocked bodies with
+  blocking semantics and kept the else-branch state after an `if`; both could
+  prune live branches.  Clocked bodies no longer track (only `blocking_vars`),
+  and the state after `if`/`case` is the meet of all paths.  Case arms whose
+  constant key can never equal a constant selector are now dropped, and
+  `x & 0` folds with `x` unknown.
+
+Two ASIC-side sweeps silently removed logic and are fixed too: `Lib_map.dce`
+never visited the per-bit drivers of a bus whose bare name was marked (every
+multi-bit register's D cone was swept: picorv32 shipped 284 of 1565 FFs), and
+`Kary_merge.dce_module` dropped every bus wire declaration.  Both netlists are
+now complete and yosys-readable; the ASIC flow's area (3x yosys) and runtime
+(picorv32 ~12 min) remain the next ASIC items.
+
+**Inout pads** (`Behavioral_iobuf_hoist`, run by `gate_map` and by the
+miter's `prep_for_z3`): a behavioural tristate drive on an `inout` port
+(`assign io = oe ? din : 1'bz`; the frontend now keeps `'bz` as an `@z`
+marker) is hoisted onto one IOBUF black box per bit -- `io__o` / `io__t`
+drive it, every read of the pad becomes the sensed `io__i`.  The mapped
+netlist carries the same instance, so `cut_blackboxes` compares each pad as
+three signals (drive, direction, sense) with the pad pin itself left to the
+outside world.  `recipes/xil_models_selftest.lua`'s `inout_bidir` case, which
+failed with "unbound identifier io" before, now proves EQUIVALENT (20/20).
+
+**`svd.miter_strict(a, b)`** makes an output present on one side only a
+DIFFER instead of a silently skipped signal; mapped-netlist register names are
+preserved by default (`FPGA_LEC_NAMES=0` disables) so state pairs by name.
+
+Measured with `test/qor/run_qor.sh` (xc7, k=6, default profile, abc backend; yosys 0.64 `synth_xilinx -noiopad -noclkbuf` as reference; depth = LUT/MUXF/CARRY4 levels between registers):
+
+| Design | this flow (LUT / FF / CARRY4 / DSP / RAM / depth) | yosys synth_xilinx | source vote | netlist check |
+|---|---|---|---|---|
+| uart_transmitter | 34 / 7 / 0 / 0 / 0 / 4 | 38 / 16 / 0 / 0 / 0 / 5 | 3/3 | 1/1 EQUIVALENT |
+| uart_receiver (+3 children) | 64 / 25 / 11 / 0 / 0 / 4 | 63 / 36 / 6 / 0 / 0 / 3 | 3/3 | 4/4 EQUIVALENT |
+| cascade_mac (24-bit MAC) | 483 / 51 / 109 / 9 / 0 / 15 | 326 / 51 / 25 / 9 / 0 / 16 | 1/3 (2 inconclusive: 8x8 multiply exceeds the Z3 budget) | 3/3 EQUIVALENT |
+| picorv32 | 1377 / 593 / 84 / 0 / 12 RAM32M / 15 | 1039 / 574 / 97 / 0 / 12 RAM32M / 16 | 0/3 (no pair finished in the 40 min budget: whole-core miter) | 1/1 EQUIVALENT |
+
+The yosys FF counts on the UARTs include its one-hot FSM recoding.  Before this
+work the same flow gave 49 / 84 / 1641 / 4365 LUTs on these four designs, and
+the earlier "853 LUT" picorv32 figure was produced by the unsound propagator
+and is withdrawn.  Remaining gaps: the MAC's CARRY4 count (the 48-bit adders
+are not yet absorbed into the DSPs), picorv32 +34 % LUTs, and FSM one-hot
+recoding / `unique case` handling for control-path depth.
+
 
 ## DFT (scan + ATPG + JTAG / BSDL)
 

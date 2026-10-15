@@ -140,14 +140,27 @@ let tt_of_cover ~(nin : int) (cubes : (string * char) list) : Tt.t =
 
 (* ---- driver ---------------------------------------------------------------- *)
 let abc_bin () =
-  match Stdlib.Sys.getenv_opt "SVS_ABC" with
-  | Some s when String.length s > 0 -> s
-  | _ -> "deps/yosys/yosys-abc"
+  match (Fpga_opts.get ()).Fpga_opts.abc_bin with
+  | Some s -> s
+  | None ->
+    (match Fpga_opts.find_abc () with
+     | Some s -> s
+     | None -> "deps/yosys/yosys-abc")
 
+(* Default script: explicit resyn2 (the alias needs abc.rc, which yosys-abc
+   does not load) then choice-based DELAY mapping with area recovery, then mfs.
+   Measured against the old area-only `if -K 6 -a` (LUT / depth):
+     uart_transmitter 31/10 -> 34/4, uart_receiver 72/4 -> 76/3,
+     picorv32 862/17 -> 853/17.
+   SVS_ABC_SCRIPT overrides; GATE_MAP_ABC_AREA=1 selects the area-only form. *)
+let resyn2 = "balance; rewrite; refactor; balance; rewrite; rewrite -z; balance; refactor -z; rewrite -z; balance"
 let abc_script () =
   match Stdlib.Sys.getenv_opt "SVS_ABC_SCRIPT" with
   | Some s when String.length s > 0 -> s
-  | _ -> "strash; dch -f; if -K 6 -a; mfs -W 4"
+  | _ ->
+    (match Stdlib.Sys.getenv_opt "GATE_MAP_ABC_AREA" with
+     | Some "1" -> "strash; " ^ resyn2 ^ "; dch -f; if -K 6 -a; mfs -W 4"
+     | _ -> "strash; " ^ resyn2 ^ "; dch -f; if -K 6; mfs -W 4")
 
 (* Map [g] with abc and return one Signal.t per g.outputs entry (in order).
  * [input_nodes].(i) is the node id of the i-th Input (i.e. pi<i>); [resolve_input]

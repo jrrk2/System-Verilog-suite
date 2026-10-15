@@ -169,6 +169,10 @@ let rec fold_const_arith e = match e with
        | l, r -> BBinOp { op; lhs = l; rhs = r; result_type })
   | e -> e
 
+(* Default for the parallel-case lowering below; BALANCED_CASE=1/0 overrides.
+   The FPGA flow sets it from Fpga_opts. *)
+let balanced_case_default = ref false
+
 let rec width_of_btype = function
   | BInt { width; _ } -> width
   | BBool -> 1
@@ -899,7 +903,9 @@ let rec stmt_to_always ~is_reg ctx alw = function
       let keys = List.map key_const cases in
       (* Opt-in (BALANCED_CASE=1): default keeps the exact-Verilog priority
          chain so other flows are untouched. *)
-      let balanced_case_enabled = Sys.getenv_opt "BALANCED_CASE" = Some "1" in
+      let balanced_case_enabled =
+        match Sys.getenv_opt "BALANCED_CASE" with
+        | Some "1" -> true | Some "0" -> false | _ -> !balanced_case_default in
       let mutually_exclusive =
         balanced_case_enabled
         && List.for_all (fun k -> k <> None) keys

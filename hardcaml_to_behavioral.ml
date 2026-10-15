@@ -186,7 +186,11 @@ let of_circuit (circ : Circuit.t) : Behavioral_ir.bmodule =
                collide a register net with its output port through the identity
                OBUF (self-loop), so the default netlist/bitstream path keeps the
                original anonymous nets.  Z3-LEC runs set the env var. *)
-            let lec_names = Option.is_some (Stdlib.Sys.getenv_opt "FPGA_LEC_NAMES") in
+            (* Name each FF's Q net after its source register (iCounter__b2) so
+               the Z3 miter can pair state by name; FPGA_LEC_NAMES=0 disables. *)
+            let lec_names =
+              match Stdlib.Sys.getenv_opt "FPGA_LEC_NAMES" with
+              | Some "0" -> false | _ -> true in
             let nm0 = inst.inst_instance in
             let base0 = match String.lsplit2 nm0 ~on:'[' with Some (b, _) -> b | None -> nm0 in
             (* A register is nameable for LEC when it's an FDxE with a real RTL

@@ -1,0 +1,5 @@
+# name	top	extra modules to map (children; "-" for none)	source files (space separated; $HOME expanded)
+uart_transmitter	uart_transmitter	-	sysver_tests/uart_transmitter.sv
+uart_receiver	uart_receiver	slib_counter__W4 slib_input_filter__S4 slib_mv_filter__W4_T10	sysver_tests/uart_receiver.sv sysver_tests/slib_counter.sv sysver_tests/slib_mv_filter.sv sysver_tests/slib_input_filter.sv
+cascade_mac	cascade_mac	mul8 add48	test/cascade/cascade_mac.sv
+picorv32	picorv32	-	$HOME/demo-projects/vc707_picosoc/picorv32.v
