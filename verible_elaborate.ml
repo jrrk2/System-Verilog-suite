@@ -119,7 +119,21 @@ let cw_children = function
   | TLIST xs -> xs
   | _ -> []
 
+let rec has_user_call tok =
+  match tok with
+  | TUPLE3 (STRING "reference_or_call_base1", _, _) -> true
+  | TUPLE2 (a, b) -> has_user_call a || has_user_call b
+  | TUPLE3 (a, b, c) -> has_user_call a || has_user_call b || has_user_call c
+  | TUPLE4 (a, b, c, d) -> List.exists has_user_call [a; b; c; d]
+  | TUPLE5 (a, b, c, d, e) -> List.exists has_user_call [a; b; c; d; e]
+  | TUPLE6 (a, b, c, d, e, f) -> List.exists has_user_call [a; b; c; d; e; f]
+  | TLIST xs -> List.exists has_user_call xs
+  | _ -> false
+
 let rec eval_cw tok : (int * int) option =
+  (* a user function call is not a literal: its first number is the ARGUMENT
+     (`Val_int(0)` folded to 0).  Decline; the Eval path evaluates the body. *)
+  if has_user_call tok then None else
   match tok with
   | TK_DecNumber n | TK_UnBasedNumber n ->
       (* SV unsized fills `'0`/`'1` carry value 0 / all-ones at width 0 (a
@@ -186,9 +200,49 @@ let rec eval_cw tok : (int * int) option =
            Some ((v lsr i) land 1, 1)
        | _ -> None)
   | SymbolIdentifier id -> Hashtbl.find_opt param_vw id
+  | TUPLE3 (STRING tg, SymbolIdentifier name, _) when prefix_is "unqualified_id" tg ->
+      Hashtbl.find_opt param_vw name
   | TUPLE4 (STRING tag, _, _, TUPLE3 (STRING tg2, SymbolIdentifier name, _))
     when prefix_is "qualified_id" tag && prefix_is "unqualified_id" tg2 ->
       Hashtbl.find_opt param_vw name
+  (* replication `{k{e}}`: TUPLE7(expr_primary_braces, {, k, {, e, }, }) *)
+  | TUPLE7 (STRING tag, LBRACE, cnt, LBRACE, elem, RBRACE, RBRACE)
+    when prefix_is "expr_primary_braces" tag ->
+      (match eval_cw cnt, eval_cw elem with
+       | Some (k, _), Some (0, w) when k >= 0 && w > 0 -> Some (0, k * w)
+       | Some (k, _), Some (v, w) when k >= 0 && w > 0 && k * w <= 62 ->
+           let mask = (1 lsl w) - 1 in
+           let rec rep acc i = if i = 0 then acc else rep ((acc lsl w) lor (v land mask)) (i - 1) in
+           Some (rep 0 k, k * w)
+       | _ -> None)
+  (* transparent wrappers: `( e )`, sequence/dist wrappers, singleton lists *)
+  | TUPLE4 (STRING tag, LPAREN, body, RPAREN) when prefix_is "expr_primary_parens" tag -> eval_cw body
+  | TUPLE3 (STRING tag, inner, _)
+    when prefix_is "sequence_repetition_expr" tag || prefix_is "expression_or_dist" tag -> eval_cw inner
+  | TLIST [ x ] -> eval_cw x
+  (* bitwise operators (width = max of operands) *)
+  | TUPLE4 (STRING tag, lhs, _, rhs)
+    when prefix_is "bitor_expr" tag || prefix_is "or_expr" tag
+      || prefix_is "bitand_expr" tag || prefix_is "and_expr" tag
+      || prefix_is "bitxor_expr" tag || prefix_is "xor_expr" tag ->
+      (match eval_cw lhs, eval_cw rhs with
+       | Some (a, wa), Some (b, wb) ->
+           let r =
+             if prefix_is "bitor_expr" tag || prefix_is "or_expr" tag then a lor b
+             else if prefix_is "bitxor_expr" tag || prefix_is "xor_expr" tag then a lxor b
+             else a land b in
+           Some (r, max wa wb)
+       | _ -> None)
+  | TUPLE3 (STRING tag, op_tok, operand) when prefix_is "unary_prefix_expr" tag ->
+      (match eval_cw operand with
+       | Some (v, w) ->
+           (match op_tok with
+            | PLING -> Some ((if v = 0 then 1 else 0), 1)
+            | HYPHEN -> Some (- v, w)
+            | PLUS -> Some (v, w)
+            | TILDE -> Some ((lnot v) land (if w >= 62 || w <= 0 then -1 else (1 lsl w) - 1), w)
+            | _ -> None)
+       | None -> None)
   (* `$bits(<type>)` → the declared packed width of the type (from type_widths).
      Folds `.Width($bits(dmi_resp_o))` on the typed tree instead of via
      resolve_value's string output. *)
@@ -229,6 +283,7 @@ let rec eval_cw tok : (int * int) option =
              | PERCENT -> Some (if b = 0 then 0 else a mod b)
              | LT_LT -> Some (a lsl b)
              | GT_GT -> Some (a lsr b)
+             | GT_GT_GT -> Some (a asr b)
              | STAR_STAR when b >= 0 ->
                  let rec p x e = if e = 0 then 1 else x * p x (e - 1) in Some (p a b)
              | _ -> None
@@ -1893,6 +1948,16 @@ and resolve_arg_to_sv pkgs tok : sv_value =
  * sv_value, with struct-typed args feeding a tiny resolver inside
  * eval_int_expr that lets `<arg>.<field>` references in the body
  * fold to integer field values. *)
+(* Constant-function calls met while folding an expression (`Val_int(0)` as a
+   localparam initialiser).  Set by specialise_design once the function table
+   exists: name -> int args -> int result. *)
+let fn_call_hook : (string -> int list -> int option) ref = ref (fun _ _ -> None)
+let known_functions : (string, unit) Hashtbl.t = Hashtbl.create 16
+let is_known_function f = Hashtbl.mem known_functions f
+(* scope of the expression currently being evaluated, so a function body
+   evaluated through the hook can see the enclosing module's parameters *)
+let cur_scope : (string * int) list ref = ref []
+
 let eval_function ~functions ~lookup_int ~pkgs
                   (fn : sv_function) (args : sv_value list) : sv_value =
   let _ = functions in
@@ -1928,10 +1993,22 @@ let eval_function ~functions ~lookup_int ~pkgs
     List.iter (fun (k, v) -> Hashtbl.replace struct_table k v) saved
   in
   let eval_int_expr tok : sv_value =
-    let s = deep_string_of_token tok in
-    match lookup_int !scope s with
-    | Some n -> SVInt n
-    | None -> SVUnknown
+    (* typed-tree fold first (eval_cw sees braces, `|`, literal widths that the
+       string renderer drops), with the call args and the enclosing scope
+       visible through param_vw for the duration; then the string path *)
+    let binds = !cur_scope @ !scope in   (* args LAST so they take priority *)
+    let saved = List.map (fun (k, _) -> (k, Hashtbl.find_opt param_vw k)) binds in
+    List.iter (fun (k, v) -> Hashtbl.replace param_vw k (v, 32)) binds;
+    let typed = eval_cw tok in
+    List.iter (fun (k, old) ->
+      match old with Some o -> Hashtbl.replace param_vw k o | None -> Hashtbl.remove param_vw k) saved;
+    match typed with
+    | Some (n, _) -> SVInt n
+    | None ->
+      let s = deep_string_of_token tok in
+      match lookup_int !scope s with
+      | Some n -> SVInt n
+      | None -> SVUnknown
   in
   (* Track the canonical struct-build local. *)
   let struct_acc : (string * sv_value) list ref = ref [] in
@@ -1957,8 +2034,48 @@ let eval_function ~functions ~lookup_int ~pkgs
       when prefix_is "jump_statement" tag -> Some e
     | _ -> None
   in
+  (* `Val_int = <expr>;` -- the classic Verilog-2001 way to return: an
+     assignment whose only LHS identifier is the function's own name. *)
+  let try_fname_assign n =
+    match n with
+    | TUPLE4 (STRING tag, lp, _, rhs)
+      when prefix_is "assignment_statement_no_expr" tag ->
+        let ids = ref [] in
+        walk (function SymbolIdentifier id -> ids := id :: !ids | _ -> ()) lp;
+        (match !ids with
+         | [ id ] when id = fn.fn_name ->
+             if Sys.getenv_opt "EVAL_DEBUG" <> None then begin
+               let rec shape t = match t with
+                 | STRING s -> "\"" ^ s ^ "\""
+                 | SymbolIdentifier id -> "Id(" ^ id ^ ")"
+                 | TK_DecNumber n -> "Dec(" ^ n ^ ")"
+                 | TUPLE2 (a, b) -> "(" ^ shape a ^ " " ^ shape b ^ ")"
+                 | TUPLE3 (a, b, c) -> "(" ^ String.concat " " (List.map shape [a; b; c]) ^ ")"
+                 | TUPLE4 (a, b, c, d) -> "(" ^ String.concat " " (List.map shape [a; b; c; d]) ^ ")"
+                 | TUPLE5 (a, b, c, d, e) -> "(" ^ String.concat " " (List.map shape [a; b; c; d; e]) ^ ")"
+                 | TUPLE6 (a, b, c, d, e, f) -> "(" ^ String.concat " " (List.map shape [a; b; c; d; e; f]) ^ ")"
+                 | TUPLE7 (a, b, c, d, e, f, g) -> "(" ^ String.concat " " (List.map shape [a; b; c; d; e; f; g]) ^ ")"
+                 | TUPLE8 (a, b, c, d, e, f, g, h) -> "(" ^ String.concat " " (List.map shape [a; b; c; d; e; f; g; h]) ^ ")"
+                 | TLIST xs -> "[" ^ String.concat "; " (List.map shape xs) ^ "]"
+                 | EMPTY_TOKEN -> "."
+                 | t -> Source_text_verible_tokens.getstr t in
+               Printf.eprintf "[eval_function] %s = %S -> %s\n  shape: %s\n%!" fn.fn_name
+                 (deep_string_of_token rhs)
+                 (match eval_int_expr rhs with SVInt n -> string_of_int n | _ -> "?")
+                 (shape rhs)
+             end;
+             Some rhs
+         | _ -> None)
+    | _ -> None
+  in
   walk (fun stmt ->
     if !returned <> None then () else
+    match try_fname_assign stmt with
+    | Some rhs ->
+        (match eval_int_expr rhs with
+         | SVInt n -> returned := Some (SVInt n)
+         | _ -> ())
+    | None ->
     match try_field_assign stmt with
     | Some (_base, field, rhs) ->
         let v = eval_int_expr rhs in
@@ -2131,9 +2248,12 @@ let _ = int_of_pvalue
 module Eval = struct
   type tok =
     | TNum of int | TId of string
+    | TSized of int * int               (* sized literal: value, width *)
     | TLP | TRP | TComma | TDot
     | TPlus | TMinus | TStar | TPow | TSlash | TPercent
-    | TShl | TShr
+    | TShl | TShr | TAshr
+    | TBOr | TBAnd | TBXor | TTilde
+    | TLBrace | TRBrace
     | TEq | TNeq | TLt | TLe | TGt | TGe
     | TLAnd | TLOr | TBang
     | TQuestion | TColon
@@ -2179,6 +2299,8 @@ module Eval = struct
       | '*' -> push TStar; incr i
       | '/' -> push TSlash; incr i
       | '%' -> push TPercent; incr i
+      | '<' when !i + 2 < n && s.[!i + 1] = '<' && s.[!i + 2] = '<' -> push TShl; i := !i + 3
+      | '>' when !i + 2 < n && s.[!i + 1] = '>' && s.[!i + 2] = '>' -> push TAshr; i := !i + 3
       | '<' when !i + 1 < n && s.[!i + 1] = '<' -> push TShl; i := !i + 2
       | '>' when !i + 1 < n && s.[!i + 1] = '>' -> push TShr; i := !i + 2
       | '=' when !i + 1 < n && s.[!i + 1] = '=' -> push TEq; i := !i + 2
@@ -2189,6 +2311,12 @@ module Eval = struct
       | '>' -> push TGt; incr i
       | '&' when !i + 1 < n && s.[!i + 1] = '&' -> push TLAnd; i := !i + 2
       | '|' when !i + 1 < n && s.[!i + 1] = '|' -> push TLOr; i := !i + 2
+      | '&' -> push TBAnd; incr i
+      | '|' -> push TBOr; incr i
+      | '^' -> push TBXor; incr i
+      | '~' -> push TTilde; incr i
+      | '{' -> push TLBrace; incr i
+      | '}' -> push TRBrace; incr i
       | '!' -> push TBang; incr i
       | '$' ->
           let j = ref (!i + 1) in
@@ -2270,7 +2398,10 @@ module Eval = struct
                 bail (Printf.sprintf "sized literal int_of_string %S failed"
                         digits)
             in
-            push (TNum v); i := !k
+            (match int_of_string_opt lead with
+             | Some w when w > 0 -> push (TSized (v, w))
+             | _ -> push (TNum v));
+            i := !k
           end else begin
             let v = try int_of_string lead
                     with _ -> bail (Printf.sprintf
@@ -2319,13 +2450,38 @@ module Eval = struct
       | rest -> (l, rest)
     in loop l t
   and parse_land scope toks =
-    let l, t = parse_eq scope toks in
+    let l, t = parse_bor scope toks in
     let rec loop l = function
       | TLAnd :: rest ->
-          let r, t' = parse_eq scope rest in
+          let r, t' = parse_bor scope rest in
           (match l, r with
            | Some a, Some b -> loop (Some (bool_int (a <> 0 && b <> 0))) t'
            | _ -> loop None t')
+      | rest -> (l, rest)
+    in loop l t
+  (* bitwise | ^ & sit between && and == in SV precedence *)
+  and parse_bor scope toks =
+    let l, t = parse_bxor scope toks in
+    let rec loop l = function
+      | TBOr :: rest ->
+          let r, t' = parse_bxor scope rest in
+          (match l, r with Some a, Some b -> loop (Some (a lor b)) t' | _ -> loop None t')
+      | rest -> (l, rest)
+    in loop l t
+  and parse_bxor scope toks =
+    let l, t = parse_band scope toks in
+    let rec loop l = function
+      | TBXor :: rest ->
+          let r, t' = parse_band scope rest in
+          (match l, r with Some a, Some b -> loop (Some (a lxor b)) t' | _ -> loop None t')
+      | rest -> (l, rest)
+    in loop l t
+  and parse_band scope toks =
+    let l, t = parse_eq scope toks in
+    let rec loop l = function
+      | TBAnd :: rest ->
+          let r, t' = parse_eq scope rest in
+          (match l, r with Some a, Some b -> loop (Some (a land b)) t' | _ -> loop None t')
       | rest -> (l, rest)
     in loop l t
   and parse_eq scope toks =
@@ -2362,6 +2518,7 @@ module Eval = struct
       | TMinus :: rest -> binop scope (-)   l rest loop
       | TShl   :: rest -> binop scope (lsl) l rest loop
       | TShr   :: rest -> binop scope (lsr) l rest loop
+      | TAshr  :: rest -> binop scope (asr) l rest loop
       | rest -> (l, rest)
     in loop l t
   and parse_mul scope toks =
@@ -2408,9 +2565,83 @@ module Eval = struct
     | TBang :: rest ->
         let v, t = parse_unary scope rest in
         (Option.map (fun n -> bool_int (n = 0)) v, t)
+    | TTilde :: rest ->
+        let v, t = parse_unary scope rest in
+        (Option.map lnot v, t)
     | toks -> parse_atom scope toks
+  (* `{a, b, {k{c}}}` with just enough width tracking for the shapes constant
+     functions use: sized literals and replications have known widths; an
+     unsized element is accepted only in the LSB position behind zero-valued
+     elements (zero-extension), which is the `{{(W-32){1'b0}}, expr}` idiom.
+     Returns (value, width) with None for "can't fold". *)
+  and parse_concat scope toks : (int * int option) option * tok list =
+    let rec elements acc toks =
+      let v, t = parse_elem scope toks in
+      match t with
+      | TComma :: r -> elements (v :: acc) r
+      | TRBrace :: r -> (List.rev (v :: acc), r)
+      | _ -> (List.rev (v :: acc), t)
+    in
+    let elems, rest = elements [] toks in
+    let rec fold acc_v acc_w = function
+      | [] -> Some (acc_v, Some acc_w)
+      | Some (v, Some w) :: tl -> fold ((acc_v lsl w) lor v) (acc_w + w) tl
+      | [ Some (v, None) ] when acc_v = 0 -> Some (v, None)
+      | _ -> None
+    in
+    (fold 0 0 elems, rest)
+  and parse_elem scope toks : (int * int option) option * tok list =
+    match toks with
+    | TLBrace :: rest ->
+        (* replication `{k{e}}` or a nested concat *)
+        (match rest with
+         | _ ->
+           let k, t = parse_expr scope rest in
+           (match k, t with
+            | Some k, TLBrace :: t' ->
+                let e, t'' = parse_elem scope t' in
+                (match t'' with
+                 | TRBrace :: TRBrace :: r ->
+                     (match e with
+                      | Some (0, Some w) -> (Some (0, Some (k * w)), r)
+                      | Some (v, Some w) when k >= 0 && k * w <= 62 ->
+                          let rec rep acc i = if i = 0 then acc else rep ((acc lsl w) lor v) (i - 1) in
+                          (Some (rep 0 k, Some (k * w)), r)
+                      | _ -> (None, r))
+                 | _ -> (None, t''))
+            | _ ->
+                (* nested plain concat: re-parse from the brace *)
+                let c, r = parse_concat scope rest in (c, r)))
+    | TSized (v, w) :: ((TComma | TRBrace) :: _ as r) -> (Some (v, Some w), r)
+    | _ ->
+        let v, t = parse_expr scope toks in
+        ((match v with Some v -> Some (v, None) | None -> None), t)
   and parse_atom scope = function
     | TNum n :: rest -> (Some n, rest)
+    | TSized (n, _) :: rest -> (Some n, rest)
+    | TLBrace :: rest ->
+        let c, r = parse_concat scope rest in
+        ((match c with Some (v, _) -> Some v | None -> None), r)
+    | TId f :: TLP :: rest when is_known_function f ->
+        (* constant function call: fold the arguments, then the body *)
+        let rec args acc toks =
+          match toks with
+          | TRP :: r -> (List.rev acc, r)
+          | _ ->
+            let v, t = parse_expr scope toks in
+            (match t with
+             | TComma :: r -> args (v :: acc) r
+             | TRP :: r -> (List.rev (v :: acc), r)
+             | _ -> (List.rev (v :: acc), t))
+        in
+        let vs, r = args [] rest in
+        if List.for_all Option.is_some vs then begin
+          let saved = !cur_scope in
+          cur_scope := scope;
+          let res = !fn_call_hook f (List.map Option.get vs) in
+          cur_scope := saved;
+          (res, r)
+        end else (None, r)
     | TId base :: TDot :: TId field :: rest ->
         (* Struct field access: try the global struct table first
          * (populated by resolve_param_default for top-level
@@ -2825,6 +3056,25 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
     @ List.concat_map (fun p -> extract_functions p.pkg_body) pkgs
   in
   Hashtbl.clear struct_table;
+  (* let Eval fold `f(args)` inside any constant expression (localparam
+     initialisers like `VAL_UNIT = Val_int(0)`): the body is evaluated with
+     the args bound on top of the scope of the expression being folded, so
+     the enclosing module's parameters (VALUEW) are visible *)
+  Hashtbl.reset known_functions;
+  List.iter (fun f -> Hashtbl.replace known_functions f.fn_name ()) functions;
+  if Sys.getenv_opt "PARAM_DEBUG" <> None then
+    Printf.eprintf "[elab] constant functions: %s\n%!"
+      (String.concat ", " (List.map (fun f -> f.fn_name) functions));
+  fn_call_hook := (fun name args ->
+    match List.find_opt (fun f -> f.fn_name = name) functions with
+    | None -> None
+    | Some fn ->
+        let outer = !cur_scope in
+        let lookup_int sc s = Eval.eval_string (sc @ outer) s in
+        (match eval_function ~functions ~lookup_int ~pkgs fn
+                 (List.map (fun a -> SVInt a) args) with
+         | SVInt n -> Some n
+         | _ -> None));
   (* Register type widths so `$bits(<type>)` folds during specialization.
      Feed package constants as the eval scope so a parameterised typedef range
      (`logic [IbexMuBiWidth-1:0] ibex_mubi_t`) resolves to its real width. *)
@@ -2977,6 +3227,9 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
        params; stop when no new ones bind.  Two passes covers the
        chain depth in real designs (rope: H→ICW). *)
     let lps = extract_module_internal_params mdecl.m_body in
+    if Sys.getenv_opt "PARAM_DEBUG" <> None then
+      Printf.eprintf "[elab] %s localparams: %s\n%!" mdecl.m_name
+        (String.concat ", " (List.map fst lps));
     (* Package-scoped constants (enum members + localparams) as a low-priority
      * base, so a generate condition that references a bare imported enum —
      * ibex_alu's `if (RV32B != RV32BNone)` with `import ibex_pkg::*` — resolves
@@ -3002,11 +3255,21 @@ let specialise_design ?(pkgs = []) ?(top_params : (string * string) list = [])
         else
           let bind n = Hashtbl.replace param_vw name (n, 32); ((name, n) :: sc, rem) in
           match eval_cw rhs_tok with
-          | Some (n, _) -> bind n
+          | Some (n, _) ->
+              if Sys.getenv_opt "PARAM_DEBUG" <> None then
+                Printf.eprintf "[localparam] %-22s %-16s (eval_cw) -> %d\n%!" mdecl.m_name name n;
+              bind n
           | None ->
-              (match Eval.eval_string sc (resolve_value pkgs rhs_tok) with
-               | Some n -> bind n
-               | None -> (sc, (name, rhs_tok) :: rem))
+              let rendered = resolve_value pkgs rhs_tok in
+              (match Eval.eval_string sc rendered with
+               | Some n ->
+                   if Sys.getenv_opt "PARAM_DEBUG" <> None then
+                     Printf.eprintf "[localparam] %-22s %-16s %S -> %d\n%!" mdecl.m_name name rendered n;
+                   bind n
+               | None ->
+                   if Sys.getenv_opt "PARAM_DEBUG" <> None then
+                     Printf.eprintf "[localparam] %-22s %-16s %S -> EVAL FAILED\n%!" mdecl.m_name name rendered;
+                   (sc, (name, rhs_tok) :: rem))
       ) (sc, []) remaining in
       if List.length sc' > List.length sc && remaining' <> [] then
         fixed_point sc' remaining'

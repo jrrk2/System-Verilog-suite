@@ -365,18 +365,23 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
      Returns ([sum bits LSB-first], top carry-out lit).  The CO is
      the full carry chain output at bit (w-1), used by comparator
      lowerings (a<b = !(a + ~b + 1).CO_top, etc.). *)
+  (* Block-level CSE: a CARRY4 whose carry source (the chain's carry_in lit,
+     or the block below it) and four S / DI lits are all identical to an
+     already-emitted block computes the same O / CO, so the later chain
+     reuses it instead of emitting a duplicate.  Chains with a common prefix
+     then share it: the unsigned and signed compares of the same operands
+     differ only in the sign lane, and `a < b` is the same chain as `a - b`
+     (S = a XNOR b, DI = a, carry-in 1).  CARRY4_CSE=0 disables. *)
+  let carry4_cse =
+    match Sys.getenv "CARRY4_CSE" with Some "0" -> false | _ -> true in
+  let carry4_blocks : (string * int list * int list, string * lit list * lit list) Hashtbl.t =
+    Hashtbl.Poly.create () in
   let emit_carry4_chain ~carry_in s_lits di_lits ~w =
     let n_blocks = (w + 3) / 4 in
     let out_lits = Array.create ~len:w const_false in
-    let prev_co3_name = ref None in
+    let prev_base = ref None in
     let top_co_lit = ref const_false in
     for k = 0 to n_blocks - 1 do
-      let block_id = !carry4_counter in
-      Int.incr carry4_counter;
-      let base = Printf.sprintf "c4_%d" block_id in
-      let mk_bit_names port =
-        List.init 4 ~f:(fun j -> Printf.sprintf "%s_%s_%d" base port j)
-      in
       (* Pad the unused upper lanes of the top CARRY4 (bit_idx >= w) with the
          last real S/DI lit rather than a constant 0.  Those lanes' sum and
          carry-out feed nothing (the chain's used carry-out is taken at lane
@@ -385,75 +390,220 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
          driven by the slice's own LUTs and so are NOT reachable by general
          constant routing (they'd be left unrouted).  Reusing a real local
          signal keeps every lane routable. *)
-      let s_names = mk_bit_names "S" in
-      let di_names = mk_bit_names "DI" in
-      let pad_s  = s_lits.(w - 1) in
-      let pad_di = di_lits.(w - 1) in
-      List.iteri s_names ~f:(fun j nm ->
+      let lane arr pad j =
         let bit_idx = (4 * k) + j in
-        let lit = if bit_idx < w then s_lits.(bit_idx) else pad_s in
-        inst_outs := (nm, lit) :: !inst_outs);
-      List.iteri di_names ~f:(fun j nm ->
-        let bit_idx = (4 * k) + j in
-        let lit = if bit_idx < w then di_lits.(bit_idx) else pad_di in
-        inst_outs := (nm, lit) :: !inst_outs);
-      (* Carry-in source: the chain head uses CYINIT (driven by carry_in);
-         upper blocks cascade via CI from the block below.  Each block must
-         drive EXACTLY ONE of the two (see in_ports): CI is a dedicated
-         cascade pin that can't take a routed constant, and driving CYINIT
-         and CI on the same block makes the fasm backend emit conflicting
-         PRECYINIT.AX and PRECYINIT.CIN bits for that slice. *)
-      let o_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_O_%d" base j) in
-      let co_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_CO_%d" base j) in
-      let o_lits = List.map o_names ~f:(aig_input b) in
-      let co_lits = List.map co_names ~f:(aig_input b) in
+        if bit_idx < w then arr.(bit_idx) else pad in
+      let s4 = List.init 4 ~f:(lane s_lits s_lits.(w - 1)) in
+      let di4 = List.init 4 ~f:(lane di_lits di_lits.(w - 1)) in
+      let cin_key =
+        match !prev_base with
+        | Some pb -> "ci:" ^ pb
+        | None -> "cyinit:" ^ Int.to_string carry_in in
+      let key = (cin_key, s4, di4) in
+      let base, o_lits, co_lits =
+        match (if carry4_cse then Hashtbl.find carry4_blocks key else None) with
+        | Some hit -> hit
+        | None ->
+          let block_id = !carry4_counter in
+          Int.incr carry4_counter;
+          let base = Printf.sprintf "c4_%d" block_id in
+          let mk_bit_names port =
+            List.init 4 ~f:(fun j -> Printf.sprintf "%s_%s_%d" base port j)
+          in
+          let s_names = mk_bit_names "S" in
+          let di_names = mk_bit_names "DI" in
+          List.iter2_exn s_names s4 ~f:(fun nm lit -> inst_outs := (nm, lit) :: !inst_outs);
+          List.iter2_exn di_names di4 ~f:(fun nm lit -> inst_outs := (nm, lit) :: !inst_outs);
+          (* Carry-in source: the chain head uses CYINIT (driven by carry_in);
+             upper blocks cascade via CI from the block below.  Each block must
+             drive EXACTLY ONE of the two (see in_ports): CI is a dedicated
+             cascade pin that can't take a routed constant, and driving CYINIT
+             and CI on the same block makes the fasm backend emit conflicting
+             PRECYINIT.AX and PRECYINIT.CIN bits for that slice. *)
+          let o_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_O_%d" base j) in
+          let co_names = List.init 4 ~f:(fun j -> Printf.sprintf "%s_CO_%d" base j) in
+          let o_lits = List.map o_names ~f:(aig_input b) in
+          let co_lits = List.map co_names ~f:(aig_input b) in
+          let in_ports =
+            let common = [ "DI", di_names; "S", s_names ] in
+            match !prev_base with
+            | Some prev -> ("CI", [ prev ^ "_CO_3" ]) :: common   (* upper block: CI cascade, no CYINIT *)
+            | None ->                                             (* head block: CYINIT only, no CI *)
+                let cyinit_name = Printf.sprintf "%s_CYINIT" base in
+                inst_outs := (cyinit_name, carry_in) :: !inst_outs;
+                ("CYINIT", [ cyinit_name ]) :: common
+          in
+          let out_ports = [ "O", o_names; "CO", co_names ] in
+          insts
+          := { ib_name = "CARRY4"
+             ; ib_instance = base
+             ; ib_generics = []
+             ; ib_in_ports = in_ports
+             ; ib_out_ports = out_ports
+             }
+             :: !insts;
+          let entry = (base, o_lits, co_lits) in
+          if carry4_cse then Hashtbl.set carry4_blocks ~key ~data:entry;
+          entry in
       List.iteri o_lits ~f:(fun j l ->
         let bit_idx = (4 * k) + j in
         if bit_idx < w then out_lits.(bit_idx) <- l);
       (* The carry-out at bit w-1 lives in block k = (w-1)/4 at position
          (w-1) mod 4.  Record it as we walk the chain. *)
-      let last_block = n_blocks - 1 in
-      if k = last_block
-      then begin
+      if k = n_blocks - 1 then begin
         let last_bit = (w - 1) - (4 * k) in
         top_co_lit := List.nth_exn co_lits last_bit
       end;
-      let in_ports =
-        let common = [ "DI", di_names; "S", s_names ] in
-        match !prev_co3_name with
-        | Some prev -> ("CI", [ prev ]) :: common      (* upper block: CI cascade, no CYINIT *)
-        | None ->                                       (* head block: CYINIT only, no CI *)
-            let cyinit_name = Printf.sprintf "%s_CYINIT" base in
-            inst_outs := (cyinit_name, carry_in) :: !inst_outs;
-            ("CYINIT", [ cyinit_name ]) :: common
-      in
-      let out_ports = [ "O", o_names; "CO", co_names ] in
-      insts
-      := { ib_name = "CARRY4"
-         ; ib_instance = base
-         ; ib_generics = []
-         ; ib_in_ports = in_ports
-         ; ib_out_ports = out_ports
-         }
-         :: !insts;
-      prev_co3_name := List.nth co_names 3
+      prev_base := Some base
     done;
     out_lits, !top_co_lit
   in
+  (* a + bb + carry_in over w bits, with the CARRY4 chain trimmed to the
+     span whose carry is actually unknown.  Below that span the carry is a
+     known constant c and each bit has a constant operand that keeps it so
+     (c = 0 and a or b = 0, or c = 1 and a or b = 1): the sum bit is a plain
+     XOR and no carry cell is needed.  Above it both operands are constant,
+     so the sum bits are functions of the span's carry-out alone (folded by
+     the AIG constructors, no gates).  Zero-padded partial products and
+     shifted operands (yosys gets the same from opt_expr + wreduce) were
+     costing a full-width chain per adder.  CARRY4_TRIM=0 restores the
+     full-width chain. *)
+  let carry4_trim =
+    match Sys.getenv "CARRY4_TRIM" with Some "0" -> false | _ -> true in
+  (* residual span below which the trimmed adder ripples through LUTs *)
+  let carry4_trim_min =
+    match Sys.getenv "CARRY4_TRIM_MIN" with
+    | Some s -> (try Int.of_string s with _ -> carry4_min)
+    | None -> carry4_min in
   let v_add_carry4 ~carry_in a bb ~w =
-    let s_lits = Array.init w ~f:(fun i -> aig_xor b (vbit a i) (vbit bb i)) in
-    let di_lits = Array.init w ~f:(fun i -> vbit a i) in
-    let sum, _co = emit_carry4_chain ~carry_in s_lits di_lits ~w in
-    sum
+    let is_c l = l = const_false || l = const_true in
+    let lo = ref 0 in
+    if carry4_trim && is_c carry_in then
+      while !lo < w && (vbit a !lo = carry_in || vbit bb !lo = carry_in) do
+        Int.incr lo
+      done;
+    let hi = ref w in
+    if carry4_trim then
+      while !hi > !lo && is_c (vbit a (!hi - 1)) && is_c (vbit bb (!hi - 1)) do
+        Int.decr hi
+      done;
+    let lo = !lo and hi = !hi in
+    if (lo > 0 || hi < w) && Option.is_some (Sys.getenv "CARRY4_TRIM_DEBUG") then
+      Stdlib.Printf.eprintf "[carry4_trim] w=%d span=[%d,%d) cin=%s aconst=%b bconst=%b\n%!" w lo hi
+        (if carry_in = const_true then "1" else if carry_in = const_false then "0" else "x")
+        (List.for_all (List.range lo hi) ~f:(fun i -> is_c (vbit a i)))
+        (List.for_all (List.range lo hi) ~f:(fun i -> is_c (vbit bb i)));
+    let out = Array.create ~len:w const_false in
+    for i = 0 to lo - 1 do
+      out.(i) <- aig_xor b (aig_xor b (vbit a i) (vbit bb i)) carry_in
+    done;
+    let mid = hi - lo in
+    let co =
+      if mid = 0 then carry_in
+      else if carry4_trim && mid < carry4_trim_min
+              && (List.for_all (List.range lo hi) ~f:(fun i -> is_c (vbit a i))
+                  || List.for_all (List.range lo hi) ~f:(fun i -> is_c (vbit bb i)))
+      then begin
+        (* short residual span against a constant (an increment / add-const
+           left after trimming): ripple in LUTs, keeping the carry-out -- a
+           LUT6 packs several such bits, where the chain costs a LUT per bit
+           plus the CARRY4s (uart_receiver 64 -> 47 LUTs, 11 -> 0 CARRY4).
+           Two variable operands keep the chain: rippling those measured
+           +26 LUTs on picorv32. *)
+        let cy = ref carry_in in
+        for i = lo to hi - 1 do
+          let ai = vbit a i and bi = vbit bb i in
+          let axb = aig_xor b ai bi in
+          out.(i) <- aig_xor b axb !cy;
+          cy := aig_or b (aig_and b ai bi) (aig_and b !cy axb)
+        done;
+        !cy
+      end else begin
+        let s_lits = Array.init mid ~f:(fun j -> aig_xor b (vbit a (lo + j)) (vbit bb (lo + j))) in
+        let di_lits = Array.init mid ~f:(fun j -> vbit a (lo + j)) in
+        let sum, co = emit_carry4_chain ~carry_in s_lits di_lits ~w:mid in
+        Array.iteri sum ~f:(fun j l -> out.(lo + j) <- l);
+        co
+      end in
+    let cy = ref co in
+    for i = hi to w - 1 do
+      let ai = vbit a i and bi = vbit bb i in
+      let axb = aig_xor b ai bi in
+      out.(i) <- aig_xor b axb !cy;
+      cy := aig_or b (aig_and b ai bi) (aig_and b !cy axb)
+    done;
+    out
   in
   (* a < b (unsigned), via CARRY4 of a + ~b + 1.  Top CO = 0 iff a < b
      (the subtract borrowed).  Returns a 1-bit lit. *)
   let v_lt_carry4 a bb ~w =
-    let s_lits = Array.init w ~f:(fun i -> aig_xnor b (vbit a i) (vbit bb i)) in
+    (* S = a XOR ~b, built exactly as Signal_sub builds it, so the carry-block
+       CSE recognises `a < b` and `a - b` as the same chain *)
+    let s_lits = Array.init w ~f:(fun i -> aig_xor b (vbit a i) (lit_not (vbit bb i))) in
     let di_lits = Array.init w ~f:(fun i -> vbit a i) in
     let _sum, co = emit_carry4_chain ~carry_in:const_true s_lits di_lits ~w in
     [| lit_not co |]
   in
+  (* carry-in fusion: Some (x, y, c) when one operand of a w-bit add is
+     itself a w-bit add x + y and the other is a single bit c (zero-extended).
+     CARRY4_FUSE=0 disables. *)
+  let carry4_fuse =
+    match Sys.getenv "CARRY4_FUSE" with Some "0" -> false | _ -> true in
+  let rec strip_wire (s : T.t) =
+    match s with
+    | T.Wire { driver; _ } when not (T.is_empty !driver) -> strip_wire !driver
+    | s -> s in
+  let walk_ref = ref (fun (_ : T.t) -> ([||] : lit array)) in
+  let fuse_cin ~w p q =
+    let try_one inner bit =
+      match strip_wire inner with
+      | T.Op2 { op = Signal_add; arg_a = x; arg_b = y; _ } when S.width inner = w ->
+          let cb = !walk_ref bit in
+          if Array.length cb >= 1
+             && Array.for_alli cb ~f:(fun i l -> i = 0 || l = const_false)
+             && not (cb.(0) = const_false)
+          then Some (x, y, cb.(0)) else None
+      | _ -> None in
+    match try_one p q with
+    | Some r -> Some r
+    | None -> try_one q p in
+  (* Mux trees as AND-OR (MUX_ANDOR=0 disables; MUX_ANDOR_MIN leaves,
+     default 6).  A case/if chain arrives as nested 2:1 muxes -- one mux per
+     arm per bit, packed about two to a LUT.  Its root-to-leaf path
+     conditions are mutually exclusive and exhaustive, which the cover cannot
+     see; using that, out = OR_j (sel_j & V_j) with sel_j the OR of the paths
+     reaching distinct leaf value V_j.  The path literals are built once and
+     shared by every bit, a constant leaf bit reduces its term to sel_j or
+     nothing, and the value reached by most paths (usually the register's
+     hold) is the default: selected exactly when no other sel_j is, so it
+     needs no OR of its own.  Exact for any inputs, so the miter checks it
+     combinationally. *)
+  let mux_andor = match Sys.getenv "MUX_ANDOR" with Some "0" -> false | _ -> true in
+  let mux_andor_min =
+    match Sys.getenv "MUX_ANDOR_MIN" with
+    | Some s -> (try Int.of_string s with _ -> 6)
+    | None -> 6 in
+  let mux_andor_debug = Option.is_some (Sys.getenv "MUX_ANDOR_DEBUG") in
+  let is_mux2 (s : T.t) =
+    match s with
+    | T.Mux { select; cases = [ _; _ ]; _ } -> S.width select = 1
+    | _ -> false in
+  (* leaves of the 2:1-mux tree under s, counting stops at [budget] *)
+  let rec mux_leaves (s : T.t) budget =
+    if budget <= 0 then 0
+    else match s with
+      | T.Mux { cases = [ c0; c1 ]; _ } when is_mux2 s ->
+        let a = mux_leaves c0 budget in
+        a + mux_leaves c1 (budget - a)
+      | _ -> 1 in
+  let rec bal_or = function
+    | [] -> const_false
+    | [ x ] -> x
+    | l ->
+      let rec pairs = function
+        | x :: y :: r -> aig_or b x y :: pairs r
+        | r -> r in
+      bal_or (pairs l) in
   let rec walk sig_ : lit array =
     if T.is_empty sig_ then [||]
     else begin
@@ -470,6 +620,14 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
             let s = Hardcaml.Bits.to_string constant in
             Array.init w ~f:(fun i ->
               if Char.equal s.[w - 1 - i] '1' then const_true else const_false)
+          | Op2 { op = Signal_add; arg_a; arg_b; _ }
+            when (walk_ref := walk; carry4_fuse) && w >= carry4_min
+                 && Option.is_some (fuse_cin ~w arg_a arg_b) ->
+            (* (x + y) + c with c a single bit: one chain, c on CYINIT --
+               the add/sub fusion `c ? x - y : x + y` -> `(x + (c ? ~y : y)) + c`
+               (Behavioral_share_accum.fuse_addsub) lands here *)
+            let x, y, c = Option.value_exn (fuse_cin ~w arg_a arg_b) in
+            v_add_carry4 ~carry_in:c (walk x) (walk y) ~w
           | Op2 { op; arg_a; arg_b; _ } ->
             let a = walk arg_a and bb = walk arg_b in
             let n = Int.max (Array.length a) (Array.length bb) in
@@ -490,11 +648,64 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
                else v_add b a nb ~carry_in:const_true ~n:w
              | Signal_mulu -> fit (v_mul b a bb) w
              | Signal_muls ->
-               Stdlib.prerr_endline
-                 "[bir_to_aig] WARN: signed * lowered as unsigned (sign ignored)";
-               fit (v_mul b a bb) w
+               (* two's-complement product mod 2^w = unsigned product of the
+                  operands sign-extended to w bits (a no-op when the frontend
+                  already widened them to the context width) *)
+               let sext v =
+                 let n = Array.length v in
+                 if n = 0 || n >= w then v
+                 else Array.init w ~f:(fun i -> if i < n then v.(i) else v.(n - 1)) in
+               fit (v_mul b (sext a) (sext bb)) w
              | _ -> failwith "bir_to_aig: unhandled Op2")
           | Not { arg; _ } -> Array.map (walk arg) ~f:lit_not
+          | Mux _ when mux_andor && is_mux2 sig_
+                       && mux_leaves sig_ mux_andor_min >= mux_andor_min ->
+            let groups = Hashtbl.Poly.create () and order = ref [] in
+            let rec go (s : T.t) path =
+              match s with
+              | Mux { select; cases = [ c0; c1 ]; _ } when is_mux2 s ->
+                let c = (walk select).(0) in
+                if c = const_true then go c1 path
+                else if c = const_false then go c0 path
+                else begin
+                  go c1 (aig_and b path c);
+                  go c0 (aig_and b path (lit_not c))
+                end
+              | leaf ->
+                if not (path = const_false) then begin
+                  let v = fit (walk leaf) w in
+                  match Hashtbl.find groups v with
+                  | Some l -> Hashtbl.set groups ~key:v ~data:(path :: l)
+                  | None ->
+                    order := v :: !order;
+                    Hashtbl.set groups ~key:v ~data:[ path ]
+                end in
+            go sig_ const_true;
+            let vals = List.rev !order in
+            let npaths v = List.length (Hashtbl.find_exn groups v) in
+            (match vals with
+             | [] -> Array.create ~len:w const_false
+             | [ v ] -> v
+             | v0 :: _ ->
+               let dflt =
+                 List.fold vals ~init:v0 ~f:(fun d v -> if npaths v > npaths d then v else d) in
+               let sels =
+                 List.filter_map vals ~f:(fun v ->
+                   if phys_equal v dflt then None
+                   else Some (v, bal_or (Hashtbl.find_exn groups v))) in
+               let none = lit_not (bal_or (List.map sels ~f:snd)) in
+               if mux_andor_debug then
+                 Stdlib.Printf.eprintf "[mux_andor] %s: w=%d leaves=%d values=%d default=%d paths\n%!"
+                   (signal_name sig_) w
+                   (List.fold vals ~init:0 ~f:(fun a v -> a + npaths v))
+                   (List.length vals) (npaths dflt);
+               let term s l =
+                 if l = const_false then None
+                 else if l = const_true then Some s
+                 else Some (aig_and b s l) in
+               Array.init w ~f:(fun i ->
+                 bal_or
+                   (List.filter_map ((dflt, none) :: sels) ~f:(fun (v, s) -> term s (vbit v i)))))
           | Mux { select; cases; _ } ->
             let sel = walk select in
             let cases = List.map cases ~f:walk in
@@ -597,7 +808,7 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
                  | T.Mux _ -> "MUX_wide"
                  | _ -> "PLAIN" in
                let has_async = match rst with Some _ -> 1 | None -> 0 in
-               Stdlib.Printf.eprintf "CE_LIFT_STAT %s async=%d w=%d\n" cls has_async w
+               Stdlib.Printf.eprintf "CE_LIFT_STAT %s async=%d w=%d %s\n" cls has_async w base
              end);
             let is_const s = match resolve s with T.Const _ -> true | _ -> false in
             let const_int s =
@@ -642,7 +853,80 @@ let lower_circuit (circ : Hardcaml.Circuit.t) : lowered =
                   (Some sr, Some (const_int c0), c1)
                 | _ -> (None, None, d)
             in
+            (* The hold leaves of the whole D mux tree, not only a top-level
+               [mux en dnext Q]: a threaded next-state tree keeps the
+               register (`: accu`) in every arm that does not write it, and
+               those leaves are what the CE pin is for.  CE = OR of the path
+               conditions reaching a non-hold leaf, and D is the tree with
+               each hold leaf replaced by the non-hold value reached by most
+               paths (any value does: CE is low there), which the AND-OR
+               lowering then takes as its default.  yosys gets the same
+               through opt_dff; without it the VM's accu had CE tied high and
+               2400 LUTs in its D cone.  CE_LIFT_TREE=0 keeps the one-level
+               rule. *)
+            let tree_lift =
+              match Stdlib.Sys.getenv_opt "CE_LIFT_TREE" with Some "0" -> false | _ -> true in
+            (* the OR of the write paths is paid once per register, the saved
+               hold term once per bit: a 1-bit register keeps its hold mux
+               (CE_LIFT_MIN_W, default 2 -- measured best on uart_rx/tx,
+               picorv32 and the VM; 1 and 4 were worse on all of them) *)
+            let tree_lift =
+              tree_lift
+              && w >= (match Stdlib.Sys.getenv_opt "CE_LIFT_MIN_W" with
+                       | Some s -> (try Int.of_string s with _ -> 2) | None -> 2) in
+            let is_self s = uid_int (resolve s) = uid_int sig_ in
+            let tree_result =
+              if not tree_lift then None
+              else begin
+                let budget = ref 65536 in
+                let rec leaves s path acc =
+                  match resolve s with
+                  | T.Mux { select; cases = [ c0; c1 ]; _ }
+                    when S.width select = 1 && !budget > 0 ->
+                    Int.decr budget;
+                    let sel = select in
+                    let with_ c = match path with None -> Some c | Some q -> S.(Some (q &: c)) in
+                    leaves c0 (with_ (S.( ~: ) sel)) (leaves c1 (with_ sel) acc)
+                  | _ -> (path, s) :: acc in
+                let ls = leaves d1 None [] in
+                let selves = List.filter ls ~f:(fun (_, l) -> is_self l) in
+                let others = List.filter ls ~f:(fun (_, l) -> not (is_self l)) in
+                if !budget <= 0 || List.is_empty selves || List.is_empty others
+                   || List.exists others ~f:(fun (p, _) -> Option.is_none p)
+                then None
+                else begin
+                  (* the non-hold value reached by most paths *)
+                  let counts = Hashtbl.create (module Int) in
+                  List.iter others ~f:(fun (_, l) ->
+                    Hashtbl.update counts (uid_int (resolve l)) ~f:(function None -> 1 | Some n -> n + 1));
+                  let best =
+                    List.fold others ~init:(snd (List.hd_exn others)) ~f:(fun acc (_, l) ->
+                      let c x = Option.value (Hashtbl.find counts (uid_int (resolve x))) ~default:0 in
+                      if c l > c acc then l else acc) in
+                  let rec rebuild s =
+                    match resolve s with
+                    | T.Mux { select; cases = [ c0; c1 ]; _ } when S.width select = 1 ->
+                      S.mux2 select (rebuild c1) (rebuild c0)
+                    | _ -> if is_self s then best else s in
+                  let rec bal = function
+                    | [] -> S.gnd
+                    | [ x ] -> x
+                    | l ->
+                      let rec pairs = function
+                        | x :: y :: r -> S.(x |: y) :: pairs r
+                        | r -> r in
+                      bal (pairs l) in
+                  let ce = bal (List.map others ~f:(fun (p, _) -> Option.value_exn p)) in
+                  Some (ce, rebuild d1)
+                end
+              end in
             let rb_enable, eff_d =
+              match tree_result with
+              | Some (ce, d') ->
+                let en_name = Printf.sprintf "%s__ce" base in
+                Queue.enqueue reg_queue (ce, [ en_name ]);
+                (Some en_name, d')
+              | None ->
               match resolve d1 with
               | T.Mux { select; cases = [ c0; c1 ]; _ }
                 when S.width select = 1 && uid_int (resolve c0) = uid_int sig_ ->

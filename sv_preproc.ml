@@ -50,6 +50,12 @@ let included_files : (string, unit) Hashtbl.t = Hashtbl.create 16
  * are visible in EVERY file, matching a tool-level +define+.  In-file
  * `\`define / `\`undef still work normally on top of these. *)
 let seed_defines_from_env () =
+  (* every synthesis tool predefines SYNTHESIS; sources guard simulation-only
+     code ($display, checkers, file I/O) with `ifndef SYNTHESIS.  Without it
+     the OCaml VM's GC checker read the heap from inside a function and
+     meminfer counted 6 read ports.  SVS_NO_SYNTHESIS_DEFINE=1 turns it off. *)
+  if Sys.getenv_opt "SVS_NO_SYNTHESIS_DEFINE" <> Some "1" then
+    Hashtbl.replace defines "SYNTHESIS" (Plain "1");
   match Sys.getenv_opt "SVS_DEFINE" with
   | None | Some "" -> ()
   | Some s ->

@@ -147,20 +147,67 @@ let abc_bin () =
      | Some s -> s
      | None -> "deps/yosys/yosys-abc")
 
-(* Default script: explicit resyn2 (the alias needs abc.rc, which yosys-abc
-   does not load) then choice-based DELAY mapping with area recovery, then mfs.
-   Measured against the old area-only `if -K 6 -a` (LUT / depth):
-     uart_transmitter 31/10 -> 34/4, uart_receiver 72/4 -> 76/3,
-     picorv32 862/17 -> 853/17.
-   SVS_ABC_SCRIPT overrides; GATE_MAP_ABC_AREA=1 selects the area-only form. *)
+(* Default flow: explicit resyn2 (the alias needs abc.rc, which yosys-abc
+   does not load) then choice-based DELAY mapping with area recovery, then mfs
+   -- one ROUND.  Re-strashing the mapped network and running another round
+   re-derives structure from the previous cover, and usually wins area, but
+   ABC is chaotic here: the same picorv32 netlist came out 1173 / 1215 / 1263
+   LUTs at 3 / 2 / 4 rounds, and a 1-gate change upstream can move any one of
+   them by +-60.  So one ABC run writes the network after every round and
+   [pick_round] keeps the smallest whose LUT depth is no worse than round 1's
+   -- the noise then only ever helps.  SVS_ABC_ROUNDS (default 4) sets the
+   number of rounds.  SVS_ABC_SCRIPT overrides the whole script (single
+   result); GATE_MAP_ABC_AREA=1 selects the old area-only form. *)
 let resyn2 = "balance; rewrite; refactor; balance; rewrite; rewrite -z; balance; refactor -z; rewrite -z; balance"
+let round = "strash; " ^ resyn2 ^ "; dch -f; if -K 6; mfs -W 4"
+let abc_rounds () =
+  match Stdlib.Sys.getenv_opt "SVS_ABC_ROUNDS" with
+  | Some r -> (try Int.max 1 (Int.of_string r) with _ -> 4)
+  | None -> 4
+
+(* Some script = fixed single-result script; None = the multi-round flow *)
 let abc_script () =
   match Stdlib.Sys.getenv_opt "SVS_ABC_SCRIPT" with
-  | Some s when String.length s > 0 -> s
+  | Some s when String.length s > 0 -> Some s
   | _ ->
     (match Stdlib.Sys.getenv_opt "GATE_MAP_ABC_AREA" with
-     | Some "1" -> "strash; " ^ resyn2 ^ "; dch -f; if -K 6 -a; mfs -W 4"
-     | _ -> "strash; " ^ resyn2 ^ "; dch -f; if -K 6; mfs -W 4")
+     | Some "1" -> Some ("strash; " ^ resyn2 ^ "; dch -f; if -K 6 -a; mfs -W 4")
+     | _ -> None)
+
+(* LUT count and LUT depth of a parsed BLIF (1-input nodes are aliases /
+   inverters the emitter folds away, so they cost nothing) *)
+let blif_cost (_, pos, defn) =
+  let real e = List.length e.e_ins >= 2 in
+  let luts = Hashtbl.count defn ~f:real in
+  let memo = Hashtbl.create (module String) in
+  let rec depth nm =
+    match Hashtbl.find memo nm with
+    | Some d -> d
+    | None ->
+      Hashtbl.set memo ~key:nm ~data:0;            (* cycle guard *)
+      let d =
+        match Hashtbl.find defn nm with
+        | None -> 0
+        | Some e ->
+          let sub = List.fold e.e_ins ~init:0 ~f:(fun acc i -> Int.max acc (depth i)) in
+          if real e then sub + 1 else sub in
+      Hashtbl.set memo ~key:nm ~data:d;
+      d in
+  let d = List.fold pos ~init:0 ~f:(fun acc o -> Int.max acc (depth o)) in
+  luts, d
+
+(* rounds in order; keep the fewest LUTs among those no deeper than round 1 *)
+let pick_round parsed =
+  let costs = List.map parsed ~f:(fun p -> p, blif_cost p) in
+  let _, (_, d0) = List.hd_exn costs in
+  let best, (bl, bd) =
+    List.fold costs ~init:(List.hd_exn costs) ~f:(fun ((_, (bl, _)) as acc) ((_, (l, d)) as c) ->
+      if d <= d0 && l < bl then c else acc) in
+  if Option.is_some (Stdlib.Sys.getenv_opt "SVS_ABC_DEBUG") then
+    Stdlib.Printf.eprintf "[abc_cover] rounds (luts/depth): %s -> %d/%d\n%!"
+      (String.concat ~sep:" " (List.map costs ~f:(fun (_, (l, d)) -> Printf.sprintf "%d/%d" l d)))
+      bl bd;
+  best
 
 (* Map [g] with abc and return one Signal.t per g.outputs entry (in order).
  * [input_nodes].(i) is the node id of the i-th Input (i.e. pi<i>); [resolve_input]
@@ -177,16 +224,27 @@ let map_graph
   let base = Stdlib.Filename.temp_file ("svs_abc_" ^ name ^ "_") "" in
   let aig = base ^ ".aig" and blif = base ^ ".blif" in
   write_aig_binary g aig;
+  let script, outs =
+    match abc_script () with
+    | Some sc -> sc ^ "; write_blif " ^ blif, [ blif ]
+    | None ->
+      let outs = List.init (abc_rounds ()) ~f:(fun r -> Printf.sprintf "%s.r%d.blif" base r) in
+      String.concat ~sep:"; " (List.map outs ~f:(fun o -> round ^ "; write_blif " ^ o)), outs in
   let cmd =
-    Printf.sprintf "'%s' -q 'read_aiger %s; %s; write_blif %s' >/dev/null 2>&1"
-      (abc_bin ()) aig (abc_script ()) blif
+    Printf.sprintf "'%s' -q 'read_aiger %s; %s' >/dev/null 2>&1" (abc_bin ()) aig script
   in
   let rc = Stdlib.Sys.command cmd in
-  if rc <> 0 || not (Stdlib.Sys.file_exists blif) then
+  let parsed =
+    List.filter_map outs ~f:(fun o ->
+      if Stdlib.Sys.file_exists o then begin
+        let r = parse_blif o in
+        (try Stdlib.Sys.remove o with _ -> ());
+        Some r
+      end else None) in
+  if rc <> 0 || List.is_empty parsed then
     failwith (Printf.sprintf "abc_cover: abc failed (rc=%d) for %s [cmd: %s]" rc name cmd);
-  let pis, pos, defn = parse_blif blif in
+  let pis, pos, defn = pick_round parsed in
   (try Stdlib.Sys.remove aig with _ -> ());
-  (try Stdlib.Sys.remove blif with _ -> ());
   let pi_arr = Array.of_list pis in
   if Array.length pi_arr <> Array.length input_nodes then
     Stdlib.Printf.eprintf
@@ -204,6 +262,24 @@ let map_graph
      1-input inversion -> ~: (Hardcaml folds NOT into the consuming LUT INIT
      during of_circuit, so it does not cost a standalone LUT1). *)
   let open Hardcaml in
+  (* abc's `if` duplicates a node into every cut that covers it, and the copies
+     come back as distinct BLIF nets with the same function of the same
+     inputs.  Hash-cons them here: one LUT per (truth table, input signals).
+     On the VM each heap-tile address pin had its own copy -- 576 identical
+     LUTs per address bit, 10k of 19k LUTs.  ABC_NODEDUP=1 skips. *)
+  let dedup = Option.is_none (Stdlib.Sys.getenv_opt "ABC_NODEDUP") in
+  let lut_cache = Hashtbl.Poly.create () in
+  let emit ~complement ~ins tt =
+    if not dedup then Lut_cover.emit_cut_signal ~complement ~ins tt
+    else begin
+      let nin = List.length ins in
+      let key = (complement, nin, Tt.to_bool_list ~k:nin tt, List.map ins ~f:Signal.uid) in
+      match Hashtbl.find lut_cache key with
+      | Some s -> s
+      | None ->
+        let s = Lut_cover.emit_cut_signal ~complement ~ins tt in
+        Hashtbl.set lut_cache ~key ~data:s; s
+    end in
   let rec resolve nm =
     match Hashtbl.find wires nm with
     | Some s -> s
@@ -227,9 +303,31 @@ let map_graph
           end
           else
             let ins = List.map e.e_ins ~f:resolve in
-            Lut_cover.emit_cut_signal ~complement:false ~ins tt
+            emit ~complement:false ~ins tt
       in
       Hashtbl.set wires ~key:nm ~data:s;
       s
   in
-  Array.of_list (List.map pos ~f:resolve)
+  (* A primary output drives a non-LUT pin (FF D, CARRY4 S/DI, port), where an
+     inverter cannot fold into a consumer and would become a LUT1.  When the
+     output inverts a real LUT, emit that LUT with its truth table complemented
+     instead: never more LUTs than the LUT1 (a duplicate at worst, when the
+     positive form is used elsewhere) and one level shallower.  On picorv32
+     the LUT1s fall 37 -> 21 at an unchanged total -- those inverted outputs
+     were all also used positively. *)
+  let resolve_po nm =
+    match Hashtbl.find defn nm with
+    | Some { e_ins = [ inner ]; e_cubes } when not (Hashtbl.mem wires nm) ->
+      let tt = tt_of_cover ~nin:1 e_cubes in
+      (match Tt.bit tt 0, Tt.bit tt 1, Hashtbl.find defn inner with
+       | true, false, Some ie when List.length ie.e_ins >= 2 && not (Hashtbl.mem wires inner) ->
+         let s =
+           emit ~complement:true
+             ~ins:(List.map ie.e_ins ~f:resolve)
+             (tt_of_cover ~nin:(List.length ie.e_ins) ie.e_cubes) in
+         Hashtbl.set wires ~key:nm ~data:s;
+         s
+       | _ -> resolve nm)
+    | _ -> resolve nm
+  in
+  Array.of_list (List.map pos ~f:resolve_po)

@@ -162,6 +162,30 @@ let call_args call_base =
   collect arg_list
 
 let rec eval_int ~pkgs ~params tok =
+  (* `Val_int(0)` as a localparam initialiser: fold the call through the
+     elaborator's constant-function evaluator (Verible_elaborate.fn_call_hook,
+     set by specialise_design), with the module's folded params as the scope
+     the body sees (VALUEW in `{{(VALUEW-32){1'b0}}, ...}`). *)
+  let user_call () =
+    match tok with
+    | TUPLE3 (STRING "reference_or_call_base1", ref_node, call_base) ->
+        let fname = ref None in
+        walk (function SymbolIdentifier id when !fname = None -> fname := Some id | _ -> ()) ref_node;
+        (match !fname with
+         | Some f when Verible_elaborate.is_known_function f ->
+             let args = List.map (eval_int ~pkgs ~params) (call_args call_base) in
+             if List.for_all Option.is_some args then begin
+               let saved = !Verible_elaborate.cur_scope in
+               Verible_elaborate.cur_scope :=
+                 List.filter_map (fun (n, v) ->
+                   match int_of_string_opt (String.trim v) with Some i -> Some (n, i) | None -> None) params;
+               let r = !Verible_elaborate.fn_call_hook f (List.map Option.get args) in
+               Verible_elaborate.cur_scope := saved;
+               r
+             end else None
+         | _ -> None)
+    | _ -> None in
+  match user_call () with Some v -> Some v | None ->
   let lookup name =
     match List.assoc_opt name params with
     | Some v -> int_of_pvalue (PStr v)
@@ -1107,6 +1131,10 @@ let cur_signal_struct : (string * string) list ref = ref []
  * builders can compute a real `result_type` width instead of falling
  * back to dummy_bool. *)
 let cur_signal_widths : (string * int) list ref = ref []
+(* return widths of the functions declared so far: an expression over a call
+   (`Val_int(-Int_val(accu))`) is as wide as the function's return value, not
+   1 bit *)
+let cur_func_ret_w : (string, int) Hashtbl.t = Hashtbl.create 16
 
 (* Per-module table of signals declared with a NON-ZERO packed LSB, e.g.
  * `logic [31:1] instr_addr_q`.  The emitted declaration is normalised to
@@ -1328,7 +1356,9 @@ let rec width_of_bexpr_ctx widths = function
        | Some a, Some b -> Some (max a b)
        | Some a, None | None, Some a -> Some a
        | _ -> None)
-  | BSelect _ | BCall _ -> None
+  | BCall { func = "@signed"; args = [ x ] } -> width_of_bexpr_ctx widths x
+  | BCall { func; _ } -> Hashtbl.find_opt cur_func_ret_w func
+  | BSelect _ -> None
 
 (* Resolve a `$signed(x)` right-hand side against the width of what it is
    assigned to.  Verilog extends the cast value to the target's width by
@@ -1386,7 +1416,12 @@ let result_type_for op lhs rhs =
     | Some a, None | None, Some a ->
         BInt { width = a; signed = Unsigned }
     | None, None ->
-        BInt { width = 1; signed = Unsigned }   (* legacy dummy_bool fallback *)
+        (* neither width known (calls of functions not yet seen, array selects):
+           an integer-sized result.  1 bit here made the VM's
+           `Val_int(-Int_val(accu))` a 1-bit negation that the call-argument
+           normaliser zero-padded, and the `<< 1` spilled its sign into the
+           word's metadata bit. *)
+        BInt { width = 32; signed = Unsigned }
 
 let result_type_for_un op operand =
   let reduction = match op with
@@ -1396,7 +1431,7 @@ let result_type_for_un op operand =
   else
     match width_of_bexpr_ctx !cur_signal_widths operand with
     | Some w -> BInt { width = w; signed = Unsigned }
-    | None -> BInt { width = 1; signed = Unsigned }
+    | None -> BInt { width = 32; signed = Unsigned }
 
 (* Pack a struct-typed localparam into a single BConst: field VALUES from
    cur_struct_params, field WIDTHS/order from cur_struct_defs (via the
@@ -1423,6 +1458,18 @@ let pack_struct_const id : bexpr option =
   | _ -> None
 
 let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
+  (if Sys.getenv_opt "SVS_DEBUG_SIGNED" <> None then begin
+     let has = ref false in
+     walk (function SystemTFIdentifier "$signed" | SymbolIdentifier "$signed" -> has := true | _ -> ()) tok;
+     if !has then
+       Printf.eprintf "[signed-dbg] %s\n%!"
+         (match tok with
+          | TUPLE2 (STRING t, _) -> "T2 " ^ t | TUPLE3 (STRING t, _, _) -> "T3 " ^ t
+          | TUPLE4 (STRING t, _, _, _) -> "T4 " ^ t | TUPLE5 (STRING t, _, _, _, _) -> "T5 " ^ t
+          | TUPLE3 (SystemTFIdentifier s, _, _) -> "T3 tf:" ^ s
+          | TUPLE2 (SystemTFIdentifier s, _) -> "T2 tf:" ^ s
+          | TLIST _ -> "TLIST" | _ -> "other")
+   end);
   let recurse = expr_to_bexpr ~pkgs ~params ~arrays in
   let bin op a b =
     let lhs = recurse a in
@@ -2268,18 +2315,15 @@ let rec expr_to_bexpr ~pkgs ~params ~arrays tok =
         (* SV `>>>` is arithmetic right-shift but the LRM-spec'd fill
          * depends on the LHS type: signed operands fill with the
          * sign bit, unsigned operands fill with 0 (i.e. behave like
-         * `>>`). Verilator pre-applies this distinction; on the
-         * verible side our only signedness signal is whether the
-         * LHS got tagged with `$signed(...)` (an @signed BCall). If
-         * so emit BAshr, otherwise fall back to logical BShr so the
-         * two miter sides match on the common unsigned-RHS shift
-         * idiom `(unsigned_expr >>> k)`. *)
+         * `>>`).  Declared signedness is only known after the module's
+         * declarations are scanned, so emit BAshr here and let the
+         * signedness post-pass (below, "Declared-`signed` recovery")
+         * turn it into a logical BShr when the left operand is
+         * unsigned.  Deciding here from a `$signed(...)` wrapper alone
+         * made `a >>> b` on an `input signed` a logical shift: zeros
+         * where the sign bits belong (the OCaml VM's ASR). *)
         let lhs_bexpr = recurse lhs in
-        let is_signed_lhs = match lhs_bexpr with
-          | BCall { func = "@signed"; _ } -> true
-          | _ -> false
-        in
-        let op = if is_signed_lhs then BAshr else BShr in
+        let op = BAshr in
         let rhs_bexpr = recurse rhs in
         BBinOp { op; lhs = lhs_bexpr; rhs = rhs_bexpr;
                  result_type = result_type_for op lhs_bexpr rhs_bexpr }
@@ -3167,6 +3211,11 @@ let extract_assign ~pkgs ~params ~arrays tok =
    makes the difference between "we know this is nothing" and "we hope it was
    nothing", and only the first is safe to drop in silence. *)
 let noop_tasks : (string, unit) Hashtbl.t = Hashtbl.create 8
+(* every task this module declares, and the LHS names its body assigns with
+   blocking `=` (they become in-cycle temps of whichever clocked block calls
+   the task, once Behavioral_inline has spliced the body in) *)
+let task_names : (string, unit) Hashtbl.t = Hashtbl.create 8
+let task_blocking : (string, string list) Hashtbl.t = Hashtbl.create 8
 
 let first_symbol tok =
   let found = ref None in
@@ -3181,20 +3230,40 @@ let first_symbol tok =
    `task_declaration1(Task, lifetime, id, ports, ;, body, Endtask, label)`. *)
 let collect_noop_tasks m_body =
   Hashtbl.reset noop_tasks;
+  Hashtbl.reset task_names; Hashtbl.reset task_blocking;
   List.iter
     (fun t ->
       match t with
       | TUPLE9 (STRING _, _task, _lifetime, id, _ports, _semi, body, _end, _label) -> (
+          (* any assignment or statement form: a task whose body is only
+             `accu <= 32'hC0010000;` (nonblocking_assignment) was taken for a
+             no-op and its calls dropped -- the VM's C_CALL1 arms *)
+          let contains s sub =
+            let n = String.length s and m = String.length sub in
+            let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in go 0 in
           let has_logic =
             collect_by
               (has_tag (fun tg ->
-                   prefix_is "statement" tg || prefix_is "assignment" tg
-                   || prefix_is "conditional_statement" tg
-                   || prefix_is "case_statement" tg || prefix_is "loop_statement" tg
-                   || prefix_is "for_loop_statement" tg))
+                   contains tg "statement" || contains tg "assignment"
+                   || contains tg "case" || contains tg "loop"))
               body
             <> []
           in
+          (match first_symbol id with
+           | Some n ->
+               Hashtbl.replace task_names n ();
+               let names = ref [] in
+               walk (function
+                 | TUPLE4 (STRING t, lhs, _, _)
+                   when prefix_is "assignment_statement_no_expr" t ->
+                     let lid = ref None in
+                     walk (function
+                       | SymbolIdentifier x when !lid = None -> lid := Some x
+                       | _ -> ()) lhs;
+                     (match !lid with Some x -> names := x :: !names | None -> ())
+                 | _ -> ()) body;
+               Hashtbl.replace task_blocking n (List.sort_uniq compare !names)
+           | None -> ());
           match first_symbol id with
           | Some n when not has_logic -> Hashtbl.replace noop_tasks n ()
           | _ -> ())
@@ -3222,6 +3291,14 @@ let has_full_case tok =
   !found
 
 let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
+  (if Sys.getenv_opt "SVS_DEBUG_STMT" <> None then begin
+     let toks = ref [] and n = ref 0 in
+     walk (function
+       | SymbolIdentifier s when !n < 6 -> incr n; toks := ("id:" ^ s) :: !toks
+       | STRING s when !n < 6 -> incr n; toks := s :: !toks
+       | _ -> ()) tok;
+     Printf.eprintf "[stmt-dbg] %s\n%!" (String.concat " " (List.rev !toks))
+   end);
   let recurse_e = expr_to_bexpr ~pkgs ~params ~arrays in
   let recurse_s = stmt_to_bstmt ~pkgs ~params ~arrays in
   (* Bit range [msb:lsb] of struct field [fname] in struct-typed signal
@@ -4113,12 +4190,71 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
       (* Verible wraps a block item / statement / null in this node inside a
          begin/end; the middle child is the real content — recurse into it. *)
       recurse_s inner
+  | TUPLE3 (STRING t, SymbolIdentifier id, _)
+    when prefix_is "unqualified_id" t && Hashtbl.mem task_names id ->
+      (* `flush();` -- a task called with no arguments parses as a bare
+         identifier.  The VM's C_CALL1 arms are such calls
+         (caml_ml_open_descriptor_in(); accu <= 32'hC0010000), and dropping
+         them left accu unchanged after every C call. *)
+      BCallStmt { func = id; args = [] }
   | TUPLE3 (STRING t, _, _) when prefix_is "unqualified_id" t ->
       (* A bare identifier in statement position (a label / macro-expansion
          artifact in the Xilinx PCS source) — no procedural effect. *)
       BBlock []
-  | TUPLE3 (STRING t, _, _)
+  | TUPLE3 (STRING t, payload, _)
+    when prefix_is "data_declaration_or_module_instantiation" t
+      && (match first_symbol payload with
+          | Some n -> Hashtbl.mem task_names n | None -> false) ->
+      (* `stack_write(sp-1, accu);` inside an always block: Verible parses an
+         identifier followed by a parenthesised list as this instantiation-
+         shaped node, and it used to vanish here as a no-op -- 50 of the OCaml
+         VM's 52 stack_write calls, silently.  A declared task is a call. *)
+      let n = Option.get (first_symbol payload) in
+      (match expr_to_bexpr ~pkgs ~params ~arrays payload with
+       | BCall { func; args } when func = n -> BCallStmt { func; args }
+       | BCall { args; _ } -> BCallStmt { func = n; args }
+       | _ -> BCallStmt { func = n; args = [] })
+  | TUPLE3 (STRING t, payload, _)
+    when prefix_is "data_declaration_or_module_instantiation" t
+      && (collect_by (function
+            | TUPLE3 (STRING t2, EQUALS, _) when prefix_is "trailing_decl_assignment" t2 -> true
+            | _ -> false) payload <> []) ->
+      (* a procedural variable declared WITH an initialiser (`logic [15:0]
+         wosize16 = wosize;` in a function body): the initialiser is an
+         assignment the inliner needs, cut to the DECLARED width.  The
+         inliner substitutes the value where the local is read, so without
+         the cut `{wosize16, 8'd0, tag8}` concatenated the 32-bit `int`
+         arguments and the VM's Make_header lost its size field. *)
+      let decl_w =
+        match extract_packed_dims ~pkgs ~params payload with
+        | (m, l) :: _ -> Some (abs (m - l) + 1)
+        | [] -> atom_width payload in
+      let cut e =
+        match decl_w, e with
+        | Some w, BConst { value; _ } -> BConst { value = Z.extract value 0 w; width = w }
+        | Some w, e -> BSlice { signal = e; msb = w - 1; lsb = 0 }
+        | None, e -> e in
+      let assigns =
+        collect_by (function
+          | TUPLE4 (STRING t2, SymbolIdentifier _, _, _)
+            when prefix_is "non_anonymous_gate_instance_or_register_variable" t2 -> true
+          | _ -> false) payload
+        |> List.filter_map (function
+          | TUPLE4 (_, SymbolIdentifier name, _, TUPLE3 (STRING t3, EQUALS, e))
+            when prefix_is "trailing_decl_assignment" t3 ->
+              Some (BAssign { lhs = name; rhs = cut (expr_to_bexpr ~pkgs ~params ~arrays e) })
+          | _ -> None) in
+      (match assigns with [ a ] -> a | l -> BBlock (List.rev l))
+  | TUPLE3 (STRING t, payload, _)
     when prefix_is "data_declaration_or_module_instantiation" t ->
+      (if Sys.getenv_opt "SVS_DEBUG_STMT" <> None then begin
+         let toks = ref [] in
+         walk (function
+           | SymbolIdentifier s -> toks := ("id:" ^ s) :: !toks
+           | STRING s -> toks := s :: !toks
+           | _ -> ()) payload;
+         Printf.eprintf "[stmt-dbg] no-op decl/inst: %s\n%!" (String.concat " " (List.rev !toks))
+       end);
       (* Module-scope net/var declaration or module instantiation that Verible
          parsed as a statement-ambiguous node (seen in the Xilinx PCS/PMA
          transceiver source).  BOTH forms are captured by separate scans over
@@ -4127,6 +4263,19 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
          no PROCEDURAL logic and is a no-op here.  (Must precede the catch-all,
          which would otherwise hard-fail on it in strict mode.) *)
       BBlock []
+  | TUPLE3 (STRING t, a, b) when prefix_is "inc_or_dec_expression" t ->
+      (* `x++;` / `--x;` as a statement: x = x +/- 1 *)
+      let op, inner = (match a, b with
+        | PLUS_PLUS, e | e, PLUS_PLUS -> BAdd, e
+        | HYPHEN_HYPHEN, e | e, HYPHEN_HYPHEN -> BSub, e
+        | e, _ -> BAdd, e) in
+      (match expr_to_bexpr ~pkgs ~params ~arrays inner with
+       | BVar n ->
+           BAssign { lhs = n; rhs = BBinOp { op; lhs = BVar n; rhs = BConst { value = Z.one; width = 32 }
+                                           ; result_type = BInt { width = 32; signed = Unsigned } } }
+       | _ ->
+           lossage_warn "verible:stmt" "inc/dec statement on a non-identifier dropped";
+           BBlock [])
   | TUPLE3 (STRING t, payload, _semi) when prefix_is "statement3" t ->
       (* `reference_or_call ;` — a bare call statement.  Droppable ONLY when
          the callee is a task this module declares with an empty body (see
@@ -4134,12 +4283,25 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
          so it stays a reported loss rather than a quiet one. *)
       let callee = first_symbol payload in
       (match callee with
-       | Some n when Hashtbl.mem noop_tasks n -> ()
+       | Some n when Hashtbl.mem noop_tasks n -> BBlock []
+       | Some n when String.length n > 0 && n.[0] = '$' ->
+           (* system task statement ($error, $display, $readmemh ...): a
+              simulation construct, no hardware *)
+           BBlock []
+       | _ when stmt_is_system_task payload -> BBlock []
+       | Some n when Hashtbl.mem task_names n ->
+           (* a call of a task this module declares: keep it as a BCallStmt
+              so Behavioral_inline splices the task body in, formals bound
+              to the actuals (same path as function calls in expressions) *)
+           (match expr_to_bexpr ~pkgs ~params ~arrays payload with
+            | BCall { func; args } when func = n -> BCallStmt { func; args }
+            | BCall { args; _ } -> BCallStmt { func = n; args }
+            | _ -> BCallStmt { func = n; args = [] })
        | _ ->
            lossage_warn "verible:stmt"
              (Printf.sprintf "call statement '%s;' dropped to empty block (tasks are not modelled)"
-                (match callee with Some n -> n | None -> "?")));
-      BBlock []
+                (match callee with Some n -> n | None -> "?"));
+           BBlock [])
   | _ ->
       (* Master statement catch-all: an unhandled procedural statement shape
          (a while/repeat/forever loop, break/continue, wait, …) becomes an
@@ -4328,6 +4490,11 @@ let extract_always ~pkgs ~params ~arrays tok =
                   | SymbolIdentifier n when !id = None -> id := Some n
                   | _ -> ()) lhs;
                 (match !id with Some n -> names := n :: !names | None -> ())
+            | TUPLE3 (STRING t, payload, _) when prefix_is "statement3" t ->
+                (match first_symbol payload with
+                 | Some n -> (match Hashtbl.find_opt task_blocking n with
+                              | Some l -> names := l @ !names | None -> ())
+                 | None -> ())
             | _ -> ()) an;
           List.sort_uniq compare !names
         in
@@ -5758,6 +5925,7 @@ let convert_module ~pkgs (mdecl : module_decl)
    * port + internal signals are extracted, before any expr_to_bexpr
    * call. Keeps result_type_for from falling back to dummy_bool. *)
   cur_signal_widths := [];
+  Hashtbl.reset cur_func_ret_w;
   cur_signal_lsb := [];
   (* Non-zero-based packed ranges on nets (`wire [4:3] w;`) -- the WRITE
    * side only.  Reads are rebased by the post-hoc `range_offsets`
@@ -7357,6 +7525,7 @@ let convert_module ~pkgs (mdecl : module_decl)
        module actually calls, so surplus package functions are harmless. *)
     let function_decls =
       collect_by (has_tag (fun t -> prefix_is "function_declaration" t)) mdecl_body
+      @ collect_by (has_tag (fun t -> prefix_is "task_declaration" t)) mdecl_body
       @ List.concat_map (fun (p : Verible_elaborate.package_decl) ->
           collect_by (has_tag (fun t -> prefix_is "function_declaration" t))
             p.pkg_body) pkgs in
@@ -7412,6 +7581,39 @@ let convert_module ~pkgs (mdecl : module_decl)
       else
         let return_w = width_of ~pkgs ~params fdecl in
         let return_w = if return_w <= 0 then 1 else return_w in
+        (* `function logic signed [31:0] f(...)`: a Signed token in the header,
+           i.e. before the function's name, makes the return value signed (so a
+           compare against it, or a `>>>` of it, is signed) *)
+        (* the return type is what precedes the function's name: an integer
+           atom (signed, 32 bits for integer/int) or a packed range.  width_of
+           over the whole declaration took the first range it found, which
+           was the first parameter's (`integer Int_val(input logic [35:0] v)`
+           came out 36 bits wide, so a signed compare against it extended
+           the other operand only). *)
+        let ret_w = ref None in
+        let return_signed =
+          let seen_name = ref false and sg = ref false in
+          let unsg = ref false in
+          let atom w = if not !seen_name && !ret_w = None then ret_w := Some w in
+          let scan = walk (function
+            | Signed -> if not !seen_name then sg := true
+            | Integer | Int -> (if not !seen_name then sg := true); atom 32
+            | Byte -> (if not !seen_name then sg := true); atom 8
+            | Shortint -> (if not !seen_name then sg := true); atom 16
+            | Longint -> (if not !seen_name then sg := true); atom 64
+            | Unsigned -> if not !seen_name then unsg := true
+            | TUPLE6 (STRING t, _, msb, _, lsb, _)
+              when prefix_is "decl_variable_dimension" t && not !seen_name && !ret_w = None ->
+                (match eval_int ~pkgs ~params msb, eval_int ~pkgs ~params lsb with
+                 | Some m, Some l -> ret_w := Some (abs (m - l) + 1)
+                 | _ -> ())
+            | SymbolIdentifier id when id = fname -> seen_name := true
+            | _ -> ()) in
+          scan fdecl;
+          if Sys.getenv_opt "SVS_DEBUG_SIGNED" <> None then
+            Printf.eprintf "[signed-dbg] function %s: signed=%b seen_name=%b ret_w=%s width_of=%d\n%!" fname !sg !seen_name
+              (match !ret_w with Some w -> string_of_int w | None -> "none") return_w;
+          if !sg && not !unsg then Behavioral_ir.Signed else Behavioral_ir.Unsigned in
         (* Input declarations: walk for `port_declaration_noattr`,
            `tf_port_declaration`, `tf_port_item`, or `module_port_declaration`
            tags.  SystemVerilog `function f (input X, Y, Z);` ports
@@ -7486,6 +7688,7 @@ let convert_module ~pkgs (mdecl : module_decl)
         let is_stmt_tag t =
           prefix_is "case_statement" t
           || prefix_is "conditional_statement" t
+          || prefix_is "data_declaration_or_module_instantiation" t  (* `logic [7:0] tag8 = tag;` *)
           || prefix_is "assignment_statement_no_expr" t
           || prefix_is "nonblocking_assignment" t
           || prefix_is "jump_statement" t   (* `return <expr>;` — single-return
@@ -7538,8 +7741,10 @@ let convert_module ~pkgs (mdecl : module_decl)
         in
         Some {
           fname;
-          is_task = false;
-          ftype = BInt { width = return_w; signed = Unsigned };
+          is_task = has_tag (fun t -> prefix_is "task_declaration" t) fdecl;
+          ftype = (let w = (match !ret_w with Some w -> w | None -> return_w) in
+                   Hashtbl.replace cur_func_ret_w fname w;
+                   BInt { width = w; signed = return_signed });
           params = func_params;
           locals = [];
           body;
@@ -7635,8 +7840,14 @@ let convert_module ~pkgs (mdecl : module_decl)
     || prefix_is "net_declaration" t || prefix_is "data_declaration" t
     || prefix_is "tf_port_declaration" t)) mdecl.m_body in
   List.iter (fun dn ->
-    let has_signed = ref false in
-    walk (function Signed -> has_signed := true | _ -> ()) dn;
+    (* `signed`, or one of the integer atom types, which are signed unless
+       followed by `unsigned` (`integer i` compares and shifts as signed) *)
+    let has_signed = ref false and has_unsigned = ref false in
+    walk (function
+      | Signed | Integer | Int | Byte | Shortint | Longint -> has_signed := true
+      | Unsigned -> has_unsigned := true
+      | _ -> ()) dn;
+    let has_signed = ref (!has_signed && not !has_unsigned) in
     if !has_signed then begin
       let rec collect t = match t with
         | TUPLE6 (STRING t', _, _, _, _, _)
@@ -7688,6 +7899,9 @@ let convert_module ~pkgs (mdecl : module_decl)
         | BCond { then_val; else_val; _ } ->
             expr_signed then_val && expr_signed else_val
         | BCall { func = "@signed"; _ } -> true
+        (* a shift is as signed as its left operand (the count is
+           self-determined) *)
+        | BBinOp { op = (BShl|BShr|BAshr); lhs; _ } -> expr_signed lhs
         | _ -> false in
       (* Push the assignment-context width INTO the expression (extending
          the RESULT of a narrower binop is not the same as extending its
@@ -7701,6 +7915,11 @@ let convert_module ~pkgs (mdecl : module_decl)
                     result_type = BInt { width = to_w; signed = Signed } }
         | BCond r -> BCond { r with then_val = widen to_w r.then_val;
                                     else_val = widen to_w r.else_val }
+        (* a signed shift extends its LEFT operand to the context width
+           before shifting (`y64 = a32 >>> 4` keeps a's sign in y[63:32]) *)
+        | BBinOp ({ op = (BShl|BShr|BAshr); _ } as r) ->
+            BBinOp { r with lhs = widen to_w r.lhs;
+                     result_type = BInt { width = to_w; signed = Signed } }
         | _ ->
             (match Behavioral_const.width_of_expr_with widths e with
              | Some w when w < to_w && w > 0 ->
@@ -7739,6 +7958,119 @@ let convert_module ~pkgs (mdecl : module_decl)
         processes in
       signals, processes
     end in
+  (* `>>>` was emitted as BAshr unconditionally (see shift_expr4); where its
+     left operand is unsigned by the LRM rules it is a logical shift. *)
+  let processes, instances, funcs =
+    let signed_sig : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+    (* inside a function body its parameters and locals shadow the module's
+       signals; their declared signedness decides (the decl sites record
+       Unsigned today, so a `>>>` in a function is arithmetic only under
+       `$signed(...)`, as before) *)
+    let shadow : (string, bool) Hashtbl.t = Hashtbl.create 8 in
+    List.iter (fun (s : bsignal) ->
+      match s.stype with
+      | BInt { signed = Signed; _ } -> Hashtbl.replace signed_sig s.name ()
+      | _ -> ()) signals;
+    (* widths and return signedness, for the comparisons below *)
+    let wtbl : (string, int) Hashtbl.t = Hashtbl.create 64 in
+    List.iter (fun (s : bsignal) ->
+      match s.stype with BInt { width; _ } -> Hashtbl.replace wtbl s.name width | _ -> ()) signals;
+    let shadow_w : (string, int) Hashtbl.t = Hashtbl.create 8 in
+    let fret : (string, int * bool) Hashtbl.t = Hashtbl.create 8 in
+    List.iter (fun (f : bfunc) ->
+      match f.ftype with
+      | BInt { width; signed } -> Hashtbl.replace fret f.fname (width, signed = Behavioral_ir.Signed)
+      | _ -> ()) funcs;
+    let rec width_e = function
+      | BVar n ->
+          (match Hashtbl.find_opt shadow_w n with
+           | Some w -> Some w
+           | None -> Hashtbl.find_opt wtbl n)
+      | BCall { func = "@signed"; args = [ x ] } -> width_e x
+      | BCall { func; _ } -> Option.map fst (Hashtbl.find_opt fret func)
+      | BBinOp { op = (BAdd|BSub|BMul|BAnd|BOr|BXor|BShl|BShr|BAshr); result_type; _ } ->
+          Some (Behavioral_const.width_of_btype_full result_type)
+      | BUnOp { op = (BNot|BNeg); result_type; _ } -> Some (Behavioral_const.width_of_btype_full result_type)
+      | BCond { then_val; else_val; _ } ->
+          (match width_e then_val, width_e else_val with
+           | Some a, Some b -> Some (max a b) | _ -> None)
+      | e -> Behavioral_const.width_of_expr_with wtbl e in
+    let rec signed_e = function
+      | BVar n ->
+          (match Hashtbl.find_opt shadow n with
+           | Some sg -> sg
+           | None -> Hashtbl.mem signed_sig n)
+      | BCall { func; _ } when func <> "@signed" ->
+          (match Hashtbl.find_opt fret func with Some (_, sg) -> sg | None -> false)
+      | BBinOp { op = (BAdd|BSub|BMul|BAnd|BOr|BXor); lhs; rhs; _ } -> signed_e lhs && signed_e rhs
+      | BBinOp { op = (BShl|BShr|BAshr); lhs; _ } -> signed_e lhs
+      | BUnOp { op = (BNot|BNeg); operand; _ } -> signed_e operand
+      | BCond { then_val; else_val; _ } -> signed_e then_val && signed_e else_val
+      | BCall { func = "@signed"; _ } -> true
+      | BConcat [ BReplicate { value = BSlice { signal = x; msb; lsb }; _ }; x' ]
+        when msb = lsb && x = x' -> signed_e x     (* materialised sign extension *)
+      | _ -> false in
+    (* an unsized literal is signed in the LRM, so it takes the signedness
+       of the other operand; a sized one (`32'd5`) is unsigned, but the
+       importer gives both the same BConst, and `$signed(x) < 0` is the
+       idiom that matters *)
+    let signed_operand e other = signed_e e || (match e with BConst _ -> signed_e other | _ -> false) in
+    let rec fe e = match e with
+      | BBinOp ({ op = BAshr; _ } as r) ->
+          let lhs = fe r.lhs and rhs = fe r.rhs in
+          BBinOp { r with op = (if signed_e lhs then BAshr else BShr); lhs; rhs }
+      | BBinOp ({ op = (BLt | BLe | BGt | BGe); _ } as r) ->
+          let lhs = fe r.lhs and rhs = fe r.rhs in
+          if Sys.getenv_opt "SVS_DEBUG_SIGNED" <> None then
+            Printf.eprintf "[signed-dbg] compare: lhs signed=%b w=%s rhs signed=%b w=%s\n%!"
+              (signed_operand lhs rhs) (match width_e lhs with Some w -> string_of_int w | None -> "?")
+              (signed_operand rhs lhs) (match width_e rhs with Some w -> string_of_int w | None -> "?");
+          if signed_operand lhs rhs && signed_operand rhs lhs then
+            (match width_e lhs, width_e rhs with
+             | Some lw, Some rw when lw > 0 && rw > 0 ->
+                 let strip x = match x with BCall { func = "@signed"; args = [ y ] } -> y | _ -> x in
+                 Behavioral_const.signed_compare r.op ~lw ~rw (strip lhs) (strip rhs)
+             | _ -> BBinOp { r with lhs; rhs })
+          else BBinOp { r with lhs; rhs }
+      | BBinOp r -> BBinOp { r with lhs = fe r.lhs; rhs = fe r.rhs }
+      | BUnOp r -> BUnOp { r with operand = fe r.operand }
+      | BSelect { array; index } -> BSelect { array = fe array; index = fe index }
+      | BSlice r -> BSlice { r with signal = fe r.signal }
+      | BConcat l -> BConcat (List.map fe l)
+      | BReplicate r -> BReplicate { r with value = fe r.value }
+      | BCond { condition; then_val; else_val } ->
+          BCond { condition = fe condition; then_val = fe then_val; else_val = fe else_val }
+      | BCall r -> BCall { r with args = List.map fe r.args }
+      | BVar _ | BConst _ -> e in
+    let rec fs s = match s with
+      | BAssign r -> BAssign { r with rhs = fe r.rhs }
+      | BIf r -> BIf { condition = fe r.condition; then_stmts = List.map fs r.then_stmts
+                     ; else_stmts = List.map fs r.else_stmts }
+      | BCase r -> BCase { selector = fe r.selector
+                         ; cases = List.map (fun (g, b) -> (fe g, List.map fs b)) r.cases
+                         ; default = List.map fs r.default }
+      | BWhile r -> BWhile { condition = fe r.condition; body = List.map fs r.body }
+      | BFor r -> BFor { r with condition = fe r.condition; body = List.map fs r.body }
+      | BBlock b -> BBlock (List.map fs b)
+      | BCallStmt r -> BCallStmt { r with args = List.map fe r.args }
+      | BReturn e -> BReturn (Option.map fe e) in
+    List.map (function
+      | BCombinational r -> BCombinational { r with body = List.map fs r.body }
+      | BSequential r -> BSequential { r with body = List.map fs r.body }) processes,
+    List.map (fun (i : binstance) ->
+      { i with port_connections = List.map (fun (p, e) -> (p, fe e)) i.port_connections })
+      instances,
+    List.map (fun (f : bfunc) ->
+      Hashtbl.reset shadow;
+      let mark n t = Hashtbl.replace shadow n
+                       (match t with BInt { signed = Signed; _ } -> true | _ -> false) in
+      Hashtbl.reset shadow_w;
+      let markw n t = match t with
+        | BInt { width; _ } -> Hashtbl.replace shadow_w n width | _ -> () in
+      List.iter (fun (n, t, _) -> mark n t; markw n t) f.params;
+      List.iter (fun (n, t) -> mark n t; markw n t) f.locals;
+      let f' = { f with body = List.map fs f.body } in
+      Hashtbl.reset shadow; Hashtbl.reset shadow_w; f') funcs in
   (* A variable with a declaration INITIALISER that nothing ever drives is a
      CONSTANT, not an undriven net.  The initial value is otherwise honoured
      only for clocked registers, so `integer WAIT_TIME_CDRLOCK = RX_CDRLOCK_TIME

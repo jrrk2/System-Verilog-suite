@@ -30,7 +30,7 @@
           
           sv_main_unified sv_parse sv_transform sv_tran_struct
           behavioural_to_opt_ir opt_ir_to_sv opt_ir_to_behavioral opt_ir_naming sv_opt_ir
-          behavioral_unroll behavioral_initeval behavioral_mem_merge behavioral_inline behavioral_iflift behavioral_meminfer behavioral_srl_infer behavioral_ffrip behavioral_share behavioral_sanity behavioral_blocking_subst behavioral_flatten behavioral_hier behavioral_boundary mem_macro_resolve behavioral_memlower fpga_bram_resolve behavioral_dsp_infer behavioral_nba_slice behavioral_iobuf_hoist
+          behavioral_unroll behavioral_initeval behavioral_mem_merge behavioral_inline behavioral_iflift behavioral_meminfer behavioral_srl_infer behavioral_ffrip behavioral_share behavioral_sanity behavioral_blocking_subst behavioral_flatten behavioral_hier behavioral_boundary mem_macro_resolve behavioral_memlower fpga_bram_resolve behavioral_dsp_infer behavioral_nba_slice behavioral_iobuf_hoist behavioral_json behavioral_share_accum behavioral_add_tree behavioral_onehot behavioral_wreduce
           verible_elaborate verible_to_behavioral verible_emit_source rtlil_to_behavioral
           rtl_prim
           slang_to_behavioral
@@ -48,7 +48,7 @@
           sv_elaborate sv_verible_to_ir sv_token_dumper sv_preproc
           xil_prim_models vhdl_to_behavioral sv_to_behavioral verilator_to_behavioral
           behavioral_ssa behavioral_registers behavioral_const behavioral_dce behavioral_cse behavioral_optimize behavioral_cdc_check behavioral_domain_split
-          behavioral_to_z3 behavioral_to_hardcaml z3_miter z3_hardcaml_miter tool_scan equiv_core gui_equiv
+          behavioral_to_z3 behavioral_to_hardcaml sat_backend z3_miter z3_hardcaml_miter tool_scan equiv_core gui_equiv
           file_registry
           nlview_parser nlview_to_behavioral behavioral_to_verilog nlview_to_verilog
           edif_parser edif_to_behavioral edif_to_structural edif2_to_structural edif_to_verilog behavioral_hier_struct bir_to_nextpnr_json nextpnr_json_to_bir nextpnr_json_to_behavioral bir_to_edif fpga_prim_expand bir_to_verilog_netlist hardcaml_to_behavioral

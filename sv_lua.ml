@@ -147,11 +147,17 @@ let verilator_json_of_sources ~top ~files =
   let dir = Filename.temp_file "vltdir_" "" in
   (try Sys.remove dir with _ -> ());
   Unix.mkdir dir 0o755;
+  (* +incdir+ of every source's directory: a `include "x.h"` next to the
+     source must resolve whatever directory sv_suite itself runs from. *)
+  let incdirs =
+    List.sort_uniq compare (List.map Filename.dirname files)
+    |> List.map (fun d -> "+incdir+" ^ Filename.quote d) in
   let cmd = Printf.sprintf
-    "%s --json-only --json-only-output %s/ast.json -Wno-fatal \
-       --timescale 1ns/1ps --top-module %s %s > /dev/null 2>&1"
-    (Filename.quote verilator) (Filename.quote dir) (Filename.quote top)
-    (String.concat " " (List.map Filename.quote files)) in
+    "%s --json-only --json-only-output %s/ast.json -Wno-fatal -Wno-lint \
+       +define+SYNTHESIS=1 --timescale 1ns/1ps %s --top-module %s %s > %s/verilator.log 2>&1"
+    (Filename.quote verilator) (Filename.quote dir) (String.concat " " incdirs)
+    (Filename.quote top) (String.concat " " (List.map Filename.quote files))
+    (Filename.quote dir) in
   let rc = Sys.command cmd in
   let direct = Filename.concat dir "ast.json" in
   if Sys.file_exists direct then direct
@@ -1758,7 +1764,7 @@ let lmiter_hier a_prog_h b_prog_h top =
       end) p_raw.modules;
     used in
   let n_eq = ref 0 in
-  let n_unc = ref 0 in
+  let n_unc = ref 0 and n_inc = ref 0 in
   let buf = Buffer.create 256 in
   List.iter (fun n ->
     match by_name pa n, by_name pb (bname n) with
@@ -1778,14 +1784,26 @@ let lmiter_hier a_prog_h b_prog_h top =
            masked — a flow that proved it redundant in context (rx_clk ≡
            eth_clk; pcspma_status[15:2] unread by the LED logic) rewires or
            ties it, and comparing only reproduces that trusted optimisation. *)
+        (* A module nothing instantiates (the top) has every output read by
+           the outside world.  Its usage table is empty, and defaulting a
+           missing entry to "unread" dropped every top-level output from the
+           compare: a combinational top was proven EQUIVALENT vacuously, and
+           a sequential one only had its registers' next-state compared --
+           the Verible front-end's logical `>>>` on a signed operand passed
+           the three-way vote that way. *)
+        let instantiated (p : bprogram) n =
+          List.exists (fun (m : bmodule) ->
+            List.exists (fun (i : binstance) -> i.module_name = n) m.instances) p.modules in
+        let top_a = not (instantiated pa_raw n) and top_b = not (instantiated pb_raw (bname n)) in
         let output_masks =
           match by_name pa_raw n with
           | Some mm ->
               List.filter_map (fun (s : bsignal) ->
                 if s.direction = `Output then begin
-                  let m v = match Hashtbl.find_opt v s.name with
+                  let m top v = if top then Z.minus_one else
+                    match Hashtbl.find_opt v s.name with
                     | Some x -> x | None -> Z.zero in
-                  Some (s.name, Z.logand (m ua) (m ub))
+                  Some (s.name, Z.logand (m top_a ua) (m top_b ub))
                 end else None) mm.signals
           | None -> [] in
         let verdict = miter_core ~input_consts ~output_masks (ma, pa) (mb, pb) in
@@ -1795,19 +1813,23 @@ let lmiter_hier a_prog_h b_prog_h top =
         Printf.eprintf "HIER %-34s %s\n%!" n verdict;
         if verdict = "EQUIVALENT" then incr n_eq
         else if String.length verdict >= 12
-                && String.sub verdict 0 12 = "UNCOMPARABLE" then incr n_unc;
+                && String.sub verdict 0 12 = "UNCOMPARABLE" then incr n_unc
+        else if String.length verdict >= 12
+                && String.sub verdict 0 12 = "INCONCLUSIVE" then incr n_inc;
         Buffer.add_string buf
           (Printf.sprintf "HIER %-34s %s%s\n" n verdict
              (if kids = [] then ""
               else "  [children abstracted: " ^ String.concat "," kids ^ "]"))
     | _ -> ()) ordered;
-  (* Report UNCOMPARABLE separately.  Folding it into the DIFFER remainder
-     overstates how much actually differs — in the Vivado-netlist-vs-emission
-     run, 11 of 23 "DIFFER" verdicts were modules sharing no port at all. *)
+  (* Report UNCOMPARABLE and INCONCLUSIVE separately.  Folding them into the
+     DIFFER remainder overstates how much actually differs — in the
+     Vivado-netlist-vs-emission run, 11 of 23 "DIFFER" verdicts were modules
+     sharing no port at all, and a solver timeout (CaDiCaL missing, Z3
+     fallback) read as a DIFFER on cascade_mac. *)
   Buffer.add_string buf
-    (Printf.sprintf "HIER-SUMMARY %d/%d modules EQUIVALENT, %d DIFFER, %d UNCOMPARABLE%s"
+    (Printf.sprintf "HIER-SUMMARY %d/%d modules EQUIVALENT, %d DIFFER, %d INCONCLUSIVE, %d UNCOMPARABLE%s"
        !n_eq (List.length ordered)
-       (List.length ordered - !n_eq - !n_unc) !n_unc
+       (List.length ordered - !n_eq - !n_unc - !n_inc) !n_inc !n_unc
        (if !n_eq = List.length ordered && ordered <> []
         then " → whole design EQUIVALENT (assume-guarantee)" else ""));
   Buffer.contents buf
@@ -3289,6 +3311,27 @@ let lgate_map mod_h k_lut io_flag =
               if p'' = p then p else rounds p'' (n - 1) in
           rounds single 4
         end in
+      (* common-operand adder sharing (Behavioral_share_accum); GATE_MAP_BIR_NOSHARE=1 skips *)
+      let single =
+        if on "GATE_MAP_BIR_NOSHARE" then single
+        else Behavioral_share_accum.share_program single in
+      (* one-hot state compares -> bits; experimental, needs a miter invariant *)
+      let single =
+        if on "GATE_MAP_BIR_ONEHOT" then Behavioral_onehot.reduce_program single
+        else single in
+      (* `c ? x - y : x + y` -> one adder with carry-in c; GATE_MAP_BIR_NOADDSUB=1 skips *)
+      let single =
+        if on "GATE_MAP_BIR_NOADDSUB" then single
+        else Behavioral_share_accum.fuse_addsub_program single in
+      (* add-chain rebalancing (Behavioral_add_tree); GATE_MAP_BIR_NOADDTREE=1 skips *)
+      let single =
+        if on "GATE_MAP_BIR_NOADDTREE" then single
+        else Behavioral_add_tree.rebalance_program single in
+      (* operators narrowed to the bits their consumers use (Behavioral_wreduce);
+         GATE_MAP_BIR_NOWREDUCE=1 skips *)
+      let single =
+        if on "GATE_MAP_BIR_NOWREDUCE" then single
+        else Behavioral_wreduce.narrow_program single in
       let single =
         if on "GATE_MAP_BIR_NODCE" then single
         else Behavioral_dce.eliminate_dead_program single in
@@ -3305,6 +3348,14 @@ let lgate_map mod_h k_lut io_flag =
    | Some path when path <> "" ->
        let oc = open_out_gen [Open_append; Open_creat] 0o644 path in
        output_string oc (Behavioral_ir.string_of_bmodule m); output_string oc "\n"; close_out oc
+   | _ -> ());
+  (* GATE_MAP_BIR_JSON=<dir>: same module as JSON (<dir>/<module>.json) for
+     offline structural analysis (test/qor/bir_share_scan.py). *)
+  (match Sys.getenv_opt "GATE_MAP_BIR_JSON" with
+   | Some dir when dir <> "" ->
+       (try Unix.mkdir dir 0o755 with _ -> ());
+       Yojson.Safe.to_file (Filename.concat dir (m.Behavioral_ir.name ^ ".json"))
+         (Behavioral_json.bmodule_to_json m)
    | _ -> ());
   let port_dir = build_port_dir m prog in
   let circ = Behavioral_to_hardcaml.create_circuit ~emit_instances:true ~port_dir m in

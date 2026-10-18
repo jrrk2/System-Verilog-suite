@@ -13,6 +13,19 @@
 open Behavioral_ir
 
 (* ---- Verilog INIT literal -> LSB-first bit array ---------------------- *)
+(* MITER_CUT_PRIMS=DSP48E1[,...]: abstract these modelled primitives as
+   uninterpreted functions of their inputs (the default branch) instead of
+   expanding their behavioural model.  Equal inputs on both miter sides then
+   give equal outputs by congruence -- sound, parameters included only via
+   the instance's own connections, so use it when both sides took their DSPs
+   from the same inference pass (the DSP-vs-`*` step has its own proof in
+   dsp_selftest).  Nine bit-blasted 25x18 multipliers per side otherwise
+   put the flat cascade_mac miter out of reach. *)
+let uf_prims =
+  lazy (match Sys.getenv_opt "MITER_CUT_PRIMS" with
+        | Some s -> List.map String.trim (String.split_on_char ',' s)
+        | None -> [])
+
 let parse_init_bits (s : string) : bool array =
   let s = String.trim s in
   match String.index_opt s '\'' with
@@ -563,7 +576,7 @@ let expand_instance ?canon ?(sigw : (string, int) Hashtbl.t = Hashtbl.create 0)
         List.mapi (fun b n -> BAssign { lhs = n; rhs = arr.(b) }) (out_nets i port) in
       let body = asg "O" o @ asg "CO" co in
       if body = [] then [], true else [ comb ("exp_carry_" ^ i.inst_name) body ], false
-  | "DSP48E1" ->
+  | "DSP48E1" when not (List.mem "DSP48E1" (Lazy.force uf_prims)) ->
       (* combinational configuration (all *REG = 0): P = sext(A[24:0]) *
          sext(B[17:0]) + (OPMODE[6:4] == 3'b011 ? C : 0) -- same model as
          Xil_prim_models.dsp48e1_body, so a DSP the mapper inferred is checked

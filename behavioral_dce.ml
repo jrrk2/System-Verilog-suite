@@ -228,15 +228,23 @@ let rec eliminate_dead_stmt live_vars = function
         Some (BIf { condition; then_stmts = then_stmts'; else_stmts = else_stmts' })
 
   | BCase { selector; cases; default } ->
-      let cases' = List.filter_map (fun (value, stmts) ->
-        let stmts' = List.filter_map (eliminate_dead_stmt live_vars) stmts in
-        if List.length stmts' = 0 then None
-        else Some (value, stmts')
-      ) cases in
-
+      let cases' = List.map (fun (value, stmts) ->
+        (value, List.filter_map (eliminate_dead_stmt live_vars) stmts)) cases in
       let default' = List.filter_map (eliminate_dead_stmt live_vars) default in
+      (* An arm left empty still claims its key: with a non-empty default,
+         dropping it sends that key to the default (an opcode whose only write
+         was hoisted out by share_accum then took the case's trap arm).  Empty
+         arms go only when there is no default and the keys are distinct
+         constants, so no later arm can match in their place. *)
+      let distinct_consts =
+        let ks = List.map fst cases' in
+        List.for_all (function BConst _ -> true | _ -> false) ks
+        && List.length (List.sort_uniq compare ks) = List.length ks in
+      let cases' =
+        if default' = [] && distinct_consts then List.filter (fun (_, b) -> b <> []) cases'
+        else cases' in
 
-      if List.length cases' = 0 && List.length default' = 0 then
+      if List.for_all (fun (_, b) -> b = []) cases' && default' = [] then
         None
       else
         Some (BCase { selector; cases = cases'; default = default' })

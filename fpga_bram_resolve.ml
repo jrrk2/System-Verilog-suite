@@ -142,9 +142,11 @@ let tile_ports (g : tile_geom) : Behavioral_ir.library_port list =
 
 (* ── single-tile RAMB36E1 binstance builder ──────────────────────────
    Emit the BIR for a sync 1-write/1-read RAM of depth<=1024, width<=32
-   on ONE RAMB36E1, matching the yosys synth_xilinx mapping exactly:
+   on ONE RAMB36E1, matching the yosys synth_xilinx mapping except that the
+   unused ports carry the memory's width rather than 0 (see below):
      - TDP mode (default); port A write @ WRITE_WIDTH_A=36, port B read @
-       READ_WIDTH_B=36; outputs unregistered (DO?_REG=0).
+       READ_WIDTH_B=36; the unused read-A and write-B ports also at 36 (all
+       four widths agree); outputs unregistered (DO?_REG=0).
      - address {1'b1, word_addr[9:0], 5'b0} (word addr in ADDR[14:5]).
      - WEA = {4{we}}, EN*=1, all RST/REGCE=0, WEBWE=0.
      - x36 data interleave: 8 data + 1 parity per 9-bit lane, so the 32
@@ -198,7 +200,14 @@ let build_single_ramb36 ~(name : string) ~(depth : int) ~(width : int)
     ; module_name = "RAMB36E1"
     ; param_values =
         [ ("WRITE_WIDTH_A", 36); ("READ_WIDTH_B", 36)
-        ; ("READ_WIDTH_A", 0); ("WRITE_WIDTH_B", 0)
+          (* The ports this RAM does not use -- read through A, write through
+             B -- are still configured at the memory's width, not 0.  Their
+             width markers set the memory's width mux, which the used ports
+             share, so a bitstream with them left out is a different memory;
+             and Vivado's DRC requires all four widths to agree once the RAMB
+             is cascaded.  yosys writes 0 here; that is the mapping this was
+             first copied from, not a requirement of it. *)
+        ; ("READ_WIDTH_A", 36); ("WRITE_WIDTH_B", 36)
         ; ("DOA_REG", 0); ("DOB_REG", 0) ]
     ; param_strs = []
     ; port_connections =
@@ -241,6 +250,18 @@ type ram_port =
       (* per-byte write strobe ([width]/8 bits, bit b = byte b). When set,
          forces 8-bit tiles and drives byte tile b's WE from strobe bit b,
          so the CPU's mem_wstrb gives correct sb/sh/sw. *)
+  ; p_re : bexpr option
+      (* read enable: the port's EN is re | we and the RAMB's output holds
+         when neither -- the registered read `if (re) q <= mem[a]` with no
+         FF after the tile.  None: EN tied high (the output follows the
+         address every cycle). *)
+  ; p_wmode : [ `Read_first | `No_change ]
+      (* WRITE_MODE: what the port's output does on a write cycle.
+         READ_FIRST shows the old word at the write address (a read and a
+         write of the same address in one cycle see the old data, as the
+         RTL's `<=` does); NO_CHANGE holds it (a write cycle that is not a
+         read cycle leaves q alone).  The caller picks the one its design's
+         port usage makes exact. *)
   }
 
 (* 64 INIT_xx (256-bit binary strings) for byte [lane] of [words]; entry A
@@ -290,29 +311,92 @@ let tile_init_strings ~(words : int array) ~(tile_lo : int) ~(slice_w : int)
    true-dual-port ports (each read+write): port A reads on DOADO, B on
    DOBDO.  Returns (binstances, internal signals, read-reassembly stmts,
    one rdata net name per input port). *)
-let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
+(* Depth tiling needs one registered select per read port (the RAMB read is
+   synchronous, so the high address bits must be delayed a cycle to steer the
+   output mux).  The builder returns only combinational assigns, so it records
+   (reg, clock, next, width) here and [Behavioral_memlower.lower_module] turns
+   each into a clocked process. *)
+let deep_select_regs : (string * string * bexpr * int) list ref = ref []
+
+let rec build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
     ?(init : int array option) ~(ports : ram_port list) ()
     : binstance list * bsignal list * bstmt list * string list =
   (match ports with [ _ ] | [ _; _ ] -> () | _ -> failwith "build_byte_lane_ram: 1 or 2 ports");
   (* per-byte write strobes force 8-bit (one tile per byte) so each byte
      tile's WE comes from one strobe bit. *)
   let byte_mode = List.exists (fun p -> Option.is_some p.p_wstrb) ports in
+  (* Deeper than one tile: an address-decoded bank of single-tile RAMs.
+     Tile d holds words [d*td, (d+1)*td); a write goes to the tile whose
+     index matches addr_hi; a read's data is selected by addr_hi delayed by
+     one clock (registered select) to line up with the RAMB's own read
+     latency. *)
+  let tile_depth_limit =
+    if byte_mode then prim_capacity RAMB36E1 / 8
+    else let pl = plan ~depth ~width () in if pl.n_depth_tiles > 1 then pl.tile.tile_depth else depth in
+  if depth > tile_depth_limit then begin
+    let td = tile_depth_limit in
+    let nd = (depth + td - 1) / td in
+    let aw = bits_needed depth and lo_bits = bits_needed td in
+    let hi_bits = max 1 (aw - lo_bits) in
+    let addr_lo a = BSlice { signal = a; msb = lo_bits - 1; lsb = 0 } in
+    let addr_hi a = BSlice { signal = a; msb = aw - 1; lsb = lo_bits } in
+    let b1 = BInt { width = 1; signed = Unsigned } in
+    let sel_of a d = BBinOp { op = BEq; lhs = addr_hi a; rhs = kconst d hi_bits; result_type = b1 } in
+    let band x y = BBinOp { op = BAnd; lhs = x; rhs = y; result_type = b1 } in
+    let tiles =
+      List.init nd (fun d ->
+        let dep = min td (depth - (d * td)) in
+        let ports' =
+          List.map (fun p ->
+            let sel = sel_of p.p_addr d in
+            { p with p_addr = addr_lo p.p_addr
+                   ; p_we = band p.p_we sel
+                   ; p_wstrb = Option.map (fun ws ->
+                       BBinOp { op = BAnd; lhs = ws
+                              ; rhs = BReplicate { count = width / 8; value = sel }
+                              ; result_type = BInt { width = width / 8; signed = Unsigned } }) p.p_wstrb })
+            ports in
+        let init' = match init with
+          | Some words when Array.length words > d * td ->
+              Some (Array.sub words (d * td) (min dep (Array.length words - (d * td))))
+          | _ -> None in
+        build_byte_lane_ram ~name:(Printf.sprintf "%s_d%d" name d) ~depth:dep ~width ?init:init' ~ports:ports' ())
+    in
+    let insts = List.concat_map (fun (i, _, _, _) -> i) tiles in
+    let sigs = List.concat_map (fun (_, s, _, _) -> s) tiles in
+    let stmts = List.concat_map (fun (_, _, st, _) -> st) tiles in
+    let out_sigs = ref [] and out_stmts = ref [] and names = ref [] in
+    List.iteri (fun pi p ->
+      let suffix = if pi = 0 then "a" else "b" in
+      let rsel = Printf.sprintf "%s_rsel_%s" name suffix in
+      let clk = match p.p_clk with BVar c -> c | _ -> failwith "deep RAM: clock must be a signal" in
+      let nxt = match p.p_re with
+        | None -> addr_hi p.p_addr
+        | Some re -> BCond { condition = re; then_val = addr_hi p.p_addr; else_val = BVar rsel } in
+      deep_select_regs := (rsel, clk, nxt, hi_bits) :: !deep_select_regs;
+      let rdata = Printf.sprintf "%s_rdata_%s" name suffix in
+      let mux =
+        List.fold_right (fun d acc ->
+          let _, _, _, rn = List.nth tiles d in
+          let tile_rd = BVar (List.nth rn pi) in
+          if d = nd - 1 && acc = None then Some tile_rd
+          else Some (BCond { condition = BBinOp { op = BEq; lhs = BVar rsel; rhs = kconst d hi_bits; result_type = b1 }
+                           ; then_val = tile_rd
+                           ; else_val = (match acc with Some e -> e | None -> tile_rd) }))
+          (List.init nd (fun d -> d)) None in
+      out_sigs := !out_sigs @ [ isig rsel hi_bits; isig rdata width ];
+      out_stmts := !out_stmts @ [ BAssign { lhs = rdata; rhs = Option.get mux } ];
+      names := !names @ [ rdata ]) ports;
+    insts, sigs @ !out_sigs, stmts @ !out_stmts, !names
+  end else
   let prim, tw, n =
     if byte_mode then begin
       if width mod 8 <> 0 then failwith "build_byte_lane_ram: byte strobes need width%8=0";
       let prim = if depth <= 2048 then RAMB18E1 else RAMB36E1 in
-      if depth > prim_capacity prim / 8 then
-        failwith
-          (Printf.sprintf "build_byte_lane_ram: byte-write depth %d > %d (deep tiling TODO)"
-             depth (prim_capacity prim / 8));
       prim, 8, width / 8
     end
     else begin
       let pl = plan ~depth ~width () in
-      if pl.n_depth_tiles > 1 then
-        failwith
-          (Printf.sprintf "build_byte_lane_ram: depth %d exceeds one tile (%d) — deep tiling TODO"
-             depth pl.tile.tile_depth);
       pl.tile.prim, pl.tile.tile_width, pl.n_width_tiles
     end
   in
@@ -360,17 +444,35 @@ let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
         let slice = BSlice { signal = p.p_wdata; msb = lo + sw - 1; lsb = lo } in
         if di_w = sw then slice else BConcat [ kconst 0 (di_w - sw); slice ]
       in
+      let wmode (p : ram_port) =
+        match p.p_wmode with `Read_first -> "READ_FIRST" | `No_change -> "NO_CHANGE" in
       let base_strs =
-        [ ("RAM_MODE", "TDP"); ("WRITE_MODE_A", "READ_FIRST")
-        ; ("WRITE_MODE_B", "READ_FIRST") ]
+        [ ("RAM_MODE", "TDP"); ("WRITE_MODE_A", wmode pa)
+        ; ("WRITE_MODE_B", (match pb with Some p -> wmode p | None -> "READ_FIRST")) ]
       in
+      (* EN: high when the port reads or writes; a port without a read
+         enable is always enabled. *)
+      let en_of (p : ram_port) =
+        let b1 = BInt { width = 1; signed = Unsigned } in
+        match p.p_re with
+        | None -> kconst 1 1
+        | Some re ->
+          let we_any = match p.p_wstrb with
+            | None -> p.p_we
+            | Some ws -> BBinOp { op = BNe; lhs = ws; rhs = kconst 0 (width / 8)
+                                ; result_type = b1 } in
+          BBinOp { op = BOr; lhs = re; rhs = we_any; result_type = b1 } in
       let param_strs =
         base_strs
         @ (match init with
            | Some words -> tile_init_strings ~words ~tile_lo:lo ~slice_w:sw ~tile_width:tw ~n_init
            | None -> [])
       in
-      let b_w = if Option.is_some pb then mw else 0 in
+      (* A single-port RAM leaves port B unused.  Unused is not width 0: the
+         port's width markers configure the memory's width mux, so B is set
+         to the memory's width whether or not a second port exists (its
+         write enable stays tied low when [pb] is None). *)
+      let b_w = mw in
       let inst =
         { inst_name = tname ^ "_ramb"
         ; module_name = prim_name prim
@@ -382,7 +484,8 @@ let build_byte_lane_ram ~(name : string) ~(depth : int) ~(width : int)
         ; port_connections =
             [ ("CLKARDCLK", pa.p_clk)
             ; ("CLKBWRCLK", (match pb with Some p -> p.p_clk | None -> pa.p_clk))
-            ; ("ENARDEN", kconst 1 1); ("ENBWREN", kconst 1 1)
+            ; ("ENARDEN", en_of pa)
+            ; ("ENBWREN", (match pb with Some p -> en_of p | None -> kconst 1 1))
             ; ("REGCEAREGCE", kconst 0 1); ("REGCEB", kconst 0 1)
             ; ("RSTRAMARSTRAM", kconst 0 1); ("RSTRAMB", kconst 0 1)
             ; ("RSTREGARSTREG", kconst 0 1); ("RSTREGB", kconst 0 1)

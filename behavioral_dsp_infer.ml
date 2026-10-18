@@ -9,9 +9,20 @@
  * extension according to Verilog's rule: the product is signed only when
  * BOTH operands are signed.
  *
+ * Wider multiplies are split (DSP_SPLIT=0 disables): the product is only
+ * needed modulo 2^r, r being its context width narrowed by a demanded-bits
+ * scan (a 72-bit `mul_p` read only as `mul_p[31:0]` needs r = 32).  Each
+ * operand is cut to r bits -- sign-extended when the product is signed and
+ * the operand is shorter -- and split into unsigned 24-bit (A side) and
+ * 17-bit (B side) limbs; every limb pair whose weight 2^(24i+17j) is below
+ * 2^r becomes one DSP48E1 (pairs with a limb under min_width bits stay a
+ * small LUT multiply), and the shifted partial products are summed in
+ * fabric.  At most DSP_SPLIT_MAX (default 8) DSPs per multiply; past that
+ * the multiplier is left to the AIG.
+ *
  * What is NOT handled yet (left as the array multiplier the AIG builds):
- *   - operands wider than 25 x 18 (yosys splits these across several DSPs)
- *   - context widths above 48 bits
+ *   - splits needing more than DSP_SPLIT_MAX DSPs (a full 72-bit signed
+ *     36 x 36 product)
  *   - operands whose signedness cannot be read off the BIR (calls, array
  *     reads) -- treating those as unsigned could be wrong, so they are skipped
  *   - register absorption (AREG/BREG/MREG/PREG) and the P += A*B accumulate
@@ -71,7 +82,74 @@ let infer_module ~min_width (m : bmodule) : bmodule * int =
     | BInt { signed; _ } -> Hashtbl.replace sig_signed s.name signed
     | _ -> ()) m.signals;
   let new_sigs = ref [] and new_assigns = ref [] and new_insts = ref [] in
-  let n = ref 0 in
+  let n = ref 0 and nsplit = ref 0 in
+  (* Demanded bits: one past the highest bit of each signal any read can
+     observe.  A read through constant slices (nested too: x[34:0][31:0])
+     sees only those bits; any other read, and every port, sees all of it. *)
+  let demand : (string, int) Hashtbl.t = Hashtbl.create 64 in
+  let need nm k =
+    let k = match Hashtbl.find_opt sig_widths nm with Some w -> min w k | None -> k in
+    match Hashtbl.find_opt demand nm with
+    | Some k0 when k0 >= k -> ()
+    | _ -> Hashtbl.replace demand nm k in
+  let rec scan e =
+    match e with
+    | BVar nm -> need nm max_int
+    | BSlice _ ->
+        (* peel nested constant slices down to a variable *)
+        let rec base e top =
+          match e with
+          | BSlice { signal; msb; lsb } ->
+              let top = match top with None -> msb | Some t -> lsb + t in
+              base signal (Some top)
+          | _ -> e, top in
+        (match base e None with
+         | BVar nm, Some top -> need nm (top + 1)
+         | e', _ -> scan e')
+    | BConst _ -> ()
+    | BBinOp { lhs; rhs; _ } -> scan lhs; scan rhs
+    | BUnOp { operand; _ } -> scan operand
+    | BSelect { array; index } -> scan array; scan index
+    | BConcat l -> List.iter scan l
+    | BReplicate { value; _ } -> scan value
+    | BCond { condition; then_val; else_val } ->
+        scan condition; scan then_val; scan else_val
+    | BCall { args; _ } -> List.iter scan args in
+  let rec scan_stmt = function
+    | BAssign { rhs; _ } -> scan rhs
+    | BIf { condition; then_stmts; else_stmts } ->
+        scan condition; List.iter scan_stmt then_stmts; List.iter scan_stmt else_stmts
+    | BCase { selector; cases; default } ->
+        scan selector;
+        List.iter (fun (k, b) -> scan k; List.iter scan_stmt b) cases;
+        List.iter scan_stmt default
+    | BWhile { condition; body } -> scan condition; List.iter scan_stmt body
+    | BFor { init; condition; update; body } ->
+        scan_stmt init; scan condition; scan_stmt update; List.iter scan_stmt body
+    | BBlock l -> List.iter scan_stmt l
+    | BCallStmt { args; _ } -> List.iter scan args
+    | BReturn e -> Option.iter scan e in
+  List.iter (function
+    | BCombinational { body; _ } | BSequential { body; _ } -> List.iter scan_stmt body)
+    m.processes;
+  List.iter (fun (i : binstance) -> List.iter (fun (_, e) -> scan e) i.port_connections)
+    m.instances;
+  List.iter (fun (s : bsignal) -> if s.direction <> `Internal then need s.name max_int)
+    m.signals;
+  let demanded nm = Option.value (Hashtbl.find_opt demand nm) ~default:0 in
+  let split_on = Sys.getenv_opt "DSP_SPLIT" <> Some "0" in
+  let split_max =
+    match Option.bind (Sys.getenv_opt "DSP_SPLIT_MAX") int_of_string_opt with
+    | Some k -> k | None -> 8 in
+  (* unsigned limb widths; DSP_SPLIT_LIMBS=a,b shrinks them so the self-test
+     exercises the split on multiplies small enough for Z3 *)
+  let limb_a, limb_b =
+    match Option.map (String.split_on_char ',') (Sys.getenv_opt "DSP_SPLIT_LIMBS") with
+    | Some [ x; y ] ->
+        (match int_of_string_opt x, int_of_string_opt y with
+         | Some x, Some y when x > 0 && y > 0 && x <= 24 && y <= 17 -> x, y
+         | _ -> 24, 17)
+    | _ -> 24, 17 in
   (* See through the frontend's explicit sign extension
      {{n{x[w-1]}}, x} so the DSP operand stays x's own width (signed). *)
   let peel_sext e =
@@ -94,60 +172,133 @@ let infer_module ~min_width (m : bmodule) : bmodule * int =
     | BCall { func = "@signed"; args = [ _ ] } -> Some Signed
     | BConst _ | BSlice _ | BConcat _ | BReplicate _ -> Some Unsigned
     | _ -> None in
-  let try_dsp a b result_type =
+  let mk name w =
+    { name; stype = BInt { width = w; signed = Unsigned }
+    ; direction = `Internal; initial_value = None; attrs = [] } in
+  let k v w = bconst_int v w in
+  (* one multiply-only DSP48E1 on already port-width A (30) / B (18) exprs *)
+  let dsp_inst a30 b18 =
+    incr n;
+    let base = Printf.sprintf "__dsp%d" !n in
+    let a_name = base ^ "_a" and b_name = base ^ "_b" and p_name = base ^ "_p" in
+    new_sigs := mk p_name 48 :: mk b_name 18 :: mk a_name 30 :: !new_sigs;
+    new_assigns :=
+      BAssign { lhs = b_name; rhs = b18 } :: BAssign { lhs = a_name; rhs = a30 }
+      :: !new_assigns;
+    new_insts :=
+      { inst_name = base; module_name = "DSP48E1"
+      ; param_values = int_params; param_strs = str_params
+      ; port_connections =
+          [ ("A", BVar a_name); ("B", BVar b_name); ("C", k 0 48)
+          ; ("P", BVar p_name)
+          ; ("ACIN", k 0 30); ("BCIN", k 0 18); ("PCIN", k 0 48)
+          ; ("ALUMODE", k 0 4); ("CARRYIN", k 0 1); ("CARRYINSEL", k 0 3)
+          ; ("D", k 0 25); ("INMODE", k 0 5); ("OPMODE", k opmode_mult 7) ] }
+      :: !new_insts;
+    p_name in
+  let zpad e from_w to_w =
+    if from_w >= to_w then e else BConcat [ bconst_int 0 (to_w - from_w); e ] in
+  let uint w = BInt { width = w; signed = Unsigned } in
+  (* a * b mod 2^r from unsigned limb products (see the header) *)
+  let try_split a aw b bw signed r =
+    let operand e w =
+      let e = match peel_sext e with Some x -> x | None -> strip_signed e in
+      if w >= r then (if w = r then e else BSlice { signal = e; msb = r - 1; lsb = 0 }), r
+      else if signed then Behavioral_const.sign_extend ~from_w:w ~to_w:r e, r
+      else e, w in
+    let a, aw = operand a aw and b, bw = operand b bw in
+    let limbs w lw = List.init ((w + lw - 1) / lw) (fun i -> i * lw, min lw (w - i * lw)) in
+    (* a pair at weight 2^off only contributes its low r - off bits, which
+       depend only on that many low bits of each limb *)
+    let pairs la lb =
+      List.concat_map (fun (oa, wa) ->
+        List.filter_map (fun (ob, wb) ->
+          let t = r - (oa + ob) in
+          if t > 0 then Some (oa, min wa t, ob, min wb t) else None) lb) la in
+    let cost ps = List.length (List.filter (fun (_, wa, _, wb) ->
+      wa >= min_width && wb >= min_width) ps) in
+    (* the wider operand on the 24-bit A side unless the other way needs fewer DSPs *)
+    let p1 = pairs (limbs aw limb_a) (limbs bw limb_b)
+    and p2 = pairs (limbs bw limb_a) (limbs aw limb_b) in
+    let swap = cost p2 < cost p1 in
+    let ps = if swap then p2 else p1 in
+    let a, b = if swap then b, a else a, b in
+    if cost ps > split_max || cost ps = 0 then None
+    else begin
+      incr nsplit;
+      let tag = Printf.sprintf "__dspw%d" !nsplit in
+      let xa = tag ^ "_x" and xb = tag ^ "_y" in
+      let wa_tot = if swap then bw else aw and wb_tot = if swap then aw else bw in
+      new_sigs := mk xb wb_tot :: mk xa wa_tot :: !new_sigs;
+      new_assigns := BAssign { lhs = xb; rhs = b } :: BAssign { lhs = xa; rhs = a }
+                     :: !new_assigns;
+      let limb nm o w = BSlice { signal = BVar nm; msb = o + w - 1; lsb = o } in
+      let terms = List.map (fun (oa, wa, ob, wb) ->
+        let off = oa + ob in
+        let tw = min (wa + wb) (r - off) in
+        let prod =
+          if wa >= min_width && wb >= min_width then begin
+            let p = dsp_inst (zpad (limb xa oa wa) wa 30) (zpad (limb xb ob wb) wb 18) in
+            BSlice { signal = BVar p; msb = tw - 1; lsb = 0 }
+          end else
+            (* tiny pair: tw-bit LUT multiply on limbs cut to tw bits *)
+            let cut nm o w = let w' = min w tw in zpad (limb nm o w') w' tw in
+            BBinOp { op = BMul; lhs = cut xa oa wa; rhs = cut xb ob wb
+                   ; result_type = uint tw } in
+        let parts = (if r - off - tw > 0 then [ bconst_int 0 (r - off - tw) ] else [])
+                    @ [ prod ] @ (if off > 0 then [ bconst_int 0 off ] else []) in
+        match parts with [ x ] -> x | l -> BConcat l) ps in
+      match terms with
+      | [] -> None
+      | t :: rest ->
+          Some (List.fold_left (fun acc t ->
+            BBinOp { op = BAdd; lhs = acc; rhs = t; result_type = uint r }) t rest)
+    end in
+  (* x * K folds to shifts and adds in the AIG; a DSP would waste the slice *)
+  let is_const e =
+    match (match peel_sext e with Some x -> x | None -> strip_signed e) with
+    | BConst _ -> true
+    | _ -> false in
+  let try_dsp ?ctx a b result_type =
     match w_of a, w_of b, sign_of a, sign_of b with
     | Some aw, Some bw, Some sa, Some sb
-      when aw >= min_width && bw >= min_width && aw > 0 && bw > 0 ->
+      when aw >= min_width && bw >= min_width && aw > 0 && bw > 0
+           && not (is_const a || is_const b) ->
         let signed = (sa = Signed && sb = Signed) in
-        let amax, bmax = if signed then 25, 18 else 24, 17 in
+        let amax, bmax = if signed then limb_a + 1, limb_b + 1 else limb_a, limb_b in
         (* wider operand on the 25/30-bit A side *)
         let a, aw, b, bw = if aw >= bw then a, aw, b, bw else b, bw, a, aw in
-        if aw > amax || bw > bmax then None
-        else begin
-          let rw = match result_type with
-            | BInt { width; _ } -> width
-            | _ -> aw + bw in
-          if rw > 48 || rw <= 0 then None
-          else begin
-            incr n;
-            let base = Printf.sprintf "__dsp%d" !n in
-            let a_name = base ^ "_a" and b_name = base ^ "_b" and p_name = base ^ "_p" in
-            let mk name w =
-              { name; stype = BInt { width = w; signed = Unsigned }
-              ; direction = `Internal; initial_value = None; attrs = [] } in
-            new_sigs := mk p_name 48 :: mk b_name 18 :: mk a_name 30 :: !new_sigs;
-            let ext e from_w to_w =
-              let e = match peel_sext e with Some x -> x | None -> strip_signed e in
-              if from_w >= to_w then e
-              else if signed then Behavioral_const.sign_extend ~from_w ~to_w e
-              else BConcat [ bconst_int 0 (to_w - from_w); e ] in
-            new_assigns :=
-              BAssign { lhs = b_name; rhs = ext b bw 18 }
-              :: BAssign { lhs = a_name; rhs = ext a aw 30 }
-              :: !new_assigns;
-            let k v w = bconst_int v w in
-            new_insts :=
-              { inst_name = base; module_name = "DSP48E1"
-              ; param_values = int_params; param_strs = str_params
-              ; port_connections =
-                  [ ("A", BVar a_name); ("B", BVar b_name); ("C", k 0 48)
-                  ; ("P", BVar p_name)
-                  ; ("ACIN", k 0 30); ("BCIN", k 0 18); ("PCIN", k 0 48)
-                  ; ("ALUMODE", k 0 4); ("CARRYIN", k 0 1); ("CARRYINSEL", k 0 3)
-                  ; ("D", k 0 25); ("INMODE", k 0 5); ("OPMODE", k opmode_mult 7) ] }
-              :: !new_insts;
-            Some (if rw = 48 then BVar p_name
-                  else BSlice { signal = BVar p_name; msb = rw - 1; lsb = 0 })
-          end
+        let rw = match result_type with
+          | BInt { width; _ } -> width
+          | _ -> aw + bw in
+        (* r: the bits anyone reads (ctx), at most the expression's width *)
+        let r = match ctx with Some c when c > 0 && c < rw -> c | _ -> rw in
+        let fits = aw <= amax && bw <= bmax && rw <= 48 && rw > 0 in
+        if fits && r = rw then begin
+          let ext e from_w to_w =
+            let e = match peel_sext e with Some x -> x | None -> strip_signed e in
+            if from_w >= to_w then e
+            else if signed then Behavioral_const.sign_extend ~from_w ~to_w e
+            else BConcat [ bconst_int 0 (to_w - from_w); e ] in
+          let p_name = dsp_inst (ext a aw 30) (ext b bw 18) in
+          Some (if rw = 48 then BVar p_name
+                else BSlice { signal = BVar p_name; msb = rw - 1; lsb = 0 })
         end
+        else if not split_on || rw <= 0 then None
+        else
+          (match try_split a aw b bw signed r with
+           | None -> None
+           | Some e -> Some (zpad e r rw))
     | _ -> None in
-  let rec rw e =
+  let rec rw ?ctx e =
     match e with
     | BBinOp { op = BMul; lhs; rhs; result_type } ->
         let lhs = rw lhs and rhs = rw rhs in
-        (match try_dsp lhs rhs result_type with
+        (match try_dsp ?ctx lhs rhs result_type with
          | Some e' -> e'
          | None -> BBinOp { op = BMul; lhs; rhs; result_type })
+    | BSlice ({ signal = BBinOp { op = BMul; _ } as mul; msb; lsb = 0 } as r) ->
+        BSlice { r with signal = rw ~ctx:(msb + 1) mul }
     | BBinOp r -> BBinOp { r with lhs = rw r.lhs; rhs = rw r.rhs }
     | BUnOp r -> BUnOp { r with operand = rw r.operand }
     | BSelect { array; index } -> BSelect { array = rw array; index = rw index }
@@ -161,7 +312,7 @@ let infer_module ~min_width (m : bmodule) : bmodule * int =
     | BVar _ | BConst _ -> e in
   let rec rw_stmt s =
     match s with
-    | BAssign { lhs; rhs } -> BAssign { lhs; rhs = rw rhs }
+    | BAssign { lhs; rhs } -> BAssign { lhs; rhs = rw ~ctx:(demanded lhs) rhs }
     | BIf { condition; then_stmts; else_stmts } ->
         BIf { condition = rw condition
             ; then_stmts = List.map rw_stmt then_stmts

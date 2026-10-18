@@ -257,6 +257,17 @@ let rec expr_to_z3 suffix ctx_sigs = function
         let target = max wa wb in
         (bump_to z3_a wa target, bump_to z3_b wb target)
       in
+      (* BAshr's left operand is signed: sign-extend it (to the count's
+         width and to the declared width below), never zero-extend --
+         `-1 >>> k` must stay all ones however wide the frame *)
+      let z3_lhs0 =
+        if op = BAshr then
+          let wl = Z3.BitVector.get_size (Z3.Expr.get_sort z3_lhs0)
+          and wr = Z3.BitVector.get_size (Z3.Expr.get_sort z3_rhs0) in
+          let dw = match result_type with BInt { width; _ } -> width | _ -> 0 in
+          let t = max wr dw in
+          if t > wl then Z3.BitVector.mk_sign_ext ctx (t - wl) z3_lhs0 else z3_lhs0
+        else z3_lhs0 in
       let z3_lhs1, z3_rhs1 = widen z3_lhs0 z3_rhs0 in
       (* LHS-context width propagation now lives in the Verible
          converter (#128), so [result_type] already carries the
@@ -490,6 +501,10 @@ let rec expr_to_z3 suffix ctx_sigs = function
                  Z3.Boolean.mk_ite ctx cond (mk_slice k) (build (k + 1))
              in
              build 0)
+  | BCall { func = ("@signed" | "$signed" | "$unsigned"); args = [ x ] } ->
+      (* sign casts change no bits; as an uninterpreted function one would
+         make every compare against a function's `$signed(...)` result DIFFER *)
+      expr_to_z3 suffix ctx_sigs x
   | BCall { func; args } ->
       (* Encode as Z3 uninterpreted function.  Both designs in the
          miter share the same [ctx] and the same [bcall_decl_cache]
@@ -1686,9 +1701,32 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
     Printf.printf "Checking for counterexample with Z3...\n\n";
     Printf.printf "─────────────────────────────────────────────────────────────\n";
 
-    (* Check satisfiability *)
+    (* Check satisfiability.  The external SAT back end (Sat_backend:
+       bit-blast to DIMACS, CaDiCaL by default) decides first; an UNSAT from
+       it is the proof.  SAT still goes through Z3 so the counterexample
+       report has a model; an unavailable/unknown back end falls back to Z3
+       entirely. *)
     let start_time = Unix.gettimeofday () in
-    let result = Z3.Solver.check miter_solver [] in
+    let result =
+      let witness = List.map (fun (name, width) -> bv_var name width "_d1") inputs1 in
+      match Sat_backend.check ~witness ctx (Z3.Solver.get_assertions miter_solver) with
+      | Sat_backend.Unsat -> Z3.Solver.UNSATISFIABLE
+      | Sat_backend.Sat fixes ->
+          (* the external solver's input values as assumptions: Z3 only has to
+             evaluate, not search.  If they do not reproduce the difference
+             (they always should), search without them. *)
+          Printf.printf "[sat] external solver found a difference; Z3 builds the model from its %d input value(s)\n%!"
+            (List.length fixes);
+          (match Z3.Solver.check miter_solver fixes with
+           | Z3.Solver.SATISFIABLE -> Z3.Solver.SATISFIABLE
+           | _ -> Z3.Solver.check miter_solver [])
+      | Sat_backend.Unknown why ->
+          Printf.printf "[sat] %s -- no verdict; falling back to Z3\n%!" why;
+          Z3.Solver.check miter_solver []
+      | Sat_backend.Unavailable why ->
+          if Sys.getenv_opt "SVS_SAT" <> Some "z3" then
+            Printf.printf "[sat] external back end unavailable (%s); using Z3\n%!" why;
+          Z3.Solver.check miter_solver [] in
     let end_time = Unix.gettimeofday () in
     let elapsed = end_time -. start_time in
 

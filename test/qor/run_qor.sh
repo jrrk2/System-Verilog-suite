@@ -10,6 +10,10 @@
 #   YOSYS=<path>              yosys binary (default: ORFS install, then PATH)
 #   QOR_OUT=<dir>             output dir (default test/qor/out)
 #   QOR_NO_VOTE=1             skip the Z3 checks (numbers only)
+#   QOR_FLATTEN=0             keep combinational children as separately mapped
+#                             modules (default flattens them, as synth_xilinx
+#                             -flatten does, so constants and add chains cross
+#                             the module boundary)
 #   any GATE_MAP_* / MEMLOWER_FPGA / LUTCOVER_BACKEND override (see fpga_opts.ml)
 #
 # Output: one TSV row per design in $QOR_OUT/results.tsv plus a summary table.
@@ -21,7 +25,7 @@ YOSYS=${YOSYS:-$HOME/OpenROAD-flow-scripts/tools/install/yosys/bin/yosys}
 [ -x "$YOSYS" ] || YOSYS=$(command -v yosys || true)
 export YOSYS_BIN="$YOSYS"   # the Lua "yosys" frontend (slang plugin -> RTLIL) finds it here
 export Z3_MITER_TIMEOUT_MS=${QOR_Z3_MS:-120000}   # per-miter solver budget
-SV_SUITE=$ROOT/_build/default/sv_suite.exe
+SV_SUITE=${SV_SUITE:-$ROOT/_build/default/sv_suite.exe}
 [ -x "$SV_SUITE" ] || { echo "build first: dune build sv_suite.exe"; exit 2; }
 
 abspath() { local f=$1; f=${f//\$HOME/$HOME}; case $f in /*) echo "$f";; *) echo "$ROOT/$f";; esac; }
@@ -54,7 +58,8 @@ run_design() {
   # ---- SVS flow: BIR pipeline -> gate_map per module -> splice -> flat JSON ----
   {
     echo "prog = svd.parse(\"verible\", \"$top\", {$lua_files})"
-    for p in unroll inline iflift blocking_subst meminfer memlower srl_infer dsp_infer; do echo "prog = svd.$p(prog)"; done
+    local flat=""; [ "${QOR_FLATTEN:-1}" = 1 ] && flat=flatten
+    for p in unroll inline $flat iflift blocking_subst meminfer memlower srl_infer dsp_infer; do echo "prog = svd.$p(prog)"; done
     echo "print(\"opts: \" .. svd.fpga_opts())"
     for m in $mods $top; do
       echo "mapped = svd.gate_map(svd.pick(prog, \"$m\"), 6, 0)"
@@ -66,23 +71,39 @@ run_design() {
     # (same machinery as recipes/xflow_miter).  HIER-SUMMARY line is the verdict.
     if [ "${QOR_NO_VOTE:-0}" != 1 ]; then
       echo "src = svd.parse(\"verible\", \"$top\", {$lua_files})"
+      # flattened flow: flatten the reference the same way and give it the same
+      # DSP48E1 inference, abstracted as matching uninterpreted functions on
+      # both sides (MITER_CUT_PRIMS below) -- the DSP-vs-`*` step is proven by
+      # dsp_selftest, and nine bit-blasted DSP models per side put the flat
+      # 24-bit MAC out of the solver's reach.
+      [ -n "$flat" ] && echo "src = svd.dsp_infer(svd.flatten(src))"
       echo "print(svd.miter_hier(src, prog, \"$top\"))"
     fi
     echo 'print("done")'
   } > "$d/svs.lua"
   local t0=$(date +%s.%N)
-  (cd "$ROOT" && "$SV_SUITE" script "$d/svs.lua") > "$d/svs.log" 2>&1
+  local cut=""; [ "${QOR_FLATTEN:-1}" = 1 ] && cut=DSP48E1
+  (cd "$ROOT" && MITER_CUT_PRIMS=$cut "$SV_SUITE" script "$d/svs.lua") > "$d/svs.log" 2>&1
   local svs_wall; svs_wall=$(echo "$(date +%s.%N) - $t0" | bc)
   local svs_stats="- - - - - - - -"
   # one JSON holding every mapped module (children stay as instances; count.py
   # expands them, read_nextpnr_json + the miter's flatten inline them)
   if [ -f "$d/$top.svs.json" ]; then
-    python3 -I - "$d/$top.flat.json" "$d"/*.svs.json <<'PY'
+    python3 -I - "$d/$top.flat.json" "$top" "$d"/*.svs.json <<'PY'
 import json, sys
-out, srcs = sys.argv[1], sys.argv[2:]
+out, top, srcs = sys.argv[1], sys.argv[2], sys.argv[3:]
 mods = {}
 for p in srcs: mods.update(json.load(open(p))["modules"])
-json.dump({"creator": "svs qor merge", "modules": mods}, open(out, "w"))
+# keep only what the top still instantiates: a child flattened into its
+# parent was mapped too (it is in the mods column) but is no longer used
+keep, todo = set(), [top]
+while todo:
+    n = todo.pop()
+    if n in keep or n not in mods: continue
+    keep.add(n)
+    todo += [c["type"] for c in mods[n]["cells"].values()]
+json.dump({"creator": "svs qor merge", "modules": {n: m for n, m in mods.items() if n in keep}},
+          open(out, "w"))
 PY
   fi
   if [ -f "$d/$top.flat.json" ]; then svs_stats=$(summarise "$d/$top.flat.json")
@@ -116,7 +137,7 @@ LUA
     (cd "$ROOT" && timeout "${QOR_TIMEOUT:-600}" "$SV_SUITE" script "$d/vote.lua") > "$d/vote.log" 2>&1
     local eq; eq=$(grep -c "whole design EQUIVALENT" "$d/vote.log")
     vote="$eq/3"
-    check=$(grep -o "HIER-SUMMARY.*" "$d/svs.log" | tail -1 | sed 's/HIER-SUMMARY //; s/ modules//' | cut -c1-48)
+    check=$(grep -o "HIER-SUMMARY.*" "$d/svs.log" | tail -1 | sed 's/HIER-SUMMARY //; s/ modules//' | cut -c1-62)
     [ -z "$check" ] && check="no-result"
   fi
 

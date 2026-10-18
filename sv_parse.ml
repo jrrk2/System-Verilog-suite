@@ -361,6 +361,14 @@ let rec parse_json attr json =
       let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
       let is_generate = json |> member "generate" |> to_bool_option |> Option.value ~default:false in
       Begin { name; stmts; is_generate }
+  (* Verilator's wrapper around an AUTOMATIC local's initialiser
+     (`logic [7:0] tag8 = tag;` inside a function/task): the assigns inside
+     ARE the initialiser and run on every call, so they are plain body
+     statements -- unlike INITIALSTATICSTMT (once at elaboration), which the
+     signal's initial_value already carries. *)
+  | "INITIALAUTOMATICSTMT" ->
+      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
+      Begin { name; stmts; is_generate = false }
 
   (* v5.048+ emits GENBLOCK for elaborated generate scopes (was folded into
      BEGIN in 5.024).  Contents live in `itemsp` (not `stmtsp`); genforp is the
@@ -985,6 +993,19 @@ incs = rwlst attr incs;}
          reasoning as CRESET above: BIR signals carry their initial_value, so
          the wrapper node has nothing left to express. *)
       "INITIALSTATICSTMT";
+      (* simulation-only system tasks/functions met on the OCaml VM benchmark
+         ($writememh dumps, file I/O, $display/$finish, $time) *)
+      "WRITEMEM";
+      "STRTOI";
+      "SSCANF";
+      "PUTC";
+      "ERRORSTMT";
+      "DUMPVARS";
+      "DUMPFILE";
+      "DUMPON";
+      "DUMPOFF";
+      "REALTIME";
+      "RANDOM";
     ] in
     if List.mem tag nonsynth_tags then
       (* Drop in a 1-bit zero literal stand-in. *)

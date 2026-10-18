@@ -270,14 +270,15 @@ let rec has_self_ref_stmt = function
  * stay correct.  ONLY blocks that actually contain a self-reference are
  * rewritten — everything else is returned byte-for-byte untouched, so this
  * never perturbs blocks that already lower correctly. *)
-let thread_comb_body orig_stmts =
+let thread_comb_body ?(only = fun _ -> true) ?(force = false) ?final_env orig_stmts =
   let rec flatten = function
     | BBlock ss :: rest -> flatten (ss @ rest)
     | s :: rest -> s :: flatten rest
     | [] -> [] in
   let stmts = flatten orig_stmts in
-  if not (List.exists has_self_ref_stmt stmts) then orig_stmts
+  if not force && not (List.exists has_self_ref_stmt stmts) then orig_stmts
   else begin
+    let assigned_names acc s = List.filter only (assigned_names acc s) in
     let env : (string, bexpr) Hashtbl.t = Hashtbl.create 16 in
     let subst e = map_expr (fun n -> Hashtbl.find_opt env n) e in
     let snapshot () = Hashtbl.fold (fun k v a -> (k, v) :: a) env [] in
@@ -295,7 +296,7 @@ let thread_comb_body orig_stmts =
       match s with
       | BAssign { lhs; rhs } ->
           let rhs' = subst rhs in
-          Hashtbl.replace env lhs rhs';
+          if only lhs then Hashtbl.replace env lhs rhs';
           (* A bracket part/bit-select write `base[..] = ..` also invalidates the
              threaded whole-`base` value: later reads of `base` must see the
              partially-updated register, not the entering default. *)
@@ -377,7 +378,9 @@ let thread_comb_body orig_stmts =
           BCallStmt { func; args = List.map subst args }
       | BReturn (Some e) -> BReturn (Some (subst e))
       | other -> other in
-    List.map thread_stmt stmts
+    let out = List.map thread_stmt stmts in
+    (match final_env with Some r -> r := snapshot () | None -> ());
+    out
   end
 
 let body_of = function
@@ -386,7 +389,86 @@ let body_of = function
 
 let process_module (m : bmodule) : bmodule =
   let bodies = List.mapi (fun i p -> (i, body_of p)) m.processes in
+  let extra = ref [] in
   let new_processes = List.mapi (fun i p -> match p with
+    | BSequential s when s.blocking_vars <> [] && Sys.getenv_opt "BLOCKING_SUBST_OLD" = None ->
+        (* Every variable assigned in a clocked body is a flip-flop; the only
+           difference a blocking `=` makes is that a later read in the same
+           body sees the expression being built for the D input, where a
+           non-blocking read sees Q.  So thread each blocking variable's
+           pending expression through the body exactly as thread_comb_body
+           does for always_comb, substitute it at every read, keep the writes
+           (their final value is still D), and the process is all non-blocking.
+           A read before any write on its path keeps Q, as it should; a
+           register whose Q is then never read is dead and DCE removes it.
+           A variable written by part-select / @slice_write / @mem_write, or
+           inside a loop, has a pending value the env cannot express: it stays
+           blocking and keeps the lowering's own threading. *)
+        let rec in_loop v = function
+          | BWhile { condition; body } ->
+              List.mem v (List.fold_left assigned_names [] body)
+              || count_in_expr v condition > 0 || count_in_stmts v body > 0
+          | BFor { init; condition; update; body } ->
+              List.mem v (List.fold_left assigned_names [] (init :: update :: body))
+              || count_in_expr v condition > 0 || count_in_stmts v (init :: update :: body) > 0
+          | BIf { then_stmts; else_stmts; _ } ->
+              List.exists (in_loop v) then_stmts || List.exists (in_loop v) else_stmts
+          | BCase { cases; default; _ } ->
+              List.exists (fun (_, b) -> List.exists (in_loop v) b) cases
+              || List.exists (in_loop v) default
+          | BBlock b -> List.exists (in_loop v) b
+          | _ -> false in
+        let threaded = List.filter (fun v ->
+          not (partial_write_target v s.body) && not (List.exists (in_loop v) s.body))
+          s.blocking_vars in
+        if threaded = [] then p
+        else begin
+          let fin = ref [] in
+          let body = thread_comb_body ~only:(fun n -> List.mem n threaded) ~force:true
+                       ~final_env:fin s.body in
+          (* The end-of-body value of v is its D input: give it one name, v__d,
+             and point every read that sees exactly that value at the name, so
+             the expression exists once (the RAM ports memlower builds from
+             these reads used to inline the whole state-machine mux per tile). *)
+          let finals = List.filter_map (fun v ->
+            match List.assoc_opt v !fin with
+            | Some (BVar _ | BConst _) | None -> None
+            | Some e -> Some (v, e, v ^ "__d")) threaded in
+          let rec rd e =
+            match List.find_opt (fun (_, f, _) -> f == e) finals with
+            | Some (_, _, d) -> BVar d
+            | None ->
+                (match e with
+                 | BVar _ | BConst _ -> e
+                 | BBinOp x -> BBinOp { x with lhs = rd x.lhs; rhs = rd x.rhs }
+                 | BUnOp x -> BUnOp { x with operand = rd x.operand }
+                 | BCond x -> BCond { condition = rd x.condition; then_val = rd x.then_val;
+                                      else_val = rd x.else_val }
+                 | BConcat l -> BConcat (List.map rd l)
+                 | BReplicate x -> BReplicate { x with value = rd x.value }
+                 | BSelect { array; index } -> BSelect { array = rd array; index = rd index }
+                 | BSlice x -> BSlice { x with signal = rd x.signal }
+                 | BCall x -> BCall { x with args = List.map rd x.args }) in
+          let rec rs = function
+            | BAssign { lhs; rhs } -> BAssign { lhs; rhs = rd rhs }
+            | BIf { condition; then_stmts; else_stmts } ->
+                BIf { condition = rd condition; then_stmts = List.map rs then_stmts;
+                      else_stmts = List.map rs else_stmts }
+            | BCase { selector; cases; default } ->
+                BCase { selector = rd selector;
+                        cases = List.map (fun (k, b) -> (rd k, List.map rs b)) cases;
+                        default = List.map rs default }
+            | BBlock b -> BBlock (List.map rs b)
+            | BCallStmt { func = ("@slice_write" | "@mem_write") as func; args = (BVar _ as tg) :: rest } ->
+                BCallStmt { func; args = tg :: List.map rd rest }
+            | BCallStmt { func; args } -> BCallStmt { func; args = List.map rd args }
+            | BReturn (Some e) -> BReturn (Some (rd e))
+            | s -> s in
+          let body = if finals = [] then body else List.map rs body in
+          List.iter (fun (v, e, d) -> extra := (v, e, d) :: !extra) finals;
+          BSequential { s with body
+          ; blocking_vars = List.filter (fun v -> not (List.mem v threaded)) s.blocking_vars }
+        end
     | BSequential s ->
         (* Only consulted for names already known to be blocking, so this stays
            cheap even on the ~400-process PCS core. *)
@@ -400,7 +482,16 @@ let process_module (m : bmodule) : bmodule =
         BCombinational { s with body = thread_comb_body s.body }
     | other -> other
   ) m.processes in
-  { m with processes = new_processes }
+  let extra = List.rev !extra in
+  let sigs = List.filter_map (fun (v, _, d) ->
+    match List.find_opt (fun (s : bsignal) -> s.name = v) m.signals with
+    | Some s -> Some { s with name = d; direction = `Internal; initial_value = None }
+    | None -> None) extra in
+  let extra = List.filter (fun (_, _, d) -> List.exists (fun (s : bsignal) -> s.name = d) sigs) extra in
+  let procs = List.map (fun (_, e, d) ->
+    BCombinational { name = "blocking_d_" ^ d; sensitivity = [];
+                     body = [ BAssign { lhs = d; rhs = e } ] }) extra in
+  { m with processes = new_processes @ procs; signals = m.signals @ sigs }
 
 let blocking_subst_program (p : bprogram) : bprogram =
   { p with modules = List.map process_module p.modules }

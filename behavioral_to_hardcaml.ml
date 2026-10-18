@@ -34,6 +34,11 @@ let clog2 n = let rec f n a = if n <= 1 then a else f ((n + 1) / 2) (a + 1) in m
    (stages compose; ≥W flushes naturally), so only the DROPPED high bits need
    handling: if any is set the true amount is ≥ 2^needed ≥ W — mux in the flush
    value (zeros for sll/srl, sign-replicate for sra). *)
+(* a signal that is a literal constant (a BConst lowered), the only shift
+   count `Signal.to_int` may be trusted on *)
+let is_const_sig (s : Signal.t) =
+  match s with Hardcaml.Signal.Type.Const _ -> true | _ -> false
+
 let log_shift_clamped ?flush op s amt =
   let needed = clog2 (Signal.width s) in
   if Signal.width amt <= needed then Signal.log_shift op s amt
@@ -358,11 +363,19 @@ let rec expr_to_signal ctx = function
          other isn't, use the non-constant's width and truncate the
          constant.  Otherwise fall back to max-width zero-extension. *)
       let is_const = function BConst _ -> true | _ -> false in
+      (* ... but never below the bits the constant's VALUE needs: narrowing
+         `32'd8 * str_byte` to the 2-bit register's width made the constant
+         0 and the product a constant, so the VM's GETSTRINGCHAR shifted by
+         nothing and its str_byte register, with no reader left, was dropped
+         (sysver_tests/strget_reg.sv). *)
+      let needed = function
+        | BConst { value; _ } -> max 1 (Z.numbits (Z.abs value))
+        | _ -> 1 in
       let wl = Signal.width s_lhs0 and wr = Signal.width s_rhs0 in
       let common_w =
         match is_const lhs, is_const rhs with
-        | true,  false -> wr
-        | false, true  -> wl
+        | true,  false -> max wr (needed lhs)
+        | false, true  -> max wl (needed rhs)
         | _ -> max wl wr in
       let pad s =
         let sw = Signal.width s in
@@ -383,9 +396,16 @@ let rec expr_to_signal ctx = function
          handles a wide count (Signal.to_int for a constant, log_shift_clamped
          otherwise), so leave the count alone. *)
       let is_shift = match op with BShl | BShr | BAshr -> true | _ -> false in
-      let s_lhs = pad s_lhs0
-      and s_rhs = if is_shift then s_rhs0 else pad s_rhs0 in
       let result_width = width_of_btype result_type in
+      (* an ARITHMETIC shift's operand is signed: widen it by sign extension
+         (to the result width too), or `-1 >>> k` in a wider frame shifts in
+         zeros -- `a >>> (n + 16)` with a 16-bit signed a and a wider count *)
+      let s_lhs =
+        if op = BAshr then
+          let tw = max common_w result_width and sw = Signal.width s_lhs0 in
+          if sw < tw then Signal.sresize s_lhs0 tw else s_lhs0
+        else pad s_lhs0
+      and s_rhs = if is_shift then s_rhs0 else pad s_rhs0 in
       (* Optional dispatch to Hardcaml_circuits prefix-sum / Wallace
          trees when LIB_MAP_ADDER / LIB_MAP_MUL is set.  Default falls
          back to Hardcaml's `+:` / `*:` which `lib_map.gen_add` /
@@ -515,19 +535,26 @@ let rec expr_to_signal ctx = function
               picorv32's decoder cares about (decoded_imm 0x03000 << 12
               becomes 0 instead of 0x03000000).  Widen s_lhs to result_width
               before the shift. *)
+           (* The constant-count path is taken only for a count that IS a
+              constant.  `Signal.to_int` of a `8 * str_byte` product did not
+              raise -- it gave 0 -- so the VM's GETSTRINGCHAR shifted by
+              nothing, read byte 0 of every word, and its str_byte register
+              had no reader left and was dropped (sysver_tests/strget_reg.sv;
+              `str_byte << 3` and `{str_byte, 3'b0}` were fine). *)
            let s = if result_width > Signal.width s_lhs
                    then Signal.uresize s_lhs result_width else s_lhs in
-           (try Signal.(sll s (Signal.to_int s_rhs))
-            with _ -> log_shift_clamped Signal.sll s s_rhs)
+           if is_const_sig s_rhs then Signal.(sll s (Signal.to_int s_rhs))
+           else log_shift_clamped Signal.sll s s_rhs
        | BShr ->
-           (try Signal.(srl s_lhs (Signal.to_int s_rhs))
-            with _ -> log_shift_clamped Signal.srl s_lhs s_rhs)
+           if is_const_sig s_rhs then Signal.(srl s_lhs (Signal.to_int s_rhs))
+           else log_shift_clamped Signal.srl s_lhs s_rhs
        | BAshr ->
-           (try Signal.(sra s_lhs (Signal.to_int s_rhs))
-            with _ ->
-              (* overflow flush for arithmetic shift = all sign bits *)
-              let fl = Signal.repeat (Signal.msb s_lhs) (Signal.width s_lhs) in
-              log_shift_clamped ~flush:fl Signal.sra s_lhs s_rhs)
+           if is_const_sig s_rhs then Signal.(sra s_lhs (Signal.to_int s_rhs))
+           else begin
+             (* overflow flush for arithmetic shift = all sign bits *)
+             let fl = Signal.repeat (Signal.msb s_lhs) (Signal.width s_lhs) in
+             log_shift_clamped ~flush:fl Signal.sra s_lhs s_rhs
+           end
        | BEq -> Signal.(s_lhs ==: s_rhs)
        | BNe -> Signal.(s_lhs <>: s_rhs)
        | BLt -> Signal.(s_lhs <: s_rhs)

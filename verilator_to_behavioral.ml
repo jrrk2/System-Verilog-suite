@@ -259,10 +259,25 @@ let rec expr_to_bexpr = function
            -> BBinOp { op = BEq; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "NEQ" | "NEQCASE" | "NEQWILD"
            -> BBinOp { op = BNe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "LT" | "LTS" -> BBinOp { op = BLt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "LTE" | "LTES" -> BBinOp { op = BLe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "GT" | "GTS" -> BBinOp { op = BGt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "GTE" | "GTES" -> BBinOp { op = BGe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "LT" -> BBinOp { op = BLt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "LTE" -> BBinOp { op = BLe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "GT" -> BBinOp { op = BGt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "GTE" -> BBinOp { op = BGe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       (* the S forms are Verilator's signed compares; the operands' own
+          dtypes give the widths (V3Width has already made them equal) *)
+       | "LTS" | "LTES" | "GTS" | "GTES" ->
+           let bop = match op with "LTS" -> BLt | "LTES" -> BLe | "GTS" -> BGt | _ -> BGe in
+           let vw = function
+             | VarRef { dtype_ref; _ } | Const { dtype_ref; _ }
+             | BinaryOp { dtype_ref; _ } | UnaryOp { dtype_ref; _ } -> get_width_from_dtype dtype_ref
+             | _ -> 0 in
+           (* a function call carries no dtype here; V3Width has sized both
+              operands alike, so one known width stands for the other *)
+           let lw = vw lhs and rw = vw rhs in
+           let w = if lw > 0 then lw else rw in
+           if w > 0
+           then Behavioral_const.signed_compare bop ~lw:w ~rw:w lhs_expr rhs_expr
+           else BBinOp { op = bop; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | _ ->
            if !debug then Printf.eprintf "Warning: Unknown binary op %s\n" op;
            BConst { value = Z.zero; width = 1 })
@@ -308,10 +323,25 @@ let rec expr_to_bexpr = function
            -> BBinOp { op = BEq; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | "NEQ" | "NEQCASE" | "NEQWILD"
            -> BBinOp { op = BNe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "LT" | "LTS" -> BBinOp { op = BLt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "LTE" | "LTES" -> BBinOp { op = BLe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "GT" | "GTS" -> BBinOp { op = BGt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
-       | "GTE" | "GTES" -> BBinOp { op = BGe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "LT" -> BBinOp { op = BLt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "LTE" -> BBinOp { op = BLe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "GT" -> BBinOp { op = BGt; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       | "GTE" -> BBinOp { op = BGe; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
+       (* the S forms are Verilator's signed compares; the operands' own
+          dtypes give the widths (V3Width has already made them equal) *)
+       | "LTS" | "LTES" | "GTS" | "GTES" ->
+           let bop = match op with "LTS" -> BLt | "LTES" -> BLe | "GTS" -> BGt | _ -> BGe in
+           let vw = function
+             | VarRef { dtype_ref; _ } | Const { dtype_ref; _ }
+             | BinaryOp { dtype_ref; _ } | UnaryOp { dtype_ref; _ } -> get_width_from_dtype dtype_ref
+             | _ -> 0 in
+           (* a function call carries no dtype here; V3Width has sized both
+              operands alike, so one known width stands for the other *)
+           let lw = vw lhs and rw = vw rhs in
+           let w = if lw > 0 then lw else rw in
+           if w > 0
+           then Behavioral_const.signed_compare bop ~lw:w ~rw:w lhs_expr rhs_expr
+           else BBinOp { op = bop; lhs = lhs_expr; rhs = rhs_expr; result_type = BBool }
        | _ ->
            if !debug then Printf.eprintf "Warning: Unknown binary op %s\n" op;
            BConst { value = Z.zero; width = 1 })
@@ -1180,6 +1210,31 @@ let is_output_named_for fname = function
 let split_param_vars stmts =
   List.partition (function Var _ | Var' _ -> true | _ -> false) stmts
 
+(* A function/task VAR with direction INPUT/OUTPUT/INOUT is a formal; one with
+   direction NONE is a body local (`logic [7:0] tag8 = tag;`).  Listing locals
+   as formals made Make_header a 4-formal function that no 2-argument call
+   could bind, so the call reached create_circuit un-inlined. *)
+let is_port_var = function
+  | Var { direction; _ } | Var' { direction; _ } ->
+      (match String.uppercase_ascii direction with
+       | "INPUT" | "OUTPUT" | "INOUT" -> true | _ -> false)
+  | _ -> false
+
+let locals_of vars =
+  List.filter_map (fun v ->
+    match var_to_param v with Some (n, t, _) -> Some (n, t) | None -> None)
+    (List.filter (fun v -> not (is_port_var v)) vars)
+
+(* `logic [7:0] tag8 = tag;` -- Verilator keeps the initialiser as the local
+   VAR's valuep; it must become the first body statement or the inliner has
+   nothing to bind tag8 to. *)
+let local_inits vars =
+  List.filter_map (function
+    | Var { name; value = Some v; direction; _ } | Var' { name; value = Some v; direction; _ }
+      when (match String.uppercase_ascii direction with "INPUT" | "OUTPUT" | "INOUT" -> false | _ -> true) ->
+        Some (BAssign { lhs = name; rhs = expr_to_bexpr v })
+    | _ -> None) vars
+
 let _ = is_output_named_for
 
 let extract_funcs sts =
@@ -1187,28 +1242,28 @@ let extract_funcs sts =
     | Func { name = fname; stmts; _ }
     | Func' { name = fname; stmts; _ } ->
         let param_vars, body = split_param_vars stmts in
-        let params = List.filter_map var_to_param param_vars in
+        let params = List.filter_map var_to_param (List.filter is_port_var param_vars) in
         let body_stmts = List.map stmt_to_bstmt body in
         Some {
           fname;
           is_task = false;
           ftype = BInt { width = 32; signed = Unsigned };
           params;
-          locals = [];
-          body = body_stmts;
+          locals = locals_of param_vars;
+          body = local_inits param_vars @ body_stmts;
         }
     | Task { name = tname; stmts; _ }
     | Task' { name = tname; stmts; _ } ->
         let param_vars, body = split_param_vars stmts in
-        let params = List.filter_map var_to_param param_vars in
+        let params = List.filter_map var_to_param (List.filter is_port_var param_vars) in
         let body_stmts = List.map stmt_to_bstmt body in
         Some {
           fname = tname;
           is_task = true;
           ftype = BBool;
           params;
-          locals = [];
-          body = body_stmts;
+          locals = locals_of param_vars;
+          body = local_inits param_vars @ body_stmts;
         }
     | _ -> None
   ) sts

@@ -236,13 +236,36 @@ let cell_to_bprocess (c : rtlil_cell) =
   | "$mul"              -> bin_2 BMul yw
   | "$shl"   | "$sshl"  -> bin_2 BShl yw
   | "$shr"              -> bin_2 BShr yw
-  | "$sshr"             -> bin_2 BAshr yw
+  | "$sshr" ->
+      (* yosys $sshr is arithmetic only when A_SIGNED; with an unsigned A it
+         is a logical shift.  A signed A narrower than Y is sign-extended to
+         Y_WIDTH first (RTLIL extends A by its own signedness). *)
+      let a_signed = (try int_of_string (List.assoc "A_SIGNED" c.cell_params) with _ -> 0) = 1 in
+      if not a_signed then bin_2 BShr yw
+      else
+        let aw = get_width c "A_WIDTH" in
+        (match pin_expr c "A", pin_expr c "B" with
+         | Some a, Some b ->
+             let a = if aw < yw && aw > 0
+                     then Behavioral_const.sign_extend ~from_w:aw ~to_w:yw a else a in
+             comb_out c "Y" (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst)
+               (BBinOp { op = BAshr; lhs = a; rhs = b; result_type = int_t yw })
+         | _ -> None)
   | "$eq"               -> bin_2 BEq 1
   | "$ne"               -> bin_2 BNe 1
-  | "$lt"               -> bin_2 BLt 1
-  | "$le"               -> bin_2 BLe 1
-  | "$gt"               -> bin_2 BGt 1
-  | "$ge"               -> bin_2 BGe 1
+  | "$lt" | "$le" | "$gt" | "$ge" ->
+      let op = match c.cell_type with
+        | "$lt" -> BLt | "$le" -> BLe | "$gt" -> BGt | _ -> BGe in
+      let signed_p k = (try int_of_string (List.assoc k c.cell_params) with _ -> 0) = 1 in
+      (* yosys compares signed only when A_SIGNED and B_SIGNED are both set *)
+      if not (signed_p "A_SIGNED" && signed_p "B_SIGNED") then bin_2 op 1
+      else
+        (match pin_expr c "A", pin_expr c "B" with
+         | Some a, Some b ->
+             comb_out c "Y" (Printf.sprintf "%s_%s" (strip_dollar c.cell_type) c.cell_inst)
+               (Behavioral_const.signed_compare op
+                  ~lw:(get_width c "A_WIDTH") ~rw:(get_width c "B_WIDTH") a b)
+         | _ -> None)
   (* Reductions.  `$reduce_bool` is yosys's "is any bit set" cell —
      semantically equivalent to a 1-bit OR-reduction. *)
   | "$reduce_and"       -> un_1 BRedAnd 1

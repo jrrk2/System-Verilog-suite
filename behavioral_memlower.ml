@@ -816,7 +816,7 @@ let build_tdp_port m_name ~read_pin ~dw (p : bprocess) =
         Fpga_bram_resolve.(
           { p_clk = BVar clk
           ; p_addr = BCond { condition = we_any; then_val = w_addr; else_val = r_addr }
-          ; p_we = we_any; p_wdata = base; p_wstrb = Some wstrb })
+          ; p_we = we_any; p_wdata = base; p_wstrb = Some wstrb; p_re = None; p_wmode = `Read_first })
       | None ->
         (* read-only port: address = read address.  If there were NO write sites
            this is genuinely read-only; but if writes exist and merely failed the
@@ -830,7 +830,7 @@ let build_tdp_port m_name ~read_pin ~dw (p : bprocess) =
                 m_name (List.length w_sites)));
         Fpga_bram_resolve.(
           { p_clk = BVar clk; p_addr = r_addr
-          ; p_we = zero_lit 1; p_wdata = zero_lit dw; p_wstrb = None })
+          ; p_we = zero_lit 1; p_wdata = zero_lit dw; p_wstrb = None; p_re = None; p_wmode = `Read_first })
     in
     Some (port, read_reg)
 
@@ -839,6 +839,305 @@ let build_tdp_port m_name ~read_pin ~dw (p : bprocess) =
 (* Try to lower a single bmem. Returns either:
  *   `Lowered (m', art) - module with this mem replaced; bmem removed
  *   `Skipped reason    - keep the bmem as bit-blast (with logged reason) *)
+(* ──────────── registered-read ports (FPGA) ────────────
+   `if (re) q <= mem[a];` is a block RAM port, not a memory read plus a
+   register: the address goes to the tile in this cycle, EN = re | we, and q
+   IS the tile's output register (it holds while EN is low).  Mapping the
+   read through a RAMB and then keeping q as an FF behind it reads a cycle
+   late.  A memory whose every read is such a statement (at most two
+   distinct q, each the memory's full width, assigned nowhere else) is
+   lowered here: the write and the read whose address is the write address
+   share port A, any other read takes port B.
+
+   Port A's WRITE_MODE decides what q does on a write cycle, and only one
+   value is exact for each kind of cycle: a read-and-write cycle needs
+   READ_FIRST (q <= the old word, as the RTL's `<=` reads it), a
+   write-only cycle needs NO_CHANGE (q holds).  The mode is chosen by
+   proving one of the two cycles impossible (a SAT query over the module's
+   combinational definitions with every register free -- sound, since the
+   reachable states are a subset); when neither can be ruled out q is
+   rebuilt exactly as `re_d1 ? rdata : hold` with a hold register, which is
+   what the FF cost today but with the right latency.  MEMLOWER_NO_REGREAD=1
+   skips the path. *)
+let reg_read_sites m_name body =
+  let acc = ref [] in
+  (* the value side of a registered read: `mem[a]`, or a mux tree (what
+     iflift makes of `if (re) q <= mem[a]`) whose leaves are reads of the
+     memory or q itself (the hold).  Any other leaf means q is not a port. *)
+  let others = ref [] in
+  (* a leaf that is neither a read of the memory nor the hold is another
+     write of q folded into the same statement: q is then rebuilt, not
+     dropped *)
+  let rec leaves path lhs = function
+    | BSelect { array = BVar n; index } when n = m_name -> [ (path, lhs, index) ]
+    | BVar v when v = lhs -> []
+    | BCond { condition; then_val; else_val } ->
+        leaves (cond_and path condition) lhs then_val
+        @ leaves (cond_and path (bool_not condition)) lhs else_val
+    | _ -> others := lhs :: !others; [] in
+  let rec stmt path = function
+    | BAssign { lhs; rhs = BSelect { array = BVar n; index } } when n = m_name ->
+        acc := (path, lhs, index) :: !acc
+    | BAssign { lhs; rhs = BCond _ as rhs } ->
+        let before = !others in
+        (match leaves path lhs rhs with
+         | [] -> others := before
+         | l -> acc := List.rev_append l !acc)
+    | BIf { condition; then_stmts; else_stmts } ->
+        List.iter (stmt (cond_and path condition)) then_stmts;
+        List.iter (stmt (cond_and path (bool_not condition))) else_stmts
+    | BCase { selector; cases; default } ->
+        let preds = List.map (fun (k, ss) ->
+          List.iter (stmt (cond_and path (bool_eq selector k))) ss;
+          bool_eq selector k) cases in
+        let none = match preds with
+          | [] -> BConst { value = Z.one; width = 1 }
+          | f :: r -> List.fold_left (fun a q -> bool_and a (bool_not q)) (bool_not f) r in
+        List.iter (stmt (cond_and path none)) default
+    | BBlock ss -> List.iter (stmt path) ss
+    | _ -> ()
+  in
+  List.iter (stmt None) body;
+  List.rev !acc, List.sort_uniq compare !others
+
+(* Is `a && b` satisfiable with the module's registers and inputs free and
+   its combinational assigns as definitions?  `Unsat is a proof the two
+   never hold together. *)
+let sat_exclusive (m : bmodule) (a : bexpr) (b : bexpr) : [ `Unsat | `Sat | `Unknown ] =
+  let ctx = Z3_miter.ctx in
+  let widths = Behavioral_const.signal_widths_of_module m in
+  let sigs = Hashtbl.fold (fun k v acc -> (k, v) :: acc) widths [] in
+  let tr e = Z3_miter.expr_to_z3 "" sigs e in
+  let size z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
+  let fit z w =
+    let s = size z in
+    if s = w then z
+    else if s < w then Z3.BitVector.mk_zero_ext ctx (w - s) z
+    else Z3.BitVector.mk_extract ctx (w - 1) 0 z in
+  let is_true z =
+    Z3.Boolean.mk_not ctx
+      (Z3.Boolean.mk_eq ctx z (Z3.BitVector.mk_numeral ctx "0" (size z))) in
+  try
+    let defs = List.concat_map (function
+      | BCombinational { body; _ } ->
+          List.filter_map (function
+            | BAssign { lhs; rhs } ->
+                (match Hashtbl.find_opt widths lhs with
+                 | Some w ->
+                   (try Some (Z3.Boolean.mk_eq ctx (tr (BVar lhs)) (fit (tr rhs) w))
+                    with _ -> None)
+                 | None -> None)
+            | _ -> None) body
+      | _ -> []) m.processes in
+    let assertions = defs @ [ is_true (tr a); is_true (tr b) ] in
+    let via_z3 () =
+      let s = Z3.Solver.mk_simple_solver ctx in
+      let ps = Z3.Params.mk_params ctx in
+      Z3.Params.add_int ps (Z3.Symbol.mk_string ctx "timeout") 60000;
+      Z3.Solver.set_parameters s ps;
+      Z3.Solver.add s assertions;
+      match Z3.Solver.check s [] with
+      | Z3.Solver.UNSATISFIABLE -> `Unsat
+      | Z3.Solver.SATISFIABLE -> `Sat
+      | Z3.Solver.UNKNOWN -> `Unknown in
+    match Sat_backend.check ctx assertions with
+    | Sat_backend.Unsat -> `Unsat
+    | Sat_backend.Sat _ -> `Sat
+    | Sat_backend.Unknown _ | Sat_backend.Unavailable _ -> via_z3 ()
+  with _ -> `Unknown
+
+let lower_regread_fpga (m : bmodule) (mm : bmem) : bmodule option =
+  let mname = mm.mname and dw = mm.data_width in
+  let dbg = Sys.getenv_opt "MEMLOWER_DEBUG" <> None in
+  let pbody = function BSequential s -> s.body | BCombinational c -> c.body in
+  let widths = Behavioral_const.signal_widths_of_module m in
+  let per_proc = List.filter_map (function
+    | BSequential s -> Some (s.clock, reg_read_sites mname s.body)
+    | _ -> None) m.processes in
+  let sites = List.concat_map (fun (clk, (ss, _)) -> List.map (fun (p, l, a) -> (clk, p, l, a)) ss) per_proc in
+  let folded_others = List.concat_map (fun (_, (_, o)) -> o) per_proc in
+  let n_all =
+    List.length (List.concat_map (fun p -> collect_read_sites mname (pbody p)) m.processes)
+    + List.length (List.concat_map (fun (f : bfunc) -> collect_read_sites mname f.body) m.funcs)
+    + List.length (List.concat_map (fun (i : binstance) ->
+        collect_read_sites mname
+          (List.map (fun (_, e) -> BAssign { lhs = "_"; rhs = e }) i.port_connections))
+        m.instances) in
+  let lhss = List.fold_left (fun acc (_, _, l, _) -> if List.mem l acc then acc else acc @ [ l ]) [] sites in
+  let whole_word l = Hashtbl.find_opt widths l = Some dw in
+  let rec reads_mem = function
+    | BSelect { array = BVar n; _ } when n = mname -> true
+    | BCond { condition; then_val; else_val } ->
+        reads_mem condition || reads_mem then_val || reads_mem else_val
+    | _ -> false in
+  (* writes to l other than its memory reads: with any, l is not the tile's
+     output register and is rebuilt around it instead of dropped *)
+  let other_writes l =
+    let rec st = function
+      | BAssign { lhs; rhs } when lhs = l -> if reads_mem rhs then 0 else 1
+      | BAssign { lhs; _ } ->
+          let n = String.length l in
+          if String.length lhs > n && String.sub lhs 0 n = l && lhs.[n] = '[' then 1 else 0
+      | BCallStmt { args = BVar x :: _; _ } -> if x = l then 1 else 0
+      | BIf { then_stmts; else_stmts; _ } -> sum then_stmts + sum else_stmts
+      | BCase { cases; default; _ } ->
+          List.fold_left (fun a (_, b) -> a + sum b) 0 cases + sum default
+      | BBlock b | BWhile { body = b; _ } | BFor { body = b; _ } -> sum b
+      | _ -> 0
+    and sum b = List.fold_left (fun a s -> a + st s) 0 b in
+    List.fold_left (fun a p -> a + sum (pbody p)) 0 m.processes in
+  let pure l = other_writes l = 0 && not (List.mem l folded_others) in
+  let blocking l =
+    List.exists (function BSequential s -> List.mem l s.blocking_vars | _ -> false) m.processes in
+  let why = ref "" in
+  let ok =
+    if sites = [] then (why := "no registered read"; false)
+    else if List.length sites <> n_all then (why := "a read that is not `q <= mem[a]`"; false)
+    else if List.length lhss > 2 then (why := "more than two read registers"; false)
+    else if not (List.for_all whole_word lhss) then (why := "a read register narrower than the word"; false)
+    else if List.exists blocking lhss then (why := "a read register still blocking"; false)
+    else true in
+  if not ok then begin
+    if dbg then Printf.eprintf "[memlower] %s: regread path not taken: %s\n%!" mname !why;
+    None
+  end else
+  match find_writing_process mname m.processes with
+  | None -> None
+  | Some w_idx ->
+  let w_clk, w_body =
+    match List.nth m.processes w_idx with BSequential s -> s.clock, s.body | _ -> "clk", [] in
+  if List.exists (fun (c, _, _, _) -> c <> w_clk) sites then None else
+  match fold_write_sites (collect_write_sites mname w_body) with
+  | None -> None
+  | Some (we, w_addr, w_data) ->
+  let port_of l =
+    let ss = List.filter (fun (_, _, l', _) -> l' = l) sites in
+    let re =
+      if List.exists (fun (_, p, _, _) -> p = None) ss then one_lit 1
+      else
+        match List.filter_map (fun (_, p, _, _) -> p) ss with
+        | [] -> one_lit 1
+        | f :: r -> List.fold_left bool_or f r in
+    let addr = Option.get (fold_read_sites (List.map (fun (_, p, _, a) -> (p, a)) ss)) in
+    (l, re, addr) in
+  let rports = List.map port_of lhss in
+  let same a b = fold_triv_mux a = fold_triv_mux b in
+  let mk ?re ~addr ~we ~wdata ~wmode () =
+    Fpga_bram_resolve.{ p_clk = BVar w_clk; p_addr = addr; p_we = we; p_wdata = wdata
+                      ; p_wstrb = None; p_re = re; p_wmode = wmode } in
+  let unsat a b = sat_exclusive m a b = `Unsat in
+  (* port A carries the write and, when exact, one read: dropped (q is the
+     tile output) when the register is pure and the write mode that makes
+     every cycle exact is proved, else rebuilt as re_d1 ? rdata : q__reg *)
+  let plan =
+    match List.find_opt (fun (_, _, a) -> same a w_addr) rports with
+    | Some (l, re, _) ->
+      let wmode, how =
+        if pure l && unsat we re then `No_change, `Drop
+        else if pure l && unsat we (bool_not re) then `Read_first, `Drop
+        else `Read_first, `Rebuild in
+      Some (mk ~re ~addr:w_addr ~we ~wdata:w_data ~wmode (), Some (l, how),
+            List.filter (fun (l', _, _) -> l' <> l) rports)
+    | None ->
+      (match rports with
+       | [ _ ] ->
+         Some (mk ~re:(zero_lit 1) ~addr:w_addr ~we ~wdata:w_data ~wmode:`Read_first (), None, rports)
+       | _ ->
+         (match List.find_opt (fun (_, re, _) -> unsat we re) rports with
+          | Some (l, re, a) ->
+            let wmode, how = if pure l then `No_change, `Drop else `Read_first, `Rebuild in
+            Some (mk ~re ~addr:(BCond { condition = we; then_val = w_addr; else_val = a })
+                    ~we ~wdata:w_data ~wmode (), Some (l, how),
+                  List.filter (fun (l', _, _) -> l' <> l) rports)
+          | None -> None)) in
+  match plan with
+  | None -> if dbg then Printf.eprintf "[memlower] %s: regread: no exact port-A assignment\n%!" mname; None
+  | Some (port_a, a_read, rest) ->
+  let port_b = match rest with
+    | [ (_, re, a) ] -> Some (mk ~re ~addr:a ~we:(zero_lit 1) ~wdata:(zero_lit dw) ~wmode:`Read_first ())
+    | _ -> None in
+  let ports = port_a :: Option.to_list port_b in
+  let init = if mm.init_values <> [] then Some (Array.of_list mm.init_values) else None in
+  let insts, new_sigs, drv_stmts, rnames =
+    Fpga_bram_resolve.build_byte_lane_ram ~name:mname ~depth:mm.depth ~width:dw ?init ~ports () in
+  (* (register, how, rdata net, read enable) per read register *)
+  let regs =
+    (match a_read with Some (l, how) -> [ (l, how, List.nth rnames 0,
+        (match port_a.Fpga_bram_resolve.p_re with Some r -> r | None -> one_lit 1)) ] | None -> [])
+    @ (match rest, rnames with
+       | [ (l, re, _) ], [ _; rdata_b ] -> [ (l, (if pure l then `Drop else `Rebuild), rdata_b, re) ]
+       | _ -> []) in
+  let dropped = List.filter_map (fun (l, how, _, _) -> if how = `Drop then Some l else None) regs in
+  let rebuilt = List.filter_map (fun (l, how, rn, re) -> if how = `Rebuild then Some (l, rn, re) else None) regs in
+  let reg_of l = l ^ "__reg" in
+  (* a rebuilt register's memory-read leaves become its own current value
+     (the hold), and its writes move to q__reg; q itself becomes the wire
+     re_d1 ? rdata : q__reg *)
+  let rec rx = function
+    | BSelect { array = BVar n; _ } when n = mname -> BVar "__regread_leaf"
+    | BCond { condition; then_val; else_val } ->
+        BCond { condition; then_val = rx then_val; else_val = rx else_val }
+    | e -> e in
+  ignore rx;
+  let rec rw body =
+    List.filter_map (function
+      | BAssign { lhs; rhs } when List.mem lhs dropped && reads_mem rhs -> None
+      | BAssign { lhs; rhs } when List.mem_assoc lhs (List.map (fun (l, rn, re) -> (l, (rn, re))) rebuilt) ->
+          let rhs = if reads_mem rhs then
+              (match rx rhs with e -> Behavioral_blocking_subst.map_expr
+                 (fun n -> if n = "__regread_leaf" then Some (BVar lhs) else None) e)
+            else rhs in
+          Some (BAssign { lhs = reg_of lhs; rhs })
+      | BAssign { lhs; rhs } ->
+          (match List.find_opt (fun (l, _, _) ->
+                    let n = String.length l in
+                    String.length lhs > n && String.sub lhs 0 n = l && lhs.[n] = '[') rebuilt with
+           | Some (l, _, _) ->
+             Some (BAssign { lhs = reg_of l ^ String.sub lhs (String.length l) (String.length lhs - String.length l); rhs })
+           | None -> Some (BAssign { lhs; rhs }))
+      | BCallStmt { func; args = BVar x :: a } when List.exists (fun (l, _, _) -> l = x) rebuilt ->
+          Some (BCallStmt { func; args = BVar (reg_of x) :: a })
+      | BBlock b -> Some (BBlock (rw b))
+      | BIf i -> Some (BIf { i with then_stmts = rw i.then_stmts; else_stmts = rw i.else_stmts })
+      | BCase c -> Some (BCase { c with cases = List.map (fun (k, ss) -> (k, rw ss)) c.cases
+                                      ; default = rw c.default })
+      | BWhile w -> Some (BWhile { w with body = rw w.body })
+      | BFor f -> Some (BFor { f with body = rw f.body })
+      | s -> Some s) body in
+  let processes' = List.map (function
+    | BSequential s -> BSequential { s with body = rw (strip_mem_writes mname s.body) }
+    | BCombinational c -> BCombinational { c with body = rw c.body }) m.processes in
+  let read_drv =
+    List.map (fun (l, _, rn, _) -> BAssign { lhs = l; rhs = BVar rn }) (List.filter (fun (_, h, _, _) -> h = `Drop) regs)
+    @ List.map (fun (l, rn, _) ->
+        BAssign { lhs = l; rhs = BCond { condition = BVar (l ^ "__re_d1"); then_val = BVar rn
+                                        ; else_val = BVar (reg_of l) } }) rebuilt in
+  let hold_procs = List.map (fun (l, _, re) ->
+    BSequential { name = l ^ "__regread"; clock = w_clk; clock_edge = `Pos; reset = None
+                ; reset_edge = None; reset_async = false; blocking_vars = []
+                ; body = [ BAssign { lhs = l ^ "__re_d1"; rhs = re } ] }) rebuilt in
+  let hold_sigs = List.concat_map (fun (l, _, _) ->
+    match List.find_opt (fun (s : bsignal) -> s.name = l) m.signals with
+    | Some s -> [ { s with name = reg_of l; direction = `Internal }; mk_signal (l ^ "__re_d1") 1 ]
+    | None -> []) rebuilt in
+  let signals' =
+    List.filter_map (fun (s : bsignal) ->
+      if s.name = mname then None
+      else if List.exists (fun (l, _, _) -> l = s.name) rebuilt then Some { s with initial_value = None }
+      else Some s) m.signals in
+  let driver = BCombinational { name = mname ^ "_drv"; sensitivity = [ BAny ]; body = drv_stmts @ read_drv } in
+  let show (l, how, _, _) = l ^ (match how with `Drop -> "" | `Rebuild -> " (re_d1/reg rebuild)") in
+  Printf.eprintf "[memlower] %s.%s: registered-read ports -> %d RAMB tile(s): A = write%s %s%s\n%!"
+    m.name mname (List.length insts)
+    (match a_read with Some _ -> " + " ^ show (List.hd regs) | None -> "")
+    (match port_a.Fpga_bram_resolve.p_wmode with `No_change -> "NO_CHANGE" | `Read_first -> "READ_FIRST")
+    (match rest with [ _ ] -> ", B = " ^ show (List.nth regs (List.length regs - 1)) | _ -> "");
+  Some { m with
+         signals = signals' @ new_sigs @ hold_sigs
+       ; processes = processes' @ [ driver ] @ hold_procs
+       ; instances = insts @ m.instances
+       ; mems = List.filter (fun mm' -> mm'.mname <> mname) m.mems }
+
 let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
   let mname = mm.mname in
   let skip reason =
@@ -848,6 +1147,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
   in
   let async_ok = Sys.getenv_opt "MEMLOWER_ASYNC_OK" = Some "1" in
   let fpga = fpga_target () in
+  let regread_result = ref None in
   (* Above this many bits, keeping an async-read RAM bit-blasted costs more than
      it saves -- see the MEMLOWER_NO_LUTRAM note below. *)
   let lutram_max_depth =
@@ -891,7 +1191,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
            let port =
              Fpga_bram_resolve.(
                { p_clk = BVar read_clk; p_addr = r_addr; p_we = zero_lit 1;
-                 p_wdata = zero_lit dw; p_wstrb = None })
+                 p_wdata = zero_lit dw; p_wstrb = None; p_re = None; p_wmode = `Read_first })
            in
            let absorb = Option.is_some read_reg in
            let insts, new_sigs, drv_stmts, _ =
@@ -1383,6 +1683,12 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
       | _ -> skip "TDP: a port process did not match the byte-masked read/write shape"
     end
   end
+  else if fpga && mm.read_is_sync && mm.kind = BRam
+          && Sys.getenv_opt "MEMLOWER_NO_REGREAD" = None
+          && (match lower_regread_fpga m mm with
+              | Some m' -> regread_result := Some m'; true
+              | None -> false) then
+    `Lowered (Option.get !regread_result, None)
   else if
     mm.n_write_ports < 1
     || (mm.n_write_ports > 1 && not (fpga_target ()))
@@ -1473,9 +1779,10 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                    end
                    else None
                in
-               let too_deep =
-                 match byte_info with Some _ -> mm.depth > 4096 | None -> mm.depth > 32768
-               in
+               (* depth tiling (fpga_bram_resolve) banks RAMB tiles behind an
+                  address decode; cap at 1M words so a runaway inference still
+                  fails loudly *)
+               let too_deep = mm.depth > (1 lsl 20) in
                if too_deep then skip "FPGA BRAM depth exceeds one tile (deep tiling TODO)"
                else begin
                  ignore aw;
@@ -1498,7 +1805,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                          { p_clk = BVar orig_clk
                          ; p_addr =
                              BCond { condition = we_any; then_val = w_addr; else_val = r_addr }
-                         ; p_we = we_any; p_wdata = base; p_wstrb = Some wstrb })
+                         ; p_we = we_any; p_wdata = base; p_wstrb = Some wstrb; p_re = None; p_wmode = `Read_first })
                      , w_addr )
                    | None ->
                      let w_addr = rw_e w_addr and w_data = rw_e w_data
@@ -1507,7 +1814,7 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
                          { p_clk = BVar orig_clk
                          ; p_addr =
                              BCond { condition = we_expr; then_val = w_addr; else_val = r_addr }
-                         ; p_we = we_expr; p_wdata = w_data; p_wstrb = None })
+                         ; p_we = we_expr; p_wdata = w_data; p_wstrb = None; p_re = None; p_wmode = `Read_first })
                      , w_addr )
                  in
                  let absorb =
@@ -1823,12 +2130,22 @@ let try_lower_one_mem ~tech (m : bmodule) (mm : bmem) =
 (* ──────────── per-module pass ──────────── *)
 
 let lower_module ~tech (m : bmodule) =
-  List.fold_left (fun (m, arts) mm ->
-    match try_lower_one_mem ~tech m mm with
-    | `Lowered (m', Some art) -> m', art :: arts
-    | `Lowered (m', None) -> m', arts
-    | `Skipped -> m, arts
-  ) (m, []) m.mems
+  Fpga_bram_resolve.deep_select_regs := [];
+  let m', arts =
+    List.fold_left (fun (m, arts) mm ->
+      match try_lower_one_mem ~tech m mm with
+      | `Lowered (m', Some art) -> m', art :: arts
+      | `Lowered (m', None) -> m', arts
+      | `Skipped -> m, arts
+    ) (m, []) m.mems in
+  (* depth-tiled BRAM banks: one registered read-select per port *)
+  let regs = List.rev !Fpga_bram_resolve.deep_select_regs in
+  Fpga_bram_resolve.deep_select_regs := [];
+  let procs = List.map (fun (r, clk, nxt, _w) ->
+    BSequential { name = "__bram_rsel_" ^ r; clock = clk; clock_edge = `Pos
+                ; reset = None; reset_edge = None; reset_async = false
+                ; body = [ BAssign { lhs = r; rhs = nxt } ]; blocking_vars = [] }) regs in
+  { m' with processes = m'.processes @ procs }, arts
 
 (* Build a tiny bmodule with the macro's IO so [hier_synth] recognises
  * the binstance.  Body is empty — the macro is a blackbox at our

@@ -784,7 +784,9 @@ let sign_extend ~from_w ~to_w x =
    uninterpreted-function call sitting in the middle of an arithmetic
    tree. *)
 let rec strip_signed_anywhere = function
-  | BCall { func = "@signed"; args = [x] } -> strip_signed_anywhere x
+  (* `$signed(x)` that survived as a plain call (a function body's cast)
+     is the same no-op at the bit level as the marker *)
+  | BCall { func = ("@signed" | "$signed" | "$unsigned"); args = [x] } -> strip_signed_anywhere x
   | BBinOp r ->
       BBinOp { r with
         lhs = strip_signed_anywhere r.lhs;
@@ -808,6 +810,18 @@ let rec strip_signed_anywhere = function
   | BCall r ->
       BCall { r with args = List.map strip_signed_anywhere r.args }
   | (BVar _ | BConst _) as e -> e
+
+(* A SIGNED comparison as the unsigned one every back end has: both operands
+   sign-extended to the wider width, their sign bits flipped (x ^ MSB maps
+   two's complement onto the unsigned order), then compared.  The LRM makes
+   `<`/`<=`/`>`/`>=` signed only when BOTH operands are signed. *)
+let signed_compare op ~lw ~rw a b =
+  let w = max lw rw in
+  let ext from e = if from < w && from > 0 then sign_extend ~from_w:from ~to_w:w e else e in
+  let top = BConst { value = Z.shift_left Z.one (w - 1); width = w } in
+  let flip e = BBinOp { op = BXor; lhs = e; rhs = top
+                      ; result_type = BInt { width = w; signed = Unsigned } } in
+  BBinOp { op; lhs = flip (ext lw a); rhs = flip (ext rw b); result_type = BBool }
 
 let normalize_one_arg sig_widths arg formal_w =
   (* When the actual arg is a BBinOp whose operands carry the

@@ -389,6 +389,256 @@ multi-bit register's D cone was swept: picorv32 shipped 284 of 1565 FFs), and
 now complete and yosys-readable; the ASIC flow's area (3x yosys) and runtime
 (picorv32 ~12 min) remain the next ASIC items.
 
+**Operator sharing by common-operand hoisting** (`Behavioral_share_accum`, in
+the pre-mapping BIR optimisation; `GATE_MAP_BIR_NOSHARE=1` skips).  A register
+updated in many mutually exclusive arms (`sp <= sp + 1` / `sp <= sp - 3` /
+`sp <= sp + imm` across a state machine) is threaded to one next-state tree and
+the shared operand is hoisted out of the mux: `sp + (s==A ? 1 : s==B ? -3 :
+... : 0)`, one adder fed by an operand mux instead of one adder per arm.
+Constant subtractions become two's-complement additions; the hold leaf is
+absorbed as `+ 0`; a bare two-constant up/down pair is left alone (two
+half-adder chains beat an adder plus mux).  Exact algebra on the threaded
+tree, verified by the netlist miter.  `test/qor/bir_share_scan.py` (over a
+`GATE_MAP_BIR_JSON=<dir>` dump of the optimised BIR, printed by
+`Behavioral_json`) reports the remaining opportunities per module: operator
+inventory, mutually-exclusive same-op operators, mux-fed identical operators,
+duplicate subexpressions, over-wide reads, constant-compare decoders.
+
+**Structural restructuring before and during mapping.**  Each item has its own
+off-switch so it can be A/B'd:
+
+- *Flatten combinational children* (`svd.flatten` in the QoR flow, as
+  `synth_xilinx -flatten` does; `QOR_FLATTEN=0` keeps them).  A generic child
+  mapped once and instanced N times never sees the constants its parent feeds
+  it: cascade_mac's `add48` got the zero-padded partial products as full
+  48-bit operands, eight times over.
+- *CARRY4 trimming* (`Bir_to_aig`, `CARRY4_TRIM=0`).  The chain covers only
+  the span whose carry is unknown: below it, bits with a constant operand that
+  pins the carry are plain XORs; above it, bits where both operands are
+  constant are functions of the span's carry-out.  A short residual span
+  against a constant (a 32-bit-context counter or decrement) ripples in LUTs
+  (`CARRY4_TRIM_MIN`, default 8).
+- *Carry-block CSE* (`CARRY4_CSE=0`).  A CARRY4 with the same carry source and
+  the same S / DI literals as an emitted one is reused, so chains sharing a
+  prefix share it: signed and unsigned compares of the same operands, and
+  `a < b` with `a - b`.
+- *Add/sub fusion* (`Behavioral_share_accum.fuse_addsub`,
+  `GATE_MAP_BIR_NOADDSUB=1`).  `c ? x - y : x + y` becomes
+  `(x + (c ? ~y : y)) + c`, and the trailing 1-bit add is fused into the
+  chain's CYINIT (`CARRY4_FUSE=0`): one adder instead of two and a mux
+  (picorv32's `alu_add_sub`).
+- *Gated single-add hoist* (`Behavioral_share_accum`).  `c ? X : X + y`
+  becomes `X + (c ? 0 : y)` when `X` is not the register being written,
+  because a hold of another signal is a mux no clock enable absorbs.  The gate
+  folds into the adder's per-bit LUT (cascade_mac's `dclr` accumulator: 48
+  LUT3s).
+- *Add-chain rebalancing* (`Behavioral_add_tree`,
+  `GATE_MAP_BIR_NOADDTREE=1`).  Same-width add trees through single-reader
+  wires are rebuilt balanced, pairing leaves by alignment (known trailing
+  zeros) so each adder stays as narrow as the trimming allows.
+- *Best-of-rounds ABC* (`Abc_cover`, `SVS_ABC_ROUNDS`, default 4).  ABC runs
+  resyn2 + `dch; if -K 6; mfs` repeatedly in one process and writes the
+  network after every round.  The flow keeps the smallest result no deeper
+  than round 1.  ABC is chaotic on these netlists: the same picorv32 AIG gives
+  1173 / 1215 / 1263 LUTs at 3 / 2 / 4 rounds.  Taking the best round means
+  that noise can only help, and any single-run LUT difference under about ±50
+  on picorv32 is noise.
+- *Mux trees as AND-OR* (`Bir_to_aig`, `MUX_ANDOR=0`; trees of at least
+  `MUX_ANDOR_MIN` leaves, default 6).  A case/if chain arrives as nested 2:1
+  muxes, one per arm per bit.  Its root-to-leaf path conditions are mutually
+  exclusive and exhaustive, which no cover can see, so the tree becomes
+  `OR_j (sel_j & V_j)`: one path literal per leaf shared by every bit, one
+  select per distinct leaf value, constant leaf bits reduced to plain ORs of
+  selects, and the value most paths reach (usually the hold) as the default
+  that needs no select of its own.  Exact for all inputs, so the
+  combinational miter proves it.  picorv32 1212 -> 1109 LUTs (native cover
+  1816 -> 1454), the OCaml VM 12732 -> 9387.
+- *Wide-multiply DSP split* (`Behavioral_dsp_infer`, `DSP_SPLIT=0`).  A
+  demanded-bits scan narrows a product to the bits anybody reads (the VM's
+  72-bit `mul_p` is only read as `mul_p[34:0][31:0]`).  The operands are cut
+  to that width and split into 24 x 17-bit unsigned limbs, one DSP48E1 per
+  limb pair below the cut, with the partial products added in fabric (at most
+  `DSP_SPLIT_MAX`, default 8, DSPs per multiply).  The VM's 36 x 36 multiply
+  goes from 1094 LUTs to 3 DSPs plus 55 LUTs.  A multiply by a constant never
+  becomes a DSP, because it folds to shifts and adds.  `dsp_selftest.sh`
+  proves the split with `DSP_SPLIT_LIMBS=5,4` standing in for 24,17.
+- *Blocking assignments as D-side reuse* (`Behavioral_blocking_subst`,
+  `BLOCKING_SUBST_OLD=1` restores the heuristic).  In an `always_ff` every
+  assigned variable is a flip-flop; a blocking `=` only means that a later
+  read in the same body sees the expression being built for D rather than Q.
+  The pass threads each blocking variable's pending expression through the
+  body (into every if/case arm, merged on the way out), substitutes it at
+  those reads, keeps the writes, and names the end-of-body value once as
+  `v__d` so a value with many readers (the VM's RAM port temporaries) is one
+  wire, not a copy per reader.  Registers whose Q nobody reads then fall to
+  DCE: the VM lost its 200 memory-port FFs.
+- *Registered-read block RAM ports* (`Behavioral_memlower`,
+  `MEMLOWER_NO_REGREAD=1`).  `if (re) q <= mem[a];` is a RAMB36E1 port: the
+  address goes to the tile in the cycle, `EN = re | we`, and q IS the tile's
+  output register.  The write and the read at the write address share port
+  A, a second read takes port B.  Port A's WRITE_MODE is proved: NO_CHANGE
+  when `re & we` is unsatisfiable (a SAT query over the module's
+  combinational definitions with every register free), READ_FIRST when
+  `we & ~re` is; otherwise, or when q is also written elsewhere, q is rebuilt
+  exactly as `re_d1 ? rdata : q__reg`.  Before this the FF stayed behind the
+  tile (a second cycle of read latency) and both read ports shared one
+  address -- the BIR-level models cut RAMB36E1 as a black box, so only the
+  gate-level oracle below could see it.
+- *Operators narrowed to the demanded bits* (`Behavioral_wreduce`,
+  `GATE_MAP_BIR_NOWREDUCE=1`; yosys's wreduce).  `pc := (pc + offset) - 1`
+  with a 24-bit pc is two 24-bit adders, not 32-bit ones; the demand flows
+  through muxes, slices and concatenation parts.
+- *Clock enables from the whole next-state tree* (`Bir_to_aig`,
+  `CE_LIFT_TREE=0`, `CE_LIFT_MIN_W`, default 2).  A threaded tree keeps the
+  register (`: accu`) in every arm that does not write it; CE becomes the OR
+  of the paths to the other leaves and D the tree with the hold leaves
+  replaced by the most common value.  yosys does the same through opt_dff
+  and had been winning on exactly this: the VM's `accu` had CE tied high
+  and 2400 LUTs in its D cone.  VM 8818 -> 7937 LUTs on that BIR (8737 after
+  the fixes below changed it: ABC chaos, see the table note), picorv32
+  1081 -> 1029.
+- *ABC's duplicate LUTs merged* (`Abc_cover`, `ABC_NODEDUP=1`).  abc's `if`
+  copies a node into every cut that uses it and the copies come back as
+  distinct nets with the same function of the same inputs; one LUT per
+  (truth table, inputs) now.  The VM had 10344 of them among 19165.
+- *A gate-level oracle* (`test/qor/gl_cosim.sh <file> <top> [cycles]`).  The
+  source RTL and the suite's netlist, the latter with Xilinx's own unisim
+  models (three idioms patched for Verilator, cached in
+  `~/.cache/svs-unisims-*`), driven by the same random inputs under
+  Verilator with every output compared every cycle; `GL_STAGE=bir` simulates
+  the post-memlower BIR instead, which splits the BIR passes from gate_map.
+  It is the only check that sees memory and DSP mappings: `augment_xil_models`
+  and `bmc_sim` cut RAMB36E1 as a black box.  `~/svs-gatesim/tools/gatesim.sh`
+  runs the full-size VM against its RTL testbench the same way.
+
+The oracle found, and the three-way vote then confirmed fixes for: dead-code
+elimination dropping an emptied `case` arm next to a non-empty default (the
+arm's opcodes took the default: `sysver_tests/case_dead_arm.sv`); a function
+local declared with a width and initialised from an `int` argument keeping
+the argument's 32 bits (`Make_header` lost its size field:
+`func_local_width.sv`); `$signed(a) < $signed(b)` compared unsigned by all
+three front ends (`signed_cmp_branch.sv`: the Verible post-pass, yosys's
+`A_SIGNED`/`B_SIGNED` and Verilator's `LTS` forms now build the compare as a
+sign-extended, sign-flipped unsigned one, `integer`/`int` declarations and
+function returns counting as signed); a task whose body is only `<=`
+assignments classed as a no-op and its calls dropped, and `flush();` parsed
+as a bare identifier (`case_task_const.sv`: the VM's C_CALL1 arms); a
+function's return width taken from the first range in its declaration, its
+first parameter's (`integer Int_val(input logic [35:0] v)` was 36 bits wide,
+so the signed compare extended only the other operand:
+`branch_pc_share.sv`, the VM's BLTINT..BGEINT); an arithmetic operator over
+a function call typed 1 bit wide because the call's width was not yet known,
+so the call-argument normaliser zero-padded it and `Val_int(-Int_val(accu))`
+spilled its sign into the word's metadata bit (`val_int_neg.sv`, the VM's
+NEGINT/ADDINT: calls now carry their function's return width, and an unknown
+width defaults to 32); and `width_of_expr_with` giving a mux the width of
+its then arm; and the Hardcaml lowering's constant-narrowing rule for binary
+operators cutting a constant to the other operand's width whatever its value
+(`32'd8 * str_byte` with a 2-bit register became `0 * str_byte`, a constant,
+so the VM's GETSTRINGCHAR shifted by nothing, read byte 0 of every string
+word, and the now-unread `str_byte` register vanished: `strget_reg.sv`; the
+constant now keeps at least the bits its value needs).  Each has a
+`sysver_tests/` design that the three-way vote and
+`gl_cosim.sh` both cover; `ram32k_regread.sv` / `ram32k_hi.sv` cover the
+32K-deep x1 RAMB36E1 tiling the full-size VM uses.
+
+Measured with every check proven equivalent (`test/qor/run_qor.sh`; the picorv32
+range reflects ABC noise):
+
+| design | before: LUT / CARRY4 / depth | after: LUT / CARRY4 / depth | yosys: LUT / CARRY4 / depth |
+|---|---|---|---|
+| uart_transmitter | 34 / 0 / 4 | 26 / 0 / 3 | 38 / 0 / 5 |
+| uart_receiver | 64 / 11 / 4 | 46 / 0 / 3 | 63 / 6 / 3 |
+| cascade_mac (9 DSP) | 483 / 109 / 15 | 155 / 52 / 20 | 326 / 25 / 16 |
+| picorv32 | 1299 / 76 / 15 | 1109 / 56 / 15 | 1039 / 97 / 16 |
+
+Checking the flattened MAC.  The hierarchical check can no longer abstract
+children, and a flat miter with nine bit-blasted DSP models per side does not
+finish within 300 s per solver.  The QoR flow therefore flattens the reference
+too and runs the same `dsp_infer` on it.  `MITER_CUT_PRIMS=DSP48E1` then makes
+`Fpga_prim_expand` treat each DSP as an uninterpreted function of its inputs on
+both sides, which is sound by congruence.  The DSP-vs-`*` step itself is
+proven by `test/qor/dsp_selftest.sh`.  CaDiCaL closes the flat MAC proof in
+3 s.
+
+**Large benchmark: the OCaml bytecode VM** (`~/bytecode/ocaml4142_vm_rtl.sv`,
+4k lines, one module, 96-state machine, three memories of 32K/256K/8K x 36).
+No yosys reader takes it (yosys-slang: blocking-after-non-blocking to `sp`;
+sv2v: `bit is_block[int]`; yosys's own: always-block nesting), so it is mapped
+through the Verilator front-end (`svd.parse("verilator", ...)`).  Getting it
+through needed: `+incdir+` of each source's directory and `+define+SYNTHESIS`
+on the Verilator call (and `SYNTHESIS` predefined in the Verible preprocessor,
+as every synthesis tool does); task-call statements and `x++` in the Verible
+frontend; function locals separated from formals and their initialisers kept
+(`INITIALAUTOMATICSTMT`) in the Verilator converter; the inliner tolerating
+dropped simulation statements; and BRAM **depth tiling** in
+`fpga_bram_resolve` (a bank of RAMB36E1 tiles behind an address decode with a
+registered read-select per port; the 256K-word heap becomes 288 tiles).
+
+Measured (xc7, Verilator front-end, abc backend; no yosys reference exists
+for this source):
+
+| OCaml VM | LUT | FF | CARRY4 | RAMB36E1 | depth | wall |
+|---|---|---|---|---|---|---|
+| default flow | 18604 | 2518 | 2676 | 333 | 44 | 13.4 min (abc) |
+| + operator sharing (58 add/sub folded) | 17796 | 2518 | 2471 | 333 | 41 | 9.9 min |
+| Verible front-end, same flow (65 folded) | 18989 | 2264 | 4029 | 333 | 39 | 12.4 min |
+| + carry trim/CSE, add/sub fusion, add trees, best-of-4 ABC | 12930 | 2264 | 1095 | 333 | 38 | 7.3 min |
+| + wide-multiply DSP split (3 DSP48E1) | 12732 | 2266 | 1117 | 333 | 31 | 6.9 min |
+| + mux trees as AND-OR (`test/qor/run_vm.sh`) | 9387 | 2266 | 1101 | 333 | 33 | 1.3 min |
+| + group sharing, blocking-aware threading | 8889 | 2249 | 960 | 333 | 33 | 1.1 min |
+| + registered-read RAM ports (correct latency, two read ports) | 9194 | 1898 | 990 | 333 | 36 | 1.0 min |
+| + wreduce, clock enables from the tree (`CE_LIFT_MIN_W=2`) | 7937 | 1894 | 988 | 333 | 34 | 1.0 min |
+| + the front-end and lowering fixes below (final; every check green) | **8737** | 1899 | 994 | 333 | 36 | 1.0 min |
+| yosys 0.4x `synth_xilinx` (sv2v, 5.5 min) | 11308 + 520 INV, 725 MUXF | 1769 | 869 | 296 | 30 | |
+
+The netlist of the final row, simulated with the unisims under the VM's own
+Verilator testbench (`~/svs-gatesim/tools/gatesim.sh`), runs helloworld, fact
+and hellofor cycle-exactly as the RTL does (the state/pc/accu log of every
+cycle identical, HALT at the same cycle); before the fixes below helloworld
+alone matched.  The small-memory VM (`vm_cosim`-sized) and a medium one with
+the full 32K stack match the RTL for 20000 random cycles at both the BIR and
+the netlist stage.
+
+The yosys row is the first reference for this source: yosys-slang rejects it
+(blocking and non-blocking writes to `sp`), sv2v then `read_verilog` takes it.
+Its 296 tiles are 4K x 9 RAMB36E1s behind a 64:1 output mux per bit, which is
+where most of its extra LUTs and all its MUXF7/8 go; the x1 tiling here
+spends 37 more tiles and no mux.  Its 177 FFs with a constant CE against our
+942 before the tree lift was the clock-enable gap above.  ABC is chaotic at
+this size: the same BIR mapped at `CE_LIFT_MIN_W` 1 / 2 / 4 gave 8816 / 7937
+/ 8865 LUTs, so VM LUT totals are judged with FF and CARRY4 counts and the
+per-register cones, not alone.
+
+(The rows from "+ carry trim" down were mapped from one Verible elaboration;
+the 12732 row still turned two constant multiplies into DSPs, which the
+constant guard has since removed.)  `test/qor/attrib.py` charges the LUTs to
+the registers they feed.  The largest remaining sinks are `accu` (1076), the
+heap write data and address (`hm_wd_a` 610, `temp_heap_addr` 531,
+`hm_addr_a` 447) and `pc` (377).
+
+**The Verible route now takes the VM too.**  It needed: the constant evaluator
+folding user-function calls in localparam initialisers (`VAL_UNIT =
+Val_int(0)`: `fname = expr` function bodies, `|` `&` `^` `~` `<<<` `>>>`,
+concatenation and replication, folded on the typed tree with the module's
+parameters in scope; `eval_cw` no longer mistakes a call's argument for its
+value); task calls that Verible parses as instantiation-shaped nodes
+(`stack_write(sp-1, accu);`, 50 of 52 call sites were silently dropped); and
+initialised local declarations in function bodies (`logic [15:0] wosize16 =
+wosize;`) becoming assignments the inliner can bind.  The two elaborations
+agree on the named state: the Verible side additionally folds `heap_lo` and
+`gc_semi` (written only in reset, from parameter-constant values), and the
+Verilator side carries ~230 bits of anonymous temporaries.  A whole-module Z3
+vote between the two did not finish in 40 minutes; the 96-state single module
+needs a per-state or bounded decomposition before it can be proven.
+
+The scan says what is left: 862 arithmetic/compare/shift operators (weighted
+bit-cost 18443), of which the mutually-exclusive sharing estimate is a
+further ~27 % once operators with different left operands are shared through
+full input muxes; `state == K` for 96 constants is the decode structure;
+`(!st_re_a & !st_we_a)` repeats 51 times (the task guards, deduplicated by
+AIG hashing).
+
 **Inout pads** (`Behavioral_iobuf_hoist`, run by `gate_map` and by the
 miter's `prep_for_z3`): a behavioural tristate drive on an `inout` port
 (`assign io = oe ? din : 1'bz`; the frontend now keeps `'bz` as an `@z`
@@ -410,7 +660,7 @@ Measured with `test/qor/run_qor.sh` (xc7, k=6, default profile, abc backend; yos
 | uart_transmitter | 34 / 7 / 0 / 0 / 0 / 4 | 38 / 16 / 0 / 0 / 0 / 5 | 3/3 | 1/1 EQUIVALENT |
 | uart_receiver (+3 children) | 64 / 25 / 11 / 0 / 0 / 4 | 63 / 36 / 6 / 0 / 0 / 3 | 3/3 | 4/4 EQUIVALENT |
 | cascade_mac (24-bit MAC) | 483 / 51 / 109 / 9 / 0 / 15 | 326 / 51 / 25 / 9 / 0 / 16 | 1/3 (2 inconclusive: 8x8 multiply exceeds the Z3 budget) | 3/3 EQUIVALENT |
-| picorv32 | 1377 / 593 / 84 / 0 / 12 RAM32M / 15 | 1039 / 574 / 97 / 0 / 12 RAM32M / 16 | 0/3 (no pair finished in the 40 min budget: whole-core miter) | 1/1 EQUIVALENT |
+| picorv32 | 1299 / 593 / 76 / 0 / 12 RAM32M / 15 (1377 / 84 before operator sharing) | 1039 / 574 / 97 / 0 / 12 RAM32M / 16 | 0/3 (no pair finished in the 40 min budget: whole-core miter) | 1/1 EQUIVALENT |
 
 The yosys FF counts on the UARTs include its one-hot FSM recoding.  Before this
 work the same flow gave 49 / 84 / 1641 / 4365 LUTs on these four designs, and

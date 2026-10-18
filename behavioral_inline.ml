@@ -262,6 +262,12 @@ let rec body_to_expr fname bindings = function
             split_intermediates acc rest
         | (BAssign { lhs; _ } as s) :: rest when lhs <> fname ->
             split_intermediates (s :: acc) rest
+        | BBlock [] :: rest ->
+            (* a dropped simulation-only statement (Verilator's
+               INITIALAUTOMATICSTMT wrapper, $display) leaves an empty block *)
+            split_intermediates acc rest
+        | BBlock inner :: rest ->
+            split_intermediates acc (inner @ rest)
         | _ -> None
       in
       (match split_intermediates [] stmts with
