@@ -47,21 +47,21 @@ let d_pin_name s = s ^ "__D"
  * state) and fold writes through. Multiple writes within the same
  * branch overwrite (last-write-wins); writes inside conditionals
  * become BConds; unwritten branches keep the prior value. *)
-let rec next_state_after ~width_of stmts q current =
-  List.fold_left (next_state_after_one ~width_of q) current stmts
-and next_state_after_one ~width_of q current = function
+let rec next_state_after ~width_of ~is_array stmts q current =
+  List.fold_left (next_state_after_one ~width_of ~is_array q) current stmts
+and next_state_after_one ~width_of ~is_array q current = function
   | BAssign { lhs; rhs } when lhs = q -> rhs
   | BAssign _ -> current
-  | BBlock ss -> next_state_after ~width_of ss q current
+  | BBlock ss -> next_state_after ~width_of ~is_array ss q current
   | BIf { condition; then_stmts; else_stmts } ->
-      let t = next_state_after ~width_of then_stmts q current in
-      let e = next_state_after ~width_of else_stmts q current in
+      let t = next_state_after ~width_of ~is_array then_stmts q current in
+      let e = next_state_after ~width_of ~is_array else_stmts q current in
       if t == current && e == current then current
       else BCond { condition; then_val = t; else_val = e }
   | BCase { selector; cases; default } ->
-      let def_expr = next_state_after ~width_of default q current in
+      let def_expr = next_state_after ~width_of ~is_array default q current in
       List.fold_right (fun (key, ss) acc ->
-        let branch = next_state_after ~width_of ss q current in
+        let branch = next_state_after ~width_of ~is_array ss q current in
         if branch == acc then acc
         else BCond {
           condition = BBinOp {
@@ -73,7 +73,16 @@ and next_state_after_one ~width_of q current = function
         }
       ) cases def_expr
   | BWhile { body; _ } | BFor { body; _ } ->
-      next_state_after ~width_of body q current
+      next_state_after ~width_of ~is_array body q current
+  (* A WORD write to an unpacked array register — `mem[a] <= d`.  This used
+     to fall through to `current`, so every RAM's next state was `mem` and the
+     miter never compared a write port (ram32k_hi: mem__D := mem on both
+     sides).  The new value is the old one with word idx replaced; a second
+     write in the same block stores over the first, which is the nonblocking
+     last-write-wins order. *)
+  | BCallStmt { func = "@mem_write"; args = [ BVar m; idx; data ] }
+    when m = q && is_array q ->
+      BCall { func = "@mem_store"; args = [ current; idx; data ] }
   (* A single-BIT write to packed register [q] — `q[idx] <= data`, which the
      frontend lowers to @mem_write(q, idx, data) — updates [current] via a
      read-modify-write: (current & ~(1<<idx)) | (zext(data) << idx).  Without
@@ -128,13 +137,13 @@ let rec collect_lhs acc = function
       List.fold_left collect_lhs acc body
   | BCallStmt _ | BReturn _ -> acc
 
-let derive_d_pins ~width_of body =
+let derive_d_pins ~width_of ~is_array body =
   let qs =
     List.fold_left collect_lhs [] body
     |> List.sort_uniq compare
   in
   List.map (fun q ->
-    let d_expr = next_state_after ~width_of body q (BVar q) in
+    let d_expr = next_state_after ~width_of ~is_array body q (BVar q) in
     (q, d_expr)
   ) qs
 
@@ -182,6 +191,14 @@ let rip_module (m : bmodule) : bmodule =
     | Some s -> width_of_btype s.stype
     | None -> 1
   in
+  (* An unpacked array keeps its BArray type on its __Q / __D signals, so the
+     miter can encode it as an array rather than one flat bitvector. *)
+  let array_type name =
+    match List.find_opt (fun (s : bsignal) -> s.name = name) m.signals with
+    | Some { stype = BArray _ as t; _ } -> Some t
+    | _ -> None
+  in
+  let is_array name = array_type name <> None in
 
   let signal_exists name =
     List.exists (fun (s : bsignal) -> s.name = name) !new_signals
@@ -202,11 +219,12 @@ let rip_module (m : bmodule) : bmodule =
         attrs = [];
       } :: !new_signals
   in
-  let add_signal name width dir =
+  let add_signal ?stype name width dir =
     if not (signal_exists name) then
       new_signals := {
         name;
-        stype = BInt { width; signed = Unsigned };
+        stype = Option.value stype
+                  ~default:(BInt { width; signed = Unsigned });
         direction = dir;
         initial_value = None;
         attrs = [];
@@ -217,7 +235,7 @@ let rip_module (m : bmodule) : bmodule =
     match p with
     | BCombinational _ -> new_processes := p :: !new_processes
     | BSequential s ->
-        let pairs = derive_d_pins ~width_of:lookup_width s.body in
+        let pairs = derive_d_pins ~width_of:lookup_width ~is_array s.body in
         (* Every Q gets ripped. For Q's that are primary OUTPUT ports we
          * additionally insert a pass-through (Q = Q__Q) so the port
          * remains driven; the input cone still feeds the miter via
@@ -292,6 +310,7 @@ let rip_module (m : bmodule) : bmodule =
           | _ -> None in
         List.iter (fun (q, d_expr) ->
           let w = lookup_width q in
+          let stype = array_type q in
           let d_name = d_pin_name q in
           (match rst_expr with
            | Some re ->
@@ -310,8 +329,8 @@ let rip_module (m : bmodule) : bmodule =
                * combinationally from Q__Q, and rewrite Q references
                * inside d_expr to use Q__Q. *)
               let q_state = q ^ "__Q" in
-              add_signal q_state w `Input;
-              add_signal d_name w `Output;
+              add_signal ?stype q_state w `Input;
+              add_signal ?stype d_name w `Output;
               let d_expr' = subst_var q (BVar q_state) d_expr in
               new_processes := BCombinational {
                 name = "ffrip_d_" ^ q;
@@ -326,7 +345,7 @@ let rip_module (m : bmodule) : bmodule =
           | _ ->
               (* Internal Q: promote to primary input, expose Q__D. *)
               upgrade_or_add_input q w;
-              add_signal d_name w `Output;
+              add_signal ?stype d_name w `Output;
               new_processes := BCombinational {
                 name = "ffrip_" ^ q;
                 sensitivity = [BAny];

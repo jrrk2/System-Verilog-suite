@@ -421,6 +421,18 @@ let rec propagate_stmt ctx = function
   | BBlock stmts ->
       BBlock (List.map (propagate_stmt ctx) stmts)
 
+  (* a write pseudo-op (@mem_write / @slice_write / @part_sel_write_up/down): its
+     FIRST argument is the target NAME, not a value.  Substituting the
+     constant the target was just assigned (`y = 0; y[k] = a[j]` became
+     `@mem_write(8'0, k, ..)`) wrote into a literal and the whole set of bit
+     writes vanished -- the output came out tied to ground.  Keep the name,
+     thread only the operands, and forget any constant the target held: it is
+     no longer that constant after a partial write. *)
+  | BCallStmt { func; args = (BVar target as t) :: rest }
+    when String.length func > 0 && func.[0] = '@' ->
+      Hashtbl.remove ctx.constants target;
+      BCallStmt { func; args = t :: List.map (propagate_expr ctx) rest }
+
   | BCallStmt { func; args } ->
       BCallStmt {
         func;
@@ -518,6 +530,10 @@ let rec collect_assign_pairs acc = function
       List.fold_left collect_assign_pairs acc default
   | BWhile { body; _ } | BFor { body; _ } ->
       List.fold_left collect_assign_pairs acc body
+  (* a partial write makes its target non-constant: record it with a
+     non-literal RHS so module_constants rejects the signal *)
+  | BCallStmt { func; args = BVar target :: _ }
+    when String.length func > 0 && func.[0] = '@' -> (target, BVar target) :: acc
   | BCallStmt _ | BReturn _ -> acc
 
 let collect_module_assign_pairs bmod =
@@ -571,6 +587,8 @@ and stmt_is_const_only = function
       List.for_all (fun (_, ss) -> body_is_const_only ss) cases
       && body_is_const_only default
   | BWhile { body; _ } | BFor { body; _ } -> body_is_const_only body
+  | BCallStmt { func; args = BVar _ :: _ }
+    when String.length func > 0 && func.[0] = '@' -> false
   | BCallStmt _ | BReturn _ -> true
 
 (* Single module-level pass: seed cross-process constants, propagate per

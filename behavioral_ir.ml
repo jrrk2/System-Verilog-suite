@@ -131,6 +131,23 @@ type bsignal = {
  * adding a bidirectional port never silently drops it from an analysis. *)
 let is_input_dir = function `Input | `Inout -> true | _ -> false
 
+(* The write pseudo-ops: a BCallStmt whose FIRST argument is the NAME of the
+ * signal written (never a value to substitute), the rest index/data operands.
+ *   @mem_write(arr, idx, data)          @slice_write(sig, msb, lsb, data)
+ *   @part_sel_write_up(sig, base, w, data)   @part_sel_write_down(sig, base, w, data)
+ * Every pass that threads or substitutes expressions must leave that first
+ * argument alone and treat the target as (partially) re-written afterwards;
+ * matching only two of the four here is how `y[i +: 1]` writes got their
+ * target replaced by the constant y had just been assigned.
+ *
+ * Its expression counterpart, made only by Behavioral_ffrip for an array
+ * register's next state: BCall "@mem_store"(arr, idx, data) is the VALUE of
+ * arr with word idx replaced by data (an out-of-range idx leaves it alone).
+ * The miter encodes it as a Z3 array store or a flat word mux. *)
+let is_write_op = function
+  | "@mem_write" | "@slice_write" | "@part_sel_write_up" | "@part_sel_write_down" -> true
+  | _ -> false
+
 (* Is this a PORT rather than an internal signal? *)
 let is_port_dir = function `Input | `Output | `Inout -> true | `Internal -> false
 

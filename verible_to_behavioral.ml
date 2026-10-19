@@ -4111,6 +4111,16 @@ let rec stmt_to_bstmt ~pkgs ~params ~arrays tok =
    * extracts as empty, in_tmp is undriven, and the trailing-zero
    * counter computes wrong values (cnt_o = 0 instead of 1 for
    * in_i = 2'b10). *)
+  (* `while (cond) body` -- loop_statement4: TUPLE6(tag, While, LPAREN, cond,
+     RPAREN, body).  The behavioural-Verilog emitter writes every BFor as
+     `init; while (cond) begin body; step end`, so reading that output back
+     needs it; Behavioral_unroll already recognises the init+BWhile shape. *)
+  | TUPLE6 (STRING tag, While, _, cond, _, body)
+    when prefix_is "loop_statement" tag ->
+      (* flat body: the unroller wants the trailing `i = i + 1` as the LAST
+         element of the body list, not inside a nested BBlock *)
+      let body = match recurse_s body with BBlock l -> l | s -> [s] in
+      BWhile { condition = recurse_e cond; body }
   | TUPLE10 (STRING tag, _For, _, init_opt, _, cond_opt, _, step_opt, _, body)
     when prefix_is "loop_statement" tag ->
       let var_name = ref None in
@@ -6011,8 +6021,14 @@ let convert_module ~pkgs (mdecl : module_decl)
             cur_signal_wlsb := (s.name, off) :: !cur_signal_wlsb)
           (extract_port_decl ~pkgs ~params pn)
     | _ -> ()) port_nodes;
+  (* collect_by walks the port list in reverse source order (see the
+     function-formal note below).  Ports must keep SOURCE order: a positional
+     instantiation `slib_input_sync u (CLK, RST, D, Q)` resolves `$pos<N>`
+     against this list (name_positional_ports), and apb_uart's came out as
+     `.Q(CLK), .D(RST), .RST(D), .CLK(Q)` -- the child's output driving the
+     parent's clock input -- until the roundtrip miter refused the module. *)
   let explicit_signals =
-    List.concat_map (extract_port_decl ~pkgs ~params) port_nodes
+    List.concat_map (extract_port_decl ~pkgs ~params) (List.rev port_nodes)
   in
   (* Register struct-typed PORTS in cur_signal_struct too, so a field read
      like `dmi_req_i.addr` on a `dm::dmi_req_t` port resolves to a BSlice of
@@ -7693,6 +7709,12 @@ let convert_module ~pkgs (mdecl : module_decl)
           || prefix_is "nonblocking_assignment" t
           || prefix_is "jump_statement" t   (* `return <expr>;` — single-return
                                                package funcs (dm_pkg encoders) *)
+          (* a loop is ONE statement: without this the walk descended into it
+             and collected its body assignment alone, so `for (i..) rev[i] =
+             d[7-i]` became a single `rev = d[7-i]` with `i` unbound
+             (check_ir: "function rev reads undeclared name i") *)
+          || prefix_is "loop_statement" t
+          || prefix_is "for_loop_statement" t
           || prefix_is "seq_block" t in
         let stmt_nodes =
           let acc = ref [] in
@@ -7729,14 +7751,18 @@ let convert_module ~pkgs (mdecl : module_decl)
            treats the LAST statement as the fname-yielding one and
            substitutes earlier locals into it. *)
         let stmt_nodes = List.rev stmt_nodes in
+        (* the result variable is an indexable target inside its own body
+           (`rev[i] = d[7-i]`): without it in `arrays` the index was dropped
+           and the function returned a single bit *)
+        let arrays = fname :: array_names in
         let body =
           match stmt_nodes with
           | [] -> []
           | [top] ->
-              [stmt_to_bstmt ~pkgs ~params ~arrays:array_names top]
+              [stmt_to_bstmt ~pkgs ~params ~arrays top]
           | many ->
               [BBlock (List.map
-                (fun n -> stmt_to_bstmt ~pkgs ~params ~arrays:array_names n)
+                (fun n -> stmt_to_bstmt ~pkgs ~params ~arrays n)
                 many)]
         in
         Some {
@@ -7746,7 +7772,29 @@ let convert_module ~pkgs (mdecl : module_decl)
                    Hashtbl.replace cur_func_ret_w fname w;
                    BInt { width = w; signed = return_signed });
           params = func_params;
-          locals = [];
+          (* the body's own variables: every assigned name that is neither a
+             formal nor the result.  Width from the declared-width cut the
+             local's initialiser carries (`tag8 = 8'(tag)` arrives as a BSlice),
+             32 otherwise.  The inliner substitutes them away; the emitter and
+             check_ir need them declared. *)
+          locals = (let formals = fname :: List.map (fun (n, _, _) -> n) func_params in
+                    let acc = ref [] in
+                    let rec walk = function
+                      | BAssign { lhs; rhs } when not (List.mem lhs formals) ->
+                          if not (List.mem_assoc lhs !acc) then
+                            let w = match rhs with
+                              | BSlice { msb; lsb; _ } -> abs (msb - lsb) + 1
+                              | _ -> 32 in
+                            acc := (lhs, BInt { width = w; signed = Unsigned }) :: !acc
+                      | BBlock ss -> List.iter walk ss
+                      | BIf { then_stmts; else_stmts; _ } ->
+                          List.iter walk then_stmts; List.iter walk else_stmts
+                      | BCase { cases; default; _ } ->
+                          List.iter (fun (_, ss) -> List.iter walk ss) cases; List.iter walk default
+                      | BWhile { body; _ } | BFor { body; _ } -> List.iter walk body
+                      | _ -> () in
+                    List.iter walk body;
+                    List.rev !acc);
           body;
         }
     ) function_decls

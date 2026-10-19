@@ -196,46 +196,60 @@ let try_unroll_while_seq stmts =
        | [] -> None)
   | _ -> None
 
-(* Walk all statements; recursively unroll where possible. *)
+(* Walk all statements; recursively unroll where possible.  Statement LISTS
+ * go through unroll_list, which finds the `init; while` pair at ANY position
+ * (a `y = 0;` ahead of `i = 0; while (...)` is the common shape in verilator's
+ * output and in hand-written always_comb blocks; matching only at the head of
+ * a BBlock left those loops un-unrolled, to fail in create_circuit). *)
 let rec unroll_stmt = function
   | BFor { init; condition; update; body } ->
-      let body' = List.map unroll_stmt body in
+      let body' = unroll_list body in
       (match try_unroll_for ~init ~condition ~update ~body:body' with
        | Some unrolled -> BBlock unrolled
        | None ->
            BFor { init; condition; update; body = body' })
-  | BBlock stmts ->
-      let stmts' = List.map unroll_stmt stmts in
-      (match try_unroll_while_seq stmts' with
-       | Some unrolled -> BBlock unrolled
-       | None -> BBlock stmts')
+  | BBlock stmts -> BBlock (unroll_list stmts)
   | BIf { condition; then_stmts; else_stmts } ->
       BIf { condition;
-            then_stmts = List.map unroll_stmt then_stmts;
-            else_stmts = List.map unroll_stmt else_stmts }
+            then_stmts = unroll_list then_stmts;
+            else_stmts = unroll_list else_stmts }
   | BCase { selector; cases; default } ->
       BCase { selector;
-              cases = List.map (fun (e, ss) ->
-                (e, List.map unroll_stmt ss)) cases;
-              default = List.map unroll_stmt default }
+              cases = List.map (fun (e, ss) -> (e, unroll_list ss)) cases;
+              default = unroll_list default }
   | BWhile { condition; body } ->
       (* Bare while without recognisable bounds — leave it. *)
-      BWhile { condition; body = List.map unroll_stmt body }
+      BWhile { condition; body = unroll_list body }
   | other -> other
+
+and unroll_list stmts =
+  let stmts = List.map unroll_stmt (drop_empty_blocks stmts) in
+  let rec scan prefix = function
+    | [] -> List.rev prefix
+    | (BAssign _ as init) :: (BWhile _ as w) :: rest ->
+        (match try_unroll_while_seq [init; w] with
+         | Some unrolled -> List.rev_append prefix (unrolled @ scan [] rest)
+         | None -> scan (w :: init :: prefix) rest)
+    | s :: rest -> scan (s :: prefix) rest
+  in
+  scan [] stmts
 
 let unroll_process = function
   | BCombinational c ->
-      BCombinational { c with body = List.map unroll_stmt c.body }
+      BCombinational { c with body = unroll_list c.body }
   | BSequential s ->
-      BSequential { s with body = List.map unroll_stmt s.body }
+      BSequential { s with body = unroll_list s.body }
 
 let unroll_func (f : bfunc) =
-  { f with body = List.map unroll_stmt f.body }
+  { f with body = unroll_list f.body }
 
 let unroll_module (m : bmodule) =
-  { m with
-    processes = List.map unroll_process m.processes;
-    funcs = List.map unroll_func m.funcs }
+  (* the induction variable is a constant now: `v[k] = d` writes become the
+     one slice-write shape every consumer understands *)
+  Behavioral_lower.bitwrites_module
+    { m with
+      processes = List.map unroll_process m.processes;
+      funcs = List.map unroll_func m.funcs }
 
 let unroll_program (p : bprogram) =
   { p with modules = List.map unroll_module p.modules }

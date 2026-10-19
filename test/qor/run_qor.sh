@@ -9,7 +9,12 @@
 #   SVS_PROFILE=legacy        run the old everything-off defaults (A/B)
 #   YOSYS=<path>              yosys binary (default: ORFS install, then PATH)
 #   QOR_OUT=<dir>             output dir (default test/qor/out)
+#   QOR_DESIGNS=<tsv>         design table (default test/qor/designs.tsv);
+#                             a mods column of `auto` takes the children from
+#                             the BIR (svd.children)
 #   QOR_NO_VOTE=1             skip the Z3 checks (numbers only)
+#   QOR_NO_ROUNDTRIP=1        skip the writer-roundtrip column (roundtrip.sh)
+#   QOR_SVS_TIMEOUT=<s>       per-design limit on the SVS flow (default none)
 #   QOR_FLATTEN=0             keep combinational children as separately mapped
 #                             modules (default flattens them, as synth_xilinx
 #                             -flatten does, so constants and add chains cross
@@ -32,7 +37,7 @@ abspath() { local f=$1; f=${f//\$HOME/$HOME}; case $f in /*) echo "$f";; *) echo
 
 RES=$OUT/results.tsv
 TAB=$'\t'
-echo -e "design\tflow\tLUT\tFF\tCARRY4\tDSP\tRAM\tMUXF\tSRL\tdepth\twall_s\tvote\tnetlist_check" > "$RES"
+echo -e "design\tflow\tLUT\tFF\tCARRY4\tDSP\tRAM\tMUXF\tSRL\tdepth\twall_s\tvote\troundtrip\tnetlist_check" > "$RES"
 
 count_field() { # count_field <counts-line> <key>
   echo "$1" | tr ' ' '\n' | awk -F= -v k="$2" '$1==k {print $2; f=1} END{if(!f) print 0}'
@@ -54,6 +59,13 @@ run_design() {
   for f in "${absfiles[@]}"; do [ -f "$f" ] || { echo "== $name: SKIP (missing $f)"; return; }; done
   local lua_files; lua_files=$(printf '"%s",' "${absfiles[@]}"); lua_files=${lua_files%,}
   [ "$mods" = "-" ] && mods=""
+  if [ "$mods" = auto ]; then
+    # the children to map, asked of the BIR (svd.children) instead of listed by hand
+    echo "prog = svd.parse(\"verible\", \"$top\", {$lua_files})" > "$d/children.lua"
+    echo "svd.write_text(\"$d/children.txt\", svd.children(prog, \"$top\"))" >> "$d/children.lua"
+    (cd "$ROOT" && "$SV_SUITE" script "$d/children.lua") > "$d/children.log" 2>&1
+    mods=$(tr '\n' ' ' < "$d/children.txt" 2>/dev/null)
+  fi
 
   # ---- SVS flow: BIR pipeline -> gate_map per module -> splice -> flat JSON ----
   {
@@ -83,7 +95,7 @@ run_design() {
   } > "$d/svs.lua"
   local t0=$(date +%s.%N)
   local cut=""; [ "${QOR_FLATTEN:-1}" = 1 ] && cut=DSP48E1
-  (cd "$ROOT" && MITER_CUT_PRIMS=$cut "$SV_SUITE" script "$d/svs.lua") > "$d/svs.log" 2>&1
+  (cd "$ROOT" && MITER_CUT_PRIMS=$cut timeout "${QOR_SVS_TIMEOUT:-0}" "$SV_SUITE" script "$d/svs.lua") > "$d/svs.log" 2>&1
   local svs_wall; svs_wall=$(echo "$(date +%s.%N) - $t0" | bc)
   local svs_stats="- - - - - - - -"
   # one JSON holding every mapped module (children stay as instances; count.py
@@ -122,7 +134,16 @@ PY
   [ -f "$d/$top.yosys.json" ] && y_stats=$(summarise "$d/$top.yosys.json") || echo "   yosys FAILED for $name: $(grep -m1 -i error "$d/yosys.log")"
 
   # ---- correctness: 3-way source vote + strict netlist miter ----
-  local vote="-" check="-"
+  local vote="-" check="-" rt="-"
+  # writer roundtrip: each front end's tree, written as Verilog and read back by
+  # verible, must miter EQUIVALENT to the tree (QOR_NO_ROUNDTRIP=1 skips)
+  if [ "${QOR_NO_VOTE:-0}" != 1 ] && [ "${QOR_NO_ROUNDTRIP:-0}" != 1 ]; then
+    local n=0 fe
+    for fe in verible yosys verilator; do
+      if "$HERE/roundtrip.sh" "$fe" "$top" "${absfiles[@]}" > "$d/roundtrip_$fe.log" 2>&1; then n=$((n+1)); fi
+    done
+    rt="$n/3"
+  fi
   if [ "${QOR_NO_VOTE:-0}" != 1 ]; then
     cat > "$d/vote.lua" <<LUA
 a = svd.parse("verible", "$top", {$lua_files})
@@ -141,9 +162,9 @@ LUA
     [ -z "$check" ] && check="no-result"
   fi
 
-  echo -e "$name\tsvs\t${svs_stats// /$TAB}\t$svs_wall\t$vote\t$check" >> "$RES"
-  echo -e "$name\tyosys\t${y_stats// /$TAB}\t$y_wall\t-\t-" >> "$RES"
-  echo "== $name  svs: LUT/FF/CARRY/DSP/RAM/MUXF/SRL/depth = $svs_stats (${svs_wall}s)  vote=$vote  check=$check"
+  echo -e "$name\tsvs\t${svs_stats// /$TAB}\t$svs_wall\t$vote\t$rt\t$check" >> "$RES"
+  echo -e "$name\tyosys\t${y_stats// /$TAB}\t$y_wall\t-\t-\t-" >> "$RES"
+  echo "== $name  svs: LUT/FF/CARRY/DSP/RAM/MUXF/SRL/depth = $svs_stats (${svs_wall}s)  vote=$vote  roundtrip=$rt  check=$check"
   echo "   yosys: $y_stats (${y_wall}s)"
 }
 
@@ -152,6 +173,6 @@ while IFS=$'\t' read -r name top mods files; do
   case "$name" in ''|\#*) continue;; esac
   if [ ${#want[@]} -gt 0 ]; then printf '%s\n' "${want[@]}" | grep -qx "$name" || continue; fi
   run_design "$name" "$top" "$mods" "$files"
-done < "$HERE/designs.tsv"
+done < "${QOR_DESIGNS:-$HERE/designs.tsv}"
 
 echo; echo "results: $RES"; column -t -s $'\t' "$RES"

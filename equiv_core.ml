@@ -648,15 +648,14 @@ let cone_solver (ra : bmodule) (rb : bmodule) =
   let ms = Z3.Solver.mk_simple_solver Z3_miter.ctx in
   Z3.Solver.add ms a1; Z3.Solver.add ms a2;
   let in1 = Z3_miter.get_input_signals ra and in2 = Z3_miter.get_input_signals rb in
-  let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
   List.iter (fun (n, w) ->
     match List.assoc_opt n in2 with
     | None -> ()
     | Some w2 ->
-        let v1 = Z3_miter.bv_var n w "_d1" and v2 = Z3_miter.bv_var n w2 "_d2" in
-        let w = min (sz v1) (sz v2) in
-        let lo z = if sz z > w then Z3.BitVector.mk_extract Z3_miter.ctx (w - 1) 0 z else z in
-        Z3.Solver.add ms [ Z3.Boolean.mk_eq Z3_miter.ctx (lo v1) (lo v2) ]) in1;
+        match Z3_miter.tie_terms (Z3_miter.bv_var n w "_d1")
+                                 (Z3_miter.bv_var n w2 "_d2") with
+        | Some eq -> Z3.Solver.add ms [ eq ]
+        | None -> ()) in1;
   ms
 
 let common_outputs (ra : bmodule) (rb : bmodule) : (string * int) list =
@@ -683,14 +682,7 @@ let explain_cone (a : side) (b : side) (pairs : pair list) (cone : string)
   | Some w1, Some w2 ->
       let ms = cone_solver ra rb in
       let o1 = Z3_miter.bv_var cone w1 "_d1" and o2 = Z3_miter.bv_var cone w2 "_d2" in
-      let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
-      let w = max (sz o1) (sz o2) in
-      let ext z = if sz z < w then Z3.BitVector.mk_zero_ext Z3_miter.ctx (w - sz z) z else z in
-      let x = Z3.BitVector.mk_xor Z3_miter.ctx (ext o1) (ext o2) in
-      Z3.Solver.add ms
-        [ Z3.Boolean.mk_not Z3_miter.ctx
-            (Z3.Boolean.mk_eq Z3_miter.ctx x
-               (Z3.BitVector.mk_numeral Z3_miter.ctx "0" w)) ];
+      Z3.Solver.add ms [ Z3_miter.differs_terms o1 o2 ];
       (match Z3.Solver.check ms [] with
        | Z3.Solver.UNSATISFIABLE ->
            Error (Printf.sprintf "cone '%s' is EQUIVALENT (no counterexample)" cone)
@@ -815,15 +807,8 @@ let differing_cones ?(limit = 40) (a : side) (b : side) (pairs : pair list)
       | None -> ()
       | Some w2 ->
           let o1 = Z3_miter.bv_var name w1 "_d1" and o2 = Z3_miter.bv_var name w2 "_d2" in
-          let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
-          let w = max (sz o1) (sz o2) in
-          let ext z = if sz z < w then Z3.BitVector.mk_zero_ext Z3_miter.ctx (w - sz z) z else z in
           Z3.Solver.push ms;
-          Z3.Solver.add ms
-            [ Z3.Boolean.mk_not Z3_miter.ctx
-                (Z3.Boolean.mk_eq Z3_miter.ctx
-                   (Z3.BitVector.mk_xor Z3_miter.ctx (ext o1) (ext o2))
-                   (Z3.BitVector.mk_numeral Z3_miter.ctx "0" w)) ];
+          Z3.Solver.add ms [ Z3_miter.differs_terms o1 o2 ];
           (match Z3.Solver.check ms [] with
            | Z3.Solver.UNSATISFIABLE -> ()
            | Z3.Solver.SATISFIABLE -> incr n; diff := name :: !diff

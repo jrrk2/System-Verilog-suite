@@ -52,15 +52,77 @@ let bcall_decl_cache : (string, Z3.FuncDecl.func_decl) Hashtbl.t =
    when declaring the uninterpreted function). *)
 let bcall_out_w : (string, int) Hashtbl.t = Hashtbl.create 16
 
-(* Create or lookup a bitvector variable *)
+(* BLOCK RAMS AS Z3 ARRAYS.  An unpacked array of at least
+   Z3_MITER_ARRAY_BITS bits (default 4096; 0 = every array) is a Z3 array
+   (BV addr -> BV elem) instead of one flat bitvector.  Flat, ram32k_hi's
+   32K x 36 `mem` was a 1,179,648-bit variable and each dynamic read a
+   32768-way ITE of slices; Z3 bit-blasted that inside one Solver.push and
+   grew to 27 GB before the OOM killer took it (and the desktop session).
+   With the array theory a read is a select, a write (ffrip's @mem_store) a
+   store, and the next-state compare is extensional array equality.
+   Keyed by name ^ suffix -> (size, elem_w); filled by build_signal_context,
+   so it spans both sides of one miter. *)
+let array_shape : (string, int * int) Hashtbl.t = Hashtbl.create 16
+
+let array_min_bits () =
+  match Option.bind (Sys.getenv_opt "Z3_MITER_ARRAY_BITS") int_of_string_opt with
+  | Some n -> n
+  | None -> 4096
+
+let addr_width size =
+  let rec go k = if 1 lsl k >= size then k else go (k + 1) in
+  max 1 (go 0)
+
+let is_array_term z = Z3.Z3Array.is_array z
+
+(* Create or lookup a bitvector variable (an array constant for a signal in
+   [array_shape]; [width] is then ignored) *)
 let bv_var name width suffix =
   let full_name = name ^ suffix in
   match Hashtbl.find_opt signal_cache full_name with
   | Some v -> v
   | None ->
-      let v = Z3.BitVector.mk_const_s ctx full_name width in
+      let v = match Hashtbl.find_opt array_shape full_name with
+        | Some (size, ew) ->
+            Z3.Z3Array.mk_const_s ctx full_name
+              (Z3.BitVector.mk_sort ctx (addr_width size))
+              (Z3.BitVector.mk_sort ctx ew)
+        | None -> Z3.BitVector.mk_const_s ctx full_name width in
       Hashtbl.add signal_cache full_name v;
       v
+
+(* The equality tying two same-named signals of the two sides: whole arrays
+   of one shape, else the overlapping low bits (any extra high bits stay free,
+   which never hides a counterexample).  None when one side is an array and
+   the other is not, or the shapes differ -- left untied, the miter can only
+   err towards DIFFER. *)
+let tie_terms a b =
+  let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
+  if is_array_term a || is_array_term b then
+    if Z3.Sort.equal (Z3.Expr.get_sort a) (Z3.Expr.get_sort b)
+    then Some (Z3.Boolean.mk_eq ctx a b) else None
+  else
+    let w = min (sz a) (sz b) in
+    let lo z = if sz z > w then Z3.BitVector.mk_extract ctx (w - 1) 0 z else z in
+    Some (Z3.Boolean.mk_eq ctx (lo a) (lo b))
+
+(* "These two outputs differ": bitvectors zero-extended to the wider width
+   (a high bit one side dropped is a real difference), arrays compared
+   extensionally.  [mask] narrows a bitvector compare to the given bits.  An
+   array against a non-array, or arrays of different shapes, count as
+   differing: a mismatch of representation must not pass as equivalence. *)
+let differs_terms ?(mask = fun _ z -> z) a b =
+  let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
+  if is_array_term a || is_array_term b then
+    if Z3.Sort.equal (Z3.Expr.get_sort a) (Z3.Expr.get_sort b)
+    then Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx a b)
+    else Z3.Boolean.mk_true ctx
+  else
+    let w = max (sz a) (sz b) in
+    let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
+    let xor = mask w (Z3.BitVector.mk_xor ctx (ext a) (ext b)) in
+    Z3.Boolean.mk_not ctx
+      (Z3.Boolean.mk_eq ctx xor (Z3.BitVector.mk_numeral ctx "0" w))
 
 (* Clear the signal cache *)
 (* A miter that shares NO input with the other side, or no output, compares
@@ -99,6 +161,7 @@ let clear_cache () = Hashtbl.clear signal_cache
 let clear_miter_caches () =
   Hashtbl.clear signal_cache;
   Hashtbl.clear array_elem_w_table;
+  Hashtbl.clear array_shape;
   Hashtbl.clear bcall_decl_cache
 
 (* Get width from behavioral IR type *)
@@ -211,6 +274,44 @@ let rec width_of_expr = function
   | BReplicate { count; value } ->
       Option.map (fun w -> count * w) (width_of_expr value)
   | BSelect _ | BCall _ -> None
+
+(* Zero-extend or truncate a bitvector to width w. *)
+let fit_width w z =
+  let zw = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
+  if zw = w then z
+  else if zw < w then Z3.BitVector.mk_zero_ext ctx (w - zw) z
+  else Z3.BitVector.mk_extract ctx (w - 1) 0 z
+
+(* The array signal an array-valued expression derives from: a BVar, or a
+   @mem_store / conditional built on one. *)
+let rec array_base = function
+  | BVar n -> Some n
+  | BCall { func = "@mem_store"; args = a :: _ } -> array_base a
+  | BCond { then_val; _ } -> array_base then_val
+  | _ -> None
+
+(* A dynamic index into Z3 array [z_arr] of [size] words: the index at the
+   array's address width, and the condition that it names a real word (None
+   when every address-width index does).  Out of range reads 0 and a write
+   leaves the array alone -- Verilog's x read / ignored write, the same on
+   both sides. *)
+let array_index ~size z_arr z_idx =
+  let aw = Z3.BitVector.get_size (Z3.Z3Array.get_domain (Z3.Expr.get_sort z_arr)) in
+  let iw = Z3.BitVector.get_size (Z3.Expr.get_sort z_idx) in
+  let idx = fit_width aw z_idx in
+  let in_range =
+    if iw <= aw && size >= 1 lsl aw then None
+    else
+      let full = if iw > aw then z_idx else idx in
+      Some (Z3.BitVector.mk_ult ctx full
+              (Z3.BitVector.mk_numeral ctx (string_of_int size) (max iw aw))) in
+  (idx, in_range)
+
+let array_size suffix e z_arr =
+  match Option.bind (array_base e) (fun n -> Hashtbl.find_opt array_shape (n ^ suffix)) with
+  | Some (size, _) -> size
+  | None ->
+      1 lsl Z3.BitVector.get_size (Z3.Z3Array.get_domain (Z3.Expr.get_sort z_arr))
 
 (* Convert behavioral IR expression to Z3 *)
 let rec expr_to_z3 suffix ctx_sigs = function
@@ -366,6 +467,10 @@ let rec expr_to_z3 suffix ctx_sigs = function
       let cond_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_cond) in
       let zero = Z3.BitVector.mk_numeral ctx "0" cond_w in
       let cond_bool = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx z3_cond zero) in
+      if is_array_term z3_then || is_array_term z3_else then
+        (* a write-enabled array next state: `we ? store(..) : mem` *)
+        Z3.Boolean.mk_ite ctx cond_bool z3_then z3_else
+      else
       (* Then/else values may have different widths; widen the smaller
        * to match the larger so the ITE returns a uniform sort. *)
       let wt = Z3.BitVector.get_size (Z3.Expr.get_sort z3_then) in
@@ -468,6 +573,18 @@ let rec expr_to_z3 suffix ctx_sigs = function
         | BVar n -> Hashtbl.find_opt array_elem_w_table n
         | _ -> None in
       let z3_array = expr_to_z3 suffix ctx_sigs array in
+      if is_array_term z3_array then begin
+        let size = array_size suffix array z3_array in
+        let idx, in_range =
+          array_index ~size z3_array (expr_to_z3 suffix ctx_sigs index) in
+        let word = Z3.Z3Array.mk_select ctx z3_array idx in
+        match in_range with
+        | None -> word
+        | Some ok ->
+            let ew = Z3.BitVector.get_size
+                       (Z3.Z3Array.get_range (Z3.Expr.get_sort z3_array)) in
+            Z3.Boolean.mk_ite ctx ok word (Z3.BitVector.mk_numeral ctx "0" ew)
+      end else
       let arr_w = Z3.BitVector.get_size (Z3.Expr.get_sort z3_array) in
       let elem_w = match elem_w with Some w -> w | None -> 1 in
       let size = arr_w / elem_w in
@@ -505,6 +622,48 @@ let rec expr_to_z3 suffix ctx_sigs = function
       (* sign casts change no bits; as an uninterpreted function one would
          make every compare against a function's `$signed(...)` result DIFFER *)
       expr_to_z3 suffix ctx_sigs x
+  | BCall { func = "@mem_store"; args = [ arr; index; data ] } ->
+      (* ffrip's array next state: [arr] with word [index] := [data] *)
+      let z3_arr = expr_to_z3 suffix ctx_sigs arr in
+      let z3_idx = expr_to_z3 suffix ctx_sigs index in
+      let z3_data = expr_to_z3 suffix ctx_sigs data in
+      if is_array_term z3_arr then begin
+        let size = array_size suffix arr z3_arr in
+        let ew = Z3.BitVector.get_size
+                   (Z3.Z3Array.get_range (Z3.Expr.get_sort z3_arr)) in
+        let idx, in_range = array_index ~size z3_arr z3_idx in
+        let st = Z3.Z3Array.mk_store ctx z3_arr idx (fit_width ew z3_data) in
+        match in_range with
+        | None -> st
+        | Some ok -> Z3.Boolean.mk_ite ctx ok st z3_arr
+      end else begin
+        (* a small array kept flat: a word mux per address *)
+        let sz z = Z3.BitVector.get_size (Z3.Expr.get_sort z) in
+        let total = sz z3_arr in
+        let ew =
+          match Option.bind (array_base arr) (Hashtbl.find_opt array_elem_w_table) with
+          | Some w -> w | None -> sz z3_data in
+        let ew = max 1 (min ew total) in
+        let size = total / ew in
+        let data = fit_width ew z3_data in
+        let iw = sz z3_idx in
+        let word k = Z3.BitVector.mk_extract ctx ((k + 1) * ew - 1) (k * ew) z3_arr in
+        let words = List.init size (fun i ->
+          let k = size - 1 - i in                         (* MSB first *)
+          if iw < 62 && k >= 1 lsl iw then word k
+          else
+            Z3.Boolean.mk_ite ctx
+              (Z3.Boolean.mk_eq ctx z3_idx
+                 (Z3.BitVector.mk_numeral ctx (string_of_int k) iw))
+              data (word k)) in
+        let words =
+          if size * ew < total
+          then Z3.BitVector.mk_extract ctx (total - 1) (size * ew) z3_arr :: words
+          else words in
+        match words with
+        | [] -> z3_arr
+        | w :: ws -> List.fold_left (Z3.BitVector.mk_concat ctx) w ws
+      end
   | BCall { func; args } ->
       (* Encode as Z3 uninterpreted function.  Both designs in the
          miter share the same [ctx] and the same [bcall_decl_cache]
@@ -544,6 +703,28 @@ let rec expr_to_z3 suffix ctx_sigs = function
  * primary output (Q__D = next-state combinational expression). The
  * encoder therefore needs no special sequential handling. *)
 let rec encode_stmt suffix ctx_sigs solver = function
+  | BAssign { lhs; rhs } when Hashtbl.mem array_shape (lhs ^ suffix) ->
+      (* an array-encoded signal: equal to an array-valued rhs, or word by
+         word to a flat one (an initialised ROM image) *)
+      let size, ew = Hashtbl.find array_shape (lhs ^ suffix) in
+      let z3_lhs = bv_var lhs 0 suffix in
+      let z3_rhs = expr_to_z3 suffix ctx_sigs rhs in
+      if is_array_term z3_rhs then begin
+        if Z3.Sort.equal (Z3.Expr.get_sort z3_lhs) (Z3.Expr.get_sort z3_rhs) then
+          Z3.Solver.add solver [ Z3.Boolean.mk_eq ctx z3_lhs z3_rhs ]
+        else
+          Printf.printf "  ⚠ %s: array assigned an array of another shape; left free\n" lhs
+      end else begin
+        let flat = fit_width (size * ew) z3_rhs in
+        let aw = addr_width size in
+        for k = 0 to size - 1 do
+          Z3.Solver.add solver
+            [ Z3.Boolean.mk_eq ctx
+                (Z3.Z3Array.mk_select ctx z3_lhs
+                   (Z3.BitVector.mk_numeral ctx (string_of_int k) aw))
+                (Z3.BitVector.mk_extract ctx ((k + 1) * ew - 1) (k * ew) flat) ]
+        done
+      end
   | BAssign { lhs; rhs } ->
       (* Get LHS width from context - must use declared signal width *)
       let width =
@@ -727,13 +908,16 @@ let infer_widths_from_module bmod =
   widths
 
 (* Build signal width context from module *)
-let build_signal_context bmod =
+let build_signal_context ?(suffix = "") bmod =
   Hashtbl.clear array_elem_w_table;
+  let min_bits = array_min_bits () in
   List.iter (fun (s : Behavioral_ir.bsignal) ->
     match s.stype with
-    | BArray { element; _ } ->
-        Hashtbl.replace array_elem_w_table s.name
-          (width_of_btype element)
+    | BArray { element; size } ->
+        let ew = width_of_btype element in
+        Hashtbl.replace array_elem_w_table s.name ew;
+        if suffix <> "" && size > 1 && ew > 0 && size * ew >= min_bits then
+          Hashtbl.replace array_shape (s.name ^ suffix) (size, ew)
     | _ -> ()
   ) bmod.signals;
   let widths = infer_widths_from_module bmod in
@@ -742,7 +926,7 @@ let build_signal_context bmod =
 (* Encode module as Z3 constraints with suffix *)
 let encode_module bmod suffix =
   let solver = Z3.Solver.mk_simple_solver ctx in
-  let ctx_sigs = build_signal_context bmod in
+  let ctx_sigs = build_signal_context ~suffix bmod in
 
   (* Debug: print inferred widths (per-signal only when Z3_MITER_VERBOSE=1 —
      a switch-level bitstream model has >100k signals, the flood alone dwarfs
@@ -831,7 +1015,7 @@ let rec collect_write_targets acc = function
       List.fold_left collect_write_targets acc default
   | BWhile { body; _ } | BFor { body; _ } ->
       List.fold_left collect_write_targets acc body
-  | BCallStmt { func = ("@slice_write" | "@mem_write"); args = BVar tgt :: _ } ->
+  | BCallStmt { func; args = BVar tgt :: _ } when Behavioral_ir.is_write_op func ->
       tgt :: acc
   | BCallStmt _ | BReturn _ -> acc
 
@@ -906,8 +1090,93 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
      per-version concat — without it, a base slice-write + conditional slice-override
      (ibex_counter's counter_load) leaves the signal unconstrained (free), giving a
      spurious counterexample even though the Cyclesim path agrees. *)
+  (* Blocking `=` temps inside clocked blocks first: ffrip's next-state
+     derivation reads every RHS name as the register's Q, so `t = a; y <= t`
+     gave y__D = Q(t) instead of `a` on BOTH sides -- a consistent wrong
+     semantics that the netlist side (threaded by the gate lowering) does not
+     share.  Behavioral_blocking_subst threads them into the D-side
+     expressions, which is exactly the blocking/non-blocking distinction. *)
+  let thread_blocking (m : bmodule) =
+    match (Behavioral_blocking_subst.blocking_subst_program
+             { modules = [m]; library_cells = [] }).modules with
+    | m' :: _ -> m'
+    | [] -> m in
+  let bmod1 = thread_blocking bmod1 in
+  let bmod2 = thread_blocking bmod2 in
   let bmod1 = Behavioral_ssa.module_to_ssa bmod1 in
   let bmod2 = Behavioral_ssa.module_to_ssa bmod2 in
+  (* A combinational process that reads a target before writing it
+     (`x = m ? v : x`: yosys's rendering of a case arm that leaves x alone;
+     verible's case-without-default is the same thing) encodes as x = f(x),
+     and Z3 may pick a different fixed point per side -- it did, on
+     picorv32's mem_la_wdata at mem_wordsize = 3, a state the source marks
+     full_case.  The pre-value is a state element: read it as `x__pre`, an
+     undriven internal that the tie below matches by name across the two
+     designs, so both sides see the same old value and the comparison is of
+     the function of it.  Reads after the write are SSA versions and stay. *)
+  let break_comb_feedback (m : bmodule) =
+    let decl = Hashtbl.create 64 in
+    List.iter (fun (s : bsignal) -> Hashtbl.replace decl s.name s) m.signals;
+    let pres = Hashtbl.create 8 in
+    let rec sub targets written = function
+      | BVar n when List.mem n targets && not (Hashtbl.mem written n) ->
+          Hashtbl.replace pres n (); BVar (n ^ "__pre")
+      | BVar _ | BConst _ as e -> e
+      | BBinOp r -> BBinOp { r with lhs = sub targets written r.lhs; rhs = sub targets written r.rhs }
+      | BUnOp r -> BUnOp { r with operand = sub targets written r.operand }
+      | BCond r -> BCond { condition = sub targets written r.condition;
+                           then_val = sub targets written r.then_val;
+                           else_val = sub targets written r.else_val }
+      | BConcat es -> BConcat (List.map (sub targets written) es)
+      | BReplicate r -> BReplicate { r with value = sub targets written r.value }
+      | BSelect r -> BSelect { array = sub targets written r.array; index = sub targets written r.index }
+      | BSlice r -> BSlice { r with signal = sub targets written r.signal }
+      | BCall r -> BCall { r with args = List.map (sub targets written) r.args } in
+    let rec sub_stmts targets written stmts = List.map (sub_stmt targets written) stmts
+    and sub_stmt targets written = function
+      | BAssign { lhs; rhs } ->
+          let rhs = sub targets written rhs in
+          Hashtbl.replace written lhs (); BAssign { lhs; rhs }
+      | BIf r ->
+          let condition = sub targets written r.condition in
+          let w1 = Hashtbl.copy written and w2 = Hashtbl.copy written in
+          let then_stmts = sub_stmts targets w1 r.then_stmts in
+          let else_stmts = sub_stmts targets w2 r.else_stmts in
+          Hashtbl.iter (fun k () -> Hashtbl.replace written k ()) w1;
+          Hashtbl.iter (fun k () -> Hashtbl.replace written k ()) w2;
+          BIf { condition; then_stmts; else_stmts }
+      | BCase r ->
+          let selector = sub targets written r.selector in
+          let arm ss = let w = Hashtbl.copy written in
+            let ss' = sub_stmts targets w ss in
+            Hashtbl.iter (fun k () -> Hashtbl.replace written k ()) w; ss' in
+          let cases = List.map (fun (e, ss) -> (sub targets written e, arm ss)) r.cases in
+          let default = arm r.default in
+          BCase { selector; cases; default }
+      | BBlock ss -> BBlock (sub_stmts targets written ss)
+      | BCallStmt r ->
+          let args = match r.args with
+            | BVar t :: rest when Behavioral_ir.is_write_op r.func ->
+                let rest = List.map (sub targets written) rest in
+                Hashtbl.replace written t (); BVar t :: rest
+            | args -> List.map (sub targets written) args in
+          BCallStmt { r with args }
+      | BReturn (Some e) -> BReturn (Some (sub targets written e))
+      | other -> other in
+    let processes = List.map (function
+      | BCombinational c ->
+          let targets = List.sort_uniq compare (List.fold_left collect_write_targets [] c.body) in
+          BCombinational { c with body = sub_stmts targets (Hashtbl.create 8) c.body }
+      | p -> p) m.processes in
+    let extra = Hashtbl.fold (fun n () acc ->
+      match Hashtbl.find_opt decl n with
+      | Some s -> { s with name = n ^ "__pre"; direction = `Internal; initial_value = None } :: acc
+      | None -> acc) pres [] in
+    if extra <> [] then
+      Printf.printf "Combinational feedback: %d pre-value(s) read as tied state\n" (List.length extra);
+    { m with processes; signals = m.signals @ extra } in
+  let bmod1 = break_comb_feedback bmod1 in
+  let bmod2 = break_comb_feedback bmod2 in
   let bmod1 = Behavioral_ffrip.rip_module bmod1 in
   let bmod2 = Behavioral_ffrip.rip_module bmod2 in
   (* Post-FF-rip register sharing: collapse pairs of FFs whose D-cones
@@ -917,6 +1186,9 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
    * with the same FF set as a synthesised reference. *)
   let bmod1 = Behavioral_share.share_module bmod1 in
   let bmod2 = Behavioral_share.share_module bmod2 in
+  if Sys.getenv_opt "Z3_MITER_DUMP" = Some "1" then
+    Printf.printf "--- ripped d1 ---\n%s\n--- ripped d2 ---\n%s\n"
+      (string_of_bmodule bmod1) (string_of_bmodule bmod2);
 
   (* Get input/output ports *)
   let inputs1 = get_input_signals bmod1 in
@@ -968,6 +1240,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
     (* Encode both designs *)
     Printf.printf "Encoding Design 1...\n";
     clear_cache ();
+    Hashtbl.clear array_shape;
     let (solver1, ctx1) = encode_module bmod1 "_d1" in
     let assertions1 = Z3.Solver.get_assertions solver1 in
     Printf.printf "  %d constraints\n" (List.length assertions1);
@@ -977,6 +1250,11 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
     let (solver2, ctx2) = encode_module bmod2 "_d2" in
     let assertions2 = Z3.Solver.get_assertions solver2 in
     Printf.printf "  %d constraints\n\n" (List.length assertions2);
+    if Hashtbl.length array_shape > 0 then
+      Printf.printf "Array-encoded memories: %s\n"
+        (String.concat ", " (Hashtbl.fold (fun n (size, ew) acc ->
+           Printf.sprintf "%s[%d x %d]" n size ew :: acc) array_shape []
+         |> List.sort compare));
 
     (* Create miter solver *)
     let miter_solver = Z3.Solver.mk_simple_solver ctx in
@@ -999,11 +1277,10 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
            design's OWN encoded width, so build both at their real widths and
            constrain only the overlapping low bits equal — leaving any extra
            high bits free is conservative (never hides a counterexample). *)
-        let in1 = bv_var name width "_d1" in
-        let in2 = bv_var name w2 "_d2" in
-        let w = min (sz in1) (sz in2) in
-        let lo z = if sz z > w then Z3.BitVector.mk_extract ctx (w - 1) 0 z else z in
-        Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx (lo in1) (lo in2) ]
+        (match tie_terms (bv_var name width "_d1") (bv_var name w2 "_d2") with
+         | Some eq -> Z3.Solver.add miter_solver [ eq ]
+         | None ->
+             Printf.printf "⚠ input %s: array on one side only, or arrays of different shapes; left untied\n" name)
       | None -> ()
     ) inputs1;
 
@@ -1013,7 +1290,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
       let apply inputs sfx =
         List.iter (fun (nm, v) ->
           match List.assoc_opt nm inputs with
-          | Some w ->
+          | Some w when not (is_array_term (bv_var nm w sfx)) ->
               incr n_ic;
               let var = bv_var nm w sfx in
               let wz = sz var in
@@ -1021,7 +1298,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
               Z3.Solver.add miter_solver
                 [ Z3.Boolean.mk_eq ctx var
                     (Z3.BitVector.mk_numeral ctx (Z.to_string masked) wz) ]
-          | None -> ()) input_consts in
+          | _ -> ()) input_consts in
       apply inputs1 "_d1";
       apply inputs2 "_d2";
       Printf.printf "Contextual port constants: %d input binding(s) applied\n"
@@ -1092,7 +1369,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
                  && String.sub lhs (String.length lhs - 3) 3 = "__D" ->
               let q = String.sub lhs 0 (String.length lhs - 3) in
               (match Hashtbl.find_opt inw q with
-               | Some w ->
+               | Some w when not (Hashtbl.mem array_shape (q ^ suffix)) ->
                    let st = bv_var q w suffix in
                    let wz = sz st in
                    (* per-bit exprs when rhs is ffpack's MSB-first concat of
@@ -1150,7 +1427,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
                                | None -> Hashtbl.add eq_groups key (ref [bit]))
                           | None -> ())
                    done
-               | None -> ())
+               | _ -> ())
           | _ -> ()) bm.processes;
         Hashtbl.iter (fun _ l ->
           match !l with
@@ -1186,7 +1463,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
           let base = Str.matched_group 1 name in
           let i = int_of_string (Str.matched_group 2 name) in
           match Hashtbl.find_opt other_w base with
-          | Some wb when i < wb ->
+          | Some wb when i < wb && not (Hashtbl.mem array_shape (base ^ other_sfx)) ->
               incr n_bb;
               let bitv = bv_var name 1 my_sfx in
               let busv = bv_var base wb other_sfx in
@@ -1220,7 +1497,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
         List.iter (fun (n, w) -> Hashtbl.replace outw n w) outputs;
         List.iter (fun (q, w) ->
           match Hashtbl.find_opt outw (q ^ "__D") with
-          | Some wd ->
+          | Some wd when not (Hashtbl.mem array_shape (q ^ sfx)) ->
               let dvar = bv_var (q ^ "__D") wd sfx in
               let qvar = bv_var q w sfx in
               let wmin = min (sz dvar) (sz qvar) in
@@ -1250,7 +1527,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
                     ignore (try_const (Z3.BitVector.mk_numeral ctx "1" 1))
                 end
               done
-          | None -> ()) inputs in
+          | _ -> ()) inputs in
       (* iterate: pinning one bit can make another's D provably 0 *)
       let last = ref (-1) in
       while !hits > !last && !probes < cap do
@@ -1272,7 +1549,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
         List.iter (fun (n, w) -> Hashtbl.replace outw n w) outputs;
         List.iter (fun (q, w) ->
           match Hashtbl.find_opt outw (q ^ "__D") with
-          | Some wd when w > 1 && w <= 32 ->
+          | Some wd when w > 1 && w <= 32 && not (Hashtbl.mem array_shape (q ^ sfx)) ->
               let dvar = bv_var (q ^ "__D") wd sfx in
               let qvar = bv_var q w sfx in
               let wmin = min (sz dvar) (sz qvar) in
@@ -1360,9 +1637,9 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
       Printf.printf "Matching %d undriven internal signal(s) across designs\n"
         (List.length shared_undriven);
       List.iter (fun (name, width) ->
-        let in1 = bv_var name width "_d1" in
-        let in2 = bv_var name width "_d2" in
-        Z3.Solver.add miter_solver [ Z3.Boolean.mk_eq ctx in1 in2 ]
+        match tie_terms (bv_var name width "_d1") (bv_var name width "_d2") with
+        | Some eq -> Z3.Solver.add miter_solver [ eq ]
+        | None -> ()
       ) shared_undriven
     end;
 
@@ -1484,7 +1761,8 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
             let base = Str.matched_group 1 name in
             let i = int_of_string (Str.matched_group 2 name) in
             match Hashtbl.find_opt other_w (base ^ "__D") with
-            | Some wb when i < wb ->
+            | Some wb when i < wb
+                           && not (Hashtbl.mem array_shape (base ^ "__D" ^ other_sfx)) ->
                 let e1 = bv_var name 1 my_sfx in
                 let e2 = Z3.BitVector.mk_extract ctx i i
                            (bv_var (base ^ "__D") wb other_sfx) in
@@ -1592,14 +1870,9 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
         let w2 = try List.assoc name outputs2 with Not_found -> width in
         let out1 = bv_var name width "_d1" in
         let out2 = bv_var name w2 "_d2" in
-        let w = max (sz out1) (sz out2) in
-        let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
-        let xor = apply_mask name w (Z3.BitVector.mk_xor ctx (ext out1) (ext out2)) in
-        let zero = Z3.BitVector.mk_numeral ctx "0" w in
         Z3.Solver.push miter_solver;
         Z3.Solver.add miter_solver
-          (Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero)
-           :: rst_guards name);
+          (differs_terms ~mask:(apply_mask name) out1 out2 :: rst_guards name);
         (match Z3.Solver.check miter_solver [] with
          | Z3.Solver.UNSATISFIABLE -> incr neq
          | _ ->
@@ -1662,11 +1935,7 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
       let w2 = try List.assoc name outputs2 with Not_found -> width in
       let out1 = bv_var name width "_d1" in
       let out2 = bv_var name w2 "_d2" in
-      let w = max (sz out1) (sz out2) in
-      let ext z = if sz z < w then Z3.BitVector.mk_zero_ext ctx (w - sz z) z else z in
-      let xor = apply_mask name w (Z3.BitVector.mk_xor ctx (ext out1) (ext out2)) in
-      let zero = Z3.BitVector.mk_numeral ctx "0" w in
-      let differs = Z3.Boolean.mk_not ctx (Z3.Boolean.mk_eq ctx xor zero) in
+      let differs = differs_terms ~mask:(apply_mask name) out1 out2 in
       (* async-reset D-cones count as differing only when BOTH resets are
          deasserted (ffrip's normalised <q>__RST; the reset nets themselves
          are compared as ordinary outputs) *)
@@ -1708,6 +1977,12 @@ let check_miter_equivalence ?(input_consts : (string * Z.t) list = [])
        entirely. *)
     let start_time = Unix.gettimeofday () in
     let result =
+      (* the bit-blast to CNF has no array theory: an array-encoded memory
+         goes to Z3, whose array solver is the point of encoding it so *)
+      if Hashtbl.length array_shape > 0 then begin
+        Printf.printf "[sat] array-encoded memories: Z3 decides\n%!";
+        Z3.Solver.check miter_solver []
+      end else
       let witness = List.map (fun (name, width) -> bv_var name width "_d1") inputs1 in
       match Sat_backend.check ~witness ctx (Z3.Solver.get_assertions miter_solver) with
       | Sat_backend.Unsat -> Z3.Solver.UNSATISFIABLE

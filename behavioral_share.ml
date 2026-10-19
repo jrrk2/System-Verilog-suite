@@ -36,15 +36,14 @@ let suffix_is s sfx =
 let strip_suffix s sfx =
   String.sub s 0 (String.length s - String.length sfx)
 
+(* [renames] maps a duplicate register's Q NAME to the canonical one's.  ffrip
+   names a port register's Q `<q>__Q` and an internal register's Q just `<q>`,
+   so the map is built with that distinction (share_module's [q_name]); the
+   old `__Q`-only rewrite left an alias `z := t_seen__Q` pointing at a signal
+   that did not exist when the canonical register was internal, and the port
+   came out FREE -- the miter then disagreed with itself on blocking_threads. *)
 let rec subst_var renames = function
-  | BVar n ->
-      let n' =
-        if suffix_is n "__Q" then
-          let base = strip_suffix n "__Q" in
-          (try List.assoc base renames ^ "__Q" with Not_found -> n)
-        else n
-      in
-      BVar n'
+  | BVar n -> BVar (try List.assoc n renames with Not_found -> n)
   | BConst _ as e -> e
   | BBinOp r ->
       BBinOp { r with lhs = subst_var renames r.lhs;
@@ -142,8 +141,10 @@ let share_module (m : bmodule) : bmodule =
       List.exists (fun (s : bsignal) ->
         s.name = name && s.direction = `Output) m.signals
     in
-    (* Step 4: rewrite all expressions to use canon's Q__Q. *)
-    let processes_subst = List.map (subst_proc !renames) m.processes in
+    let q_name q = if is_output_port q then q ^ "__Q" else q in
+    let qmap = List.map (fun (dup, canon) -> (q_name dup, q_name canon)) !renames in
+    (* Step 4: rewrite every read of a duplicate's Q to the canonical Q. *)
+    let processes_subst = List.map (subst_proc qmap) m.processes in
     (* Step 5: drop duplicates' D-cone drivers and pass-throughs, keep
      * everything else. *)
     let processes = List.filter (fun p ->
@@ -168,7 +169,7 @@ let share_module (m : bmodule) : bmodule =
           Some (BCombinational {
             name = "share_alias_" ^ dup;
             sensitivity = [BAny];
-            body = [BAssign { lhs = dup; rhs = BVar (canon ^ "__Q") }];
+            body = [BAssign { lhs = dup; rhs = BVar (q_name canon) }];
           })
         else None
       ) !renames

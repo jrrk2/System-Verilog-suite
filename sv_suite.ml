@@ -785,7 +785,39 @@ Examples:
 
 Env:
   BIR_DUMP=1     — print both sides' BIR before the miter (parse / miter / gate-miter)
-  YOSYS_SLANG=1  — yosys frontend uses read_slang plugin instead of read_verilog -sv|}
+  YOSYS_SLANG=1  — yosys frontend uses read_slang plugin instead of read_verilog -sv
+  SVS_MAX_MEM_MB=N — exit 3 with a call stack once RSS passes N MiB (checked each major GC)|}
+
+(* SVS_MAX_MEM_MB=N: bail out once resident memory passes N MiB, instead of
+ * letting the kernel OOM killer pick a victim (it took the whole desktop
+ * service down with a 27 GB cva6 run).  Checked at the end of every major
+ * GC cycle, so it catches OCaml heap growth; memory grabbed inside a C
+ * solver call is only seen once control returns to OCaml, so the same limit
+ * goes to Z3's own memory_max_size (a flat 32K x 36 RAM grew 13 GB inside
+ * one Z3_solver_push).  The call stack printed is the allocation site that
+ * tipped it over. *)
+let () =
+  match Option.bind (Sys.getenv_opt "SVS_MAX_MEM_MB") int_of_string_opt with
+  | None -> ()
+  | Some limit_mb ->
+    Z3.set_global_param "memory_max_size" (string_of_int limit_mb);
+    let page_kb = 4 in
+    let rss_mb () =
+      try
+        let ic = open_in "/proc/self/statm" in
+        let line = input_line ic in
+        close_in ic;
+        Scanf.sscanf line "%_d %d" (fun pages -> pages * page_kb / 1024)
+      with _ -> 0 in
+    ignore (Gc.create_alarm (fun () ->
+      let mb = rss_mb () in
+      if mb > limit_mb then begin
+        Printf.eprintf "[mem-limit] RSS %d MiB > SVS_MAX_MEM_MB=%d, aborting\n"
+          mb limit_mb;
+        Printexc.print_raw_backtrace stderr (Printexc.get_callstack 64);
+        flush stderr;
+        exit 3
+      end))
 
 let () =
   let args = Array.to_list Sys.argv in

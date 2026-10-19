@@ -143,6 +143,20 @@ let rec eval env (e : bexpr) : Z.t =
   | BCond { condition; then_val; else_val } ->
       if not (Z.equal (eval env condition) Z.zero)
       then eval env then_val else eval env else_val
+  | BCall { func = "@mem_store"; args = [ arr; idx; data ] } ->
+      (* ffrip's array next state, on the flat value (word k at bits
+         [k*ew +: ew]); ew from the array's elem width when known *)
+      let ew = match arr with
+        | BVar a -> (match Hashtbl.find_opt env.elemw a with
+                     | Some w -> w | None -> width_of env data)
+        | _ -> width_of env data in
+      let v = eval env arr and i = to_shift (eval env idx) in
+      let total = width_of env arr in
+      if i < 0 || (i + 1) * ew > total then v
+      else
+        let m = mask_w ew Z.minus_one in
+        Z.logor (Z.logand v (Z.lognot (safe_shl m (i * ew))))
+                (safe_shl (Z.logand (eval env data) m) (i * ew))
   | BCall { func; _ } -> raise (Unsupported ("BCall " ^ func))
 
 let set_scalar env nm v =

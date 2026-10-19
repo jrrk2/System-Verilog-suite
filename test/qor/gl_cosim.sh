@@ -7,6 +7,9 @@
 #   test/qor/gl_cosim.sh <file.sv> <top> [cycles=5000] [extra verilator args]
 #   GL_PIPELINE="unroll inline flatten iflift blocking_subst meminfer memlower srl_infer dsp_infer"
 #   GL_OUT=<dir>   GL_DEFINES="-DSYNTHESIS"
+#   GL_NET_V=<file.v>  simulate THIS behavioural Verilog of <top> against the
+#                      source instead of mapping: the importer oracle (a front
+#                      end's dump against the RTL Verilator reads itself)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 SRC=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); TOP=$2; CYC=${3:-5000}; shift 3 2>/dev/null || shift $#
@@ -35,6 +38,7 @@ PY
 fi
 OUT=${GL_OUT:-$HERE/out_gl/$TOP}; mkdir -p "$OUT"; export TMPDIR=$OUT
 PIPE=${GL_PIPELINE:-"unroll inline flatten iflift blocking_subst meminfer memlower srl_infer dsp_infer"}
+[ -n "${GL_NET_V:-}" ] && PIPE=""   # the source is only parsed for its ports and clocks
 {
   echo "prog = svd.parse(\"verible\", \"$TOP\", {\"$SRC\"})"
   for p in $PIPE; do echo "prog = svd.$p(prog)"; done
@@ -42,8 +46,14 @@ PIPE=${GL_PIPELINE:-"unroll inline flatten iflift blocking_subst meminfer memlow
   # an input (an unread register's source) has no port for it, and a
   # testbench built from the netlist's ports would tie that input to zero on
   # the RTL side too and compare nothing
-  echo "svd.write_verilog(prog, \"$OUT/src_bir.v\")"
-  if [ "${GL_STAGE:-net}" = bir ]; then
+  [ -z "${GL_NET_V:-}" ] && echo "svd.write_verilog(prog, \"$OUT/src_bir.v\")"
+  # ...and asked of the BIR directly (ports in declaration order, clocks and
+  # resets with their edges), not scraped from that text with a regex
+  echo "svd.write_text(\"$OUT/ports.txt\", svd.ports(prog, \"$TOP\"))"
+  echo "svd.write_text(\"$OUT/clocks.txt\", svd.clocks(prog, \"$TOP\"))"
+  if [ -n "${GL_NET_V:-}" ]; then
+    echo "-- GL_NET_V: no mapping, $GL_NET_V is the netlist side"
+  elif [ "${GL_STAGE:-net}" = bir ]; then
     # the BIR after the pipeline, as behavioural Verilog with the primitive
     # instances memlower/dsp_infer made: isolates the front end and the BIR
     # passes from gate_map
@@ -54,20 +64,15 @@ PIPE=${GL_PIPELINE:-"unroll inline flatten iflift blocking_subst meminfer memlow
   fi
 } > "$OUT/map.lua"
 (cd "$ROOT" && "${SV_SUITE:-./_build/default/sv_suite.exe}" script "$OUT/map.lua") > "$OUT/map.log" 2>&1 || { echo "GL-COSIM $TOP: mapping failed ($(grep -m1 -iE 'error|exception' "$OUT/map.log"))"; exit 2; }
-python3 -I - "$OUT/src_bir.v" "$TOP" > "$OUT/ports.txt" <<'PY'
-import re, sys
-t = open(sys.argv[1]).read(); top = sys.argv[2]
-body = t[t.index('module ' + top):]
-for d, w, n in re.findall(r'^\s*(input|output)\s+(?:logic\s+|wire\s+|reg\s+)?(?:\[(\d+):0\]\s+)?(\w+)', body, re.M):
-    print(d, n, int(w) + 1 if w else 1)
-PY
-if [ "${GL_STAGE:-net}" = bir ]; then
+[ -s "$OUT/ports.txt" ] || { echo "GL-COSIM $TOP: no ports (svd.ports)"; exit 2; }
+[ -n "${GL_NET_V:-}" ] && cp "$GL_NET_V" "$OUT/net.v"
+if [ -n "${GL_NET_V:-}" ] || [ "${GL_STAGE:-net}" = bir ]; then
   sed -e "s/^module $TOP\b/module ${TOP}_gl/" "$OUT/net.v" > "$OUT/net_r.v"
   printf '`timescale 1ps/1ps\nmodule %s_gl_glbl; glbl glbl(); endmodule\n' "$TOP" > "$OUT/wrap.sv"
 else
   python3 -I "$HERE/gl/wrap.py" "$OUT/net.v" "$OUT/net_r.v" "$OUT/wrap.sv" "$TOP" "${TOP}_gl" --ports "$OUT/ports.txt" > "$OUT/wrap.log"
 fi
-python3 -I "$HERE/gl/gen_tb.py" "$OUT/ports.txt" "$TOP" "$CYC" > "$OUT/tb.sv"
+python3 -I "$HERE/gl/gen_tb.py" "$OUT/ports.txt" "$TOP" "$CYC" "$OUT/clocks.txt" > "$OUT/tb.sv"
 rm -rf "$OUT/obj"
 [ "${GL_VCD:-0}" = 1 ] && TRACE="--trace" || TRACE=""
 verilator --binary --timing $TRACE -Wno-fatal -Wno-lint -Wno-style -Wno-BLKANDNBLK -Wno-MULTIDRIVEN -j "${GL_JOBS:-4}" -CFLAGS "${GL_CFLAGS:--O0}" \

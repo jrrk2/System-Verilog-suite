@@ -188,6 +188,20 @@ comparator (#63) is responsible for verifying first.
 `Z3_MITER_TIMEOUT_MS=<ms>` overrides the default 30 s budget. Set
 higher when checking parent modules with deep boundary cones.
 
+Memories: an unpacked array register's next state is ffrip's
+`@mem_store(mem, addr, data)` (each write port, enable-guarded), so write
+ports are compared, not just reads.  Arrays of at least
+`Z3_MITER_ARRAY_BITS` bits (default 4096; 0 = all) are Z3 arrays — reads
+are `select`, writes `store`, the next-state compare is extensional — and
+the miter then skips the CaDiCaL bit-blast and lets Z3 decide.  Smaller
+arrays stay flat bitvectors with a per-word write mux.  A 32K x 36 RAM
+(`ram32k_hi`) checks in ~20 s / 200 MB; flat it bit-blasted past 27 GB.
+
+`SVS_MAX_MEM_MB=<n>` caps `sv_suite`: resident memory is checked after
+every major GC (exit 3 with the call stack) and Z3 gets the same
+`memory_max_size`, which a miter reports as INCONCLUSIVE.  Set it on large
+or parallel runs.
+
 ### Compositional / hierarchical miter
 
 `behavioral_boundary.ml` lets a parent module's miter substitute every
@@ -541,6 +555,126 @@ constant now keeps at least the bits its value needs).  Each has a
 `sysver_tests/` design that the three-way vote and
 `gl_cosim.sh` both cover; `ram32k_regread.sv` / `ram32k_hi.sv` cover the
 32K-deep x1 RAMB36E1 tiling the full-size VM uses.
+
+### IR invariants, one lowering, and the writer as an oracle
+
+Running the oracles on cva6 (`test/cva6/run_cva6_oracles.sh`: verilator
+elaborates the core, the suite's verilator front end writes every specialised
+module back out as behavioural Verilog, and that Verilog is what the strict
+miter, the three-way vote and the unisim co-simulation then check) found
+that most of what failed was scaffolding, not synthesis.  Three things now
+make that class of failure visible at the source instead of in
+`create_circuit`:
+
+- *`Behavioral_check`* (`svd.check_ir(prog [, "unrolled"])`, and run on every
+  front end's output, `SVS_CHECK_IR=0|verbose|strict`).  The invariants the
+  passes rely on, written down: every name read or written is declared
+  (ports, signals, mems, a function's formals, locals and result, a for-loop's
+  induction variable); every call names a module function with its arity or
+  an `@`/`$` intrinsic; a write pseudo-op's first argument is the *name* of a
+  declared signal; every type has a positive width; no duplicate declarations;
+  a clocked process names a declared clock and only lists `blocking_vars` it
+  assigns; after unroll, no loop remains.  Warnings (several drivers, a slice
+  past a signal's width) print under `verbose`.  On its first run it reported
+  the verible front end dropping `for` loops inside functions (the body
+  assignment was collected alone, `i` unbound), function locals never
+  declared, and a function's result variable not being an indexable target
+  (`rev[i] = d[7-i]` returned one bit).
+- *`Behavioral_lower`*, the lowering every front end shares, applied in
+  `post_load`: one loop shape (`init; while` becomes `BFor`), one return
+  shape (`f = e; return` becomes `return e`), one bit-write shape (a
+  constant-index `@mem_write` on a vector becomes `@slice_write(v, k, k, d)`,
+  also after unroll turns `i` into a constant), empty blocks dropped, and the
+  signed-compare lowering re-exported from `Behavioral_const`.  The Z3 fold
+  (`Behavioral_ssa`) understood `@slice_write` and not the other, so a
+  `y[3] = 1'b1` in an `always_comb` was a *free variable* to the miter: the
+  roundtrip below caught it.  `Behavioral_ir.is_write_op` names the four
+  write pseudo-ops once; blocking substitution matched two of them and
+  substituted the just-assigned constant for the *target* of the other two.
+- *The writer roundtrip* (`test/qor/roundtrip.sh <frontend> <top> <files>`,
+  a column of `run_qor.sh`, `test/regressions/run_roundtrip.sh` over the
+  whole `sysver_tests/` corpus for verible, yosys and verilator): a front
+  end's tree, written with `svd.write_verilog` and read back by verible, must
+  miter EQUIVALENT to the tree.  Nothing downstream can be trusted on a dump
+  until this passes.  It found the writer emitting no function definitions,
+  `while` loops verible could not read back, struct-typed ports (`parameter
+  type`) collapsing to one bit in the verilator front end, block locals and
+  loop variables undeclared, early `return`s dropped (verilator lowers them
+  to an assignment plus a jump), loop control written non-blocking inside
+  clocked blocks, and `(a[i]) >> j` sliced as if it were an l-value.
+
+The harness asks the BIR instead of scraping text: `svd.ports`,
+`svd.clocks` (clock and reset names with their edges) and `svd.children`
+replace the regexes in `gl_cosim.sh` / `gen_tb.py` and the hand-written
+children column of `designs.tsv` (`auto`).  Two bugs below the scaffolding
+came out of the same run: constant propagation substituted the constant a
+vector had just been assigned for the *target name* of its bit writes, so
+`y = 0; y[i] = a[j]` mapped to a netlist with `y` tied to ground and `a`
+dropped (`sysver_tests/comb_bitwrite_const.sv`; every earlier binary does
+this), and the hierarchical miter left a 1-bit net declared `logic [0:0]`
+undriven on one side (`obuf_` reconstruction skipped width 1), a spurious
+DIFFER on cva6's `amo_buffer`.  The unroller now finds an `init; while` pair
+at any position of a statement list, not only at the head of a block, and the
+inliner reduces a function whose result is set by `return` inside `if`/`case`
+arms (`func_return_case.sv`, `while_loop_reread.sv`).
+
+The roundtrip also tests the miter against itself: a design mitered with its
+own re-parse must come out EQUIVALENT, and `blocking_threads` did not.  Two
+defects in the Z3 path: `Behavioral_share` merged registers with identical
+next-state cones and aliased a merged-away output port to `<canon>__Q`, a
+name ffrip only gives a *port* register (an internal one keeps its bare
+name), so the port was left free and the miter disagreed with itself; and
+ffrip read every right-hand name as a register's Q, so a blocking `t = a;
+y <= t` in a clocked block gave `y__D = Q(t)` on both sides, consistently
+wrong and different from what the gate lowering builds.  The miter now
+threads blocking variables (`Behavioral_blocking_subst`) before SSA, and
+a sink module with no outputs on either side (pulp's `unread`) is
+vacuously EQUIVALENT instead of UNCOMPARABLE.  The verilator front end
+scalarises 2-D+ unpacked arrays on their inner dimensions (`bht_q[63:0][1:0]`
+becomes `bht_q__0` / `bht_q__1`): flattening the inner index into the word
+turned two non-blocking writes to different elements of one word into two
+read-modify-writes, and the second dropped the first.  `gl_cosim.sh
+GL_NET_V=<dump.v>` co-simulates a front end's dump against the RTL Verilator
+reads itself -- the importer oracle that confirmed it.
+
+The first full run of the roundtrip column found two more.  The writer
+escaped a hierarchical name (`\u.RST `, what yosys's flattening leaves)
+everywhere except the sensitivity list and the reset test it writes from
+the process header, so verible read `posedge u.RST` as a member select and
+the importer crashed.  Behind that, the RTLIL importer's copy-propagation
+folded the alias `u.RST = RST` into the child's reset *test* but left the
+process header saying `async u.RST`: ffrip could not find the reset in the
+body, and the writer printed the header's name over the body's, so the
+dump said something the tree did not.  A clock or reset is a name, and any
+pass that renames wires must rename it with them; `Behavioral_check` now
+rejects an async-reset process whose body's outer `if` does not test the
+header's reset (`sysver_tests/child_async_reset.sv`).  A verdict is also
+only as good as the solver behind it: the miter falls back from CaDiCaL to
+Z3 silently when the binary is not found, and cascade_mac's three-second
+proof became a 120 s INCONCLUSIVE in a shell without it.
+
+The same column showed the RTLIL importer's alias folding never finishing
+on picorv32 (2,800 cell-output wires): it substituted to a fixed point,
+duplicating every shared subtree at every reader.  It now resolves each
+alias once, memoised, and folds a wire into its readers only when that
+cannot grow the tree -- the wire is read once, or it resolves to something
+tiny (`!rst_n`, a slice, a constant); a clock or reset only when it resolves
+to a plain wire.  picorv32: 0.01 s, 2,829 processes to 610.
+`SVS_RTLIL_TIMING=1` prints the per-module split and
+`SVS_RTLIL_NO_COPYPROP=1` skips the pass, for the next such diagnosis.
+
+With that read finishing, the yosys roundtrip of picorv32 DIFFERed on
+`mem_la_wdata` at `mem_wordsize == 3`, a state the source marks `full_case`
+and never reaches.  yosys renders the unassigned arm as a bit-mask mux that
+feeds the variable back to itself, verible reads a case without default,
+and both encode as `x = f(x)`: a fixed-point equation the solver may
+satisfy differently on each side.  The miter (`z3_miter.ml`,
+`break_comb_feedback`, after SSA) now reads a combinational target's
+pre-write value as `x__pre`, an undriven internal that the existing tie
+matches by name across the two designs, so both sides are compared as the
+same function of the same old value -- a latch's state, which is what an
+unassigned arm is.  `sysver_tests/comb_feedback_case.sv` is the four-line
+version; its yosys roundtrip DIFFERed before and does not now.
 
 Measured with every check proven equivalent (`test/qor/run_qor.sh`; the picorv32
 range reflects ABC noise):

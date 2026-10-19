@@ -1171,136 +1171,156 @@ let module_to_bmodule (m : rtlil_module) : bmodule =
  * fixed-point so chains like `b_q$6 → mux_Y → ...` collapse all the
  * way through. *)
 let copyprop_module (m : bmodule) : bmodule =
-  let internal_names =
-    List.filter_map (fun (s : bsignal) ->
-      if s.direction = `Internal then Some s.name else None
-    ) m.signals
-    |> List.fold_left (fun acc n -> n :: acc) []
-  in
-  let is_internal name = List.mem name internal_names in
-  let rec free_vars acc = function
-    | BVar n -> if List.mem n acc then acc else n :: acc
-    | BConst _ -> acc
-    | BBinOp { lhs; rhs; _ } -> free_vars (free_vars acc lhs) rhs
-    | BUnOp { operand; _ } -> free_vars acc operand
+  let internal = Hashtbl.create 64 in
+  List.iter (fun (s : bsignal) ->
+    if s.direction = `Internal then Hashtbl.replace internal s.name ()) m.signals;
+  let rec iter_vars f = function
+    | BVar n -> f n
+    | BConst _ -> ()
+    | BBinOp { lhs; rhs; _ } -> iter_vars f lhs; iter_vars f rhs
+    | BUnOp { operand; _ } -> iter_vars f operand
     | BCond { condition; then_val; else_val } ->
-        free_vars (free_vars (free_vars acc condition) then_val) else_val
-    | BConcat es -> List.fold_left free_vars acc es
-    | BReplicate { value; _ } -> free_vars acc value
-    | BSelect { array; index } -> free_vars (free_vars acc array) index
-    | BSlice { signal; _ } -> free_vars acc signal
-    | BCall { args; _ } -> List.fold_left free_vars acc args
+        iter_vars f condition; iter_vars f then_val; iter_vars f else_val
+    | BConcat es -> List.iter (iter_vars f) es
+    | BReplicate { value; _ } -> iter_vars f value
+    | BSelect { array; index } -> iter_vars f array; iter_vars f index
+    | BSlice { signal; _ } -> iter_vars f signal
+    | BCall { args; _ } -> List.iter (iter_vars f) args
   in
-  let rec subst env = function
-    | BVar n as e ->
-        (match List.assoc_opt n env with
-         | Some e' -> e'
-         | None -> e)
+  let rec iter_stmt_vars f = function
+    | BAssign { rhs; _ } -> iter_vars f rhs
+    | BIf r -> iter_vars f r.condition;
+        List.iter (iter_stmt_vars f) r.then_stmts; List.iter (iter_stmt_vars f) r.else_stmts
+    | BCase r -> iter_vars f r.selector;
+        List.iter (fun (e, ss) -> iter_vars f e; List.iter (iter_stmt_vars f) ss) r.cases;
+        List.iter (iter_stmt_vars f) r.default
+    | BBlock ss -> List.iter (iter_stmt_vars f) ss
+    | BCallStmt r -> List.iter (iter_vars f) r.args
+    | BReturn (Some e) -> iter_vars f e
+    | _ -> ()
+  in
+  let rec size = function
+    | BVar _ | BConst _ -> 1
+    | BBinOp { lhs; rhs; _ } -> 1 + size lhs + size rhs
+    | BUnOp { operand; _ } -> 1 + size operand
+    | BCond { condition; then_val; else_val } -> 1 + size condition + size then_val + size else_val
+    | BConcat es -> List.fold_left (fun a e -> a + size e) 1 es
+    | BReplicate { value; _ } -> 1 + size value
+    | BSelect { array; index } -> 1 + size array + size index
+    | BSlice { signal; _ } -> 1 + size signal
+    | BCall { args; _ } -> List.fold_left (fun a e -> a + size e) 1 args
+  in
+  let body_of = function BCombinational c -> c.body | BSequential s -> s.body in
+  (* A process's clock and reset are NAMES, not expressions: when the
+   * alias being folded is one of them, the field must follow the body
+   * (reset `rx.rst` := `rst` folded into `if rst ...` under a header
+   * still saying `async rx.rst` left ffrip unable to find the reset
+   * test, and the writer printed the header's name over the body's --
+   * two readings of one process).  A clock/reset alias of anything but
+   * a plain wire is not folded at all. *)
+  let ctrl = Hashtbl.create 8 in
+  List.iter (function
+    | BSequential { clock; reset; _ } ->
+        Hashtbl.replace ctrl clock (); Option.iter (fun r -> Hashtbl.replace ctrl r ()) reset
+    | BCombinational _ -> ()) m.processes;
+  (* how often each wire is read, over every process body *)
+  let reads = Hashtbl.create 256 in
+  List.iter (fun p -> List.iter (iter_stmt_vars (fun n ->
+      Hashtbl.replace reads n (1 + (try Hashtbl.find reads n with Not_found -> 0))))
+    (body_of p)) m.processes;
+  (* whole-wire combinational defs of internal wires; a wire with two
+   * defining assigns is not an alias *)
+  let defs = Hashtbl.create 256 and dup = Hashtbl.create 8 in
+  List.iter (function
+    | BCombinational { body = [BAssign { lhs; rhs }]; _ } when Hashtbl.mem internal lhs ->
+        if Hashtbl.mem defs lhs then Hashtbl.replace dup lhs () else Hashtbl.replace defs lhs rhs
+    | _ -> ()) m.processes;
+  Hashtbl.iter (fun n () -> Hashtbl.remove defs n) dup;
+  (* Resolve each alias once, bottom-up and memoised, and fold it into its
+   * readers only when that cannot blow the tree up: the wire is read once,
+   * or what it resolves to is tiny (`!rst_n`, a slice, a constant).  The
+   * old fixed-point substitution duplicated every shared subtree at every
+   * reader and never finished on picorv32 (2,800 cell-output wires). *)
+  let resolved : (string, bexpr option) Hashtbl.t = Hashtbl.create 256 in
+  let visiting = Hashtbl.create 16 in
+  let rec resolve n =
+    match Hashtbl.find_opt resolved n with
+    | Some r -> r
+    | None ->
+        if Hashtbl.mem visiting n then None
+        else (match Hashtbl.find_opt defs n with
+          | None -> None
+          | Some rhs ->
+              Hashtbl.replace visiting n ();
+              let e = subst rhs in
+              Hashtbl.remove visiting n;
+              let nreads = try Hashtbl.find reads n with Not_found -> 0 in
+              let plain = (match e with BVar _ -> true | _ -> false) in
+              let ok = (nreads <= 1 || size e <= 3)
+                       && (plain || not (Hashtbl.mem ctrl n)) in
+              let r = if ok then Some e else None in
+              Hashtbl.replace resolved n r; r)
+  and subst = function
+    | BVar n as e -> (match resolve n with Some e' -> e' | None -> e)
     | BConst _ as e -> e
-    | BBinOp r ->
-        BBinOp { r with lhs = subst env r.lhs; rhs = subst env r.rhs }
-    | BUnOp r -> BUnOp { r with operand = subst env r.operand }
-    | BCond r -> BCond { condition = subst env r.condition;
-                         then_val = subst env r.then_val;
-                         else_val = subst env r.else_val }
-    | BConcat es -> BConcat (List.map (subst env) es)
-    | BReplicate r -> BReplicate { r with value = subst env r.value }
-    | BSelect r -> BSelect { array = subst env r.array;
-                             index = subst env r.index }
-    | BSlice r -> BSlice { r with signal = subst env r.signal }
-    | BCall r -> BCall { r with args = List.map (subst env) r.args }
+    | BBinOp r -> BBinOp { r with lhs = subst r.lhs; rhs = subst r.rhs }
+    | BUnOp r -> BUnOp { r with operand = subst r.operand }
+    | BCond r -> BCond { condition = subst r.condition;
+                         then_val = subst r.then_val; else_val = subst r.else_val }
+    | BConcat es -> BConcat (List.map subst es)
+    | BReplicate r -> BReplicate { r with value = subst r.value }
+    | BSelect r -> BSelect { array = subst r.array; index = subst r.index }
+    | BSlice r -> BSlice { r with signal = subst r.signal }
+    | BCall r -> BCall { r with args = List.map subst r.args }
   in
-  let rec subst_stmt env = function
-    | BAssign { lhs; rhs } -> BAssign { lhs; rhs = subst env rhs }
-    | BIf r ->
-        BIf { condition = subst env r.condition;
-              then_stmts = List.map (subst_stmt env) r.then_stmts;
-              else_stmts = List.map (subst_stmt env) r.else_stmts }
-    | BCase r ->
-        BCase { selector = subst env r.selector;
-                cases = List.map (fun (e, ss) ->
-                  (subst env e, List.map (subst_stmt env) ss)) r.cases;
-                default = List.map (subst_stmt env) r.default }
-    | BBlock ss -> BBlock (List.map (subst_stmt env) ss)
-    | BCallStmt r -> BCallStmt { r with args = List.map (subst env) r.args }
-    | BReturn (Some e) -> BReturn (Some (subst env e))
+  let rec subst_stmt = function
+    | BAssign { lhs; rhs } -> BAssign { lhs; rhs = subst rhs }
+    | BIf r -> BIf { condition = subst r.condition;
+                     then_stmts = List.map subst_stmt r.then_stmts;
+                     else_stmts = List.map subst_stmt r.else_stmts }
+    | BCase r -> BCase { selector = subst r.selector;
+                         cases = List.map (fun (e, ss) -> (subst e, List.map subst_stmt ss)) r.cases;
+                         default = List.map subst_stmt r.default }
+    | BBlock ss -> BBlock (List.map subst_stmt ss)
+    | BCallStmt r -> BCallStmt { r with args = List.map subst r.args }
+    | BReturn (Some e) -> BReturn (Some (subst e))
     | other -> other
   in
-  let subst_proc env = function
-    | BCombinational c ->
-        BCombinational { c with body = List.map (subst_stmt env) c.body }
-    | BSequential s ->
-        BSequential { s with body = List.map (subst_stmt env) s.body }
-  in
-  (* Find all whole-wire combinational defs of internal wires. Each
-   * wire is allowed at most one defining BAssign — multi-driver
-   * wires are skipped (their semantics aren't a simple alias). *)
-  let defs : (string, bexpr) Hashtbl.t = Hashtbl.create 32 in
-  let dup : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+  let rename n = match resolve n with Some (BVar n') -> n' | _ -> n in
+  let processes' = List.map (function
+    | BCombinational c -> BCombinational { c with body = List.map subst_stmt c.body }
+    | BSequential s -> BSequential { s with body = List.map subst_stmt s.body;
+                                            clock = rename s.clock;
+                                            reset = Option.map rename s.reset }) m.processes in
+  let inlined n = match Hashtbl.find_opt resolved n with Some (Some _) -> true | _ -> false in
+  (* drop a folded wire's defining process unless something still reads it *)
+  let still = Hashtbl.create 256 in
   List.iter (fun p ->
-    match p with
-    | BCombinational { body = [BAssign { lhs; rhs }]; _ }
-      when is_internal lhs ->
-        if Hashtbl.mem defs lhs then Hashtbl.add dup lhs ()
-        else Hashtbl.add defs lhs rhs
-    | _ -> ()
-  ) m.processes;
-  Hashtbl.iter (fun n () -> Hashtbl.remove defs n) dup;
-  (* Build the substitution to fixed-point: each entry's RHS is
-   * itself substituted using the rest of the env. Stops when an
-   * iteration changes nothing. Bounded by max_iter to break cycles
-   * (shouldn't happen in well-formed RTLIL but cheap insurance). *)
-  let env = Hashtbl.fold (fun k v acc -> (k, v) :: acc) defs [] in
-  let max_iter = 10 in
-  let rec close iter env =
-    if iter >= max_iter then env
-    else begin
-      let changed = ref false in
-      let env' = List.map (fun (k, v) ->
-        let v' = subst (List.filter (fun (k', _) -> k' <> k) env) v in
-        if v' <> v then changed := true;
-        (k, v')
-      ) env in
-      if !changed then close (iter + 1) env' else env'
-    end
-  in
-  let env = close 0 env in
-  (* Substitute env throughout every process. Then drop any
-   * combinational process that defined an internal wire — its
-   * readers no longer reference it. Keep the alias if the wire is
-   * read by anything OTHER than a now-dead process. *)
-  let processes' = List.map (subst_proc env) m.processes in
-  let inlined_names =
-    List.filter_map (fun (k, _) -> Some k) env in
-  let still_referenced =
-    let acc = ref [] in
-    List.iter (fun p ->
-      match p with
-      | BCombinational { body = [BAssign { lhs; _ }]; _ }
-        when List.mem lhs inlined_names -> ()
-      | BCombinational c ->
-          List.iter (function
-            | BAssign { rhs; _ } -> acc := free_vars !acc rhs
-            | _ -> ()) c.body
-      | BSequential s ->
-          List.iter (function
-            | BAssign { rhs; _ } -> acc := free_vars !acc rhs
-            | _ -> ()) s.body
-    ) processes';
-    !acc
-  in
-  let processes' = List.filter (fun p ->
-    match p with
-    | BCombinational { body = [BAssign { lhs; _ }]; _ }
-      when List.mem lhs inlined_names ->
-        List.mem lhs still_referenced
-    | _ -> true
-  ) processes' in
+    (match p with
+     | BCombinational { body = [BAssign { lhs; _ }]; _ } when inlined lhs -> ()
+     | BSequential s ->
+         Hashtbl.replace still s.clock (); Option.iter (fun r -> Hashtbl.replace still r ()) s.reset;
+         List.iter (iter_stmt_vars (fun n -> Hashtbl.replace still n ())) s.body
+     | BCombinational c -> List.iter (iter_stmt_vars (fun n -> Hashtbl.replace still n ())) c.body))
+    processes';
+  let processes' = List.filter (function
+    | BCombinational { body = [BAssign { lhs; _ }]; _ } when inlined lhs -> Hashtbl.mem still lhs
+    | _ -> true) processes' in
   { m with processes = processes' }
 
 let convert_design (d : rtlil_design) : bprogram =
-  { modules = List.map (fun m -> copyprop_module (module_to_bmodule m))
-                d.design_modules;
+  let timing = Sys.getenv_opt "SVS_RTLIL_TIMING" <> None in
+  let no_copyprop = Sys.getenv_opt "SVS_RTLIL_NO_COPYPROP" <> None in
+  { modules = List.map (fun m ->
+        let t0 = Unix.gettimeofday () in
+        let bm = module_to_bmodule m in
+        let t1 = Unix.gettimeofday () in
+        let bm = if no_copyprop then bm else copyprop_module bm in
+        let t2 = Unix.gettimeofday () in
+        if timing then
+          Printf.eprintf "[rtlil] %s: to_bmodule %.2fs copyprop %.2fs (%d signals, %d processes)\n%!"
+            bm.name (t1 -. t0) (t2 -. t1) (List.length bm.signals) (List.length bm.processes);
+        bm) d.design_modules;
     library_cells = [] }
 
 (* Convenience: parse an RTLIL file straight from disk. *)

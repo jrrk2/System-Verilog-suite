@@ -229,7 +229,9 @@ let rec verilog_of_expr = function
                    (* `arr[idx][hi:lo]` is legal only when arr is a real (array)
                       signal; a BSelect into a concat/const emits a shift and is
                       NOT sliceable *)
-                   | BSelect { array; _ } -> sliceable array
+                   (* exactly one level: a nested select (2-D unpacked array)
+                      is emitted as `((a[i]) >> (j))` below, not `a[i][j]` *)
+                   | BSelect { array = BVar _; _ } -> true
                    | _ -> false in sliceable sig_) ->
            Printf.sprintf "%s[%d:%d]" (verilog_of_expr sig_) msb lsb
        | _ ->
@@ -396,13 +398,13 @@ let rec verilog_of_stmt ?(nb=false) ?(blocking=[]) indent stmt =
       else
         Printf.sprintf "%s%s(%s);" ind func (String.concat ", " (List.map verilog_of_expr args))
 
-  | BReturn _ ->
-      Printf.sprintf "%s/* return not supported in always blocks */" ind
+  | BReturn (Some e) -> Printf.sprintf "%sreturn %s;" ind (verilog_of_expr e)
+  | BReturn None -> Printf.sprintf "%sreturn;" ind
 
 (* Generate sensitivity list *)
 let verilog_of_sensitivity = function
-  | BPosEdge clk -> Printf.sprintf "posedge %s" clk
-  | BNegEdge clk -> Printf.sprintf "negedge %s" clk
+  | BPosEdge clk -> Printf.sprintf "posedge %s" (sanitize_name clk)
+  | BNegEdge clk -> Printf.sprintf "negedge %s" (sanitize_name clk)
   | BLevel sig_ -> sig_
   | BAny -> "*"
 
@@ -537,9 +539,9 @@ let verilog_of_process proc =
               | Some `Neg -> "negedge"
               | None -> "posedge"
             in
-            Printf.sprintf "%s %s or %s %s" clk_edge clock rst_edge rst
+            Printf.sprintf "%s %s or %s %s" clk_edge (sanitize_name clock) rst_edge (sanitize_name rst)
         | _ ->
-            Printf.sprintf "%s %s" clk_edge clock
+            Printf.sprintf "%s %s" clk_edge (sanitize_name clock)
       in
       let always_header = Printf.sprintf "always @(%s) begin" sens_list in
 
@@ -570,9 +572,9 @@ let verilog_of_process proc =
       let body_with_reset = match (reset, reset_async) with
         | (Some rst, true) ->
             let rst_check = match reset_edge with
-              | Some `Pos -> rst
-              | Some `Neg -> Printf.sprintf "!%s" rst
-              | None -> rst
+              | Some `Pos -> sanitize_name rst
+              | Some `Neg -> Printf.sprintf "!%s" (sanitize_name rst)
+              | None -> sanitize_name rst
             in
             (* Prefer the REAL reset values.  In an ASYNC-reset always block the
                reset guard is the body's OUTERMOST if/ternary — the frontend
@@ -896,6 +898,11 @@ let verilog_of_module prog bmod =
   List.iter (fun (s : bsignal) ->
     Hashtbl.replace current_widths s.name (width_of_type s.stype)) signals;
   let internal_signals = List.filter (fun (s : bsignal) -> s.direction = `Internal) signals in
+  let internal_signals =
+    let seen = Hashtbl.create 64 in
+    List.filter (fun (s : bsignal) ->
+      if Hashtbl.mem seen s.name then false else (Hashtbl.replace seen s.name (); true))
+      internal_signals in
   let signal_decls = String.concat "\n" (List.filter_map verilog_of_signal internal_signals) in
 
   (* Inferred memory (ROM/RAM) declarations + init blocks.  Skip the array
@@ -912,8 +919,44 @@ let verilog_of_module prog bmod =
       let already_sig = List.exists (fun (s : bsignal) -> s.name = m.mname) signals in
       verilog_of_mem ~decl:(not already_sig) m) uniq) in
 
+  (* Functions and tasks (package functions the importer attached, module
+     functions): without them a call in the dump names an undefined function *)
+  let func_text (f : bfunc) =
+    let formal (n, t, d) =
+      Printf.sprintf "%s %s %s" (match d with `Input -> "input" | `Output -> "output" | `Inout -> "inout")
+        (verilog_of_type t) (sanitize_name n) in
+    let locals = String.concat "" (List.map (fun (n, t) ->
+      Printf.sprintf "  %s %s;\n" (verilog_of_type t) (sanitize_name n)) f.locals) in
+    let body = String.concat "\n" (List.map (verilog_of_stmt ~nb:false 2) f.body) in
+    if f.is_task then
+      Printf.sprintf "task automatic %s(%s);\n%s  begin\n%s\n  end\nendtask\n"
+        (sanitize_name f.fname) (String.concat ", " (List.map formal f.params)) locals body
+    else
+      Printf.sprintf "function automatic %s %s(%s);\n%s  begin\n%s\n  end\nendfunction\n"
+        (verilog_of_type f.ftype) (sanitize_name f.fname)
+        (String.concat ", " (List.map formal f.params)) locals body in
+
   (* Processes *)
   let process_strs = String.concat "\n" (List.map verilog_of_process processes) in
+
+  (* only the functions this module (transitively) calls: the verilator
+     importer attaches every package function to every module (34 of
+     ariane_pkg's per cva6 leaf), and an unused one is just a parse hazard *)
+  let func_strs =
+    let texts = List.map (fun (f : bfunc) -> (f, func_text f)) bmod.funcs in
+    let mentions hay (f : bfunc) =
+      let needle = sanitize_name f.fname ^ "(" in
+      let n = String.length needle and h = String.length hay in
+      let rec go i = i + n <= h && (String.sub hay i n = needle || go (i + 1)) in
+      go 0 in
+    let rec fixpoint used =
+      let used' = List.filter (fun (f, _) ->
+        List.mem_assoc f.fname used
+        || mentions process_strs f
+        || List.exists (fun (_, txt) -> mentions txt f) used) texts
+        |> List.map (fun (f, txt) -> (f.fname, txt)) in
+      if List.length used' = List.length used then used else fixpoint used' in
+    String.concat "\n" (List.map snd (fixpoint [])) in
 
   (* Dedup instance NAMES within this module.  An unrolled generate-FOR block
      replicates its instances under one shared block label (gpio's
@@ -971,7 +1014,7 @@ let verilog_of_module prog bmod =
   in
 
   (* Combine all *)
-  let body_parts = [signal_decls; mem_decls; port_bit_bridges; process_strs; instance_strs]
+  let body_parts = [signal_decls; mem_decls; func_strs; port_bit_bridges; process_strs; instance_strs]
     |> List.filter (fun s -> s <> "")
     |> String.concat "\n\n"
   in

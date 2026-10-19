@@ -285,6 +285,10 @@ let post_load (p : bprogram) =
     p
     |> Behavioral_const.normalize_bcall_args_program
     |> Behavioral_const.expand_fills_program
+    (* one IR shape for loops / returns whatever the front end emitted *)
+    |> Behavioral_lower.normalize_program
+    (* and the invariants the passes rely on, checked at the source *)
+    |> Behavioral_check.report ~tag:"front end"
   in
   (* strip_signed removes the `@signed(x)` markers because the Z3/gate_map
      encoders can't interpret a foreign uninterpreted-function call in the
@@ -1062,7 +1066,12 @@ let resolve_input_bitbus (m : bmodule) : bmodule =
       match s.direction with
       | (`Output | `Internal) when not (Hashtbl.mem seq_driven s.name) ->
           let w = Behavioral_boundary.width_of_btype s.stype in
-          if w <= 1 then None
+          (* w = 1 included: a `logic [0:0] amo_valid` (every 1-bit net in a
+             verilator-elaborated dump) connected as `.full_o(amo_valid)` is
+             written through `amo_valid[0]` -> `obuf_amo_valid_0__O` like any
+             bus bit, and skipping width-1 here left it undriven: a FREE net on
+             one side of the miter and a spurious DIFFER (cva6 amo_buffer) *)
+          if w < 1 then None
           else begin
             let nets = List.init w (fun i ->
               Printf.sprintf "obuf_%s_%d__O" s.name i) in
@@ -1502,6 +1511,18 @@ let miter_core ?(trusted : string list = [])
             false-negative class as Vacuous_comparison below, and it is worse
             because it looks like a definite answer. *)
          Printf.sprintf "INCONCLUSIVE — solver returned UNKNOWN: %s" why
+     | Z3.Error "out of memory" ->
+         (* Z3's memory_max_size (SVS_MAX_MEM_MB) tripped: as with a timeout,
+            no answer is not a difference *)
+         "INCONCLUSIVE — Z3 out of memory (SVS_MAX_MEM_MB)"
+     | Z3_miter.Vacuous_comparison _
+       when not (List.exists (fun (s : bsignal) -> s.direction = `Output) ma'.signals)
+         && not (List.exists (fun (s : bsignal) -> s.direction = `Output) mb'.signals) ->
+         (* a sink module with no outputs on EITHER side (pulp's `unread`): there
+            is nothing to compare and nothing to differ on -- vacuously
+            EQUIVALENT, not UNCOMPARABLE, so it does not block the parent's
+            whole-design verdict *)
+         "EQUIVALENT"
      | Z3_miter.Vacuous_comparison why ->
          (* NOT a difference: the two sides share no comparable port, so the
             miter constrained nothing.  Reporting DIFFER here manufactures
@@ -4150,6 +4171,70 @@ let lemit_vhdl h =
         { modules=[m]; library_cells=[] }
   | _ -> failwith ("emit_vhdl: not a program/module handle: " ^ h)
 
+(* ---- the module facts a harness needs, from the BIR instead of regexes over
+   emitted text (ports, clocks/resets, children).  One line per item. ---- *)
+let module_of_handle h top =
+  match Hashtbl.find_opt lhash h with
+  | Some (Mod (_, m, p)) -> (m, p)
+  | Some (Prog _) ->
+      let mh = lpick h top in
+      let _, m, p = find_mod mh in (m, p)
+  | _ -> failwith ("not a program/module handle: " ^ h)
+
+(* "input|output|inout <name> <width>" per port, declaration order *)
+let lports h top =
+  let m, _ = module_of_handle h top in
+  String.concat "\n" (List.filter_map (fun (s : bsignal) ->
+    match s.direction with
+    | `Input -> Some (Printf.sprintf "input %s %d" s.name (width_of_btype s.stype))
+    | `Output -> Some (Printf.sprintf "output %s %d" s.name (width_of_btype s.stype))
+    | `Inout -> Some (Printf.sprintf "inout %s %d" s.name (width_of_btype s.stype))
+    | `Internal -> None) m.signals)
+
+(* "clock <name> pos|neg" and "reset <name> pos|neg async|sync", unique *)
+let lclocks h top =
+  let m, _ = module_of_handle h top in
+  let lines = ref [] in
+  let add l = if not (List.mem l !lines) then lines := l :: !lines in
+  List.iter (function
+    | BSequential { clock; clock_edge; reset; reset_edge; reset_async; _ } ->
+        add (Printf.sprintf "clock %s %s" clock (match clock_edge with `Pos -> "pos" | `Neg -> "neg"));
+        (match reset with
+         | Some r -> add (Printf.sprintf "reset %s %s %s" r
+                            (match reset_edge with Some `Neg -> "neg" | _ -> "pos")
+                            (if reset_async then "async" else "sync"))
+         | None -> ())
+    | BCombinational _ -> ()) m.processes;
+  String.concat "\n" (List.rev !lines)
+
+(* child module names this module instantiates (transitively, leaves last) *)
+let lchildren h top =
+  let m, p = module_of_handle h top in
+  let seen = ref [] in
+  let rec go (m : bmodule) =
+    List.iter (fun (i : binstance) ->
+      if not (List.mem i.module_name !seen) then begin
+        seen := i.module_name :: !seen;
+        match List.find_opt (fun (mm : bmodule) -> mm.name = i.module_name) p.modules with
+        | Some c -> go c
+        | None -> ()
+      end) m.instances in
+  go m;
+  String.concat "\n" (List.rev !seen)
+
+(* invariant report (Behavioral_check); stage "unrolled" also rejects loops *)
+let lcheck_ir h stage =
+  match Hashtbl.find_opt lhash h with
+  | Some (Prog (_, p)) -> Behavioral_check.summary ~stage p
+  | Some (Mod (_, m, _)) -> Behavioral_check.summary ~stage { modules = [m]; library_cells = [] }
+  | _ -> failwith ("check_ir: not a program/module handle: " ^ h)
+
+let lwrite_text path body =
+  let oc = open_out path in
+  output_string oc body;
+  close_out oc;
+  "ok"
+
 let lwrite_verilog h path =
   let body = lemit_verilog h in
   let oc = open_out path in
@@ -4385,6 +4470,11 @@ module MakeLib
         "emit_vhdl",     V.efunc (V.string **->> V.string) (wrap1 lemit_vhdl);
         "write_verilog", V.efunc (V.string **-> V.string **->> V.string)
                           (wrap2 lwrite_verilog);
+        "ports",       V.efunc (V.string **-> V.string **->> V.string) (wrap2 lports);
+        "clocks",      V.efunc (V.string **-> V.string **->> V.string) (wrap2 lclocks);
+        "children",    V.efunc (V.string **-> V.string **->> V.string) (wrap2 lchildren);
+        "check_ir",    V.efunc (V.string **-> V.string **->> V.string) (wrap2 lcheck_ir);
+        "write_text",  V.efunc (V.string **-> V.string **->> V.string) (wrap2 lwrite_text);
         "write_vhdl",    V.efunc (V.string **-> V.string **->> V.string)
                           (wrap2 lwrite_vhdl);
         "convert_hdl",   V.efunc (V.string **-> V.string **->> V.string)

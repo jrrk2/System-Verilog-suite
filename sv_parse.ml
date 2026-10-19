@@ -358,7 +358,11 @@ let rec parse_json attr json =
       Always { always; senses; stmts }
       
   | "BEGIN" ->
-      let stmts = json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name) in
+      (* verilator 5.x puts a block's local declarations (`always_comb begin
+         logic sgn; ... end`) in `declsp`, not `stmtsp`: read both, decls first,
+         so collect_nested_vars sees them and the emitter declares them *)
+      let decls = json |> member "declsp" |> to_list_safe |> List.map (parse' attr name) in
+      let stmts = decls @ (json |> member "stmtsp" |> to_list_safe |> List.map (parse' attr name)) in
       let is_generate = json |> member "generate" |> to_bool_option |> Option.value ~default:false in
       Begin { name; stmts; is_generate }
   (* Verilator's wrapper around an AUTOMATIC local's initialiser
@@ -748,7 +752,10 @@ let rec parse_json attr json =
      JumpBlock { stmt }
 
   | "JUMPGO" ->
-      let label = json |> member "labelp" |> to_string in
+      (* verilator < 5.050 names the target `labelp`; 5.050 renamed it `blockp` *)
+      let label = match json |> member "labelp" |> to_string_option with
+        | Some l -> l
+        | None -> json |> member "blockp" |> to_string_option |> Option.value ~default:"" in
       JumpGo' { label }
 
   | "STOP" ->
@@ -1068,7 +1075,10 @@ and rwtyp attr = function
 | ConstType { name; dtype_ref; child } ->
     ConstType { name; dtype_ref; child = List.map (rwtyp attr) child }
 | ParamTypeType' { name; dtype } ->
-    ParamTypeType { name; dtype_ref = assoc_find_opt attr.type_table dtype }
+    (* resolve the bound type like RefType' does: an unresolved (primed) entry
+       matches none of get_width_from_dtype's cases and reads as 1 bit *)
+    ParamTypeType { name;
+      dtype_ref = (try Some (rwtyp attr (assoc_find attr.type_table dtype)) with Not_found -> None) }
 | ParamTypeType { name; dtype_ref } ->
     ParamTypeType { name; dtype_ref }
 | VoidType { name; resolved } -> VoidType { name; resolved }

@@ -6,8 +6,21 @@ ports = [l.split() for l in open(sys.argv[1]) if l.strip()]
 top, cycles = sys.argv[2], int(sys.argv[3])
 ins = [(n, int(w)) for d, n, w in ports if d == 'input']
 outs = [(n, int(w)) for d, n, w in ports if d == 'output']
-clk = next((n for n, _ in ins if n in ('clk', 'clk_i', 'clock')), None)
-rst = [n for n, _ in ins if n in ('reset', 'rst', 'rst_n', 'rst_ni', 'resetn', 'rst_i')]
+# clocks.txt (svd.clocks): "clock <name> pos|neg" / "reset <name> pos|neg async|sync"
+clocks, resets = [], {}
+if len(sys.argv) > 4:
+    try:
+        for l in open(sys.argv[4]):
+            f = l.split()
+            if f and f[0] == 'clock': clocks.append(f[1])
+            if f and f[0] == 'reset': resets[f[1]] = f[2]
+    except OSError:
+        pass
+innames = [n for n, _ in ins]
+clk = next((c for c in clocks if c in innames), None)
+if clk is None:  # no clocked process named one: fall back to the usual names
+    clk = next((n for n, _ in ins if n in ('clk', 'clk_i', 'clock')), None)
+rst = [n for n, _ in ins if n in resets or n in ('reset', 'rst', 'rst_n', 'rst_ni', 'resetn', 'rst_i')]
 def rng(w): return '' if w == 1 else '[%d:0] ' % (w - 1)
 L = ['`timescale 1ns/1ps', 'module tb;', '  glbl glbl();']
 for n, w in ins: L.append('  logic %s%s = 0;' % (rng(w), n))
@@ -17,12 +30,16 @@ L.append('  %s_gl gl(%s);' % (top, ', '.join(['.%s(%s)' % (n, n) for n, _ in ins
 L.append('  int cyc = 0, errs = 0;')
 L.append('  initial if ($test$plusargs("vcd")) begin $dumpfile("dump.vcd"); $dumpvars(0, tb); end')
 # glbl holds GSR for the first 100 ns: start the clock after it, so both sides leave their initial state together
-if clk: L.append('  initial begin %s = 0; #120; forever #5 %s = ~%s; end' % (clk, clk, clk))
+if clk is None:
+    # purely combinational module: a testbench-only clock paces the stimulus
+    clk = 'tb_clk'; L.append('  logic tb_clk;')
+L.append('  initial begin %s = 0; #120; forever #5 %s = ~%s; end' % (clk, clk, clk))
 L.append('  always @(posedge %s) begin' % clk)
 for n, w in ins:
     if n == clk: continue
     if n in rst:
-        act = "1'b0" if n.endswith('_n') or n.endswith('n') and n != 'reset' and n != 'rst' else "1'b1"
+        if n in resets: act = "1'b0" if resets[n] == 'neg' else "1'b1"
+        else: act = "1'b0" if n.endswith('_n') or n.endswith('n') and n != 'reset' and n != 'rst' else "1'b1"
         ina = "1'b1" if act == "1'b0" else "1'b0"
         L.append("    %s <= (cyc < 4) ? %s : (($urandom %% 101) == 0 ? %s : %s);" % (n, act, act, ina))
     else:

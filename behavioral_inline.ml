@@ -157,7 +157,36 @@ let bind_params params args =
  * (the value assigned to `<fname>`), extract that expression with
  * formal-parameter substitution applied. Falls back to None if the
  * body has any control flow we can't represent as a pure expression. *)
+let rec stmt_yields fname = function
+  | BAssign { lhs; _ } -> lhs = fname
+  | BReturn (Some _) -> true
+  | BIf { then_stmts; else_stmts; _ } ->
+      List.exists (stmt_yields fname) then_stmts || List.exists (stmt_yields fname) else_stmts
+  | BCase { cases; default; _ } ->
+      List.exists (fun (_, ss) -> List.exists (stmt_yields fname) ss) cases
+      || List.exists (stmt_yields fname) default
+  | BBlock ss -> List.exists (stmt_yields fname) ss
+  | _ -> false
+
 let rec body_to_expr fname bindings = function
+  (* early return: `if (c) return a; <rest>` -- the branch that yields ends the
+     function there, the one that does not continues with <rest> (cva6's
+     package functions, written with `return` in case arms and if bodies) *)
+  | BIf { condition; then_stmts; else_stmts } :: (_ :: _ as rest)
+    when stmt_yields fname (BIf { condition; then_stmts; else_stmts }) ->
+      let subst e =
+        List.fold_left (fun acc (name, expr, _) ->
+          subst_expr_expr name expr acc) e bindings in
+      let arm ss = if List.exists (stmt_yields fname) ss
+        then body_to_expr fname bindings ss else body_to_expr fname bindings rest in
+      (match arm then_stmts, arm else_stmts with
+       | Some t, Some e -> Some (BCond { condition = subst condition; then_val = t; else_val = e })
+       | _ -> None)
+  (* a result initialiser (`f = 0;`) that a later statement always overrides *)
+  | BAssign { lhs; _ } :: (_ :: _ as rest)
+    when lhs = fname && List.exists (stmt_yields fname) rest
+         && (match rest with [BAssign _] -> false | _ -> true) ->
+      body_to_expr fname bindings rest
   | [BAssign { lhs; rhs }] when lhs = fname ->
       Some (List.fold_left (fun e (name, expr, _) ->
         subst_expr_expr name expr e) rhs bindings)
@@ -238,6 +267,7 @@ let rec body_to_expr fname bindings = function
       (* Does this statement assign [fname] at any depth? *)
       let rec yields_fname = function
         | BAssign { lhs; _ } -> lhs = fname
+        | BReturn (Some _) -> true
         | BIf { then_stmts; else_stmts; _ } ->
             List.exists yields_fname then_stmts
             || List.exists yields_fname else_stmts

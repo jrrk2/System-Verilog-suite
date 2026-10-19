@@ -109,8 +109,8 @@ let rec map_stmt f = function
                        (map_expr f e, List.map (map_stmt f) ss)) cases;
               default = List.map (map_stmt f) default }
   | BBlock ss -> BBlock (List.map (map_stmt f) ss)
-  | BCallStmt { func = ("@slice_write" | "@mem_write") as func;
-               args = (BVar _ as tgt) :: rest } ->
+  | BCallStmt { func;
+               args = (BVar _ as tgt) :: rest } when is_write_op func ->
       (* The FIRST arg is the write TARGET, not a read — substitution only ever
          rewrites RHS/read positions, never a write target (else a partial write
          is redirected to a different signal). *)
@@ -142,7 +142,7 @@ let rec partial_write_target name stmts =
     let ln = String.length name in
     String.length lhs > ln && String.sub lhs 0 ln = name && lhs.[ln] = '[' in
   List.exists (function
-    | BCallStmt { func = ("@slice_write" | "@mem_write"); args = BVar n :: _ } ->
+    | BCallStmt { func; args = BVar n :: _ } when is_write_op func ->
         n = name
     | BAssign { lhs; _ } -> is_bracket_write lhs
     | BIf { then_stmts; else_stmts; _ } ->
@@ -363,8 +363,8 @@ let thread_comb_body ?(only = fun _ -> true) ?(force = false) ?final_env orig_st
                   cases = List.map (fun (k', ss', _) -> (k', ss')) cases';
                   default = default' }
       | BBlock ss -> BBlock (List.map thread_stmt ss)
-      | BCallStmt { func = ("@slice_write" | "@mem_write") as func;
-                    args = (BVar tgt as tgt_e) :: rest } ->
+      | BCallStmt { func;
+                    args = (BVar tgt as tgt_e) :: rest } when is_write_op func ->
           (* The FIRST arg is the write TARGET — NEVER substitute it, else the
              partial write is redirected to whatever value was threaded for that
              name (the `sbaddr_d := sbaddress_i` default made
@@ -459,7 +459,7 @@ let process_module (m : bmodule) : bmodule =
                         cases = List.map (fun (k, b) -> (rd k, List.map rs b)) cases;
                         default = List.map rs default }
             | BBlock b -> BBlock (List.map rs b)
-            | BCallStmt { func = ("@slice_write" | "@mem_write") as func; args = (BVar _ as tg) :: rest } ->
+            | BCallStmt { func; args = (BVar _ as tg) :: rest } when is_write_op func ->
                 BCallStmt { func; args = tg :: List.map rd rest }
             | BCallStmt { func; args } -> BCallStmt { func; args = List.map rd args }
             | BReturn (Some e) -> BReturn (Some (rd e))

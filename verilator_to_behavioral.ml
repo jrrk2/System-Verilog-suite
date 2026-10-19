@@ -76,8 +76,16 @@ let rec get_width_from_dtype = function
       range_size range * get_width_from_dtype (Some base)
   | Some (ArrayType { base; _ }) ->
       (* Unpacked array: width is the element width; the range is the
-       * memory *depth*, picked up by `get_array_depth`. *)
-      get_width_from_dtype (Some base)
+       * memory *depth*, picked up by `get_array_depth`.  A 2-D (or deeper)
+       * unpacked array keeps its OUTER dimension as the depth and flattens
+       * every inner one into the element (cva6's `bht_q[63:0][1:0]` of a
+       * 3-bit struct is a 64-deep memory of 6-bit words): the inner index
+       * becomes a bit offset, see [nested_sel]. *)
+      let rec inner = function
+        | ArrayType { base; range } -> range_size range * inner base
+        | RefType { refdtype_ref = Some t; _ } -> inner t
+        | t -> get_width_from_dtype (Some t) in
+      inner base
   | Some (RefType { refdtype_ref; _ }) -> get_width_from_dtype refdtype_ref
   | Some (EnumType { base; _ }) -> get_width_from_dtype base
   | Some (StructType { members; _ }) ->
@@ -89,13 +97,52 @@ let rec get_width_from_dtype = function
   (* a struct member wraps its real dtype in dtype_ref — deref it (else each
      member counts as 1 and dmi_req_t summed to 3 not 41). *)
   | Some (MemberType { dtype_ref; _ }) -> get_width_from_dtype dtype_ref
+  (* a `parameter type T` port/signal (cva6's fu_data_t, bp_resolve_t, the
+     fifo's dtype): the PARAMTYPEDTYPE's dtypep is the bound type.  Without
+     this every such signal was 1 bit, with its struct-field slice writes
+     landing out of range. *)
+  | Some (ParamTypeType { dtype_ref; _ }) -> get_width_from_dtype dtype_ref
   | _ -> 1
 
 (* For an unpacked-array type, return its depth; otherwise None. *)
 let rec get_array_depth = function
   | Some (ArrayType { range; _ }) -> Some (range_size range)
   | Some (RefType { refdtype_ref; _ }) -> get_array_depth refdtype_ref
+  | Some (ParamTypeType { dtype_ref; _ }) -> get_array_depth dtype_ref
   | _ -> None
+
+(* The unpacked dimensions of a dtype, outer first, and the innermost element
+   width: `logic [2:0] a [63:0][1:0]` -> ([64; 2], 3). *)
+let unpacked_dims dtype_ref =
+  let rec go acc = function
+    | Some (ArrayType { base; range }) -> go (range_size range :: acc) (Some base)
+    | Some (RefType { refdtype_ref; _ }) -> go acc refdtype_ref
+    | t -> (List.rev acc, get_width_from_dtype t) in
+  go [] dtype_ref
+
+(* An ArraySel chain `base[i1][i2]...` on a plain variable: (name, dtype, [i1; i2; ...]) *)
+let rec sel_chain = function
+  | ArraySel { expr; index } ->
+      (match sel_chain expr with
+       | Some (n, d, ixs) -> Some (n, d, ixs @ [index])
+       | None -> None)
+  | VarRef { name; dtype_ref; _ } -> Some (name, dtype_ref, [])
+  | _ -> None
+
+(* 2-D+ unpacked arrays are SCALARISED on their inner dimensions: `e_t mem
+   [63:0][1:0]` becomes two 64-deep memories `mem__0` / `mem__1` (the inner
+   index, linearised, picks the memory).  Flattening the inner dimension into
+   the word instead turned two non-blocking writes to different elements of
+   one word (`mem[i][j] <= a; mem[i][~j].f <= b`) into two read-modify-writes
+   of the word, and the second silently dropped the first.  Separate arrays
+   keep NBA semantics, and memlower sees plain memories.
+   name -> (dims outer-first, element width); reset per module. *)
+let nested_arrays : (string, int list * int) Hashtbl.t = Hashtbl.create 16
+let nested_name name k = Printf.sprintf "%s__%d" name k
+let nested_count dims = List.fold_left ( * ) 1 (List.tl dims)
+let is_nested_sel sel = match sel_chain sel with
+  | Some (n, _, _) -> Hashtbl.mem nested_arrays n
+  | None -> false
 
 (* Check if dtype is signed *)
 let is_signed_dtype = function
@@ -484,6 +531,29 @@ let rec expr_to_bexpr = function
                                            signed = Unsigned } })
 
   (* `mem[i]` indexed read on a memory array. *)
+  | ArraySel _ as sel when is_nested_sel sel ->
+      (* `a[i1][i2]` on a scalarised 2-D+ array: the inner index picks the
+         memory (a mux over them when it is dynamic); `a[i1]` alone is the
+         whole inner row, highest inner index first *)
+      let name, _, ixs = Option.get (sel_chain sel) in
+      let dims, _ = Hashtbl.find nested_arrays name in
+      let n = nested_count dims in
+      let i1 = expr_to_bexpr (List.hd ixs) in
+      let sel_k k = BSelect { array = BVar (nested_name name k); index = i1 } in
+      if List.length ixs = 1 then
+        (match List.init n (fun k -> sel_k (n - 1 - k)) with [x] -> x | l -> BConcat l)
+      else
+        (match nested_offset ~dims ~ew:1 (List.tl ixs) with
+         | BConst { value; _ } -> sel_k (Z.to_int value)
+         | e ->
+             let u32 = BInt { width = 32; signed = Unsigned } in
+             let rec chain k =
+               if k >= n - 1 then sel_k k
+               else BCond { condition = BBinOp { op = BEq; lhs = e;
+                                                 rhs = BConst { value = Z.of_int k; width = 32 };
+                                                 result_type = u32 };
+                            then_val = sel_k k; else_val = chain (k + 1) } in
+             chain 0)
   | ArraySel { expr; index } ->
       BSelect { array = expr_to_bexpr expr;
                 index = expr_to_bexpr index }
@@ -508,6 +578,36 @@ let rec expr_to_bexpr = function
   | other ->
       strict_bail "expression" "expr_to_bexpr" other;
       BConst { value = Z.zero; width = 1 }
+
+(* bit offset of the inner indices [i2; i3; ...] of a word of a 2-D+ unpacked
+   array with dimensions [d1; d2; d3; ...] (outer first) and element width ew:
+   (i2 * d3 * ... + i3 * ... ) * ew, folded when every index is a constant *)
+and nested_offset ~dims ~ew inner_ixs =
+  let u32 = BInt { width = 32; signed = Unsigned } in
+  let bin op lhs rhs = BBinOp { op; lhs; rhs; result_type = u32 } in
+  let i32 v = BConst { value = Z.of_int v; width = 32 } in
+  let inner_dims = List.tl dims in
+  let rec strides = function
+    | [] -> [] | _ :: rest -> List.fold_left ( * ) 1 rest :: strides rest in
+  let st = strides inner_dims in
+  (* an index narrower than 32 bits keeps its own width before the multiply:
+     `~j` on a 1-bit j is the 1-bit complement, not 32'hfffffffe (the emitted
+     text would otherwise widen the operand before inverting it) *)
+  let index_width = function
+    | VarRef { dtype_ref; _ } | Const { dtype_ref; _ }
+    | BinaryOp { dtype_ref; _ } | UnaryOp { dtype_ref; _ } -> get_width_from_dtype dtype_ref
+    | _ -> 32 in
+  let terms = List.mapi (fun k ix ->
+    let s = (try List.nth st k with _ -> 1) * ew in
+    match expr_to_bexpr ix with
+    | BConst { value; _ } -> i32 (Z.to_int value * s)
+    | e ->
+        let w = index_width ix in
+        let e = if w > 0 && w < 32 then BSlice { signal = e; msb = w - 1; lsb = 0 } else e in
+        bin BMul e (i32 s)) inner_ixs in
+  List.fold_left (fun acc t -> match acc, t with
+    | BConst { value = a; _ }, BConst { value = b; _ } -> i32 (Z.to_int a + Z.to_int b)
+    | _ -> bin BAdd acc t) (i32 0) terms
 
 (* Convert Verilator statement to behavioral IR statement *)
 (* Is this statement pure elaboration-time computation?  Used to decide
@@ -566,7 +666,65 @@ let rec stmt_to_bstmt = function
         | Sel { expr; _ } | ArraySel { expr; _ } -> base_name expr
         | _ -> None
       in
+      (* writes into a scalarised 2-D+ array: the inner index picks the memory
+         (one guarded write per memory when it is dynamic) *)
+      let per_k name ixs f =
+        let dims, _ = Hashtbl.find nested_arrays name in
+        let n = nested_count dims in
+        match nested_offset ~dims ~ew:1 (List.tl ixs) with
+        | BConst { value; _ } -> f (Z.to_int value)
+        | e ->
+            let u32 = BInt { width = 32; signed = Unsigned } in
+            BBlock (List.init n (fun k ->
+              BIf { condition = BBinOp { op = BEq; lhs = e;
+                                         rhs = BConst { value = Z.of_int k; width = 32 };
+                                         result_type = u32 };
+                    then_stmts = [f k]; else_stmts = [] })) in
       (match lhs with
+       | ArraySel _ as sel when is_nested_sel sel ->
+           let name, _, ixs = Option.get (sel_chain sel) in
+           let dims, ew = Hashtbl.find nested_arrays name in
+           let i1 = expr_to_bexpr (List.hd ixs) in
+           let rhs_e = expr_to_bexpr rhs in
+           if List.length ixs = 1 then
+             (* the whole inner row: one slice of the value per memory *)
+             BBlock (List.init (nested_count dims) (fun k ->
+               BCallStmt { func = "@mem_write";
+                           args = [BVar (nested_name name k); i1;
+                                   BSlice { signal = rhs_e; msb = k * ew + ew - 1; lsb = k * ew }] }))
+           else
+             per_k name ixs (fun k ->
+               BCallStmt { func = "@mem_write"; args = [BVar (nested_name name k); i1; rhs_e] })
+       | Sel { expr = (ArraySel _ as sel); lsb; width; width_const = width_attr; _ } when is_nested_sel sel ->
+           (* a field / part of one element: read-modify-write of that memory's word *)
+           let name, _, ixs = Option.get (sel_chain sel) in
+           let i1 = expr_to_bexpr (List.hd ixs) in
+           let const_int_of t = match expr_to_bexpr t with
+             | BConst { value; _ } -> Some (Z.to_int value) | _ -> None in
+           let w = match Option.bind width const_int_of with
+             | Some w -> w
+             | None -> (match width_attr with Some w when w > 0 -> w | _ -> 1) in
+           let i32 v = BConst { value = Z.of_int v; width = 32 } in
+           let u32 = BInt { width = 32; signed = Unsigned } in
+           let bin op lhs rhs = BBinOp { op; lhs; rhs; result_type = u32 } in
+           let lsb_e = match lsb with Some l -> expr_to_bexpr l | None -> i32 0 in
+           let field = BConst { value = Z.sub (Z.shift_left Z.one w) Z.one; width = 32 } in
+           let smask = bin BShl field lsb_e in
+           let rhs_e = expr_to_bexpr rhs in
+           per_k name ixs (fun k ->
+             let arr = nested_name name k in
+             let elem = BSelect { array = BVar arr; index = i1 } in
+             let cleared = bin BSub elem (bin BAnd elem smask) in
+             let ins = bin BShl (bin BAnd rhs_e field) lsb_e in
+             BCallStmt { func = "@mem_write"; args = [BVar arr; i1; bin BOr cleared ins] })
+       | VarRef { name; _ } when Hashtbl.mem nested_arrays name ->
+           (* whole-array copy between two scalarised arrays (`bht_q <= bht_d`) *)
+           (match rhs with
+            | VarRef { name = src; _ } when Hashtbl.mem nested_arrays src ->
+                let dims, _ = Hashtbl.find nested_arrays name in
+                BBlock (List.init (nested_count dims) (fun k ->
+                  BAssign { lhs = nested_name name k; rhs = BVar (nested_name src k) }))
+            | _ -> BAssign { lhs = name; rhs = expr_to_bexpr rhs })
        | ArraySel { expr = arr; index } ->
            (match base_name arr with
             | Some mem_name ->
@@ -775,6 +933,14 @@ let rec stmt_to_bstmt = function
       BCallStmt { func = name; args = List.map expr_to_bexpr args }
   | StmtExpr { expr } -> stmt_to_bstmt expr
 
+  (* `return e;` / `break;` / `continue;`: verilator lowers them all to a
+     JUMPGO out of the enclosing JUMPBLOCK, with `return e` first assigning
+     the function's result variable.  Keep the jump as `BReturn None`;
+     extract_funcs folds `f = e; return` into `BReturn (Some e)` and the
+     always-block builder drops any that reach it (the old behaviour). *)
+  | JumpGo _ -> BReturn None
+  | JumpBlock { stmt } -> BBlock (List.map stmt_to_bstmt stmt)
+
   | other ->
       strict_bail "statement" "stmt_to_bstmt" other;
       BBlock []
@@ -832,6 +998,44 @@ let always_to_bprocess = function
   | Always { senses; stmts; _ } ->
       let is_edge = is_edge_triggered senses in
       let body = List.map stmt_to_bstmt stmts in
+      (* names the source assigns with a blocking `=` inside the clocked block
+         (for-loop control, in-cycle temps): the emitter must write them `=` and
+         blocking_subst threads them; verilator keeps `=` (ASSIGN) distinct from
+         `<=` (ASSIGNDLY), and a For's init/incs are blocking by construction *)
+      let rec base_name = function
+        | VarRef { name; _ } | VarRef' { name; _ } -> Some name
+        | Sel { expr; _ } | ArraySel { expr; _ } -> base_name expr
+        | _ -> None in
+      let rec blocking_names acc = function
+        | Assign { lhs; is_blocking = true; _ } ->
+            (match base_name lhs with Some n -> n :: acc | None -> acc)
+        | For { name; stmts; incs; _ } ->
+            List.fold_left blocking_names (name :: acc) (stmts @ incs)
+        | Begin { stmts; _ } | JumpBlock { stmt = stmts } -> List.fold_left blocking_names acc stmts
+        | If { then_stmt; else_stmt; _ } ->
+            let acc = blocking_names acc then_stmt in
+            (match else_stmt with Some e -> blocking_names acc e | None -> acc)
+        | Case { items; _ } ->
+            List.fold_left (fun a (ci : case_item) ->
+              List.fold_left blocking_names a ci.statements) acc items
+        | _ -> acc in
+      let blocking_vars =
+        if is_edge then List.sort_uniq compare (List.fold_left blocking_names [] stmts) else [] in
+      (* a `break` that reached a process body: drop it, as before *)
+      let rec drop_returns = function
+        | BReturn _ -> BBlock []
+        | BBlock l -> BBlock (List.map drop_returns l)
+        | BIf { condition; then_stmts; else_stmts } ->
+            BIf { condition; then_stmts = List.map drop_returns then_stmts;
+                  else_stmts = List.map drop_returns else_stmts }
+        | BCase { selector; cases; default } ->
+            BCase { selector; cases = List.map (fun (v, s) -> (v, List.map drop_returns s)) cases;
+                    default = List.map drop_returns default }
+        | BWhile { condition; body } -> BWhile { condition; body = List.map drop_returns body }
+        | BFor { init; condition; update; body } ->
+            BFor { init; condition; update; body = List.map drop_returns body }
+        | s -> s in
+      let body = List.map drop_returns body in
       if is_edge then
         let clock = match get_clock_signal senses with
           | Some c -> c
@@ -846,7 +1050,7 @@ let always_to_bprocess = function
           reset_edge = None;
           reset_async = false;
           body;
-          blocking_vars = [];
+          blocking_vars;
         }
       else
         BCombinational { name = "always_comb"; sensitivity = [BAny]; body }
@@ -885,7 +1089,13 @@ let rec collect_nested_vars node acc =
       List.fold_left (fun a (ci : case_item) ->
         List.fold_left (fun a' s -> collect_nested_vars s a') a ci.statements
       ) acc items
-  | For { stmts; _ } -> List.fold_left (fun a s -> collect_nested_vars s a) acc stmts
+  | For { name; dtype_ref; stmts; incs; _ } ->
+      (* sv_parse folds the loop variable's VAR and its init into the For node:
+         re-synthesise the Var so the emitter declares `i` (else the loop
+         reads an undeclared name) *)
+      let v = Var { name; dtype_ref; var_type = "VAR"; direction = "NONE";
+                    value = None; dtype_name = ""; is_param = false } in
+      List.fold_left (fun a s -> collect_nested_vars s a) (v :: acc) (stmts @ incs)
   | _ -> acc
 
 (* Extract signals from module. For unpacked-array dtypes the bsignal
@@ -921,8 +1131,16 @@ let extract_signals stmts =
        promotes it to a FREE INPUT that doesn't tie across frontends — a spurious
        miter interface mismatch (ibex_counter's `CounterWidth` leaked as a 7th
        input, blocking an otherwise-equivalent module). *)
-    | Var { is_param = true; _ } -> None
-    | Var { var_type = ("GPARAM" | "LPARAM"); _ } -> None
+    | Var { is_param = true; _ } -> []
+    | Var { var_type = ("GPARAM" | "LPARAM"); _ } -> []
+    | Var { name; dtype_ref; direction; _ }
+      when List.length (fst (unpacked_dims dtype_ref)) >= 2 ->
+        let dims, ew = unpacked_dims dtype_ref in
+        Hashtbl.replace nested_arrays name (dims, ew);
+        List.init (nested_count dims) (fun k ->
+          { name = nested_name name k;
+            stype = BArray { element = BInt { width = ew; signed = Unsigned }; size = List.hd dims };
+            direction = dir_of direction; initial_value = None; attrs = [] })
     | Var { name; dtype_ref; direction; _ } ->
         let elem_width = get_width_from_dtype dtype_ref in
         let signed = is_signed_dtype dtype_ref in
@@ -932,22 +1150,22 @@ let extract_signals stmts =
           | Some depth -> BArray { element; size = depth }
           | None -> element
         in
-        Some {
+        [{
           name;
           stype;
           direction = dir_of direction;
           initial_value = None; attrs = [];
-        }
+        }]
     | Var' { name; direction; _ } ->
-        Some {
+        [{
           name;
           stype = BInt { width = 32; signed = Unsigned };
           direction = dir_of direction;
           initial_value = None; attrs = [];
-        }
-    | _ -> None
+        }]
+    | _ -> []
   in
-  let top_level = List.filter_map var_of_node stmts in
+  let top_level = List.concat_map var_of_node stmts in
   (* Also collect procedural-scope locals from inside Always/Begin/If/
      Case/For trees.  Each becomes an `Internal` bsignal (regardless
      of what direction the Var node carries — procedural locals are
@@ -955,7 +1173,7 @@ let extract_signals stmts =
      internal). *)
   let proc_vars =
     List.fold_left (fun acc s -> collect_nested_vars s acc) [] stmts
-    |> List.filter_map var_of_node
+    |> List.concat_map var_of_node
     |> List.map (fun s -> { s with direction = `Internal })
   in
   (* De-dup: a name appearing in both lists keeps the top-level
@@ -963,8 +1181,13 @@ let extract_signals stmts =
      locals fill in only the names not already declared at module
      scope. *)
   let known = List.fold_left (fun acc (s : bsignal) -> s.name :: acc) [] top_level in
+  (* one declaration per name: three for-loops with `int i` are three Var
+     nodes, and the emitted `logic [31:0] i;` x3 is a redefinition error *)
+  let seen = Hashtbl.create 16 in
+  List.iter (fun n -> Hashtbl.replace seen n ()) known;
   let extras = List.filter (fun (s : bsignal) ->
-    not (List.mem s.name known)) proc_vars in
+    if Hashtbl.mem seen s.name then false
+    else (Hashtbl.replace seen s.name (); true)) proc_vars in
   top_level @ extras
 
 (* Find a pin's connected expression by pin name. *)
@@ -1239,15 +1462,23 @@ let _ = is_output_named_for
 
 let extract_funcs sts =
   List.filter_map (function
-    | Func { name = fname; stmts; _ }
-    | Func' { name = fname; stmts; _ } ->
+    | Func { name = fname; stmts; vars; _ }
+    | Func' { name = fname; stmts; vars; _ } ->
         let param_vars, body = split_param_vars stmts in
         let params = List.filter_map var_to_param (List.filter is_port_var param_vars) in
-        let body_stmts = List.map stmt_to_bstmt body in
+        (* `f = e; <jump>` is verilator's `return e;` *)
+        let body_stmts = Behavioral_lower.fold_returns fname (List.map stmt_to_bstmt body) in
+        (* the result variable (fvarp) carries the declared return type *)
+        let ftype = match List.find_opt (function
+            | Var { name; _ } | Var' { name; _ } -> name = fname | _ -> false) vars with
+          | Some (Var { dtype_ref; _ }) ->
+              BInt { width = get_width_from_dtype dtype_ref;
+                     signed = if is_signed_dtype dtype_ref then Signed else Unsigned }
+          | _ -> BInt { width = 32; signed = Unsigned } in
         Some {
           fname;
           is_task = false;
-          ftype = BInt { width = 32; signed = Unsigned };
+          ftype;
           params;
           locals = locals_of param_vars;
           body = local_inits param_vars @ body_stmts;
@@ -1273,6 +1504,7 @@ let extract_funcs sts =
  * those are visible to this module via `import pkg::*`. *)
 let module_to_bmodule_with_funcs extra_funcs = function
   | Module { name; stmts } ->
+      Hashtbl.reset nested_arrays;
       let signals = extract_signals stmts in
 
       (* Generate blocks (genvar-for, conditional generate) come in as
@@ -1520,11 +1752,20 @@ let convert_ast ast =
 (* array from a descending-index BConcat of constants.  meminfer folds   *)
 (* that into init_values and then drops the driver, so both front ends   *)
 (* converge on an identical BIR.                                         *)
+(* Each pair carries the MODULE it was found in.  Unscoped, the LiteX top's
+   `$readmemh("..._mem.init", mem)` was attached to EVERY module declaring an
+   array called `mem` -- CVA6's ariane_regfile_fpga, AsyncDpRam and
+   AsyncThreePortRam among them -- which would have loaded the SoC's ident
+   ROM into the register file. *)
 let readmem_pairs json =
   let out = ref [] in
-  let rec walk j =
+  let rec walk modname j =
     match j with
     | `Assoc kvs ->
+        let modname =
+          match List.assoc_opt "type" kvs, List.assoc_opt "name" kvs with
+          | Some (`String "MODULE"), Some (`String n) -> Some n
+          | _ -> modname in
         (match List.assoc_opt "type" kvs with
          | Some (`String "READMEM") ->
              let first_name key =
@@ -1541,13 +1782,13 @@ let readmem_pairs json =
                     String.iter (fun c ->
                       if c <> '"' && c <> '\\' then Buffer.add_char b c) fn;
                     Buffer.contents b in
-                  out := (mem, fn) :: !out
+                  out := (modname, mem, fn) :: !out
               | _ -> ())
          | _ -> ());
-        List.iter (fun (_, v) -> walk v) kvs
-    | `List l -> List.iter walk l
+        List.iter (fun (_, v) -> walk modname v) kvs
+    | `List l -> List.iter (walk modname) l
     | _ -> () in
-  walk json; List.rev !out
+  walk None json; List.rev !out
 
 (* Same search order as the verible path: the path as written, then
    $MEM_INIT_DIR, then the directory of the JSON, then PWD.  Getting this wrong
@@ -1582,8 +1823,10 @@ let attach_readmem_inits ~json ~json_file bprog =
   if pairs = [] then bprog
   else begin
     let modules = List.map (fun (m : bmodule) ->
-      let extra = List.filter_map (fun (mem, fn) ->
-        (* only for arrays this module actually declares *)
+      let extra = List.filter_map (fun (modname, mem, fn) ->
+        (* only in the module the $readmemh is in, for an array it declares *)
+        if (match modname with Some n -> n <> m.name | None -> false) then None
+        else
         let decl = List.find_opt (fun (s : bsignal) ->
           s.name = mem && (match s.stype with BArray _ -> true | _ -> false))
           m.signals in
