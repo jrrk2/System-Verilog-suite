@@ -173,8 +173,14 @@ let try_unroll_for ~init ~condition ~update ~body =
 (* Drop empty BBlocks: they appear from variable declarations the
  * Verilator → BIR converter strips, and they confuse the
  * `BAssign :: BWhile` pattern match below. *)
-let drop_empty_blocks =
-  List.filter (function BBlock [] -> false | _ -> true)
+let drop_empty_blocks stmts =
+  List.filter_map (function
+    | BBlock [] -> None
+    (* a loop alone in a block -- what is left of verilator's JUMPBLOCK
+       around a loop with `break` (CVA6 store_buffer) -- so `i = 0;
+       begin while ... end` still matches the init; while shape *)
+    | BBlock [ (BWhile _ | BFor _) as l ] -> Some l
+    | s -> Some s) stmts
 
 (* Match the `init; while (cond) { body; update }` shape Verilator
  * emits for `for` loops, then attempt unroll. *)
@@ -204,8 +210,23 @@ let try_unroll_while_seq stmts =
 let rec unroll_stmt = function
   | BFor { init; condition; update; body } ->
       let body' = unroll_list body in
-      (match try_unroll_for ~init ~condition ~update ~body:body' with
-       | Some unrolled -> BBlock unrolled
+      (* Verilator's JSON can carry `for (int unsigned i = 0; i < N; i++)` as a
+         BFor with an EMPTY update and the step as the body's last statement
+         (common_cells' addr_decode in CVA6's AXI crossbar): take that
+         statement as the update, as the init; while shape below does. *)
+      let update_eff, body_eff =
+        match update, init with
+        | BBlock [], BAssign { lhs = i_var; _ } ->
+            (match List.rev body' with
+             | (BAssign { lhs; _ } as step) :: rest when lhs = i_var ->
+                 (step, List.rev rest)
+             | _ -> (update, body'))
+        | _ -> (update, body') in
+      (* unroll again afterwards: an inner `for (k = level; ...)` only has a
+         constant start once the outer `level` has been substituted
+         (cva6_shared_tlb's PtLevels x PtLevels tag compare) *)
+      (match try_unroll_for ~init ~condition ~update:update_eff ~body:body_eff with
+       | Some unrolled -> BBlock (unroll_list unrolled)
        | None ->
            BFor { init; condition; update; body = body' })
   | BBlock stmts -> BBlock (unroll_list stmts)
@@ -228,7 +249,8 @@ and unroll_list stmts =
     | [] -> List.rev prefix
     | (BAssign _ as init) :: (BWhile _ as w) :: rest ->
         (match try_unroll_while_seq [init; w] with
-         | Some unrolled -> List.rev_append prefix (unrolled @ scan [] rest)
+         | Some unrolled ->
+             List.rev_append prefix (unroll_list unrolled @ scan [] rest)
          | None -> scan (w :: init :: prefix) rest)
     | s :: rest -> scan (s :: prefix) rest
   in

@@ -994,6 +994,8 @@ let rec is_posedge = function
  * pass V↔V. The Verible side has the latch detection because Vivado
  * does, so when both sides see a true latch they may still disagree
  * — but this is the side it's safer to leave loose.) *)
+let jumps_dropped = ref 0
+
 let always_to_bprocess = function
   | Always { senses; stmts; _ } ->
       let is_edge = is_edge_triggered senses in
@@ -1021,9 +1023,12 @@ let always_to_bprocess = function
         | _ -> acc in
       let blocking_vars =
         if is_edge then List.sort_uniq compare (List.fold_left blocking_names [] stmts) else [] in
-      (* a `break` that reached a process body: drop it, as before *)
+      (* a `break` that reached a process body: drop it, as before -- but
+         count it.  Dropping it lets the loop run every iteration, which is
+         only right when the later iterations cannot change the result (CVA6
+         store_buffer's `matches = 1; break;`); module_to_bmodule reports it. *)
       let rec drop_returns = function
-        | BReturn _ -> BBlock []
+        | BReturn _ -> incr jumps_dropped; BBlock []
         | BBlock l -> BBlock (List.map drop_returns l)
         | BIf { condition; then_stmts; else_stmts } ->
             BIf { condition; then_stmts = List.map drop_returns then_stmts;
@@ -1523,10 +1528,16 @@ let module_to_bmodule_with_funcs extra_funcs = function
        * so the Z3 encoder treats it as an unconditional equation. RTL_*
        * cells are encoded directly via cell_to_bprocess so we don't need
        * to walk into their module bodies. *)
+      jumps_dropped := 0;
       let always_processes = List.filter_map (function
         | Always _ as a -> Some (always_to_bprocess a)
         | _ -> None
       ) flat_stmts in
+      if !jumps_dropped > 0 then
+        Printf.eprintf
+          "[verilator_to_behavioral] %s: %d break/continue/return in always \
+           blocks DROPPED -- each loop runs every iteration; correct only when \
+           later iterations cannot change the result\n%!" name !jumps_dropped;
       let rec lhs_base = function
         | VarRef { name; _ } | VarRef' { name; _ } -> Some name
         (* `tmp_mask[i]` LHS — recover base name. Lossy: we drop the bit

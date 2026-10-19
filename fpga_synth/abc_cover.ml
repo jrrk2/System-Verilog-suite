@@ -221,6 +221,10 @@ let map_graph
   : Hardcaml.Signal.t array
   =
   ignore k;
+  (* A module with no logic of its own -- CVA6's axi_xbar_intf only re-packs
+     an interface into structs -- gives a graph with no outputs, and abc
+     aborts on the empty network (Abc_NtkCheckNames assertion, rc 134). *)
+  if List.is_empty g.outputs then [||] else
   let base = Stdlib.Filename.temp_file ("svs_abc_" ^ name ^ "_") "" in
   let aig = base ^ ".aig" and blif = base ^ ".blif" in
   write_aig_binary g aig;
